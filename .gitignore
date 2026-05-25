@@ -1,0 +1,35 @@
+.workbuddy/
+/deliverables/
+
+# Root-level grammar snapshots; compiler sources live under jasper-compiler/src/main/antlr.
+/JasperLexer.g4
+/JasperParser.g4
+
+# Legacy standalone compiler-project wrapper; use the repository-level Gradle wrapper.
+/jasper-compiler/gradle/
+/jasper-compiler/gradlew
+/jasper-compiler/gradlew.bat
+/jasper-compiler/settings.gradle.kts
+
+# Gradle / Kotlin local state
+.gradle/
+.kotlin/
+**/.gradle/
+**/.kotlin/
+
+# Build output
+**/build/
+**/out/
+
+# IDE/project-local files
+**/.idea/
+*.iml
+
+# JVM crash / heap dumps
+*.hprof
+hs_err_pid*
+replay_pid*
+
+# Accidental compiled class output
+*.class
+/org/

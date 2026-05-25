@@ -1,0 +1,18 @@
+package literals;
+
+public class Literals {
+    public static function main(): void {
+        var a: int32 = 42;
+        var b: int32 = 0xFF;
+        var c: int32 = 0o77;
+        var d: int32 = 0b1010;
+
+        var e: float64 = 3.14;
+
+        var s1: string = "hello";
+        var s2: string = `raw string`;
+        var s4: bool = true;
+        var s5: bool = false;
+        var n: string? = null;
+    }
+}

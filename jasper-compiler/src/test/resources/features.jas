@@ -1,0 +1,79 @@
+package demo;
+
+import std.io;
+import std.collections.*;
+
+from "some-module" import SomeType;
+
+public class Demo {
+    public class Box<T extends any> {
+        private var value: T;
+
+        public constructor(value: T) {
+            this.value = value;
+        }
+
+        public function getValue(): T {
+            return this.value;
+        }
+
+        public function setValue(value: T): void {
+            this.value = value;
+        }
+    }
+
+    public interface Drawable {
+        public function draw(): void;
+    }
+
+    public enum Color {
+        Red,
+        Green,
+        Blue
+    }
+
+    public static function swap<T>(a: T, b: T): void {
+        var tmp: T = a;
+        a = b;
+        b = tmp;
+    }
+
+    public static function describe(value: any): string {
+        switch (value) {
+            case 0 => {
+                return "zero";
+            }
+            case 1 => {
+                return "one";
+            }
+            default => {
+                return "many";
+            }
+        }
+    }
+
+    public static function main(): void {
+        var x: int32 = 42;
+        var y: string = "hello";
+        const z: float64 = 3.14;
+
+        if (x > 0) {
+            println("positive");
+        } else {
+            println("non-positive");
+        }
+
+        var i: int32 = 0;
+        while (i < 10) {
+            i = i + 1;
+        }
+
+        for (var j: int32 = 0; j < 10; j = j + 1) {
+            println(j);
+        }
+
+        defer {
+            println("cleanup");
+        }
+    }
+}

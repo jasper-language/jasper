@@ -1,0 +1,3 @@
+#!/bin/bash
+# Jasper compiler launcher
+exec java -jar "$(dirname "$0")/jasper-compiler/build/libs/jasper-compiler.jar" "$@"
