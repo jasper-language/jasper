@@ -10,10 +10,16 @@ repositories {
     mavenCentral()
 }
 
+// The ANTLR tool used to generate the parser is resolved from Maven Central so
+// that grammar generation works on any machine (the previous build hardcoded an
+// absolute path to a jar on one developer's Windows box).
+val antlrTool: Configuration by configurations.creating
+
 dependencies {
     implementation("org.antlr:antlr4-runtime:4.13.2")
     implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.0")
     testImplementation(kotlin("test"))
+    add(antlrTool.name, "org.antlr:antlr4:4.13.2")
 }
 
 application {
@@ -31,13 +37,11 @@ kotlin {
 
 val generatedAntlrDir = layout.buildDirectory.dir("generated-src/antlr/main")
 
-val antlrJar = file("C:\\Users\\admin\\AppData\\Local\\Temp\\opencode\\antlr-4.13.2-complete.jar")
-
 val generateAntlrGrammar = tasks.register<JavaExec>("generateGrammarSource") {
     description = "Generate ANTLR lexer and parser from .g4 files"
     group = "build"
 
-    classpath = files(antlrJar)
+    classpath = antlrTool
     mainClass.set("org.antlr.v4.Tool")
 
     val g4Dir = file("src/main/antlr")
