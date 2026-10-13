@@ -191,9 +191,6 @@ importDeclaration
 fromImportDeclaration
     : softFrom qn=qualifiedName Import clause=importClause ';'                #FromImportQualified
     | softFrom s=STRING_LITERAL Import clause=importClause ';'               #FromImportString
-    | softFrom rs=RAW_STRING_LITERAL Import clause=importClause ';'          #FromImportRawString
-    | softFrom ts=TRIPLE_STRING_LITERAL Import clause=importClause ';'       #FromImportTripleString
-    | softFrom rts=RAW_TRIPLE_STRING_LITERAL Import clause=importClause ';'  #FromImportRawTripleString
     ;
 
 /*
@@ -261,7 +258,6 @@ softWhere    : { _input.LT(1).getText().equals("where") }? Identifier ;
 //graph::softIs #@rule 说明：软关键字：softIs，用于 where 约束：T is NonNull。
 softIs
     : Is
-    | Is
     ;
 
 /*
@@ -334,23 +330,6 @@ softAs     : As ;
 softCast     : Cast ;
 
 /*
- * 规则：softJson
- * 所属分块：03 软关键字
- * 用途：软关键字：softJson，通过 Identifier+谓词匹配固定文本。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 实现说明：
- *   - 该软关键字通过 specific softXxx rule 进行匹配，仅在被引用的位置生效。
- *
- * 典型写法：
- *   // softJson 的一种典型写法（见该规则 RHS）
- */
-//graph::softJson #@rule 说明：软关键字：softJson，通过 Identifier+谓词匹配固定文本。
-softJson     : Json ;
-
-/*
  * 规则：softGet
  * 所属分块：03 软关键字
  * 用途：软关键字：softGet，通过 Identifier+谓词匹配固定文本。
@@ -365,7 +344,7 @@ softJson     : Json ;
  *   // softGet 的一种典型写法（见该规则 RHS）
  */
 //graph::softGet #@rule 说明：软关键字：softGet，通过 Identifier+谓词匹配固定文本。
-softGet     : Get ;
+softGet     : { _input.LT(1).getText().equals("get") }? Identifier ;
 
 /*
  * 规则：softSet
@@ -382,58 +361,7 @@ softGet     : Get ;
  *   // softSet 的一种典型写法（见该规则 RHS）
  */
 //graph::softSet #@rule 说明：软关键字：softSet，通过 Identifier+谓词匹配固定文本。
-softSet     : Set ;
-
-/*
- * 规则：softOr
- * 所属分块：03 软关键字
- * 用途：软关键字：softOr，通过 Identifier+谓词匹配固定文本。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 实现说明：
- *   - 该软关键字通过 specific softXxx rule 进行匹配，仅在被引用的位置生效。
- *
- * 典型写法：
- *   // softOr 的一种典型写法（见该规则 RHS）
- */
-//graph::softOr #@rule 说明：软关键字：softOr，通过 Identifier+谓词匹配固定文本。
-softOr     : Or ;
-
-/*
- * 规则：softAnd
- * 所属分块：03 软关键字
- * 用途：软关键字：softAnd，通过 Identifier+谓词匹配固定文本。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 实现说明：
- *   - 该软关键字通过 specific softXxx rule 进行匹配，仅在被引用的位置生效。
- *
- * 典型写法：
- *   // softAnd 的一种典型写法（见该规则 RHS）
- */
-//graph::softAnd #@rule 说明：软关键字：softAnd，通过 Identifier+谓词匹配固定文本。
-softAnd     : And ;
-
-/*
- * 规则：softNot
- * 所属分块：03 软关键字
- * 用途：软关键字：softNot，通过 Identifier+谓词匹配固定文本。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 实现说明：
- *   - 该软关键字通过 specific softXxx rule 进行匹配，仅在被引用的位置生效。
- *
- * 典型写法：
- *   // softNot 的一种典型写法（见该规则 RHS）
- */
-//graph::softNot #@rule 说明：软关键字：softNot，通过 Identifier+谓词匹配固定文本。
-softNot     : Not ;
+softSet     : { _input.LT(1).getText().equals("set") }? Identifier ;
 
 /*
 ======================================================================
@@ -488,6 +416,7 @@ literal
     | HEX_FLOAT_LITERAL             #HexFloatLiteral
 
     | STRING_LITERAL                #StringLiteral
+    | CHAR_LITERAL                  #CharLiteral
     | RAW_STRING_LITERAL            #RawStringLiteral
     | REGEX_LITERAL                 #RegexLiteral
     | FORMAT_STRING_LITERAL         #FormatStringLiteral
@@ -502,7 +431,6 @@ literal
     | False                         #FalseLiteral
     | Null                          #NullLiteral
     | dictLiteral                   #LiteralDict
-    | jsonLiteral                   #LiteralJson
     ;
 
 /*
@@ -541,67 +469,6 @@ dictEntry
     ;
 
 /*
- * 规则：jsonLiteral
- * 所属分块：05 字面量与初始化
- * 用途：json 字面量：json{ k: v, ... }，key/value 允许任意表达式，
- *       语义层保证结果为严格 JSON（key 运行时必须为 string，value 必须为 JSON 合法类型）。
- * 说明：
- *   - 该规则只描述"可解析的语法形态"；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   json{ "a": 1, "b": true, "c": null }
- *   json{ keyExpr(): valExpr() }
- */
-//graph::jsonLiteral #@rule 说明：json 字面量：json{ k: v, ... }，key/value 允许任意表达式。
-jsonLiteral
-    : softJson '{' (jsonEntry (',' jsonEntry)* ','?)? '}'
-    ;
-
-/*
- * 规则：jsonEntry
- * 所属分块：05 字面量与初始化
- * 用途：json 条目：expression : expression；与 dictEntry 语法一致，语义层做 JSON 合规校验。
- * 说明：
- *   - 该规则只描述"可解析的语法形态"；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * AST 友好：
- *   - jsonEntry 抽出后，jsonLiteral 内部是 entry 的列表，避免 AST 侧按 token/下标配对。
- *
- * 典型写法：
- *   "a": 1
- *   obj.getKey(): obj.getValue()
- */
-//graph::jsonEntry #@keep #@rule 说明：json 条目：expression : expression；抽出后更 AST 友好。
-jsonEntry
-    : key=expression ':' value=expression
-    ;
-
-/*
- * 规则：jsonValue
- * 所属分块：05 字面量与初始化
- * 用途：json 值：字符串/数字/布尔/null/json 对象/json 数组。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // jsonValue 的一种典型写法（见该规则 RHS）
- */
-//graph::jsonValue #@rule 说明：json 值：字符串/数字/布尔/null/json 对象/json 数组。
-jsonValue
-    : STRING_LITERAL                                                             #JsonString
-    | (DEC_LITERAL | HEX_LITERAL | OCT_LITERAL | BIN_LITERAL)                     #JsonNumber
-    | True                                                                       #JsonTrue
-    | False                                                                      #JsonFalse
-    | Null                                                                       #JsonNull
-    | jsonLiteral                                                                #JsonObject
-    | '[' (jsonValue (',' jsonValue)* ','?)? ']'                                 #JsonArray
-    ;
-
-
-/*
  * 规则：arrayInitializer
  * 所属分块：05 字面量与初始化
  * 用途：语法节点：arrayInitializer。
@@ -614,7 +481,7 @@ jsonValue
  */
 //graph::arrayInitializer #@rule 说明：语法节点：arrayInitializer。
 arrayInitializer
-    : '[' ( variableInitializer (',' variableInitializer)* ','? )? ','? ']'
+    : '[' ( variableInitializer (',' variableInitializer)* ','? )? ']'
     ;
 
 /*
@@ -654,7 +521,7 @@ primitiveType
  */
 //graph::typeExpr #@keep #@core 说明：语法节点：typeExpr。
 typeExpr
-    : typeAtom typeSuffix* typeQualifier*                         #TypeExpression
+    : typeAtom typeSuffix* typeQualifier?                         #TypeExpression
     ;
 
 
@@ -687,7 +554,7 @@ typePrefix
  */
 //graph::typeStarRun #@rule 说明：星号链：支持 '*'（以及若 lexer 有定义则支持 '**' 单 token）。
 typeStarRun
-    : ('*' | '**')+                                               #TypeAsteriskSequenceNode
+    : ('*')+                                                      #TypeAsteriskSequenceNode
     ;
 
 
@@ -727,6 +594,7 @@ typeAtomBase
     | Regex                                                       #TypeAtomNodeRegex
     | Any                                                         #TypeAtomNodeAny
     | Void                                                        #TypeAtomNodeUnit
+    | Dict typeArguments?                                         #TypeAtomNodeDict
     | '(' typeExpr (',' typeExpr)+ ','? ')'                        #TypeAtomNodeTuple
     | '(' typeExpr ')'                                            #TypeAtomNodeGroup
     | annotation* Identifier typeArguments?                        #TypeAtomNodeIdentifier
@@ -763,22 +631,6 @@ typeQualifier
 typeSuffix
     : '.' annotation* Identifier typeArguments?                    #TypeSuffixDot
     | annotation* '[' ']'                                          #TypeSuffixArray
-    ;
-
-/*
- * 规则：typePostfix
- * 所属分块：06 类型系统
- * 用途：语法节点：typePostfix。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   List<Int32>[]?
- */
-//graph::typePostfix #@rule 说明：语法节点：typePostfix。
-typePostfix
-    : typeAtom typeSuffix* typeQualifier*                         //#TypePostfix
     ;
 
 /*
@@ -942,10 +794,6 @@ modifier
     | Abstract
     | Static
     | Final
-    | Default
-    | Defer
-    | Lock
-    | Atomic
     ;
 
 /*
@@ -957,7 +805,7 @@ modifier
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotation #@keep #@core 说明：@X 注解/装饰器统一语法：@X ≡ @X()；@X(...) 的括号内为“实参列表”（位置参数、命名参数、展开、嵌套 @）。
 annotation
@@ -973,7 +821,7 @@ annotation
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationArguments #@rule 说明：注解/装饰器的调用括号：(...)。
 annotationArguments
@@ -1007,7 +855,7 @@ annotationArgumentList
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationPositionalArgument #@rule 说明：位置实参：value 或 ...value。
 annotationPositionalArgument
@@ -1024,7 +872,7 @@ annotationPositionalArgument
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationNamedArgument #@rule 说明：命名实参：name = value。
 annotationNamedArgument
@@ -1040,7 +888,7 @@ annotationNamedArgument
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationSpreadArgument #@rule 说明：展开/转发：...expr。
 annotationSpreadArgument
@@ -1056,12 +904,13 @@ annotationSpreadArgument
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationArgumentValue #@rule 说明：实参值：允许 expression，或嵌套 @（annotation）。
 annotationArgumentValue
     : annotation                                                               #AnnotationArgumentValueAtNode
     | expression                                                               #AnnotationArgumentValueExpressionNode
+    | '{' ( annotationArgumentValue (',' annotationArgumentValue)* ','? )? '}'   #AnnotationArgumentValueArrayNode
     ;
 
 /*
@@ -1136,7 +985,7 @@ normalClassDeclaration
  */
 //graph::superclass #@rule 说明：语法节点：superclass。
 superclass
-    : Extends typePostfix
+    : Extends namedType
     ;
 
 /*
@@ -1152,7 +1001,19 @@ superclass
  */
 //graph::superinterfaces #@rule 说明：语法节点：superinterfaces。
 superinterfaces
-    : Implements typePostfix (',' typePostfix)* ','?
+    : Implements namedType (',' namedType)* ','?
+    ;
+
+/*
+ * 规则：namedType
+ * 所属分块：06 类型系统
+ * 用途：父类 / 接口位置允许的类型：可选注解 + 具名类型 + 可选泛型实参。
+ * 说明：
+ *   - 语法层直接排除 `extends B[]`、`implements C?`、`extends *D` 这类形态。
+ */
+//graph::namedType #@keep #@rule 说明：父类/接口位置的受限类型（具名 + 泛型）。
+namedType
+    : annotation* qualifiedName typeArguments?                        #NamedTypeRef
     ;
 
 /*
@@ -1447,7 +1308,7 @@ enumDeclaration
  */
 //graph::enumBody #@rule 说明：语法节点：enumBody。
 enumBody
-    : '{' (enumConstant (',' enumConstant)* ','?)? ','? enumBodyDeclarations? '}'
+    : '{' (enumConstant (',' enumConstant)* ','?)? enumBodyDeclarations? '}'
     ;
 
 /*
@@ -1512,7 +1373,7 @@ normalInterfaceDeclaration
  */
 //graph::extendsInterfaces #@rule 说明：语法节点：extendsInterfaces。
 extendsInterfaces
-    : Extends typePostfix (',' typePostfix)* ','?
+    : Extends typeExpr (',' typeExpr)* ','?
     ;
 
 /*
@@ -1546,8 +1407,8 @@ interfaceBody
 interfaceMemberDeclaration
     : decl=constantDeclaration                                 #InterfaceMemberConst
     | decl=interfacePropertyDeclaration                         #InterfaceMemberProperty
-    | decl=methodDeclaration                                    #InterfaceMemberMethod
     | decl=interfaceMethodDeclaration                           #InterfaceMemberAbstractMethod
+    | decl=methodDeclaration                                    #InterfaceMemberMethod
     | decl=normalClassDeclaration                               #InterfaceMemberClass
     | decl=enumDeclaration                                      #InterfaceMemberEnum
     | decl=normalInterfaceDeclaration                           #InterfaceMemberInterface
@@ -1617,7 +1478,7 @@ interfaceMethodDeclaration
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationTypeDeclaration #@rule 说明：声明节点：annotationTypeDeclaration。
 annotationTypeDeclaration
@@ -1634,7 +1495,7 @@ annotationTypeDeclaration
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationTypeBody #@rule 说明：类型相关节点：annotationTypeBody。
 annotationTypeBody
@@ -1650,7 +1511,7 @@ annotationTypeBody
  *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  */
 //graph::annotationTypeMemberDeclaration #@rule 说明：声明节点：annotationTypeMemberDeclaration。
 annotationTypeMemberDeclaration
@@ -1685,7 +1546,7 @@ typeOrPrimitive
  * 作用：匹配语法形态：mods=modifier* ty=typeOrPrimitive name=Identifier '(' ')' ('[' ']')* defaultValue? ';'
  *
  * 典型写法：
- *   @Test(timeout: 1000)
+ *   @Test(timeout = 1000)
  *
  * 备注：
  *   - 本规则只描述可解析的语法形态；语义/名称解析/类型推断/合法性收敛在 AST Checker 中完成。
@@ -1750,7 +1611,7 @@ throws_
  */
 //graph::exceptionType #@rule 说明：类型相关节点：exceptionType。
 exceptionType
-    : typePostfix
+    : typeExpr
     | typeExpr
     ;
 
@@ -1829,106 +1690,6 @@ variableInitializer
 pattern 系列规则（or/and/not/primary）与绑定模式，用于 for-in 赋值模式等。
 ======================================================================
 */
-
-/*
- * 规则：pattern
- * 所属分块：10 模式匹配与 pattern
- * 用途：模式匹配入口：按 or/and/not/paren 优先级组织。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // pattern 的一种典型写法（见该规则 RHS）
- */
-//graph::pattern #@keep #@core 说明：模式匹配入口：按 or/and/not/paren 优先级组织。
-pattern
-    : patternOr                                     #PatternRoot
-    ;
-
-/*
- * 规则：patternOr
- * 所属分块：10 模式匹配与 pattern
- * 用途：语法节点：patternOr。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // patternOr 的一种典型写法（见该规则 RHS）
- */
-//graph::patternOr #@rule 说明：语法节点：patternOr。
-patternOr
-    : patternAnd (softOr patternAnd)*               #PatternOrChain
-    ;
-
-/*
- * 规则：patternAnd
- * 所属分块：10 模式匹配与 pattern
- * 用途：语法节点：patternAnd。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // patternAnd 的一种典型写法（见该规则 RHS）
- */
-//graph::patternAnd #@rule 说明：语法节点：patternAnd。
-patternAnd
-    : patternUnary (softAnd patternUnary)*          #PatternAndChain
-    ;
-
-/*
- * 规则：patternUnary
- * 所属分块：10 模式匹配与 pattern
- * 用途：语法节点：patternUnary。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // patternUnary 的一种典型写法（见该规则 RHS）
- */
-//graph::patternUnary #@rule 说明：语法节点：patternUnary。
-patternUnary
-    : softNot patternUnary                          #PatternUnaryNot
-    | patternPrimary                                #PatternUnaryBase
-    ;
-
-/*
- * 规则：patternPrimary
- * 所属分块：10 模式匹配与 pattern
- * 用途：语法节点：patternPrimary。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // patternPrimary 的一种典型写法（见该规则 RHS）
- */
-//graph::patternPrimary #@rule 说明：语法节点：patternPrimary。
-patternPrimary
-    : primaryPattern                                #PatternPrimaryAtom
-    | '(' pattern ')'                               #PatternPrimaryParen
-    ;
-
-/*
- * 规则：primaryPattern
- * 所属分块：10 模式匹配与 pattern
- * 用途：语法节点：primaryPattern。
- * 说明：
- *   - 该规则只描述“可解析的语法形态”；名称解析/类型推断/语义收敛等由 AST Checker 处理。
- *   - 若本规则包含多个分支，建议在 AST 层以 alt label（#...）作为具体节点类型划分依据。
- *
- * 典型写法：
- *   // primaryPattern 的一种典型写法（见该规则 RHS）
- */
-//graph::primaryPattern #@rule 说明：语法节点：primaryPattern（限制为原子模式；不直接吞任意 expression）。
-primaryPattern
-    : Underscore
-    | literal
-    | qualifiedName
-    ;
 
 /*
  * 规则：bindingPattern
@@ -2140,6 +1901,7 @@ primaryAtom
     | '(' expression ')'                               #PrimaryAtomParen
     | classInstanceCreationExpression                  #PrimaryAtomNew
     | arrayCreationExpression                          #PrimaryAtomArrayCreation
+    | arrayInitializer                                 #PrimaryAtomArrayLiteral
     | qualifiedName                                   #PrimaryAtomName
     | Super                                            #PrimaryAtomSuper
     | qualifiedName '.' Super                               #PrimaryAtomTypeSuper
@@ -2171,7 +1933,7 @@ methodReference
       COLON_COLON typeArguments? Identifier                             #MethodReferencePrimaryChain
     | Super COLON_COLON typeArguments? Identifier                       #MethodReferenceSuper
     | qualifiedName '.' Super COLON_COLON typeArguments? Identifier          #MethodReferenceTypeSuper
-    | typePostfix COLON_COLON typeArguments? New                          #ConstructorReferenceClass
+    | typeExpr COLON_COLON typeArguments? New                          #ConstructorReferenceClass
     | typeExpr COLON_COLON New                                         #ConstructorReferenceArray
     ;
 
@@ -2223,9 +1985,9 @@ classInstanceCreationExpressionAfterDot
 //graph::arrayCreationExpression #@rule 说明：表达式节点：arrayCreationExpression。
 arrayCreationExpression
     : New primitiveType dimExprs dims?                 #ArrayNewPrimitiveDimExprs
-    | New typePostfix  dimExprs dims?                  #ArrayNewRefDimExprs
+    | New typeExpr  dimExprs dims?                  #ArrayNewRefDimExprs
     | New primitiveType dims arrayInitializer          #ArrayInitPrimitive
-    | New typePostfix  dims arrayInitializer           #ArrayInitRef
+    | New typeExpr  dims arrayInitializer           #ArrayInitRef
     ;
 
 
@@ -2356,7 +2118,7 @@ conditionalExpression
 
 //graph::nullFallbackExpression #@rule 说明：语法糖：a?.b else c  ≡ (a?.b) ?? c
 nullFallbackExpression
-    : nullCoalesceExpression (Else nullCoalesceExpression)?                 #NullFallbackExpr
+    : nullCoalesceExpression                                                 #NullFallbackExpr
     ;
 
 //graph::nullCoalesceExpression #@rule 说明：空合并（??），优先级介于 binary 与 conditional 之间。
@@ -2458,8 +2220,7 @@ goExpression
 //graph::castExpression #@rule 说明：统一转换表达式：括号 cast 与 cast ... as ... 共用一族节点。
 castExpression
     : '(' primitiveType ')' unaryExpression                                             #CastPrimitive
-    | '(' typeExpr ')' (unaryExpression | lambdaExpression)                          #CastTypeExpr
-    | softCast expr=unaryExpression softAs ty=typePostfix                                #CastAs
+    | softCast expr=unaryExpression softAs ty=typeExpr                                #CastAs
     ;
 
 
@@ -2477,13 +2238,30 @@ castExpression
  */
 //graph::assignment #@rule 说明：统一赋值表达式：单一 assignmentTarget + operator + rhs。
 assignment
-    : target=assignmentTarget op=assignmentOperator rhs=expression    #AssignmentExpr
+    : target=assignmentTarget '=' inc=postfixIncrement                #AssignmentExprIncrement
+    | target=assignmentTarget op=assignmentOperator rhs=expression    #AssignmentExpr
+    ;
+
+/*
+ * 规则：postfixIncrement
+ * 所属分块：11 表达式
+ * 用途：后缀自增/自减的唯一合法形态。只允许出现在三个位置：
+ *       ① 独立语句 `i++;`  ② 赋值右侧 `x = i++;`  ③ for 更新子句 `for (...; ...; i++)`
+ * 说明：
+ *   - 语法层硬性限制「一条语句最多一次自增/自减」，因此链式（i++++、++i++）与
+ *     一条语句内多次自增（x = (i++) * i++;）在语法层就不可能写出。
+ *   - 只支持后缀形式，不支持前缀 ++i。
+ */
+//graph::postfixIncrement #@keep #@rule 说明：后缀自增/自减，仅限三个位置。
+postfixIncrement
+    : target=assignmentTarget op=('++' | '--')                        #PostfixIncDec
     ;
 
 //graph::assignmentTarget #@rule 说明：统一可赋值目标：限定名或带至少一个后缀的 primary 链。
 assignmentTarget
     : qualifiedName                                                   #AssignmentExprTargetQualifiedName
     | primaryAtom primarySuffix+                                      #AssignmentExprTargetPrimaryChain
+    | '*' assignmentTarget                                            #AssignmentExprTargetDeref
     ;
 
 
@@ -2576,6 +2354,7 @@ statement
     : block                #StatementBlock
     | ';'                  #StatementEmpty
     | expression ';'       #StatementExpressionStatement
+    | postfixIncrement ';' #StatementIncrement
     | yieldStatement        #StatementYield
     | assertStatement       #StatementAssert
     | switchStatement        #StatementSwitch
@@ -2832,7 +2611,8 @@ forClassicInit
  */
 //graph::forClassicUpdate #@inline_ok #@rule 说明：语法节点：forClassicUpdate（classic for 的 update 部分）。
 forClassicUpdate
-    : exprs+=expression (',' exprs+=expression)* ','?                      #ForClassicUpdateExprs
+    : postfixIncrement                                                    #ForClassicUpdateIncrement
+    | exprs+=expression (',' exprs+=expression)* ','?                      #ForClassicUpdateExprs
     ;
 
 /*

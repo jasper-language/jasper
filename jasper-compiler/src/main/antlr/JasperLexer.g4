@@ -6,13 +6,18 @@
 //   不包含 parser 规则，不包含语义逻辑。
 //
 // 设计原则：
-//   1) 软关键字（from/as/then/get/set）不在 lexer 做保留字，
-//      而是在 parser 中通过具体 softXxx 规则在需要的位置匹配，
-//      这样它们在非关键语境下仍可作为普通标识符使用。
+//   1) 真软关键字只有 get / set：lexer **不**为它们定义 token，
+//      由 parser 的 softGet / softSet 用谓词匹配 Identifier 的文本，
+//      因此它们在属性体之外可作普通标识符（例如 function get()）。
+//      其余（from / as / then / cast / label / is / and / or / not）是硬保留字。
 //   2) 运算符/分隔符按"长规则优先"排列，避免 >> 被拆成 > >
 //      （详见 Operators & Punctuators 章节说明）。
-//   3) dict / json 字面量 Token 必须出现在 Identifier 之前，
+//   3) dict 字面量 Token 必须出现在 Identifier 之前，
 //      否则会被错误识别为普通标识符。
+//
+//   4) 这里**故意不定义** IllegalCharacter : . -> skip。那条例外会让无法识别
+//      的输入被静默吞掉（例如 'A' 与未闭合的 "abc 会退化成标识符），删掉它
+//      之后这类输入会产生词法错误。
 // =============================================================================
 
 lexer grammar JasperLexer;
@@ -70,9 +75,10 @@ Weak         : 'weak';      // 永久保留关键字：非 GC 设计保留，不
 Auto         : 'auto';      // 永久保留关键字：非 GC 设计保留，不实现
 Unique       : 'unique';    // 永久保留关键字：非 GC 设计保留，不实现
 
-// ---------- 属性访问器（软关键字，parser 中按具体规则匹配） ----------
-Get          : 'get';
-Set          : 'set';
+// ---------- 属性访问器 ----------
+// get / set 是**真软关键字**，故意不在此定义 token：
+// 只在属性体 `{ get; set; }` 内由 parser 的 softGet / softSet 规则谓词匹配，
+// 其他位置可作普通标识符（function get()、var set = 1）。
 Cast         : 'cast';
 
 // ---------- 类 / 接口 / 函数 ----------
@@ -141,14 +147,12 @@ Is           : 'is';
 // ---------- 模块系统 ----------
 Package      : 'package';
 Import       : 'import';
-From         : 'from';      // 软关键字：from x import y
-As           : 'as';        // 软关键字：import alias / cast
-Module       : 'module';
+From         : 'from';      // 硬保留字：from x import y
+As           : 'as';        // 硬保留字：import alias / cast
 
 // ---------- 集合字面量 ----------
 // 注意：必须出现在 Identifier 之前，避免被 tokenize 为普通标识符
-Dict         : 'dict';      // dict{...}
-Json         : 'json';      // json{...}
+Dict         : 'dict';      // dict{...}（json 已移出语言核心，不再是关键字）
 
 // ---------- 特殊字面量 ----------
 Null         : 'null';
@@ -216,14 +220,25 @@ STRING_LITERAL
     : '"' ( ~["\\] | '\\' . )* '"'
     ;
 
-// 原始字符串（反引号）
-RAW_STRING_LITERAL
-    : '`' ( ~'`' )* '`'
+// 字符字面量：'A'  '\n'  '\x41'  '\u4e2d'
+CHAR_LITERAL
+    : '\'' ( CHAR_ESCAPE | ~['\\\r\n] ) '\''
     ;
 
-// 正则表达式字面量 r"..."
+fragment CHAR_ESCAPE
+    : '\\' [btnfr'"\\]
+    | '\\' 'x' [0-9a-fA-F] [0-9a-fA-F]
+    | '\\' 'u' [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
+    ;
+
+// 原始字符串：r"..."（不处理转义）—— 与 Python/C#/Go 的 r"" 约定一致
+RAW_STRING_LITERAL
+    : 'r"' ~["\r\n]* '"'
+    ;
+
+// 正则表达式字面量：re"..."
 REGEX_LITERAL
-    : 'r"' ( ~["\\] | '\\' . )* '"'
+    : 're"' ( ~["\\] | '\\' . )* '"'
     ;
 
 // 格式化字符串 f"..."
@@ -269,14 +284,14 @@ FORMAT_TRIPLE_STRING_LITERAL
 
 // --- 多字符运算符/分隔符（长优先）---
 ELLIPSIS        : '...';
-ARROW           : '->';
 
-SAFE_DOT        : '?.';       // 安全导航（future）
-NULL_COALESCE_ASSIGN : '??='; // null 合并赋值（future）
-NULL_COALESCE   : '??';       // null 合并（future）
-POW_ASSIGN      : '**=';      // 幂赋值（future）
-POW             : '**';       // 幂运算（future）
+SAFE_DOT        : '?.';       // 安全导航
+NULL_COALESCE   : '??';       // null 合并
 COLON_COLON     : '::';       // 命名空间/方法引用/路径分隔
+
+// 定稿删除：ARROW '->'（无引用）、NULL_COALESCE_ASSIGN '??='（无语法依据，
+// 统一用 '??'）、POW_ASSIGN '**=' 与 POW '**'（不设幂运算；双指针类型由两个
+// STAR token 表达，见 parser 的 typeStarRun）。
 
 URSHIFT_ASSIGN  : '>>>=';     // 无符号右移赋值
 URSHIFT         : '>>>';      // 无符号右移
@@ -336,7 +351,7 @@ TILDE           : '~';
 AMP             : '&';
 PIPE            : '|';
 CARET           : '^';
-Dollar           : '$';
+// Dollar '$' 已删除：无任何规则引用（'$' 仍属 IdentifierStart，可作标识符字符）
 
 // 全角竖线（兼容中文输入法误触发），用于 Union Type：A｜B
 FULLWIDTH_PIPE   : '\uFF5C';
@@ -351,10 +366,9 @@ Identifier
     : IdentifierStart IdentifierPart*
     ;
 
-// 非法字符：跳过无法识别的输入
-IllegalCharacter
-    : . -> skip
-    ;
+// 定稿删除：IllegalCharacter : . -> skip
+// 那条例外会让无法识别的输入被静默吞掉（'A' 退化成标识符 A、未闭合字符串
+// "abc 退化成标识符 abc，且词法层零报错）。删掉后这类输入会产生词法错误。
 
 // 空白字符
 WS : [ \t\r\n]+ -> skip ;
