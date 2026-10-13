@@ -1,0 +1,3 @@
+[submodule "jasper-compiler/src/main/antlr"]
+	path = jasper-compiler/src/main/antlr
+	url = https://github.com/jasper-language/jasper-grammar.git
