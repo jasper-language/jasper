@@ -607,6 +607,17 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return buildVarStmt(ctx.tail, ctx.kind.text == "const", ctx)
     }
 
+    override fun visitVariableBindingIncDec(ctx: JasperParser.VariableBindingIncDecContext): JasNode? {
+        val b = ctx.core
+        val init = visit(ctx.init) as? JasExpression
+        return JasVariableStatement(
+            b.name.text,
+            if (b.typeRef != null) visit(b.typeRef) as? JasType else null,
+            init,
+            false
+        ).at(ctx)
+    }
+
     // 鈹€鈹€ Expressions 鈹€鈹€
 
     override fun visitExprLambda(ctx: JasperParser.ExprLambdaContext): JasNode? = visit(ctx.lambdaExpression())
@@ -1354,6 +1365,19 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     private fun buildVarStmt(tail: JasperParser.VariableDeclarationTailContext, isConst: Boolean, ctx: ParserRuleContext): JasNode? {
+        // Handle variableBindingIncrement (single binding with postfix inc/dec)
+        val incCtx = tail.variableBindingIncrement()
+        if (incCtx is JasperParser.VariableBindingIncDecContext) {
+            val b = incCtx.core
+            val init = visit(incCtx.init) as? JasExpression
+            return JasVariableStatement(
+                b.name.text,
+                if (b.typeRef != null) visit(b.typeRef) as? JasType else null,
+                init,
+                isConst
+            ).at(ctx)
+        }
+        // Handle variableBinding (multiple bindings)
         val stmts = tail.variableBinding().map { vb ->
             val b = vb.core
             JasVariableStatement(
