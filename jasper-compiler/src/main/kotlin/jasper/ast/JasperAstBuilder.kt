@@ -1,4 +1,4 @@
-﻿package jasper.ast
+package jasper.ast
 
 import jasper.parser.JasperParser
 import jasper.parser.JasperParserBaseVisitor
@@ -354,6 +354,22 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             ctx.typeArguments().typeArgument().mapNotNull { visit(it) as? JasType }
         } else emptyList()
         return JasNamedType("dict", args).at(ctx)
+    }
+
+    /**
+     * `namedType : annotation* qualifiedName typeArguments?  #NamedTypeRef`
+     *
+     * 父类（extends）与接口（implements）位置使用受限类型 namedType。
+     * 此方法必须存在：缺失时 visit() 会走 visitChildren 返回非 JasType，
+     * 调用侧 as? JasType / mapNotNull 会**静默丢弃** superclass / interfaces，
+     * 于是类照常编译，运行期 invokeinterface 才抛 NoSuchMethodError。
+     */
+    override fun visitNamedTypeRef(ctx: JasperParser.NamedTypeRefContext): JasNode? {
+        val name = ctx.qualifiedName().Identifier().joinToString(".") { it.text }
+        val args = if (ctx.typeArguments() != null) {
+            ctx.typeArguments().typeArgument().mapNotNull { visit(it) as? JasType }
+        } else emptyList()
+        return JasNamedType(name, args).at(ctx)
     }
 
     override fun visitPrimitiveType(ctx: JasperParser.PrimitiveTypeContext): JasNode? = JasPrimitiveType(ctx.getText()).at(ctx)
