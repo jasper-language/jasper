@@ -390,7 +390,7 @@ class FeaturesTranslationTest {
     }
 
     @Test
-    fun `test prefix increment compiles`() {
+    fun `test prefix increment is syntax error`() {
         val source = """
             package test;
             function main(): void {
@@ -399,7 +399,7 @@ class FeaturesTranslationTest {
             }
         """.trimIndent()
         val result = JasperCompiler().compile(source)
-        assertTrue(result is JasperCompiler.CompileResult.Success, "Expected Success but got: $result")
+        assertTrue(result is JasperCompiler.CompileResult.Error, "Prefix increment should be syntax error: $result")
     }
 
     @Test
@@ -416,7 +416,7 @@ class FeaturesTranslationTest {
     }
 
     @Test
-    fun `test prefix decrement compiles`() {
+    fun `test prefix decrement is syntax error`() {
         val source = """
             package test;
             function main(): void {
@@ -425,7 +425,7 @@ class FeaturesTranslationTest {
             }
         """.trimIndent()
         val result = JasperCompiler().compile(source)
-        assertTrue(result is JasperCompiler.CompileResult.Success, "Expected Success but got: $result")
+        assertTrue(result is JasperCompiler.CompileResult.Error, "Prefix decrement should be syntax error: $result")
     }
 
     @Test

@@ -20,7 +20,7 @@ import jasper.compiler.JasperErrorStrategy
 
 /**
  * Preprocesses source text for syntactic sugar that the parser cannot handle natively.
- * Note: `++`/`--` are now handled via token-stream desugaring in [DesugaredTokenStream].
+ * Note: `++`/`--` are now handled directly in the grammar.
  */
 private fun preprocessSource(source: String): String {
     val ident = "[a-zA-Z_\\$][a-zA-Z0-9_\\$]*"
@@ -370,7 +370,7 @@ class JasperCompiler {
     private fun createParser(source: String): Pair<JasperParser, JasperErrorListener> {
         val input = CharStreams.fromString(source)
         val lexer = JasperLexer(input)
-        val tokens = DesugaredTokenStream(lexer)
+        val tokens = org.antlr.v4.runtime.CommonTokenStream(lexer)
         val parser = JasperParser(tokens)
         val errorListener = JasperErrorListener()
         parser.removeErrorListeners()

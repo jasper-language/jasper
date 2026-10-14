@@ -619,6 +619,7 @@ class JasperToIrTranslator {
             is JasYield -> translateYield(stmt, ctx)
             is JasDestructuringDeclaration -> translateDestructuringDeclaration(stmt, ctx)
             is JasMatch -> translateMatch(stmt, ctx)
+            is JasStatementIncrement -> translateStatementIncrement(stmt, ctx)
             else -> null
         }
     }
@@ -659,6 +660,10 @@ class JasperToIrTranslator {
 
     private fun translateExpressionStatement(stmt: JasExpressionStatement, ctx: TranslationContext): IrStatement {
         return translateExpression(stmt.expression, ctx)
+    }
+
+    private fun translateStatementIncrement(stmt: JasStatementIncrement, ctx: TranslationContext): IrStatement {
+        return translateExpression(stmt.increment, ctx)
     }
 
     private fun translateIf(stmt: JasIf, ctx: TranslationContext): IrWhen {
@@ -1184,6 +1189,8 @@ class JasperToIrTranslator {
                 block
             }
             is JasAssignment -> translateAssignment(expr, ctx)
+            is JasAssignmentIncrement -> translateAssignmentIncrement(expr, ctx)
+            is JasPostfixIncDec -> translatePostfixIncDec(expr, ctx)
             else -> typeMapper.unitExpr()
         }
     }
@@ -1885,5 +1892,136 @@ class JasperToIrTranslator {
             return block
         }
         return value
+    }
+
+    private fun translatePostfixIncDec(expr: JasPostfixIncDec, ctx: TranslationContext): IrExpression {
+        val target = expr.target
+        val op = expr.op
+        val one = typeMapper.intConst(1)
+        if (target is JasIdentifier) {
+            val foundSymbol = ctx.symbols[target.name]
+            if (foundSymbol != null) {
+                val getX = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), foundSymbol, IrStatementOrigin.GET_PROPERTY)
+                val stubSymbol = IrSimpleFunctionSymbolImpl()
+                ctx.callNames[stubSymbol] = if (op == "++") "plus" else "minus"
+                val binOp = IrNodeFactory.createCall(
+                    0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
+                    arrayOf(getX, one), emptyArray(), stubSymbol, null
+                )
+                val setX = IrNodeFactory.createSetValue(
+                    0, 0, typeMapper.unitType(), foundSymbol,
+                    IrStatementOrigin.EQ, binOp
+                )
+                val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
+                (block.statements as MutableList<IrStatement>).add(setX)
+                val resultSymbol = IrVariableSymbolImpl()
+                val resultVar = IrNodeFactory.createVariable(
+                    0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
+                    typeMapper.intType(), resultSymbol, true, false, false
+                )
+                if (op == "++") {
+                    resultVar.initializer = getX
+                } else {
+                    resultVar.initializer = IrNodeFactory.createCall(
+                        0, 0, typeMapper.intType(), IrStatementOrigin.MINUS,
+                        arrayOf(getX, one), emptyArray(), stubSymbol, null
+                    )
+                }
+                (block.statements as MutableList<IrStatement>).add(resultVar)
+                return block
+            }
+        } else if (target is JasPropertyAccess) {
+            val pa = target
+            val targetExpr = translateExpression(pa.target, ctx)
+            val fieldSymbol = ctx.fieldSymbols[pa.property] ?: IrFieldSymbolImpl()
+            val getField = IrNodeFactory.createGetField(0, 0, typeMapper.intType(), fieldSymbol, null, IrStatementOrigin.GET_PROPERTY)
+            getField.receiver = targetExpr
+            val stubSymbol = IrSimpleFunctionSymbolImpl()
+            ctx.callNames[stubSymbol] = if (op == "++") "plus" else "minus"
+            val binOp = IrNodeFactory.createCall(
+                0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
+                arrayOf(getField, one), emptyArray(), stubSymbol, null
+            )
+            val targetExpr2 = translateExpression(pa.target, ctx)
+            val setField = IrNodeFactory.createSetField(0, 0, typeMapper.unitType(), fieldSymbol, null, IrStatementOrigin.EQ)
+            setField.receiver = targetExpr2
+            setField.value = binOp
+            val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
+            (block.statements as MutableList<IrStatement>).add(setField)
+            val resultSymbol = IrVariableSymbolImpl()
+            val resultVar = IrNodeFactory.createVariable(
+                0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
+                typeMapper.intType(), resultSymbol, true, false, false
+            )
+            if (op == "++") {
+                resultVar.initializer = getField
+            } else {
+                resultVar.initializer = IrNodeFactory.createCall(
+                    0, 0, typeMapper.intType(), IrStatementOrigin.MINUS,
+                    arrayOf(getField, one), emptyArray(), stubSymbol, null
+                )
+            }
+            (block.statements as MutableList<IrStatement>).add(resultVar)
+            return block
+        } else if (target is JasArrayAccess) {
+            val aa = target
+            val arrayExpr = translateExpression(aa.target, ctx)
+            val indexExpr = translateExpression(aa.index, ctx)
+            val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
+            val arrSymbol = IrVariableSymbolImpl()
+            val arrVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("aa$"), arrayExpr.type, arrSymbol, true, false, false)
+            arrVar.initializer = arrayExpr
+            (block.statements as MutableList<IrStatement>).add(arrVar)
+            val idxSymbol = IrVariableSymbolImpl()
+            val idxVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("ai$"), indexExpr.type, idxSymbol, true, false, false)
+            idxVar.initializer = indexExpr
+            (block.statements as MutableList<IrStatement>).add(idxVar)
+            val getSymbol = IrSimpleFunctionSymbolImpl()
+            ctx.callNames[getSymbol] = "get"
+            val getCall = IrNodeFactory.createCall(
+                0, 0, typeMapper.intType(), null,
+                arrayOf(
+                    IrNodeFactory.createGetValue(0, 0, arrayExpr.type, arrSymbol, null),
+                    IrNodeFactory.createGetValue(0, 0, indexExpr.type, idxSymbol, null)
+                ), emptyArray(), getSymbol, null
+            )
+            val stubSymbol = IrSimpleFunctionSymbolImpl()
+            ctx.callNames[stubSymbol] = if (op == "++") "plus" else "minus"
+            val binOp = IrNodeFactory.createCall(
+                0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
+                arrayOf(getCall, one), emptyArray(), stubSymbol, null
+            )
+            val setSymbol = IrSimpleFunctionSymbolImpl()
+            ctx.callNames[setSymbol] = "arraySet"
+            val setCall = IrNodeFactory.createCall(
+                0, 0, typeMapper.unitType(), null,
+                arrayOf(
+                    IrNodeFactory.createGetValue(0, 0, arrayExpr.type, arrSymbol, null),
+                    IrNodeFactory.createGetValue(0, 0, indexExpr.type, idxSymbol, null),
+                    binOp
+                ), emptyArray(), setSymbol, null
+            )
+            (block.statements as MutableList<IrStatement>).add(setCall)
+            val resultSymbol = IrVariableSymbolImpl()
+            val resultVar = IrNodeFactory.createVariable(
+                0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
+                typeMapper.intType(), resultSymbol, true, false, false
+            )
+            if (op == "++") {
+                resultVar.initializer = getCall
+            } else {
+                resultVar.initializer = IrNodeFactory.createCall(
+                    0, 0, typeMapper.intType(), IrStatementOrigin.MINUS,
+                    arrayOf(getCall, one), emptyArray(), stubSymbol, null
+                )
+            }
+            (block.statements as MutableList<IrStatement>).add(resultVar)
+            return block
+        }
+        return typeMapper.unitExpr()
+    }
+
+    private fun translateAssignmentIncrement(expr: JasAssignmentIncrement, ctx: TranslationContext): IrExpression {
+        return translatePostfixIncDec(expr.increment, ctx)
     }
 }

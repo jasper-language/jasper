@@ -49,15 +49,6 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
                     is JasperParser.FromImportStringContext -> {
                         source = fromCtx.s.text; clause = fromCtx.clause
                     }
-                    is JasperParser.FromImportRawStringContext -> {
-                        source = fromCtx.rs.text; clause = fromCtx.clause
-                    }
-                    is JasperParser.FromImportTripleStringContext -> {
-                        source = fromCtx.ts.text; clause = fromCtx.clause
-                    }
-                    is JasperParser.FromImportRawTripleStringContext -> {
-                        source = fromCtx.rts.text; clause = fromCtx.clause
-                    }
                     else -> { source = null; clause = null!! }
                 }
                 if (clause is JasperParser.ImportClauseAllContext) {
@@ -89,8 +80,8 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitNormalClassDeclaration(ctx: JasperParser.NormalClassDeclarationContext): JasNode? {
         val mods = doExtractMods(ctx.modifier())
         val typeParams = if (ctx.tparams != null) doVisitTypeParams(ctx.tparams) else emptyList()
-        val superclass = if (ctx.sc != null) visit(ctx.sc.typePostfix()) as? JasType else null
-        val interfaces = if (ctx.sis != null) ctx.sis.typePostfix().mapNotNull { visit(it) as? JasType } else emptyList()
+        val superclass = if (ctx.sc != null) visit(ctx.sc.namedType()) as? JasType else null
+        val interfaces = if (ctx.sis != null) ctx.sis.namedType().mapNotNull { visit(it) as? JasType } else emptyList()
         val members = mutableListOf<JasDeclaration>()
         val constructors = mutableListOf<JasConstructor>()
         for (member in ctx.body.classBodyDeclaration()) {
@@ -239,7 +230,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitNormalInterfaceDeclaration(ctx: JasperParser.NormalInterfaceDeclarationContext): JasNode? {
         val mods = doExtractMods(ctx.modifier())
         val typeParams = if (ctx.tparams != null) doVisitTypeParams(ctx.tparams) else emptyList()
-        val extends = if (ctx.exts != null) ctx.exts.typePostfix().mapNotNull { visit(it) as? JasType } else emptyList()
+        val extends = if (ctx.exts != null) ctx.exts.typeExpr().mapNotNull { visit(it) as? JasType } else emptyList()
         val members = mutableListOf<JasDeclaration>()
         for (im in ctx.body.interfaceMemberDeclaration()) {
             visit(im)?.let { if (it is JasDeclaration) members.add(it) }
@@ -306,7 +297,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             doVisitTypeAtomNode(atomCtx)
         } else JasAnyType
         val suffixes = ctx.typeSuffix()
-        val qualifiers = ctx.typeQualifier()
+        val qualifier = ctx.typeQualifier()
         var result = type
         for (s in suffixes) {
             when (s) {
@@ -318,11 +309,8 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
                 is JasperParser.TypeSuffixArrayContext -> result = JasArrayType(result)
             }
         }
-        for (q in qualifiers) {
-            result = when (q) {
-                is JasperParser.TypeQualNullableContext -> JasNullableType(result)
-                else -> result
-            }
+        if (qualifier != null) {
+            result = JasNullableType(result)
         }
         return result.at(ctx)
     }
@@ -361,6 +349,13 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return JasNamedType(ctx.Identifier().text, args).at(ctx)
     }
 
+    override fun visitTypeAtomNodeDict(ctx: JasperParser.TypeAtomNodeDictContext): JasNode? {
+        val args = if (ctx.typeArguments() != null) {
+            ctx.typeArguments().typeArgument().mapNotNull { visit(it) as? JasType }
+        } else emptyList()
+        return JasNamedType("dict", args).at(ctx)
+    }
+
     override fun visitPrimitiveType(ctx: JasperParser.PrimitiveTypeContext): JasNode? = JasPrimitiveType(ctx.getText()).at(ctx)
     override fun visitTypeSuffixArray(ctx: JasperParser.TypeSuffixArrayContext): JasNode? = JasArrayType(JasAnyType).at(ctx)
     override fun visitTypeQualNullable(ctx: JasperParser.TypeQualNullableContext): JasNode? = JasNullableType(JasAnyType).at(ctx)
@@ -387,13 +382,6 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return visit(ctx.typeExpr())
     }
 
-
-    override fun visitTypePostfix(ctx: JasperParser.TypePostfixContext): JasNode? {
-        return if (ctx.typeAtom() is JasperParser.TypeAtomNodeContext) {
-            doVisitTypeAtomNode(ctx.typeAtom() as JasperParser.TypeAtomNodeContext).at(ctx)
-        } else JasAnyType
-    }
-
     // 鈹€鈹€ Statements 鈹€鈹€
 
     override fun visitBlock(ctx: JasperParser.BlockContext): JasNode? {
@@ -406,6 +394,11 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitStatementExpressionStatement(ctx: JasperParser.StatementExpressionStatementContext): JasNode? {
         val expr = visit(ctx.expression()) as? JasExpression ?: return null
         return JasExpressionStatement(expr).at(ctx)
+    }
+
+    override fun visitStatementIncrement(ctx: JasperParser.StatementIncrementContext): JasNode? {
+        val inc = visitPostfixIncrement(ctx.postfixIncrement() as JasperParser.PostfixIncDecContext)
+        return JasStatementIncrement(inc).at(ctx)
     }
 
     override fun visitStatementIf(ctx: JasperParser.StatementIfContext): JasNode? = visit(ctx.ifStatement())
@@ -459,8 +452,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             val init = doBuildForInit(classicCtx.`init`, ctx)
             val condition = if (classicCtx.cond != null) visit(classicCtx.cond) as? JasExpression else null
             val update = if (classicCtx.update != null) {
-                val u = classicCtx.update as JasperParser.ForClassicUpdateExprsContext
-                visit(u.expression) as? JasExpression
+                val u = classicCtx.update
+                when (u) {
+                    is JasperParser.ForClassicUpdateExprsContext -> visit(u.expression) as? JasExpression
+                    is JasperParser.ForClassicUpdateIncrementContext -> visitPostfixIncrement(u.postfixIncrement() as JasperParser.PostfixIncDecContext)
+                    else -> null
+                }
             } else null
             return JasForStatement(init, condition, update, body).at(ctx)
         }
@@ -618,28 +615,41 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
 
     override fun visitAssignExprAssignment(ctx: JasperParser.AssignExprAssignmentContext): JasNode? {
         val a = ctx.assignment()
-        val isAssignmentExpr = a is JasperParser.AssignmentExprContext
-        val target = if (isAssignmentExpr) {
-            val ae = a as JasperParser.AssignmentExprContext
-            when (val tc = ae.target) {
-                is JasperParser.AssignmentExprTargetQualifiedNameContext -> doQualifiedNameToExpr(tc.qualifiedName())
-                is JasperParser.AssignmentExprTargetPrimaryChainContext -> {
-                    var expr = visit(tc.primaryAtom()) as? JasExpression
-                    for (suf in tc.primarySuffix()) {
-                        expr = if (expr != null) doApplySuffix(expr, suf) else null
-                    }
-                    expr
-                }
-                else -> null
-            }
-        } else null
-
-        if (isAssignmentExpr && target != null) {
-            val ae = a as JasperParser.AssignmentExprContext
-            return JasAssignment(target, visit(ae.rhs) as JasExpression, ae.op.text).at(ctx)
+        if (a is JasperParser.AssignmentExprIncrementContext) {
+            val target = visitAssignmentTarget(a.target)
+            val inc = visitPostfixIncrement(a.inc as JasperParser.PostfixIncDecContext)
+            return JasAssignmentIncrement(target, inc).at(ctx)
         }
-        val ae = a as JasperParser.AssignmentExprContext
-        return JasExpressionStatement(visit(ae.rhs) as JasExpression).at(ctx)
+        if (a is JasperParser.AssignmentExprContext) {
+            val target = visitAssignmentTarget(a.target)
+            val rhs = visit(a.rhs) as JasExpression
+            return JasAssignment(target, rhs, a.op.text).at(ctx)
+        }
+        return null
+    }
+
+    private fun visitAssignmentTarget(ctx: JasperParser.AssignmentTargetContext): JasExpression {
+        return when (ctx) {
+            is JasperParser.AssignmentExprTargetQualifiedNameContext -> doQualifiedNameToExpr(ctx.qualifiedName())
+            is JasperParser.AssignmentExprTargetPrimaryChainContext -> {
+                var expr = visit(ctx.primaryAtom()) as? JasExpression
+                for (suf in ctx.primarySuffix()) {
+                    expr = if (expr != null) doApplySuffix(expr, suf) else null
+                }
+                expr ?: JasIdentifier("")
+            }
+            is JasperParser.AssignmentExprTargetDerefContext -> {
+                val target = visitAssignmentTarget(ctx.assignmentTarget())
+                JasUnaryOp("*", target).at(ctx)
+            }
+            else -> JasIdentifier("")
+        }
+    }
+
+    private fun visitPostfixIncrement(ctx: JasperParser.PostfixIncDecContext): JasPostfixIncDec {
+        val target = visitAssignmentTarget(ctx.target)
+        val op = ctx.op.text
+        return JasPostfixIncDec(target, op).at(ctx)
     }
 
     override fun visitAssignExprConditional(ctx: JasperParser.AssignExprConditionalContext): JasNode? {
@@ -655,10 +665,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     override fun visitNullFallbackExpr(ctx: JasperParser.NullFallbackExprContext): JasNode? {
-        val left = visit(ctx.nullCoalesceExpression(0)) as JasExpression
-        return if (ctx.nullCoalesceExpression().size > 1) {
-            JasNullCoalescing(left, visit(ctx.nullCoalesceExpression(1)) as JasExpression).at(ctx)
-        } else left
+        return visit(ctx.nullCoalesceExpression())
     }
 
     override fun visitNullCoalesceExpr(ctx: JasperParser.NullCoalesceExprContext): JasNode? {
@@ -820,7 +827,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     override fun visitArrayNewRefDimExprs(ctx: JasperParser.ArrayNewRefDimExprsContext): JasNode? {
-        val type = visit(ctx.typePostfix()) as? JasType ?: return null
+        val type = visit(ctx.typeExpr()) as? JasType ?: return null
         val dims = ctx.dimExprs().dimExpr().map { de -> visit(de.expression()) as? JasExpression ?: JasIntLiteral(0L, "0") }
         return JasArrayCreation(type, dims, null).at(ctx)
     }
@@ -831,8 +838,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     override fun visitArrayInitRef(ctx: JasperParser.ArrayInitRefContext): JasNode? {
-        val type = visit(ctx.typePostfix()) as? JasType ?: return null
+        val type = visit(ctx.typeExpr()) as? JasType ?: return null
         return JasArrayCreation(type, emptyList(), visit(ctx.arrayInitializer()) as? JasArrayInit).at(ctx)
+    }
+
+    override fun visitPrimaryAtomArrayLiteral(ctx: JasperParser.PrimaryAtomArrayLiteralContext): JasNode? {
+        return visit(ctx.arrayInitializer())
     }
 
     override fun visitArrayInitializer(ctx: JasperParser.ArrayInitializerContext): JasNode? {
@@ -900,6 +911,16 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return JasFloatLiteral(0.0, ctx.text).at(ctx)
     }
 
+    override fun visitCharLiteral(ctx: JasperParser.CharLiteralContext): JasNode? {
+        val text = ctx.text
+        val unescaped = doUnescape(text.drop(1).dropLast(1))
+        return if (unescaped.length == 1) {
+            JasCharLiteral(unescaped.codePointAt(0), text)
+        } else {
+            JasCharLiteral(0, text)
+        }.at(ctx)
+    }
+
     override fun visitStringLiteral(ctx: JasperParser.StringLiteralContext): JasNode? {
         return JasStringLiteral(doUnescape(ctx.text)).at(ctx)
     }
@@ -923,23 +944,11 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitNullLiteral(ctx: JasperParser.NullLiteralContext): JasNode? = JasNullLiteral
     override fun visitLiteralDict(ctx: JasperParser.LiteralDictContext): JasNode? = visit(ctx.dictLiteral())
 
-    override fun visitLiteralJson(ctx: JasperParser.LiteralJsonContext): JasNode? = visit(ctx.jsonLiteral())
-
     override fun visitDictLiteral(ctx: JasperParser.DictLiteralContext): JasNode? {
         val entries = ctx.dictEntry().map { de ->
             JasDictEntry(
                 visit(de.key) as? JasExpression ?: JasStringLiteral(""),
                 visit(de.value) as? JasExpression ?: JasNullLiteral
-            ).at(ctx)
-        }
-        return JasDictLiteral(entries).at(ctx)
-    }
-
-    override fun visitJsonLiteral(ctx: JasperParser.JsonLiteralContext): JasNode? {
-        val entries = ctx.jsonEntry().map { je ->
-            JasDictEntry(
-                visit(je.key) as? JasExpression ?: JasStringLiteral(""),
-                visit(je.value) as? JasExpression ?: JasNullLiteral
             ).at(ctx)
         }
         return JasDictLiteral(entries).at(ctx)
@@ -1210,17 +1219,6 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
 
     // 鈹€鈹€ Patterns 鈹€鈹€
 
-    override fun visitPatternRoot(ctx: JasperParser.PatternRootContext): JasNode? = visit(ctx.patternOr())
-    override fun visitPatternPrimaryAtom(ctx: JasperParser.PatternPrimaryAtomContext): JasNode? = visit(ctx.primaryPattern())
-    override fun visitPatternPrimaryParen(ctx: JasperParser.PatternPrimaryParenContext): JasNode? = visit(ctx.pattern())
-
-    override fun visitPrimaryPattern(ctx: JasperParser.PrimaryPatternContext): JasNode? {
-        if (ctx.Underscore() != null) return JasWildcardPattern
-        if (ctx.literal() != null) return visit(ctx.literal())
-        if (ctx.qualifiedName() != null) return doQualifiedNameToExpr(ctx.qualifiedName())
-        return null
-    }
-
     // 鈹€鈹€ Type parameter helpers 鈹€鈹€
 
     private fun doVisitTypeParams(ctx: JasperParser.TypeParametersContext): List<JasTypeParameter> {
@@ -1309,6 +1307,10 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return when (ctx) {
             is JasperParser.AnnotationArgumentValueExpressionNodeContext -> {
                 visit(ctx.expression()) as? JasExpression
+            }
+            is JasperParser.AnnotationArgumentValueArrayNodeContext -> {
+                val values = ctx.annotationArgumentValue().mapNotNull { parseAnnotationArgValue(it) }
+                JasArrayInitValues(values).at(ctx) as JasExpression
             }
             else -> null
         }

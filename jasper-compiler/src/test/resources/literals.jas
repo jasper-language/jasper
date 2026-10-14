@@ -10,7 +10,7 @@ public class Literals {
         var e: float64 = 3.14;
 
         var s1: string = "hello";
-        var s2: string = `raw string`;
+        var s2: string = r"raw string";
         var s4: bool = true;
         var s5: bool = false;
         var n: string? = null;

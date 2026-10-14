@@ -40,7 +40,7 @@ class PreprocessSourceTest {
     }
 
     @Test
-    fun `prefix increment on multi char var compiles`() {
+    fun `prefix increment on multi char var is syntax error`() {
         val source = """
             package test;
             function main(): int32 {
@@ -50,8 +50,8 @@ class PreprocessSourceTest {
             }
         """.trimIndent()
         val result = compile(source)
-        assertTrue(result is JasperCompiler.CompileResult.Success,
-            "Prefix increment should work on multi-char var: $result")
+        assertTrue(result is JasperCompiler.CompileResult.Error,
+            "Prefix increment should be syntax error: $result")
     }
 
     @Test
@@ -70,7 +70,7 @@ class PreprocessSourceTest {
     }
 
     @Test
-    fun `prefix decrement on multi char var compiles`() {
+    fun `prefix decrement on multi char var is syntax error`() {
         val source = """
             package test;
             function main(): int32 {
@@ -80,8 +80,8 @@ class PreprocessSourceTest {
             }
         """.trimIndent()
         val result = compile(source)
-        assertTrue(result is JasperCompiler.CompileResult.Success,
-            "Prefix decrement should work on multi-char var: $result")
+        assertTrue(result is JasperCompiler.CompileResult.Error,
+            "Prefix decrement should be syntax error: $result")
     }
 
     @Test

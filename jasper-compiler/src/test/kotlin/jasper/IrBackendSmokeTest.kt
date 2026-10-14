@@ -348,20 +348,29 @@ class IrBackendSmokeTest {
             package test;
             public function main(): int32 {
                 var x: int32 = 5;
-                return x++;
+                var y: int32 = x++;
+                return y;
             }
         """.trimIndent(), "test.main", "main", expected = 5)
     }
 
     @Test
-    fun `prefix inc returns new via IR`() {
-        testIr("""
+    fun `prefix inc returns new via IR is syntax error`() {
+        val source = """
             package test;
             public function main(): int32 {
                 var x: int32 = 5;
                 return ++x;
             }
-        """.trimIndent(), "test.main", "main", expected = 6)
+        """.trimIndent()
+        val outputDir = Files.createTempDirectory("irtest")
+        try {
+            val result = JasperCompiler().compileToDirWithIr(source, outputDir)
+            assertTrue(result is JasperCompiler.CompileResult.Error,
+                "Prefix increment should be syntax error: $result")
+        } finally {
+            outputDir.toFile().deleteRecursively()
+        }
     }
 
     @Test

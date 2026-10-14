@@ -91,7 +91,9 @@ data class JasLock(val expression: JasExpression, val body: JasBlock) : JasState
 data class JasAssert(val condition: JasExpression, val message: JasExpression?) : JasStatement()
 data class JasYield(val expression: JasExpression) : JasStatement()
 data class JasLabeledStatement(val label: String, val statement: JasStatement) : JasStatement()
+data class JasStatementIncrement(val increment: JasPostfixIncDec) : JasStatement()
 data class JasAssignment(val target: JasExpression, val value: JasExpression, val op: String = "=") : JasExpression()
+data class JasAssignmentIncrement(val target: JasExpression, val increment: JasPostfixIncDec) : JasExpression()
 data class JasDestructuringDeclaration(val bindings: List<JasDestructuringBinding>, val initializer: JasExpression) : JasStatement()
 data class JasDestructuringBinding(val name: String, val type: JasType?) : JasNode()
 
@@ -105,12 +107,14 @@ object JasWildcardPattern : JasPattern()
 open class JasExpression : JasNode()
 data class JasIntLiteral(val value: Long, val raw: String) : JasExpression()
 data class JasFloatLiteral(val value: Double, val raw: String) : JasExpression()
+data class JasCharLiteral(val value: Int, val raw: String) : JasExpression()
 data class JasStringLiteral(val text: String, val raw: Boolean = false) : JasExpression()
 data class JasBoolLiteral(val value: Boolean) : JasExpression()
 object JasNullLiteral : JasExpression()
 data class JasIdentifier(val name: String) : JasExpression()
 data class JasBinaryOp(val left: JasExpression, val op: String, val right: JasExpression) : JasExpression()
 data class JasUnaryOp(val op: String, val operand: JasExpression, val prefix: Boolean = true) : JasExpression()
+data class JasPostfixIncDec(val target: JasExpression, val op: String) : JasExpression()
 class JasCall(
     val target: JasExpression,
     val args: List<JasExpression>,

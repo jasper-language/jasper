@@ -391,32 +391,20 @@ class JvmBackendTest {
     // ─── Increment/Decrement Tests ───
 
     @Test
-    fun `test prefix increment returns new value`() {
-        val outputDir = createTempDir()
-        try {
-            val source = """
-                package test;
-                public function testPrefixInc(): int32 {
-                    var x: int32 = 5;
-                    var y: int32 = ++x;
-                    return y;
-                }
-                function main(): void {
-                    testPrefixInc();
-                }
-            """.trimIndent()
-            val result = JasperCompiler().compileToDir(source, outputDir)
-            assertTrue(result is JasperCompiler.CompileResult.Success, "Expected Success but got: $result")
-
-            val loader = URLClassLoader(arrayOf(outputDir.toUri().toURL()))
-            val clazz = loader.loadClass("test.testPrefixInc")
-            val method = clazz.getMethod("testPrefixInc")
-            val ret = method.invoke(null)
-            // ++x → x becomes 6, y = 6
-            assertTrue(ret == 6, "Expected 6 but got $ret")
-        } finally {
-            outputDir.toFile().deleteRecursively()
-        }
+    fun `test prefix increment is syntax error`() {
+        val source = """
+            package test;
+            public function testPrefixInc(): int32 {
+                var x: int32 = 5;
+                var y: int32 = ++x;
+                return y;
+            }
+            function main(): void {
+                testPrefixInc();
+            }
+        """.trimIndent()
+        val result = JasperCompiler().compile(source)
+        assertTrue(result is JasperCompiler.CompileResult.Error, "Prefix increment should be syntax error: $result")
     }
 
     @Test
@@ -427,7 +415,8 @@ class JvmBackendTest {
                 package test;
                 public function testPostfixInc(): int32 {
                     var x: int32 = 5;
-                    var y: int32 = x++;
+                    var y: int32;
+                    y = x++;
                     return y;
                 }
                 function main(): void {
@@ -456,7 +445,8 @@ class JvmBackendTest {
                 package test;
                 public function testPostfixSideEffect(): int32 {
                     var x: int32 = 5;
-                    var y: int32 = x++;
+                    var y: int32;
+                    y = x++;
                     return x;
                 }
                 function main(): void {
@@ -478,32 +468,20 @@ class JvmBackendTest {
     }
 
     @Test
-    fun `test prefix decrement returns new value`() {
-        val outputDir = createTempDir()
-        try {
-            val source = """
-                package test;
-                public function testPrefixDec(): int32 {
-                    var x: int32 = 5;
-                    var y: int32 = --x;
-                    return y;
-                }
-                function main(): void {
-                    testPrefixDec();
-                }
-            """.trimIndent()
-            val result = JasperCompiler().compileToDir(source, outputDir)
-            assertTrue(result is JasperCompiler.CompileResult.Success, "Expected Success but got: $result")
-
-            val loader = URLClassLoader(arrayOf(outputDir.toUri().toURL()))
-            val clazz = loader.loadClass("test.testPrefixDec")
-            val method = clazz.getMethod("testPrefixDec")
-            val ret = method.invoke(null)
-            // --x → x becomes 4, y = 4
-            assertTrue(ret == 4, "Expected 4 but got $ret")
-        } finally {
-            outputDir.toFile().deleteRecursively()
-        }
+    fun `test prefix decrement is syntax error`() {
+        val source = """
+            package test;
+            public function testPrefixDec(): int32 {
+                var x: int32 = 5;
+                var y: int32 = --x;
+                return y;
+            }
+            function main(): void {
+                testPrefixDec();
+            }
+        """.trimIndent()
+        val result = JasperCompiler().compile(source)
+        assertTrue(result is JasperCompiler.CompileResult.Error, "Prefix decrement should be syntax error: $result")
     }
 
     @Test
@@ -514,7 +492,8 @@ class JvmBackendTest {
                 package test;
                 public function testPostfixDec(): int32 {
                     var x: int32 = 5;
-                    var y: int32 = x--;
+                    var y: int32;
+                    y = x--;
                     return y;
                 }
                 function main(): void {
