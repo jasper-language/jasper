@@ -1914,35 +1914,38 @@ class JasperToIrTranslator {
                 val getX = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), foundSymbol, IrStatementOrigin.GET_PROPERTY)
                 val stubSymbol = IrSimpleFunctionSymbolImpl()
                 ctx.callNames[stubSymbol] = if (op == "++") "+" else "-"
-                val binOp = IrNodeFactory.createCall(
-                    0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
-                    arrayOf(getX, one), emptyArray(), stubSymbol, null
-                )
-                val setX = IrNodeFactory.createSetValue(
-                    0, 0, typeMapper.unitType(), foundSymbol,
-                    IrStatementOrigin.EQ, binOp
-                )
                 if (needsResult) {
-                    val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
                     val resultSymbol = IrVariableSymbolImpl()
                     val resultVar = IrNodeFactory.createVariable(
                         0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
                         typeMapper.intType(), resultSymbol, true, false, false
                     )
-                    if (op == "++") {
-                        resultVar.initializer = getX
-                    } else {
-                        resultVar.initializer = IrNodeFactory.createCall(
-                            0, 0, typeMapper.intType(), IrStatementOrigin.MINUS,
-                            arrayOf(getX, one), emptyArray(), stubSymbol, null
-                        )
-                    }
-                    (block.statements as MutableList<IrStatement>).add(resultVar)
-                    (block.statements as MutableList<IrStatement>).add(setX)
+                    resultVar.initializer = getX
+                    val outerBlock = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
+                    (outerBlock.statements as MutableList<IrStatement>).add(resultVar)
+                    val binOp = IrNodeFactory.createCall(
+                        0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
+                        arrayOf(getX, one), emptyArray(), stubSymbol, null
+                    )
+                    val setX = IrNodeFactory.createSetValue(
+                        0, 0, typeMapper.unitType(), foundSymbol,
+                        IrStatementOrigin.EQ, binOp
+                    )
+                    val innerBlock = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
+                    (innerBlock.statements as MutableList<IrStatement>).add(setX)
                     val getResult = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), resultSymbol, IrStatementOrigin.GET_PROPERTY)
-                    (block.statements as MutableList<IrStatement>).add(getResult)
-                    return block
+                    (innerBlock.statements as MutableList<IrStatement>).add(getResult)
+                    (outerBlock.statements as MutableList<IrStatement>).add(innerBlock)
+                    return outerBlock
                 } else {
+                    val binOp = IrNodeFactory.createCall(
+                        0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
+                        arrayOf(getX, one), emptyArray(), stubSymbol, null
+                    )
+                    val setX = IrNodeFactory.createSetValue(
+                        0, 0, typeMapper.unitType(), foundSymbol,
+                        IrStatementOrigin.EQ, binOp
+                    )
                     val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
                     (block.statements as MutableList<IrStatement>).add(setX)
                     return block
