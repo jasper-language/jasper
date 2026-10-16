@@ -181,6 +181,9 @@ class JasperCompiler {
 
         val allErrors = mutableListOf<CompileError>()
         allErrors.addAll(parsed.errors)
+        allErrors.addAll(annotated.errors.map { ae ->
+            CompileError.Annotation(ae.message, ae.line, ae.column)
+        })
 
         val symbolTable = SymbolTable()
         symbolTable.registerBuiltins()
@@ -219,6 +222,9 @@ class JasperCompiler {
             parsed[filename] = annotated.ast
             annotationIndexes[filename] = annotated.index
             allErrors.addAll(result.errors)
+            allErrors.addAll(annotated.errors.map { ae ->
+                CompileError.Annotation(ae.message, ae.line, ae.column)
+            })
             symbolTable.collectDeclarations(annotated.ast)
         }
 
@@ -268,6 +274,9 @@ class JasperCompiler {
 
         val allErrors = mutableListOf<CompileError>()
         allErrors.addAll(parsed.errors)
+        allErrors.addAll(annotated.errors.map { ae ->
+            CompileError.Annotation(ae.message, ae.line, ae.column)
+        })
 
         symbolTable.collectDeclarations(ast)
         allErrors.addAll(symbolTable.errors.map { se ->

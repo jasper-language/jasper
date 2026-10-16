@@ -49,6 +49,14 @@ data class TranslationContext(
     val classSymbols: MutableMap<String, IrClassSymbol> = mutableMapOf(),
     val fieldSymbols: MutableMap<String, IrFieldSymbol> = mutableMapOf(),
     val fieldTypes: MutableMap<String, IrType> = mutableMapOf(),
+    // Per-class field indexes (JVM-style class name -> field name -> symbol/type).
+    // Needed so a property read/write resolves the field owner from the
+    // *receiver's* declared type rather than globally by name; without this two
+    // classes that share a property name (e.g. a mapper's source and target)
+    // would collide on the last-registered symbol.
+    val fieldSymbolsByClass: MutableMap<String, MutableMap<String, IrFieldSymbol>> = mutableMapOf(),
+    val fieldTypesByClass: MutableMap<String, MutableMap<String, IrType>> = mutableMapOf(),
+    var currentClassName: String = "",
     val loopStack: MutableList<IrLoop> = mutableListOf(),
     val deferredBodies: MutableList<IrBlock> = mutableListOf(),
     var currentFunction: IrSimpleFunction? = null,
@@ -259,6 +267,7 @@ class JasperToIrTranslator {
         val bodyStatements: List<JasStatement>? = when {
             func.syntheticAccessor != null -> syntheticAccessorBody(func.syntheticAccessor!!, func)
             func.syntheticEquality != null -> syntheticEqualityBody(func.syntheticEquality!!, ctx)
+            func.syntheticMapper != null -> syntheticMapperBody(func.syntheticMapper!!)
             func.body != null -> func.body!!.statements
             else -> null
         }
@@ -418,6 +427,35 @@ class JasperToIrTranslator {
         )
     }
 
+    /**
+     * Late body generation for annotation-synthesized mappers
+     * ([JasSyntheticMapper]). The mapper method signature was synthesized by the
+     * annotation processing phase; here the simple property-to-property body is
+     * lowered through the normal statement pipeline:
+     *
+     * ```
+     * var result = new Target();
+     * result.t1 = src.s1;
+     * ...
+     * return result;
+     * ```
+     */
+    private fun syntheticMapperBody(mapper: JasSyntheticMapper): List<JasStatement> {
+        val resultName = "result$"
+        val stmts = mutableListOf<JasStatement>()
+        stmts.add(JasVariableStatement(resultName, mapper.targetType, JasNew(mapper.targetType, emptyList())))
+        for (assignment in mapper.assignments) {
+            stmts.add(JasExpressionStatement(
+                JasAssignment(
+                    JasPropertyAccess(JasIdentifier(resultName), assignment.targetProperty),
+                    JasPropertyAccess(JasIdentifier(mapper.parameterName), assignment.sourceProperty)
+                )
+            ))
+        }
+        stmts.add(JasReturn(JasIdentifier(resultName)))
+        return stmts
+    }
+
     // ── class ──
 
     private fun translateClass(cls: JasClass, ctx: TranslationContext): IrClass {
@@ -440,6 +478,11 @@ class JasperToIrTranslator {
             SourceElement.NO_SOURCE
         )
         ctx.classSymbols[cls.name] = symbol
+        // Track the enclosing class so `this.prop` and receiver-typed property
+        // accesses resolve their field owner during member translation.
+        val qualifiedClassName = if (ctx.currentPkg.isNotEmpty()) "${ctx.currentPkg}/${cls.name}" else cls.name
+        val previousClassName = ctx.currentClassName
+        ctx.currentClassName = qualifiedClassName
         // Record implemented interfaces
         val ifaceNames = cls.interfaces.mapNotNull { iface ->
             if (iface is JasNamedType) {
@@ -491,6 +534,7 @@ class JasperToIrTranslator {
             }
         }
         ctx.currentSuperclassName = ""
+        ctx.currentClassName = previousClassName
         return irCls
     }
 
@@ -694,6 +738,10 @@ class JasperToIrTranslator {
         irProp.backingField = irField
         ctx.fieldSymbols[prop.name] = fieldSymbol
         ctx.fieldTypes[prop.name] = propType
+        if (ctx.currentClassName.isNotEmpty()) {
+            ctx.fieldSymbolsByClass.getOrPut(ctx.currentClassName) { mutableMapOf() }[prop.name] = fieldSymbol
+            ctx.fieldTypesByClass.getOrPut(ctx.currentClassName) { mutableMapOf() }[prop.name] = propType
+        }
         if (prop.getter != null) {
             val getterFunc = translatePropertyAccessor(prop.getter!!, prop.name, propType, isGetter = true, ctx)
             irProp.getter = getterFunc
@@ -1594,16 +1642,58 @@ class JasperToIrTranslator {
 
     private fun translatePropertyAccess(expr: JasPropertyAccess, ctx: TranslationContext): IrExpression {
         val target = translateExpression(expr.target, ctx)
-        val fieldSymbol = ctx.fieldSymbols[expr.property] ?: IrFieldSymbolImpl()
-        val fieldType = when {
-            expr.property == "length" && isArrayIrType(target.type) -> typeMapper.intType()
-            else -> ctx.fieldTypes[expr.property] ?: typeMapper.unitType()
-        }
+        val fieldSymbol = resolveFieldSymbol(expr.property, expr.target, target, ctx)
+        val fieldType = resolveFieldType(expr.property, expr.target, target, ctx) ?: typeMapper.unitType()
         val irGetField = IrNodeFactory.createGetField(
             0, 0, fieldType, fieldSymbol, null, IrStatementOrigin.GET_PROPERTY
         )
         irGetField.receiver = target
         return irGetField
+    }
+
+    /**
+     * JVM-style class key identifying the field owner for a property receiver.
+     * `this` / `super` map to the enclosing class; everything else uses the
+     * receiver's declared IR type.
+     */
+    private fun receiverClassKey(target: JasExpression, irReceiver: IrExpression, ctx: TranslationContext): String? {
+        if (target is JasIdentifier && (target.name == "this" || target.name == "super")) {
+            return ctx.currentClassName.ifEmpty { null }
+        }
+        return typeMapper.irTypeClassName(irReceiver.type)
+    }
+
+    /**
+     * Resolves the field symbol for a property access from the receiver's type,
+     * falling back to the global by-name index when the receiver type cannot be
+     * mapped to a declared class. This keeps two classes that share a property
+     * name (e.g. a mapper source and target) from colliding.
+     */
+    private fun resolveFieldSymbol(
+        property: String,
+        target: JasExpression,
+        irReceiver: IrExpression,
+        ctx: TranslationContext
+    ): IrFieldSymbol {
+        val key = receiverClassKey(target, irReceiver, ctx)
+        if (key != null) {
+            ctx.fieldSymbolsByClass[key]?.get(property)?.let { return it }
+        }
+        return ctx.fieldSymbols[property] ?: IrFieldSymbolImpl()
+    }
+
+    private fun resolveFieldType(
+        property: String,
+        target: JasExpression,
+        irReceiver: IrExpression,
+        ctx: TranslationContext
+    ): IrType? {
+        if (property == "length" && isArrayIrType(irReceiver.type)) return typeMapper.intType()
+        val key = receiverClassKey(target, irReceiver, ctx)
+        if (key != null) {
+            ctx.fieldTypesByClass[key]?.get(property)?.let { return it }
+        }
+        return ctx.fieldTypes[property]
     }
 
     private fun isArrayIrType(type: IrType): Boolean =
@@ -2020,7 +2110,7 @@ class JasperToIrTranslator {
         } else if (expr.target is JasPropertyAccess) {
             val pa = expr.target as JasPropertyAccess
             val targetExpr = translateExpression(pa.target, ctx)
-            val fieldSymbol = ctx.fieldSymbols[pa.property] ?: IrFieldSymbolImpl()
+            val fieldSymbol = resolveFieldSymbol(pa.property, pa.target, targetExpr, ctx)
             if (expr.op != "=") {
                 val op = expr.op.removeSuffix("=")
                 val getField = IrNodeFactory.createGetField(0, 0, value.type, fieldSymbol, null, IrStatementOrigin.GET_PROPERTY)
@@ -2161,7 +2251,7 @@ class JasperToIrTranslator {
         } else if (target is JasPropertyAccess) {
             val pa = target
             val targetExpr = translateExpression(pa.target, ctx)
-            val fieldSymbol = ctx.fieldSymbols[pa.property] ?: IrFieldSymbolImpl()
+            val fieldSymbol = resolveFieldSymbol(pa.property, pa.target, targetExpr, ctx)
             val getField = IrNodeFactory.createGetField(0, 0, typeMapper.intType(), fieldSymbol, null, IrStatementOrigin.GET_PROPERTY)
             getField.receiver = targetExpr
             val stubSymbol = IrSimpleFunctionSymbolImpl()

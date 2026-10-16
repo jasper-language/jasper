@@ -12,7 +12,8 @@ data class JasFunction(
     val body: JasBlock?, val modifiers: List<Any>, val typeParameters: List<JasTypeParameter> = emptyList(),
     val whereConstraints: List<JasTypeConstraint> = emptyList(),
     val syntheticAccessor: JasSyntheticAccessor? = null,
-    val syntheticEquality: JasSyntheticEquality? = null
+    val syntheticEquality: JasSyntheticEquality? = null,
+    val syntheticMapper: JasSyntheticMapper? = null
 ) : JasDeclaration()
 
 /**
@@ -37,6 +38,24 @@ data class JasSyntheticEquality(
 ) : JasNode()
 
 data class JasEqualityField(val name: String, val type: JasType?) : JasNode()
+
+/**
+ * Marks a mapper method whose *signature* was synthesized by the annotation
+ * processing phase from `@Mapper` / `@Mapping`; the *body* is generated later
+ * during lowering ([jasper.translator.JasperToIrTranslator]).
+ *
+ * The plan captured here is intentionally the *simple property-to-property*
+ * shape (v1): take one source object, create the target object, assign one
+ * source property to one target property per entry, return the target. No
+ * collections, nested objects, multiple sources, or custom conversions.
+ */
+data class JasSyntheticMapper(
+    val parameterName: String,
+    val targetType: JasNamedType,
+    val assignments: List<JasMapperAssignment>
+) : JasNode()
+
+data class JasMapperAssignment(val targetProperty: String, val sourceProperty: String) : JasNode()
 
 data class JasClass(
     val name: String, val modifiers: List<Any>, val typeParameters: List<JasTypeParameter>,

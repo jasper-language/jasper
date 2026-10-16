@@ -1,6 +1,6 @@
 package jasper.compiler
 
-enum class ErrorCategory { SYNTAX, SEMANTIC, TYPE, SYMBOL, INTERNAL }
+enum class ErrorCategory { SYNTAX, SEMANTIC, TYPE, SYMBOL, ANNOTATION, INTERNAL }
 
 data class ParseError(
     val line: Int,
@@ -41,6 +41,14 @@ sealed class CompileError {
         override val column: Int = 0
     ) : CompileError() {
         override val category: ErrorCategory = ErrorCategory.TYPE
+    }
+
+    data class Annotation(
+        override val message: String,
+        override val line: Int = 0,
+        override val column: Int = 0
+    ) : CompileError() {
+        override val category: ErrorCategory = ErrorCategory.ANNOTATION
     }
 
     data class Internal(
