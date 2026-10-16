@@ -75,7 +75,8 @@ class TypeMapper {
         "kotlin.Short" to "S",
         "kotlin.Char" to "C",
         "kotlin.String" to "Ljava/lang/String;",
-        "kotlin.Unit" to "V"
+        "kotlin.Unit" to "V",
+        "kotlin.Any" to "Ljava/lang/Object;"
     )
 
     private val jvmInternalNames = mapOf(
@@ -88,7 +89,8 @@ class TypeMapper {
         "kotlin.Short" to "short",
         "kotlin.Char" to "char",
         "kotlin.String" to "java/lang/String",
-        "kotlin.Unit" to "void"
+        "kotlin.Unit" to "void",
+        "kotlin.Any" to "java/lang/Object"
     )
 
     fun type(name: String): IrType {

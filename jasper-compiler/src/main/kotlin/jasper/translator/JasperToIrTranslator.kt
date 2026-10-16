@@ -58,7 +58,12 @@ data class TranslationContext(
     var currentPkg: String = "",
     val classSuperclassNames: MutableMap<String, String> = mutableMapOf(),
     val interfaceNames: MutableMap<String, MutableList<String>> = mutableMapOf(), // class/interface -> implemented/extends interface names
-    val interfaceDeclNames: MutableSet<String> = mutableSetOf() // names of types declared as interfaces
+    val interfaceDeclNames: MutableSet<String> = mutableSetOf(), // names of types declared as interfaces
+    // Class names that provide a `hash()` member (handwritten or synthesized
+    // from @EqualsAndHashCode); used by the late @EqualsAndHashCode body
+    // generator to decide between `.hash()` and `.hashCode()` for nested
+    // object fields.
+    val hashableClassNames: MutableSet<String> = mutableSetOf()
 )
 
 class JasperToIrTranslator {
@@ -70,6 +75,8 @@ class JasperToIrTranslator {
         val pkg = ast.packageName ?: ""
         ctx.currentPkg = pkg
         typeMapper.currentPkg = pkg
+        predeclareRuntimeBuiltins(ctx)
+        collectHashableClassNames(listOf(ast), ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
         val fileEntry = NaiveSourceBasedFileEntryImpl("<main>", intArrayOf(), 0)
         val fileSymbol = IrFileSymbolImpl()
@@ -89,9 +96,11 @@ class JasperToIrTranslator {
 
     fun translateAll(asts: List<JasSourceFile>, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
+        predeclareRuntimeBuiltins(ctx)
         for (ast in asts) {
             ctx.currentPkg = ast.packageName ?: ""
             typeMapper.currentPkg = ctx.currentPkg
+            collectHashableClassNames(listOf(ast), ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
         }
 
@@ -129,6 +138,42 @@ class JasperToIrTranslator {
             }
         }
     }
+
+    /**
+     * Declares the signatures of runtime helpers the lowering of synthesized
+     * member bodies relies on. `hashCode()` is the universal JVM object-hash
+     * entry point (inherited by every class); its return type must be known so
+     * member calls to it lower with an `I` return descriptor instead of `V`.
+     */
+    private fun predeclareRuntimeBuiltins(ctx: TranslationContext) {
+        ctx.functionReturnTypes["hashCode"] = typeMapper.intType()
+        ctx.functionParamTypes["hashCode"] = emptyList()
+    }
+
+    /**
+     * Records the class names that provide a `hash()` member — handwritten or
+     * synthesized from `@EqualsAndHashCode`. The late equality body generator
+     * calls `.hash()` on nested fields of such classes (value-based) and
+     * `.hashCode()` on everything else (identity/default).
+     */
+    private fun collectHashableClassNames(asts: List<JasSourceFile>, ctx: TranslationContext) {
+        for (ast in asts) {
+            for (decl in ast.declarations) {
+                if (decl !is JasClass) continue
+                val hasHashFunction = decl.members.any { it is JasFunction && it.name == "hash" }
+                val hasEqualityAnnotation =
+                    decl.modifiers.filterIsInstance<JasAnnotationUse>().any { simpleAnnotationName(it.name) == "EqualsAndHashCode" } ||
+                        decl.members.filterIsInstance<JasProperty>().any { prop ->
+                            prop.modifiers.filterIsInstance<JasAnnotationUse>().any { simpleAnnotationName(it.name) == "EqualsAndHashCode" }
+                        }
+                if (hasHashFunction || hasEqualityAnnotation) {
+                    ctx.hashableClassNames.add(decl.name)
+                }
+            }
+        }
+    }
+
+    private fun simpleAnnotationName(qualified: String): String = qualified.substringAfterLast('.')
 
     private fun translateTopLevelDeclaration(decl: JasDeclaration, ctx: TranslationContext): IrDeclaration? {
         return when (decl) {
@@ -213,6 +258,7 @@ class JasperToIrTranslator {
         }
         val bodyStatements: List<JasStatement>? = when {
             func.syntheticAccessor != null -> syntheticAccessorBody(func.syntheticAccessor!!, func)
+            func.syntheticEquality != null -> syntheticEqualityBody(func.syntheticEquality!!, ctx)
             func.body != null -> func.body!!.statements
             else -> null
         }
@@ -258,6 +304,118 @@ class JasperToIrTranslator {
             val paramName = func.parameters.firstOrNull()?.name ?: "value"
             listOf(JasExpressionStatement(JasAssignment(thisField, JasIdentifier(paramName))))
         }
+    }
+
+    /**
+     * Late body generation for `@EqualsAndHashCode`-synthesized members
+     * ([JasSyntheticEquality]). The signature (`equals(other: any): bool` /
+     * `hash(): int32`) was synthesized by the annotation processing phase
+     * before type checking; these bodies are lowered here directly because the
+     * source syntax has no type-test expression (`other is Foo`), so the
+     * instanceof guard can only be expressed at the AST→IR boundary.
+     */
+    private fun syntheticEqualityBody(eq: JasSyntheticEquality, ctx: TranslationContext): List<JasStatement> =
+        if (eq.isEquals) syntheticEqualsBody(eq) else syntheticHashBody(eq, ctx)
+
+    /**
+     * `equals` body:
+     * ```
+     * if (!(other is Foo)) { return false; }
+     * var other$ = cast other as Foo;
+     * return this.f1 == o.f1 && ...;
+     * ```
+     * The instanceof guard also rejects `null` (instanceof null is false), so
+     * different-class comparisons return false without throwing.
+     */
+    private fun syntheticEqualsBody(eq: JasSyntheticEquality): List<JasStatement> {
+        val clsType = JasNamedType(eq.className)
+        val other = JasIdentifier("other")
+        val guard = JasIf(
+            condition = JasUnaryOp("!", JasInstanceOfExpr(other, clsType), prefix = true),
+            thenBody = JasBlock(listOf(JasReturn(JasBoolLiteral(false)))),
+            elseBody = null
+        )
+        val local = JasVariableStatement("other$", clsType, JasCastExpr(other, clsType))
+        val comparisons = eq.fields.map { field ->
+            JasBinaryOp(
+                JasPropertyAccess(JasIdentifier("this"), field.name),
+                "==",
+                JasPropertyAccess(JasIdentifier("other$"), field.name)
+            )
+        }
+        val result = comparisons.reduceOrNull { acc, next -> JasBinaryOp(acc, "&&", next) }
+            ?: JasBoolLiteral(true)
+        return listOf(guard, local, JasReturn(result))
+    }
+
+    /**
+     * `hash` body: seed and mix every participating field with
+     * `h = h * 31 + fieldHash`, then `return h`. Deterministic, no randomness
+     * and no object-identity dependence beyond what `equals` itself treats as
+     * value (e.g. nested objects that only have identity equality).
+     */
+    private fun syntheticHashBody(eq: JasSyntheticEquality, ctx: TranslationContext): List<JasStatement> {
+        val stmts = mutableListOf<JasStatement>()
+        stmts.add(JasVariableStatement("h", JasPrimitiveType("int32"), JasIntLiteral(17, "17")))
+        for (field in eq.fields) {
+            val mixed = JasBinaryOp(
+                JasBinaryOp(JasIdentifier("h"), "*", JasIntLiteral(31, "31")),
+                "+",
+                fieldHashExpr(field, ctx)
+            )
+            stmts.add(JasExpressionStatement(JasAssignment(JasIdentifier("h"), mixed)))
+        }
+        stmts.add(JasReturn(JasIdentifier("h")))
+        return stmts
+    }
+
+    /** int32 contribution of one field to the `hash` accumulator. */
+    private fun fieldHashExpr(field: JasEqualityField, ctx: TranslationContext): JasExpression {
+        val thisField = JasPropertyAccess(JasIdentifier("this"), field.name)
+        return when (val type = field.type) {
+            is JasPrimitiveType -> when (type.name.lowercase()) {
+                "bool" -> JasTernaryExpr(thisField, JasIntLiteral(1, "1"), JasIntLiteral(0, "0"))
+                "int64" -> {
+                    // XOR-fold the high 32 bits into the low 32 bits.
+                    val hi = JasCastExpr(
+                        JasBinaryOp(thisField, ">>>", JasIntLiteral(32, "32")),
+                        JasPrimitiveType("int32")
+                    )
+                    val lo = JasCastExpr(thisField, JasPrimitiveType("int32"))
+                    JasBinaryOp(hi, "^", lo)
+                }
+                "float32", "float64" -> JasCastExpr(thisField, JasPrimitiveType("int32"))
+                else -> thisField // int32 / char / byte / short mix as ints
+            }
+            is JasStringType -> nullGuardedMemberHash(thisField, "hashCode")
+            is JasArrayType -> {
+                // Arrays compare by identity in `equals`; their length is a
+                // deterministic, identity-free contribution.
+                nullGuardedMemberHash(thisField, "length")
+            }
+            is JasNamedType -> {
+                val hashMethod = if (type.name.substringAfterLast('.') in ctx.hashableClassNames) "hash" else "hashCode"
+                nullGuardedMemberHash(thisField, hashMethod)
+            }
+            else -> nullGuardedMemberHash(thisField, "hashCode")
+        }
+    }
+
+    /**
+     * `field == null ? 0 : field.member()` — null fields hash to 0 instead of
+     * throwing. `length` is lowered as ARRAYLENGTH by the property-access path.
+     */
+    private fun nullGuardedMemberHash(fieldAccess: JasPropertyAccess, member: String): JasExpression {
+        val useExpr: JasExpression = if (member == "length") {
+            JasPropertyAccess(fieldAccess, "length")
+        } else {
+            JasCall(JasPropertyAccess(fieldAccess, member), emptyList())
+        }
+        return JasTernaryExpr(
+            JasBinaryOp(fieldAccess, "==", JasNullLiteral),
+            JasIntLiteral(0, "0"),
+            useExpr
+        )
     }
 
     // ── class ──
@@ -1338,7 +1496,28 @@ class JasperToIrTranslator {
         if (expr.target is JasPropertyAccess) {
             args.add(translateExpression(expr.target.target, ctx))
         }
-        args.addAll(expr.args.map { translateExpression(it, ctx) })
+        args.addAll(expr.args.map { translateExpression(it, ctx) }.toTypedArray())
+        // Member-call arguments are widened to the declared parameter type when
+        // the declared parameter is `any` (java/lang/Object) but the argument
+        // has a more specific type. Without this the backend derives the call
+        // descriptor from the *argument* type and misses the `Object`-typed
+        // parameter (e.g. synthesized `equals(other: any)`).
+        if (expr.target is JasPropertyAccess) {
+            val declaredParams = ctx.functionParamTypes[name]
+            if (declaredParams != null && declaredParams.size == expr.args.size) {
+                for (i in expr.args.indices) {
+                    val declared = declaredParams[i]
+                    val argExpr = args[i + 1]
+                    if (typeMapper.jvmDescriptorFromIrType(declared) == "Ljava/lang/Object;" &&
+                        typeMapper.jvmDescriptorFromIrType(argExpr.type) != "Ljava/lang/Object;"
+                    ) {
+                        args[i + 1] = IrTypeOperatorCallImpl(
+                            0, 0, declared, IrTypeOperator.CAST, declared, argExpr
+                        )
+                    }
+                }
+            }
+        }
         val irArgs = args.toTypedArray()
         // Compute the call's return type: use inferred type arguments to substitute
         // type parameters in the function's return type.

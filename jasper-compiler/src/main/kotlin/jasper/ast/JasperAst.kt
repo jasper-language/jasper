@@ -11,7 +11,8 @@ data class JasFunction(
     val name: String, val parameters: List<JasParameter>, val returnType: JasType?,
     val body: JasBlock?, val modifiers: List<Any>, val typeParameters: List<JasTypeParameter> = emptyList(),
     val whereConstraints: List<JasTypeConstraint> = emptyList(),
-    val syntheticAccessor: JasSyntheticAccessor? = null
+    val syntheticAccessor: JasSyntheticAccessor? = null,
+    val syntheticEquality: JasSyntheticEquality? = null
 ) : JasDeclaration()
 
 /**
@@ -20,6 +21,22 @@ data class JasFunction(
  * later, during lowering, when full type information is available.
  */
 data class JasSyntheticAccessor(val propertyName: String, val isGetter: Boolean) : JasNode()
+
+/**
+ * Marks an `equals` / `hash` function whose *signature* was synthesized by the
+ * annotation processing phase from `@EqualsAndHashCode`; the *body* is generated
+ * later during lowering ([jasper.translator.JasperToIrTranslator]).
+ *
+ * The participating instance fields are captured here (name + declared type) so
+ * the late body generator does not have to re-derive class structure.
+ */
+data class JasSyntheticEquality(
+    val isEquals: Boolean,
+    val className: String,
+    val fields: List<JasEqualityField>
+) : JasNode()
+
+data class JasEqualityField(val name: String, val type: JasType?) : JasNode()
 
 data class JasClass(
     val name: String, val modifiers: List<Any>, val typeParameters: List<JasTypeParameter>,

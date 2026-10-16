@@ -865,11 +865,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         if (desc0 == "Ljava/lang/String;" || desc0 == "Ljava/lang/String") {
                             emitStringConcatCall(mv, expr, ctx, owner)
                         } else {
-                            val wider = binaryOpWiderDesc(desc0, desc1)
+                            // JVM shift instructions take (long, int): the shift
+                            // count must stay int even when the value is long.
+                            val isShift = irName == "<<" || irName == ">>" || irName == ">>>"
+                            val wider = if (isShift) desc0 else binaryOpWiderDesc(desc0, desc1)
                             generateIrExpression(mv, arg0, ctx, owner)
                             widenIfNeeded(mv, desc0, wider)
                             generateIrExpression(mv, arg1, ctx, owner)
-                            widenIfNeeded(mv, desc1, wider)
+                            if (!isShift) widenIfNeeded(mv, desc1, wider)
                             emitBinaryArithmeticOp(mv, irName, wider)
                         }
                     }
@@ -1130,11 +1133,29 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitTypeInsn(Opcodes.INSTANCEOF, internalName)
                     }
                     IrTypeOperator.CAST -> {
-                        generateIrExpression(mv, expr.argument, ctx, owner)
-                        val desc = typeMapper.jvmDescriptorFromIrType(expr.typeOperand)
-                        if (desc.startsWith("L") || desc.startsWith("[")) {
-                            val internalName = typeMapper.jvmInternalNameFromIrType(expr.typeOperand)
-                            mv.visitTypeInsn(Opcodes.CHECKCAST, internalName)
+                        val argument = expr.argument
+                        generateIrExpression(mv, argument, ctx, owner)
+                        val srcDesc = typeMapper.jvmDescriptorFromIrType(argument.type)
+                        val dstDesc = typeMapper.jvmDescriptorFromIrType(expr.typeOperand)
+                        if (dstDesc.startsWith("L") || dstDesc.startsWith("[")) {
+                            if (isPrimitiveDesc(srcDesc)) {
+                                // Primitive -> reference: box first so the
+                                // verifier sees a reference value.
+                                emitBoxingIfNeeded(mv, srcDesc, dstDesc)
+                                if (dstDesc != "Ljava/lang/Object;" && dstDesc != "Ljava/io/Serializable;") {
+                                    val internalName = typeMapper.jvmInternalNameFromIrType(expr.typeOperand)
+                                    mv.visitTypeInsn(Opcodes.CHECKCAST, internalName)
+                                }
+                            } else {
+                                val internalName = typeMapper.jvmInternalNameFromIrType(expr.typeOperand)
+                                mv.visitTypeInsn(Opcodes.CHECKCAST, internalName)
+                            }
+                        } else if (isPrimitiveDesc(srcDesc)) {
+                            emitNumericConversion(mv, srcDesc, dstDesc)
+                        } else {
+                            // Reference -> primitive: checkcast to the box
+                            // type, then unbox.
+                            emitUnboxingFromRef(mv, dstDesc)
                         }
                     }
                     else -> generateIrExpression(mv, expr.argument, ctx, owner)
@@ -1258,6 +1279,53 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 "D" -> mv.visitInsn(Opcodes.F2D)
             }
         }
+    }
+
+    private fun isPrimitiveDesc(desc: String): Boolean =
+        desc.length == 1 && desc[0] in "IJFDBSCZ"
+
+    /**
+     * Primitive-to-primitive numeric conversion used by `cast` lowering.
+     * Boolean/byte/short/char all live on the JVM stack as ints, so
+     * conversions among the int-like descriptors are no-ops.
+     */
+    private fun emitNumericConversion(mv: MethodVisitor, srcDesc: String, dstDesc: String) {
+        if (srcDesc == dstDesc) return
+        val intLike = "IZBSC"
+        if (srcDesc in intLike && dstDesc in intLike) return
+        val opcode = when {
+            srcDesc == "I" && dstDesc == "J" -> Opcodes.I2L
+            srcDesc == "I" && dstDesc == "F" -> Opcodes.I2F
+            srcDesc == "I" && dstDesc == "D" -> Opcodes.I2D
+            srcDesc == "J" && dstDesc == "I" -> Opcodes.L2I
+            srcDesc == "J" && dstDesc == "F" -> Opcodes.L2F
+            srcDesc == "J" && dstDesc == "D" -> Opcodes.L2D
+            srcDesc == "F" && dstDesc == "I" -> Opcodes.F2I
+            srcDesc == "F" && dstDesc == "J" -> Opcodes.F2L
+            srcDesc == "F" && dstDesc == "D" -> Opcodes.F2D
+            srcDesc == "D" && dstDesc == "I" -> Opcodes.D2I
+            srcDesc == "D" && dstDesc == "J" -> Opcodes.D2L
+            srcDesc == "D" && dstDesc == "F" -> Opcodes.D2F
+            else -> -1
+        }
+        if (opcode >= 0) mv.visitInsn(opcode)
+    }
+
+    /** Reference -> primitive: checkcast to the box type, then unbox. */
+    private fun emitUnboxingFromRef(mv: MethodVisitor, dstDesc: String) {
+        val (boxInternal, getter) = when (dstDesc) {
+            "I" -> "java/lang/Integer" to "intValue"
+            "J" -> "java/lang/Long" to "longValue"
+            "F" -> "java/lang/Float" to "floatValue"
+            "D" -> "java/lang/Double" to "doubleValue"
+            "Z" -> "java/lang/Boolean" to "booleanValue"
+            "B" -> "java/lang/Byte" to "byteValue"
+            "S" -> "java/lang/Short" to "shortValue"
+            "C" -> "java/lang/Character" to "charValue"
+            else -> return
+        }
+        mv.visitTypeInsn(Opcodes.CHECKCAST, boxInternal)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, boxInternal, getter, "()$dstDesc", false)
     }
 
     private fun emitBoxingIfNeeded(mv: MethodVisitor, fromDesc: String, toDesc: String) {

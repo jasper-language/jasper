@@ -2,12 +2,16 @@ package jasper.annotations
 
 import jasper.ast.JasAnnotationArgument
 import jasper.ast.JasAnnotationUse
+import jasper.ast.JasAnyType
 import jasper.ast.JasClass
 import jasper.ast.JasDeclaration
+import jasper.ast.JasEqualityField
 import jasper.ast.JasFunction
 import jasper.ast.JasParameter
+import jasper.ast.JasPrimitiveType
 import jasper.ast.JasProperty
 import jasper.ast.JasSyntheticAccessor
+import jasper.ast.JasSyntheticEquality
 import jasper.ast.JasUnitType
 import jasper.ast.JasSourceFile
 
@@ -50,11 +54,12 @@ data class AnnotatedSourceFile(val ast: JasSourceFile, val index: AnnotationInde
  * The annotation processing phase.
  *
  * It sits **between AST building and the TypeChecker**. It reads annotations
- * (`@Getter` / `@Setter` for this stage), synthesizes the *member signatures*
- * those annotations imply, and attaches them to the owning class so the
- * TypeChecker can resolve them. It never synthesizes method bodies: bodies need
- * type information and are generated later, during lowering
- * (`JasperToIrTranslator`, driven by [JasSyntheticAccessor]).
+ * (`@Getter` / `@Setter` / `@EqualsAndHashCode`), synthesizes the *member
+ * signatures* those annotations imply, and attaches them to the owning class so
+ * the TypeChecker can resolve them. It never synthesizes method bodies: bodies
+ * need type information and are generated later, during lowering
+ * (`JasperToIrTranslator`, driven by [JasSyntheticAccessor] /
+ * [JasSyntheticEquality]).
  *
  * Code without these annotations is returned unchanged (same AST instance where
  * possible) so the existing path is byte-for-byte identical.
@@ -85,6 +90,7 @@ class AnnotationProcessor {
         val classAnnotations = cls.modifiers.filterIsInstance<JasAnnotationUse>()
         val classHasGetter = classAnnotations.any { simpleName(it.name) == GETTER }
         val classHasSetter = classAnnotations.any { simpleName(it.name) == SETTER }
+        val classHasEquality = classAnnotations.any { simpleName(it.name) == EQUALS_AND_HASH_CODE }
 
         for (annotation in classAnnotations) {
             record(records, cls.name, "class", cls.name, annotation)
@@ -96,12 +102,18 @@ class AnnotationProcessor {
             .toMutableSet()
 
         val generated = mutableListOf<JasDeclaration>()
+        val propertyLevelEqualityFields = mutableListOf<JasEqualityField>()
         for (member in cls.members) {
             when (member) {
                 is JasProperty -> {
                     val propAnnotations = member.modifiers.filterIsInstance<JasAnnotationUse>()
                     for (annotation in propAnnotations) {
                         record(records, cls.name, "property", member.name, annotation)
+                    }
+                    if (propAnnotations.any { simpleName(it.name) == EQUALS_AND_HASH_CODE } &&
+                        isEligibleForEquality(member)
+                    ) {
+                        propertyLevelEqualityFields.add(JasEqualityField(member.name, member.type))
                     }
                     val wantGetter = classHasGetter || propAnnotations.any { simpleName(it.name) == GETTER }
                     val wantSetter = classHasSetter || propAnnotations.any { simpleName(it.name) == SETTER }
@@ -125,6 +137,26 @@ class AnnotationProcessor {
                     }
                 }
                 else -> {}
+            }
+        }
+
+        // @EqualsAndHashCode (class-level or property-level): synthesize the
+        // `equals` / `hash` *signatures*. Handwritten methods always win: if a
+        // function with the same name already exists, the respective member is
+        // not generated (idempotence).
+        if (classHasEquality || propertyLevelEqualityFields.isNotEmpty()) {
+            val fields = if (classHasEquality) {
+                cls.members.filterIsInstance<JasProperty>()
+                    .filter { isEligibleForEquality(it) }
+                    .map { JasEqualityField(it.name, it.type) }
+            } else {
+                propertyLevelEqualityFields
+            }
+            if (existingFunctionNames.add(EQUALS_METHOD)) {
+                generated.add(equalitySignature(isEquals = true, className = cls.name, fields = fields))
+            }
+            if (existingFunctionNames.add(HASH_METHOD)) {
+                generated.add(equalitySignature(isEquals = false, className = cls.name, fields = fields))
             }
         }
 
@@ -158,11 +190,43 @@ class AnnotationProcessor {
         syntheticAccessor = JasSyntheticAccessor(prop.name, isGetter = false)
     )
 
+    /**
+     * Synthesizes the *signature only* of a `@EqualsAndHashCode` member:
+     * `equals(other: any): bool` or `hash(): int32`. The body is produced later
+     * by the translator from [JasSyntheticEquality].
+     */
+    private fun equalitySignature(isEquals: Boolean, className: String, fields: List<JasEqualityField>): JasFunction {
+        val marker = JasSyntheticEquality(isEquals = isEquals, className = className, fields = fields)
+        return if (isEquals) {
+            JasFunction(
+                name = EQUALS_METHOD,
+                parameters = listOf(JasParameter("other", JasAnyType)),
+                returnType = JasPrimitiveType("bool"),
+                body = null,
+                modifiers = listOf("public"),
+                syntheticEquality = marker
+            )
+        } else {
+            JasFunction(
+                name = HASH_METHOD,
+                parameters = emptyList(),
+                returnType = JasPrimitiveType("int32"),
+                body = null,
+                modifiers = listOf("public"),
+                syntheticEquality = marker
+            )
+        }
+    }
+
     private fun isEligibleForGetter(prop: JasProperty): Boolean =
         prop.type != null && !isStatic(prop)
 
     private fun isEligibleForSetter(prop: JasProperty): Boolean =
         prop.type != null && !isStatic(prop) && !prop.isConst
+
+    /** Equality/hash participation: typed instance fields only (no statics). */
+    private fun isEligibleForEquality(prop: JasProperty): Boolean =
+        prop.type != null && !isStatic(prop)
 
     private fun isStatic(prop: JasProperty): Boolean =
         prop.modifiers.any { it is String && it == "static" }
@@ -194,5 +258,8 @@ class AnnotationProcessor {
     companion object {
         const val GETTER = "Getter"
         const val SETTER = "Setter"
+        const val EQUALS_AND_HASH_CODE = "EqualsAndHashCode"
+        const val EQUALS_METHOD = "equals"
+        const val HASH_METHOD = "hash"
     }
 }
