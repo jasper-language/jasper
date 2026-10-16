@@ -68,7 +68,7 @@ var add = lambda (a: int32, b: int32) {
 try {
     risky();
 } catch (e: Error) {
-    handle(e);
+    onError(e);
 } finally {
     cleanup();
 }
@@ -76,13 +76,17 @@ try {
 
 ## 保留但不实现
 
-以下关键字永久保留给非 GC 方向或底层实验，但 Jasper 当前及未来主线不实现：
+以下关键字是 lexer token，但 parser **零引用**（保留但未启用）：
 
 ```text
-raw shared weak auto unique atomic pointer handle
+raw shared weak auto unique atomic pointer handle locked delete destructor
 ```
 
 它们是 lexer 保留字，不能作为普通标识符使用；parser 不把它们接入有效语言语法。
+当前裁决**不启用 GC/所有权超集**，因此不把它们写成"超集专用激活态"。
+
+> 关键字分类、类型别名、计数/容器语义、相等与哈希协议等跨章节约定，
+> 统一收录在第十一章 `11-语言约定.md`。
 
 ## 当前修饰符
 

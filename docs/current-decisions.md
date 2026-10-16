@@ -4,7 +4,16 @@ This document records the current source-of-truth decisions that supersede older
 
 ## Soft Keywords
 
-`where` is a soft keyword. It is valid only in generic constraint positions:
+The true soft keywords are `get`, `set`, `from`, `then`, `where`.
+The lexer defines no token for them; the parser matches an `Identifier` by text
+predicate only in the relevant position, so they remain usable as ordinary
+identifiers elsewhere.
+
+The following are intentionally kept as **hard reserved** tokens because they
+appear mid-expression and a predicate would introduce prediction uncertainty:
+`as`, `cast`, `label`, `is`, `and`, `or`, `not`.
+
+`where` is valid only in generic constraint positions:
 
 ```jasper
 function sort<T>(items: T[]): T[]
@@ -39,13 +48,16 @@ function nativeCall(): int32;
 
 ## Reserved But Not Implemented
 
-The following words are reserved and not implemented:
+The following words are lexer tokens with zero parser references (reserved but
+not enabled):
 
 ```text
-raw shared weak auto unique atomic pointer handle delete destructor locked
+raw shared weak auto unique atomic pointer handle locked delete destructor
 ```
 
-They are not valid modifiers or type modifiers.
+They are not valid modifiers or type modifiers. The current decision is to **not
+enable a GC/ownership superset**, so they must not be described as an
+"activated superset mode".
 
 ## Lambda
 
@@ -83,7 +95,7 @@ try-with-resources is supported:
 try (var f = open("file.txt")) {
     use(f);
 } catch (e: Error) {
-    handle(e);
+    onError(e);
 }
 ```
 
