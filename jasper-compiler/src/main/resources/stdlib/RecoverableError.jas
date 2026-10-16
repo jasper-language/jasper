@@ -1,0 +1,8 @@
+package std;
+
+// An error from which execution may recover (e.g. bad input).
+public class RecoverableError extends Error {
+    public constructor(message: string) {
+        super(message);
+    }
+}

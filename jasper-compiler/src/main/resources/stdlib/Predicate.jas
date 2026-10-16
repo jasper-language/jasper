@@ -1,0 +1,6 @@
+package std;
+
+// Function-object protocol: tests a value of type T, yielding a bool.
+public interface Predicate<T> {
+    public function test(t: T): bool;
+}

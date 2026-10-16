@@ -1,0 +1,6 @@
+package std;
+
+// Function-object protocol: folds a value of type B into an accumulator of type A.
+public interface Reducer<A, B> {
+    public function reduce(acc: A, x: B): A;
+}

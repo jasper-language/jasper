@@ -1,0 +1,6 @@
+package std;
+
+// Function-object protocol: consumes a value of type T for its side effect.
+public interface Action<T> {
+    public function accept(t: T): void;
+}

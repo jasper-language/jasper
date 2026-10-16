@@ -1,0 +1,6 @@
+package std;
+
+// Function-object protocol: transforms a value of type A into a value of type B.
+public interface Mapper<A, B> {
+    public function apply(a: A): B;
+}

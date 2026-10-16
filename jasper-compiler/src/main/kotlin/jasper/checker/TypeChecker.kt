@@ -10,6 +10,20 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     private val classImplements = mutableMapOf<String, List<String>>() // className -> interfaceNames
     private val interfaceExtends = mutableMapOf<String, List<String>>() // interfaceName -> parentInterfaceNames
 
+    /**
+     * Function-object protocols recognized as "semantic" (no JVM interface
+     * dispatch): the protocol name maps to its single abstract method name.
+     * Declared in the Jasper standard library; see `PROTOCOL_METHODS` in the
+     * translator for the call-routing counterpart.
+     */
+    private val PROTOCOL_SAM = mapOf(
+        "Mapper" to "apply",
+        "Predicate" to "test",
+        "Reducer" to "reduce",
+        "Comparator" to "compare",
+        "Action" to "accept"
+    )
+
     fun check(sourceFile: JasSourceFile): List<TypeError> {
         errors.clear()
         classImplements.clear()
@@ -322,7 +336,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             is JasForInStatement -> {
                 val iterableType = inferExpression(stmt.iterable, env)
                 val loopEnv = env.copy()
-                loopEnv.set(stmt.varName, (iterableType as? JasArrayType)?.inner)
+                // Arrays expose their element type directly; a declared object
+                // type is consumed through the iteration protocol, so the element
+                // type is the `next()` member's return type.
+                val elemType = when (iterableType) {
+                    is JasArrayType -> iterableType.inner
+                    is JasNamedType -> (findMemberType(iterableType.name, "next", iterableType.typeArguments) as? JasFunctionType)?.returnType
+                    else -> null
+                } ?: JasAnyType
+                loopEnv.set(stmt.varName, elemType)
                 loopEnv.loopDepth++
                 checkStatement(stmt.body, loopEnv, returnType)
                 loopEnv.loopDepth--
@@ -556,7 +578,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 val targetType = inferExpression(expr.target, env)
                 when {
                     targetType is JasNamedType -> {
-                        findMemberType(targetType.name, expr.property) ?: run {
+                        findMemberType(targetType.name, expr.property, targetType.typeArguments) ?: run {
                             warn("Cannot resolve member '${expr.property}' on type '${targetType.name}'", expr)
                             JasAnyType
                         }
@@ -653,7 +675,24 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
     }
 
-    private fun findMemberType(typeName: String, memberName: String): JasType? {
+    private fun findMemberType(
+        typeName: String,
+        memberName: String,
+        typeArguments: List<JasType> = emptyList()
+    ): JasType? {
+        val raw = rawMemberType(typeName, memberName) ?: return null
+        // Substitute the receiver's type arguments into the declaring type's
+        // type parameters, so a member of `Mapper<int32, int32>` types as
+        // `(int32) -> int32` instead of `(A) -> B`.
+        val typeParams = symbolTable?.findInterface(typeName)?.typeParameters
+            ?: symbolTable?.findClass(typeName)?.typeParameters
+            ?: return raw
+        if (typeParams.isEmpty() || typeArguments.isEmpty()) return raw
+        val mapping = typeParams.map { it.name }.zip(typeArguments).toMap()
+        return substitute(raw, mapping)
+    }
+
+    private fun rawMemberType(typeName: String, memberName: String): JasType? {
         // Resolve through the symbol table's member signature index first; this
         // index includes annotation-synthesized members (e.g. @Getter/@Setter).
         when (val indexed = symbolTable?.findMemberSignature(typeName, memberName)) {
@@ -746,6 +785,31 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 val newBound = type.bound?.let { substitute(it, mapping) }
                 if (newBound != type.bound) JasWildcardType(newBound, type.extends) else type
             }
+            is JasFunctionType -> {
+                val newParams = type.paramTypes.map { substitute(it, mapping) }
+                val newReturn = substitute(type.returnType, mapping)
+                if (newParams != type.paramTypes || newReturn != type.returnType) {
+                    JasFunctionType(newParams, newReturn)
+                } else {
+                    type
+                }
+            }
+            is JasArrayType -> {
+                val newInner = substitute(type.inner, mapping)
+                if (newInner != type.inner) JasArrayType(newInner) else type
+            }
+            is JasNullableType -> {
+                val newInner = substitute(type.inner, mapping)
+                if (newInner != type.inner) JasNullableType(newInner) else type
+            }
+            is JasNonNullType -> {
+                val newInner = substitute(type.inner, mapping)
+                if (newInner != type.inner) JasNonNullType(newInner) else type
+            }
+            is JasTupleType -> {
+                val newTypes = type.types.map { substitute(it, mapping) }
+                if (newTypes != type.types) JasTupleType(newTypes) else type
+            }
             else -> type
         }
     }
@@ -791,7 +855,31 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         if (actual is JasArrayType && expected is JasArrayType) {
             return typesCompatible(actual.inner, expected.inner)
         }
+        // Function-object protocols are "semantic": a lambda (function type) may
+        // be assigned to a protocol-typed variable when its shape matches the
+        // protocol's single abstract method (`Mapper.apply`, `Predicate.test`,
+        // `Reducer.reduce`, `Comparator.compare`, `Action.accept`).
+        if (actual is JasFunctionType && expected is JasNamedType && isSamCompatible(actual, expected)) {
+            return true
+        }
         return false
+    }
+
+    /**
+     * True when a lambda shape `actual` is a valid implementation of the
+     * function-object protocol `expected` (e.g. `Predicate<int32>`). The
+     * protocol's abstract method signature is looked up from the symbol table and
+     * its type parameters are substituted with the receiver's type arguments.
+     */
+    private fun isSamCompatible(actual: JasFunctionType, expected: JasNamedType): Boolean {
+        val methodName = PROTOCOL_SAM[expected.name] ?: return false
+        val methodType = findMemberType(expected.name, methodName, expected.typeArguments) as? JasFunctionType
+            ?: return false
+        if (methodType.paramTypes.size != actual.paramTypes.size) return false
+        for (i in actual.paramTypes.indices) {
+            if (!typesCompatible(actual.paramTypes[i], methodType.paramTypes[i])) return false
+        }
+        return typesCompatible(actual.returnType, methodType.returnType)
     }
 
     private fun isSubtype(subName: String, superName: String, visited: MutableSet<String> = mutableSetOf()): Boolean {

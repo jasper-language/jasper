@@ -1,0 +1,16 @@
+package std;
+
+// Base of the Jasper error hierarchy. Extends the platform throwable so it can
+// flow through the language's existing `throw` / `try` / `catch` machinery.
+public class Error extends java.lang.Throwable {
+    private var msg: string;
+
+    public constructor(message: string) {
+        super(message);
+        this.msg = message;
+    }
+
+    public function message(): string {
+        return this.msg;
+    }
+}

@@ -1,0 +1,6 @@
+package std;
+
+// Function-object protocol: orders two values of type T (negative, zero, positive).
+public interface Comparator<T> {
+    public function compare(a: T, b: T): int32;
+}

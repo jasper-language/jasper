@@ -6,6 +6,7 @@ import jasper.ast.JasperAstBuilder
 import jasper.checker.TypeChecker
 import jasper.parser.JasperLexer
 import jasper.parser.JasperParser
+import jasper.stdlib.StdLib
 import jasper.translator.JasperToIrTranslator
 import jasper.translator.TranslationResult
 import jasper.translator.TypeMapper
@@ -169,6 +170,18 @@ class JasperCompiler {
         } catch (e: Exception) {
             CompileResult.Error(listOf(CompileError.Internal(e.message ?: "Unknown error", e)))
         }
+    }
+
+    /**
+     * Compiles the standard library together with [sources] and writes the
+     * resulting classes to [outputDir]. The stdlib sources are inserted first so
+     * user declarations win the translator's last-writer-wins member indexes.
+     */
+    fun compileAllWithStdlib(sources: Map<String, String>, outputDir: Path): CompileResult {
+        val merged = LinkedHashMap<String, String>()
+        merged.putAll(StdLib.sources())
+        merged.putAll(sources)
+        return compileAllToDir(merged, outputDir)
     }
 
     fun compileToPipeline(source: String): CompilePipeline {

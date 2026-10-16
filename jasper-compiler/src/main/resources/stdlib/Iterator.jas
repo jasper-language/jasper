@@ -1,0 +1,9 @@
+package std;
+
+// Minimal iteration protocol consumed by the existing `for (x in it)` syntax.
+// A concrete iterable class implements this protocol and the loop lowers to
+// `hasNext()` / `next()` calls on that concrete type.
+public interface Iterator<T> {
+    public function hasNext(): bool;
+    public function next(): T;
+}

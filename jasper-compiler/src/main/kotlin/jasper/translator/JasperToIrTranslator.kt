@@ -23,6 +23,15 @@ import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.descriptors.SourceElement
 import org.jetbrains.kotlin.types.Variance
 
+/**
+ * Method names of the standard-library function-object protocols
+ * (`Mapper.apply`, `Predicate.test`, `Reducer.reduce`, `Comparator.compare`,
+ * `Action.accept`). They are semantic protocols: a call to one of these names on
+ * a closure variable is routed to the closure's generated `invoke` method rather
+ * than dispatched through the (abstract) protocol interface.
+ */
+private val PROTOCOL_METHODS = setOf("apply", "test", "reduce", "compare", "accept")
+
 data class TranslationResult(
     val irFiles: List<IrFile>,
     val callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap(),
@@ -46,6 +55,14 @@ data class TranslationContext(
     val typeMapper: TypeMapper? = null,
     val lambdas: MutableMap<String, JasLambdaExpr> = mutableMapOf(),
     val lambdaVarNames: MutableSet<String> = mutableSetOf(),
+    // Closure variable name -> its generated `invoke` return type. Keyed per
+    // variable (not the global `functionReturnTypes["invoke"]`) so two closures
+    // with different shapes in the same scope do not clobber each other.
+    val lambdaInvokeReturnTypes: MutableMap<String, IrType> = mutableMapOf(),
+    // Member-return index: JVM-style class/interface name -> member name ->
+    // return type. Used by the iteration protocol lowering to type the loop
+    // variable from the concrete iterable's `next()` member.
+    val memberReturnTypesByType: MutableMap<String, MutableMap<String, IrType>> = mutableMapOf(),
     val classSymbols: MutableMap<String, IrClassSymbol> = mutableMapOf(),
     val fieldSymbols: MutableMap<String, IrFieldSymbol> = mutableMapOf(),
     val fieldTypes: MutableMap<String, IrType> = mutableMapOf(),
@@ -85,6 +102,7 @@ class JasperToIrTranslator {
         typeMapper.currentPkg = pkg
         predeclareRuntimeBuiltins(ctx)
         collectHashableClassNames(listOf(ast), ctx)
+        collectMemberReturnTypes(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
         val fileEntry = NaiveSourceBasedFileEntryImpl("<main>", intArrayOf(), 0)
         val fileSymbol = IrFileSymbolImpl()
@@ -109,6 +127,7 @@ class JasperToIrTranslator {
             ctx.currentPkg = ast.packageName ?: ""
             typeMapper.currentPkg = ctx.currentPkg
             collectHashableClassNames(listOf(ast), ctx)
+            collectMemberReturnTypes(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
         }
 
@@ -182,6 +201,32 @@ class JasperToIrTranslator {
     }
 
     private fun simpleAnnotationName(qualified: String): String = qualified.substringAfterLast('.')
+
+    /**
+     * Indexes member return types per declaring type (JVM-style name). The
+     * iteration protocol lowering reads `next()` from this index so the loop
+     * variable is typed from the *concrete* iterable rather than the global,
+     * last-writer-wins `functionReturnTypes` map.
+     */
+    private fun collectMemberReturnTypes(ast: JasSourceFile, ctx: TranslationContext) {
+        val pkg = ast.packageName ?: ""
+        fun record(typeName: String, members: List<JasDeclaration>) {
+            val qualified = if (pkg.isNotEmpty()) "$pkg/$typeName" else typeName
+            val index = ctx.memberReturnTypesByType.getOrPut(qualified) { mutableMapOf() }
+            for (member in members) {
+                if (member is JasFunction) {
+                    index.putIfAbsent(member.name, typeMapper.mapType(member.returnType))
+                }
+            }
+        }
+        for (decl in ast.declarations) {
+            when (decl) {
+                is JasClass -> record(decl.name, decl.members)
+                is JasInterface -> record(decl.name, decl.members)
+                else -> {}
+            }
+        }
+    }
 
     private fun translateTopLevelDeclaration(decl: JasDeclaration, ctx: TranslationContext): IrDeclaration? {
         return when (decl) {
@@ -879,7 +924,19 @@ class JasperToIrTranslator {
         val varSymbol = IrVariableSymbolImpl()
         // Translate the initializer once to avoid double-creating anonymous classes
         val translatedInit = if (stmt.initializer != null) translateExpression(stmt.initializer!!, ctx) else null
-        val varType = if (stmt.type != null) typeMapper.mapType(stmt.type)
+        // A closure assigned to a protocol-typed variable is lowered to an
+        // anonymous class; the variable must carry that concrete class type so a
+        // later protocol call routes to the generated `invoke` method instead of
+        // dispatching on the (abstract) declared protocol interface.
+        val isClosureInit = stmt.initializer is JasLambdaExpr || stmt.initializer is JasMethodReference
+        if (isClosureInit) {
+            // Snapshot the just-generated closure's `invoke` return type under the
+            // variable's name; the global `functionReturnTypes["invoke"]` entry is
+            // overwritten by every subsequent lambda.
+            ctx.functionReturnTypes["invoke"]?.let { ctx.lambdaInvokeReturnTypes[stmt.name] = it }
+        }
+        val varType = if (isClosureInit && translatedInit != null) translatedInit.type
+            else if (stmt.type != null) typeMapper.mapType(stmt.type)
             else translatedInit?.type ?: typeMapper.unitType()
         val irVar = IrNodeFactory.createVariable(
             0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(stmt.name),
@@ -967,8 +1024,21 @@ class JasperToIrTranslator {
     }
 
     private fun translateForIn(stmt: JasForInStatement, ctx: TranslationContext): IrStatement {
-        val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.FOR_LOOP)
         val iterableExpr = translateExpression(stmt.iterable, ctx)
+        val desc = typeMapper.jvmDescriptorFromIrType(iterableExpr.type)
+        // Arrays keep the index-based lowering. A declared object type is treated
+        // as an instance of the iteration protocol (`hasNext()` / `next()`); any
+        // other/unknown shape falls back to the array lowering to preserve the
+        // previous behaviour.
+        return when {
+            desc.startsWith("[") -> translateForInArray(stmt, iterableExpr, ctx)
+            desc.startsWith("L") -> translateForInIterator(stmt, iterableExpr, ctx)
+            else -> translateForInArray(stmt, iterableExpr, ctx)
+        }
+    }
+
+    private fun translateForInArray(stmt: JasForInStatement, iterableExpr: IrExpression, ctx: TranslationContext): IrStatement {
+        val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.FOR_LOOP)
 
         val arrSymbol = IrVariableSymbolImpl()
         val arrVar = IrNodeFactory.createVariable(
@@ -1074,6 +1144,107 @@ class JasperToIrTranslator {
         return block
     }
 
+    /**
+     * Lowers `for (x in iterable)` over an object type using the standard-library
+     * iteration protocol:
+     *
+     * ```
+     * var it$ = iterable;
+     * var didRun$ = false;
+     * while (it$.hasNext()) {
+     *     didRun$ = true;
+     *     var x = it$.next();
+     *     <body>
+     * }
+     * if (didRun$) { <then> } else { <else> }
+     * ```
+     *
+     * The element type comes from the `next()` member discovered while lowering
+     * the concrete iterable type. This consumes the protocol through the existing
+     * `for ... in` syntax; no new grammar is introduced.
+     */
+    private fun translateForInIterator(stmt: JasForInStatement, iterableExpr: IrExpression, ctx: TranslationContext): IrStatement {
+        val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.FOR_LOOP)
+
+        val itSymbol = IrVariableSymbolImpl()
+        val itVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("it$"),
+            iterableExpr.type, itSymbol, true, false, false
+        )
+        itVar.initializer = iterableExpr
+        (block.statements as MutableList<IrStatement>).add(itVar)
+
+        val didRunSymbol = IrVariableSymbolImpl()
+        val didRunVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("didRun$"),
+            typeMapper.boolType(), didRunSymbol, true, false, false
+        )
+        didRunVar.initializer = typeMapper.falseConst()
+        (block.statements as MutableList<IrStatement>).add(didRunVar)
+
+        // Type the loop variable from the concrete iterable's `next()` member.
+        val iterableClass = typeMapper.irTypeClassName(iterableExpr.type)
+        val elemType = (iterableClass?.let { ctx.memberReturnTypesByType[it]?.get("next") })
+            ?: ctx.functionReturnTypes["next"]
+            ?: typeMapper.type("kotlin.Any")
+        val elemSymbol = IrVariableSymbolImpl()
+        val elemVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(stmt.varName),
+            elemType, elemSymbol, true, false, false
+        )
+        ctx.symbols[stmt.varName] = elemSymbol
+        ctx.varTypes[stmt.varName] = elemType
+
+        val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+        ctx.loopStack.add(irLoop)
+
+        val hasNextSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[hasNextSymbol] = "v:hasNext"
+        irLoop.condition = IrNodeFactory.createCall(
+            0, 0, typeMapper.boolType(), null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, iterableExpr.type, itSymbol, null)),
+            emptyArray(), hasNextSymbol, null
+        )
+
+        val loopBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+        (loopBody.statements as MutableList<IrStatement>).add(
+            IrNodeFactory.createSetValue(0, 0, typeMapper.boolType(), didRunSymbol, IrStatementOrigin.EQ, typeMapper.trueConst())
+        )
+
+        val nextSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[nextSymbol] = "v:next"
+        elemVar.initializer = IrNodeFactory.createCall(
+            0, 0, elemType, null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, iterableExpr.type, itSymbol, null)),
+            emptyArray(), nextSymbol, null
+        )
+        (loopBody.statements as MutableList<IrStatement>).add(elemVar)
+
+        for (bodyStmt in stmt.body.statements) {
+            val irBodyStmt = translateStatement(bodyStmt, ctx)
+            if (irBodyStmt != null) {
+                (loopBody.statements as MutableList<IrStatement>).add(irBodyStmt)
+            }
+        }
+
+        irLoop.body = loopBody
+        ctx.loopStack.removeAt(ctx.loopStack.size - 1)
+        (block.statements as MutableList<IrStatement>).add(irLoop)
+
+        if (stmt.thenBody != null || stmt.elseBody != null) {
+            val afterLoop = IrNodeFactory.createWhen(0, 0, typeMapper.unitType(), IrStatementOrigin.IF)
+            val didRun = IrNodeFactory.createGetValue(0, 0, typeMapper.boolType(), didRunSymbol, null)
+            if (stmt.thenBody != null) {
+                afterLoop.branches.add(IrNodeFactory.createBranch(0, 0, didRun, translateBlock(stmt.thenBody, ctx)))
+            }
+            if (stmt.elseBody != null) {
+                afterLoop.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), translateBlock(stmt.elseBody, ctx)))
+            }
+            (block.statements as MutableList<IrStatement>).add(afterLoop)
+        }
+        return block
+    }
+
     private fun arrayElementType(arrayType: IrType): IrType {
         return when (typeMapper.jvmDescriptorFromIrType(arrayType)) {
             "[I" -> typeMapper.intType()
@@ -1165,6 +1336,11 @@ class JasperToIrTranslator {
             )
             val irCatch = IrNodeFactory.createCatch(0, 0, catchParam, null)
             ctx.symbols[catchClause.parameter.name] = paramSymbol
+            // Register the catch variable's declared type so `e.message()` and
+            // other member accesses on the caught value resolve their receiver
+            // type. Without this the receiver falls back to `Unit` and the
+            // backend emits `L<package>/void;` as the owner (NoClassDefFoundError).
+            ctx.varTypes[catchClause.parameter.name] = paramType
             irCatch.result = translateBlock(catchClause.body, ctx)
             irTry.catches.add(irCatch)
         }
@@ -1506,6 +1682,35 @@ class JasperToIrTranslator {
         )
     }
 
+    /**
+     * Emits a virtual `invoke` call on a closure variable (the anonymous class
+     * produced for a lambda or method reference). Shared by direct lambda calls
+     * (`f(1)`) and function-object protocol calls (`f.apply(1)`).
+     */
+    private fun emitClosureInvoke(
+        receiverName: String,
+        args: List<JasExpression>,
+        ctx: TranslationContext
+    ): IrExpression {
+        val receiverType = ctx.varTypes[receiverName] ?: typeMapper.unitType()
+        val invokeSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[invokeSymbol] = "invoke_lambda"
+        val receiver = IrNodeFactory.createGetValue(
+            0, 0, receiverType, ctx.symbols[receiverName] ?: IrValueParameterSymbolImpl(),
+            IrStatementOrigin.GET_PROPERTY
+        )
+        val argExprs = args.map { translateExpression(it, ctx) }.toTypedArray()
+        val returnType = ctx.lambdaInvokeReturnTypes[receiverName]
+            ?: ctx.functionReturnTypes["invoke"]
+            ?: typeMapper.unitType()
+        val call = IrNodeFactory.createCall(
+            0, 0, returnType, IrStatementOrigin.INVOKE,
+            argExprs, emptyArray(), invokeSymbol, null
+        )
+        (call as? org.jetbrains.kotlin.ir.expressions.impl.IrCallImpl)?.dispatchReceiver = receiver
+        return call
+    }
+
     private fun translateCall(expr: JasCall, ctx: TranslationContext): IrExpression {
         val name = when (expr.target) {
             is JasIdentifier -> expr.target.name
@@ -1514,21 +1719,18 @@ class JasperToIrTranslator {
         }
         if (expr.target is JasIdentifier && name in ctx.lambdaVarNames) {
             // Lambda variable call: generate virtual invoke on the closure object
-            val receiverType = ctx.varTypes[name] ?: typeMapper.unitType()
-            val invokeSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[invokeSymbol] = "invoke_lambda"
-            val receiver = IrNodeFactory.createGetValue(
-                0, 0, receiverType, ctx.symbols[name] ?: IrValueParameterSymbolImpl(),
-                IrStatementOrigin.GET_PROPERTY
-            )
-            val argExprs = expr.args.map { translateExpression(it, ctx) }.toTypedArray()
-            val returnType = ctx.functionReturnTypes["invoke"] ?: typeMapper.unitType()
-            val call = IrNodeFactory.createCall(
-                0, 0, returnType, IrStatementOrigin.INVOKE,
-                argExprs, emptyArray(), invokeSymbol, null
-            )
-            (call as? org.jetbrains.kotlin.ir.expressions.impl.IrCallImpl)?.dispatchReceiver = receiver
-            return call
+            return emitClosureInvoke(name, expr.args, ctx)
+        }
+        // Function-object protocol call: a lambda stored in a variable is lowered
+        // to an anonymous class. A call to the protocol's method name on that
+        // variable (`m.apply`, `p.test`, `r.reduce`, `c.compare`, `a.accept`) is
+        // routed to the closure's generated `invoke` method. The protocol itself
+        // is semantic, not a JVM interface dispatch.
+        if (expr.target is JasPropertyAccess && expr.target.property in PROTOCOL_METHODS) {
+            val receiverTarget = expr.target.target
+            if (receiverTarget is JasIdentifier && receiverTarget.name in ctx.lambdaVarNames) {
+                return emitClosureInvoke(receiverTarget.name, expr.args, ctx)
+            }
         }
         // Legacy inline path for lambdas (backward compat during transition)
         if (expr.target is JasIdentifier) {
@@ -1824,7 +2026,10 @@ class JasperToIrTranslator {
                     }
                 } else typeMapper.unitType()
             }
-            is JasExpressionStatement -> typeMapper.intType()
+            // A lambda block whose last statement is a plain expression yields no
+            // value (block expressions are not implicit returns in Jasper); its
+            // `invoke` is void. This is what makes `Action.accept` lambdas valid.
+            is JasExpressionStatement -> typeMapper.unitType()
             else -> typeMapper.unitType()
         }
         

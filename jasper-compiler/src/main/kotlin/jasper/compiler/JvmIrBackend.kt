@@ -726,6 +726,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             }
                             val returnDesc = typeMapper.jvmReturnDescriptorFromIrType(expr.type)
                             mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, receiverInternal, "invoke", "($paramSb)$returnDesc", false)
+                            // Void closures (e.g. `Action.accept`) leave no value on
+                            // the stack, but the statement emitter always expects one
+                            // to POP. Mirror the member-call contract with a dummy null.
+                            if (returnDesc == "V") {
+                                mv.visitInsn(Opcodes.ACONST_NULL)
+                            }
                         }
                     }
                     "println", "print" -> {
