@@ -671,6 +671,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     IrConstKind.Double -> mv.visitLdcInsn(expr.value as Double)
                     IrConstKind.String -> mv.visitLdcInsn(expr.value as String)
                     IrConstKind.Boolean -> mv.visitInsn(if (expr.value as Boolean) Opcodes.ICONST_1 else Opcodes.ICONST_0)
+                    IrConstKind.Char -> pushInt(mv, (expr.value as Char).code)
                     IrConstKind.Null -> mv.visitInsn(Opcodes.ACONST_NULL)
                     else -> mv.visitInsn(Opcodes.ACONST_NULL)
                 }

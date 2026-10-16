@@ -1146,6 +1146,7 @@ class JasperToIrTranslator {
                 else -> typeMapper.floatConst(expr.value.toFloat())
             }
             is JasStringLiteral -> typeMapper.stringConst(expr.text)
+            is JasCharLiteral -> typeMapper.charConst(expr.value.toChar())
             is JasBoolLiteral -> typeMapper.boolConst(expr.value)
             is JasNullLiteral -> typeMapper.nullConst()
             is JasIdentifier -> translateIdentifier(expr, ctx)

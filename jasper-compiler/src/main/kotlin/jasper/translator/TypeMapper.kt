@@ -301,6 +301,7 @@ class TypeMapper {
     fun floatType(): IrType = type("kotlin.Float")
     fun doubleType(): IrType = type("kotlin.Double")
     fun boolType(): IrType = type("kotlin.Boolean")
+    fun charType(): IrType = type("kotlin.Char")
     fun stringType(): IrType = type("kotlin.String")
 
     fun unitExpr(): IrExpression = IrConstImpl.constNull(0, 0, unitType())
@@ -311,6 +312,7 @@ class TypeMapper {
     fun longConst(value: Long): IrExpression = IrConstImpl.long(0, 0, longType(), value)
     fun floatConst(value: Float): IrExpression = IrConstImpl.float(0, 0, floatType(), value)
     fun doubleConst(value: Double): IrExpression = IrConstImpl.double(0, 0, doubleType(), value)
+    fun charConst(value: Char): IrExpression = IrConstImpl.char(0, 0, charType(), value)
     fun stringConst(value: String): IrExpression = IrConstImpl.string(0, 0, stringType(), value)
     fun boolConst(value: Boolean): IrExpression = if (value) trueConst() else falseConst()
     fun nullConst(): IrExpression = IrConstImpl.constNull(0, 0, nullable(type("kotlin.Any")))
