@@ -654,6 +654,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     }
 
     private fun findMemberType(typeName: String, memberName: String): JasType? {
+        // Resolve through the symbol table's member signature index first; this
+        // index includes annotation-synthesized members (e.g. @Getter/@Setter).
+        when (val indexed = symbolTable?.findMemberSignature(typeName, memberName)) {
+            is JasProperty -> return indexed.type
+            is JasFunction -> return JasFunctionType(
+                indexed.parameters.map { it.type ?: JasAnyType },
+                indexed.returnType ?: JasUnitType
+            )
+            else -> {}
+        }
+
         val cls = symbolTable?.findClass(typeName)
         if (cls != null) {
             for (member in cls.members) {

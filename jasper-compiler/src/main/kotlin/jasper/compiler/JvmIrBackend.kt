@@ -957,6 +957,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             } else {
                                 mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, receiverInternal, realName, "($paramSb)$returnDesc", false)
                             }
+                            // Void member calls (e.g. generated setters) leave no value on
+                            // the stack, but the statement emitter always expects one to POP.
+                            // Mirror the print/println contract by leaving a dummy null.
+                            if (returnDesc == "V") {
+                                mv.visitInsn(Opcodes.ACONST_NULL)
+                            }
                         } else {
                             val func = try { expr.symbol.owner } catch (e: Exception) { null }
                             // Generate arguments with boxing

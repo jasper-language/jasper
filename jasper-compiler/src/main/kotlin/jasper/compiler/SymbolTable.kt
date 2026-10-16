@@ -13,6 +13,16 @@ class SymbolTable {
     val packages: MutableMap<String, MutableList<String>> = mutableMapOf()
     val imports: MutableMap<String, String> = mutableMapOf()
     val importDeclarations: MutableMap<String, JasImport> = mutableMapOf()
+
+    /**
+     * Per-type member signature index: type name -> member name -> declaration.
+     *
+     * This is the symbol-table view the TypeChecker resolves member accesses
+     * against. It contains both handwritten members and members synthesized by
+     * the annotation processing phase (e.g. `@Getter` / `@Setter`), so synthesized
+     * signatures are visible before any method body exists.
+     */
+    val memberSignatures: MutableMap<String, MutableMap<String, JasDeclaration>> = mutableMapOf()
     var currentPackage: String? = null
     var errors: MutableList<SymbolError> = mutableListOf()
 
@@ -71,6 +81,7 @@ class SymbolTable {
                         errors.add(SymbolError("Duplicate class declaration '$decl.name'", "class", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
                     }
                     classes[decl.name] = decl
+                    indexMembers(decl.name, decl.members)
                 }
                 is JasInterface -> {
                     val prev = seenTypes.put(decl.name, "interface")
@@ -81,6 +92,7 @@ class SymbolTable {
                         errors.add(SymbolError("Duplicate interface declaration '$decl.name'", "interface", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
                     }
                     interfaces[decl.name] = decl
+                    indexMembers(decl.name, decl.members)
                 }
                 is JasEnum -> {
                     val prev = seenTypes.put(decl.name, "enum")
@@ -118,6 +130,26 @@ class SymbolTable {
 
     fun findAnnotation(name: String): JasAnnotationType? {
         return annotations[name]
+    }
+
+    /**
+     * Indexes the members of a type by simple name so the TypeChecker can resolve
+     * member accesses (including annotation-synthesized accessors) uniformly.
+     * First declaration wins, matching the previous linear first-match scan.
+     */
+    private fun indexMembers(typeName: String, members: List<JasDeclaration>) {
+        val index = memberSignatures.getOrPut(typeName) { mutableMapOf() }
+        for (member in members) {
+            when (member) {
+                is JasProperty -> index.putIfAbsent(member.name, member)
+                is JasFunction -> index.putIfAbsent(member.name, member)
+                else -> {}
+            }
+        }
+    }
+
+    fun findMemberSignature(typeName: String, memberName: String): JasDeclaration? {
+        return memberSignatures[typeName]?.get(memberName)
     }
 
     fun resolveType(name: String): JasType? {
@@ -187,5 +219,6 @@ class SymbolTable {
         importDeclarations.putAll(other.importDeclarations)
         imports.putAll(other.imports)
         packages.putAll(other.packages)
+        memberSignatures.putAll(other.memberSignatures)
     }
 }

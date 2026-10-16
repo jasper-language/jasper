@@ -1,5 +1,7 @@
 package jasper.compiler
 
+import jasper.annotations.AnnotationIndex
+import jasper.annotations.AnnotationProcessor
 import jasper.ast.JasperAstBuilder
 import jasper.checker.TypeChecker
 import jasper.parser.JasperLexer
@@ -59,7 +61,8 @@ class JasperCompiler {
     data class CompilePipeline(
         val source: String,
         val ast: jasper.ast.JasSourceFile,
-        val ir: jasper.translator.TranslationResult
+        val ir: jasper.translator.TranslationResult,
+        val annotationIndex: AnnotationIndex = AnnotationIndex.EMPTY
     )
 
     private data class ParsedSource(
@@ -171,7 +174,10 @@ class JasperCompiler {
     fun compileToPipeline(source: String): CompilePipeline {
         val processed = preprocessPower(preprocessSource(source))
         val parsed = parseSource(processed)
-        val ast = parsed.ast
+
+        // Annotation processing phase: synthesize member signatures before type checking.
+        val annotated = AnnotationProcessor().process(parsed.ast)
+        val ast = annotated.ast
 
         val allErrors = mutableListOf<CompileError>()
         allErrors.addAll(parsed.errors)
@@ -195,7 +201,7 @@ class JasperCompiler {
         val translator = JasperToIrTranslator()
         val ir = translator.translate(ast)
 
-        return CompilePipeline(parsed.parsedText, ast, ir)
+        return CompilePipeline(parsed.parsedText, ast, ir, annotated.index)
     }
 
     fun compileAll(sources: Map<String, String>): Map<String, CompilePipeline> {
@@ -203,13 +209,17 @@ class JasperCompiler {
         val symbolTable = SymbolTable()
         symbolTable.registerBuiltins()
         val parsed = mutableMapOf<String, jasper.ast.JasSourceFile>()
+        val annotationIndexes = mutableMapOf<String, AnnotationIndex>()
 
         for ((filename, source) in sources) {
             val processed = preprocessPower(preprocessSource(source))
             val result = parseSource(processed)
-            parsed[filename] = result.ast
+            // Annotation processing phase: synthesize member signatures before type checking.
+            val annotated = AnnotationProcessor().process(result.ast)
+            parsed[filename] = annotated.ast
+            annotationIndexes[filename] = annotated.index
             allErrors.addAll(result.errors)
-            symbolTable.collectDeclarations(result.ast)
+            symbolTable.collectDeclarations(annotated.ast)
         }
 
         allErrors.addAll(symbolTable.errors.map { se ->
@@ -244,7 +254,7 @@ class JasperCompiler {
                 classInterfaceNames = translated.classInterfaceNames,
                 interfaceDeclNames = translated.interfaceDeclNames
             )
-            pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir)
+            pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir, annotationIndexes[filename] ?: AnnotationIndex.EMPTY)
         }
         return pipelines
     }
@@ -252,7 +262,9 @@ class JasperCompiler {
     fun compileToPipeline(source: String, symbolTable: SymbolTable): CompilePipeline {
         val processed = preprocessPower(preprocessSource(source))
         val parsed = parseSource(processed)
-        val ast = parsed.ast
+        // Annotation processing phase: synthesize member signatures before type checking.
+        val annotated = AnnotationProcessor().process(parsed.ast)
+        val ast = annotated.ast
 
         val allErrors = mutableListOf<CompileError>()
         allErrors.addAll(parsed.errors)
@@ -274,7 +286,7 @@ class JasperCompiler {
         val translator = JasperToIrTranslator()
         val ir = translator.translate(ast)
 
-        return CompilePipeline(parsed.parsedText, ast, ir)
+        return CompilePipeline(parsed.parsedText, ast, ir, annotated.index)
     }
 
     private fun parseSource(source: String): ParsedSource {

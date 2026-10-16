@@ -10,8 +10,16 @@ sealed class JasDeclaration : JasNode()
 data class JasFunction(
     val name: String, val parameters: List<JasParameter>, val returnType: JasType?,
     val body: JasBlock?, val modifiers: List<Any>, val typeParameters: List<JasTypeParameter> = emptyList(),
-    val whereConstraints: List<JasTypeConstraint> = emptyList()
+    val whereConstraints: List<JasTypeConstraint> = emptyList(),
+    val syntheticAccessor: JasSyntheticAccessor? = null
 ) : JasDeclaration()
+
+/**
+ * Marks a function whose *signature* was synthesized by the annotation
+ * processing phase (e.g. `@Getter` / `@Setter`) but whose *body* is generated
+ * later, during lowering, when full type information is available.
+ */
+data class JasSyntheticAccessor(val propertyName: String, val isGetter: Boolean) : JasNode()
 
 data class JasClass(
     val name: String, val modifiers: List<Any>, val typeParameters: List<JasTypeParameter>,

@@ -211,11 +211,16 @@ class JasperToIrTranslator {
             ctx.symbols[param.name] = paramSymbol
             ctx.varTypes[param.name] = paramType
         }
-        if (func.body != null) {
+        val bodyStatements: List<JasStatement>? = when {
+            func.syntheticAccessor != null -> syntheticAccessorBody(func.syntheticAccessor!!, func)
+            func.body != null -> func.body!!.statements
+            else -> null
+        }
+        if (bodyStatements != null) {
             val prevFunc = ctx.currentFunction
             ctx.currentFunction = irFunc
             val body = irFunc.body as? IrBlockBody ?: factory.createBlockBody(0, 0)
-            for (stmt in func.body!!.statements) {
+            for (stmt in bodyStatements) {
                 val irStmt = translateStatement(stmt, ctx)
                 if (irStmt != null) {
                     (body.statements as MutableList<IrStatement>).add(irStmt)
@@ -231,6 +236,28 @@ class JasperToIrTranslator {
         ctx.functionParamTypes[func.name] = func.parameters.map { resolveTypeParam(it.type) }
         ctx.callNames[symbol] = func.name
         return irFunc
+    }
+
+    /**
+     * Late body generation for annotation-synthesized accessors.
+     *
+     * The *signature* (`getFoo()` / `setFoo(value)`) was synthesized by the
+     * annotation processing phase before type checking. By the time lowering runs,
+     * the property's backing field symbol (`ctx.fieldSymbols`) and the setter
+     * parameter symbol are available, so the body is lowered through the normal
+     * statement pipeline (`return this.prop` / `this.prop = value`).
+     */
+    private fun syntheticAccessorBody(
+        accessor: JasSyntheticAccessor,
+        func: JasFunction
+    ): List<JasStatement> {
+        val thisField = JasPropertyAccess(JasIdentifier("this"), accessor.propertyName)
+        return if (accessor.isGetter) {
+            listOf(JasReturn(thisField))
+        } else {
+            val paramName = func.parameters.firstOrNull()?.name ?: "value"
+            listOf(JasExpressionStatement(JasAssignment(thisField, JasIdentifier(paramName))))
+        }
     }
 
     // ── class ──
