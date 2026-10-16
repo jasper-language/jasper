@@ -2061,6 +2061,6 @@ class JasperToIrTranslator {
     }
 
     private fun translateAssignmentIncrement(expr: JasAssignmentIncrement, ctx: TranslationContext): IrExpression {
-        return translatePostfixIncDec(expr.increment, ctx, needsResult = true)
+        return translateAssignment(JasAssignment(expr.target, expr.increment, "="), ctx)
     }
 }

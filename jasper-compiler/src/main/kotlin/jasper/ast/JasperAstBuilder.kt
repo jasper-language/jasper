@@ -1369,7 +1369,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         val incCtx = tail.variableBindingIncrement()
         if (incCtx is JasperParser.VariableBindingIncDecContext) {
             val b = incCtx.core
-            val init = visit(incCtx.init) as? JasExpression
+            val init = visitPostfixIncrement(incCtx.init as JasperParser.PostfixIncDecContext)
             return JasVariableStatement(
                 b.name.text,
                 if (b.typeRef != null) visit(b.typeRef) as? JasType else null,
