@@ -2147,6 +2147,19 @@ class JasperToIrTranslator {
                 }
             }
         }
+        // 真 varargs（语法裁决②）：按检查器回填的解析结果降级——尾部实参打包成数组，
+        // 或最后一个实参本身就是数组时原样传入（转成声明的数组类型，保证调用描述符对齐）。
+        expr.varargCall?.let { vararg ->
+            val arrayIrType = typeMapper.mapType(vararg.arrayType)
+            val start = (if (expr.target is JasPropertyAccess) 1 else 0) + vararg.fixedCount
+            if (vararg.passThrough) {
+                args[start] = castToDeclared(arrayIrType, args[start])
+            } else {
+                val tail = args.subList(start, args.size).toList()
+                args.subList(start, args.size).clear()
+                args.add(buildArrayFromValues(arrayIrType, tail, ctx))
+            }
+        }
         val irArgs = args.toTypedArray()
         // Compute the call's return type. Prefer the *receiver-typed* member index
         // (`memberReturnTypesByType`) so a member call is typed by the declared type
@@ -2330,41 +2343,7 @@ class JasperToIrTranslator {
         val elemDesc = if (arrayDesc.startsWith("[")) arrayDesc.substring(1)
             else typeMapper.jvmDescriptorFromType(expr.type)
         if (expr.init is JasArrayInitValues) {
-            val values = expr.init.values
-            val block = IrNodeFactory.createBlock(0, 0, resultType, null)
-            val ctorSymbol = IrConstructorSymbolImpl()
-            ctx.constructorTypes[ctorSymbol] = "array:$elemDesc"
-            val dimExpr = typeMapper.intConst(values.size)
-            val createArray = IrNodeFactory.createConstructorCall(
-                0, 0, resultType, null,
-                arrayOf(dimExpr), emptyArray(), ctorSymbol,
-                SourceElement.NO_SOURCE, 0
-            )
-            val arrSymbol = IrVariableSymbolImpl()
-            val arrVar = IrNodeFactory.createVariable(
-                0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("arr$"),
-                resultType, arrSymbol, true, false, false
-            )
-            arrVar.initializer = createArray
-            (block.statements as MutableList<IrStatement>).add(arrVar)
-            for ((i, v) in values.withIndex()) {
-                val valExpr = translateExpression(v, ctx)
-                val setSymbol = IrSimpleFunctionSymbolImpl()
-                ctx.callNames[setSymbol] = "arraySet"
-                val setCall = IrNodeFactory.createCall(
-                    0, 0, resultType, null,
-                    arrayOf(
-                        IrNodeFactory.createGetValue(0, 0, resultType, arrSymbol, null),
-                        typeMapper.intConst(i),
-                        valExpr
-                    ), emptyArray(), setSymbol, null
-                )
-                (block.statements as MutableList<IrStatement>).add(setCall)
-            }
-            (block.statements as MutableList<IrStatement>).add(
-                IrNodeFactory.createGetValue(0, 0, resultType, arrSymbol, null)
-            )
-            return block
+            return buildArrayFromValues(resultType, expr.init.values.map { translateExpression(it, ctx) }, ctx, elemDesc)
         } else {
             val ctorSymbol = IrConstructorSymbolImpl()
             ctx.constructorTypes[ctorSymbol] = "array:$elemDesc"
@@ -2376,6 +2355,62 @@ class JasperToIrTranslator {
             )
         }
     }
+
+    /**
+     * 做什么：用已翻译好的元素值构造一维数组（`new T[n]` + 逐个 arraySet），整体是一个块表达式。
+     * 什么时候用：数组初始化器 `new T[] { ... }`，以及 varargs 调用点打包尾部实参。
+     * 前置条件：resultType 是数组 IR 类型；values 已按求值顺序翻译。
+     * 为什么接受 IR 而不是 AST：varargs 打包时实参已被翻译过，重复翻译会重复登记 lambda 等副作用。
+     */
+    private fun buildArrayFromValues(
+        resultType: IrType,
+        values: List<IrExpression>,
+        ctx: TranslationContext,
+        elemDesc: String = typeMapper.jvmDescriptorFromIrType(resultType).removePrefix("["),
+    ): IrExpression {
+        // 只有元素 IR 类型与数组描述符一致时才做转型，避免把值转成退化的 Unit 类型。
+        val elementType = arrayElementType(resultType).takeIf { typeMapper.jvmDescriptorFromIrType(it) == elemDesc }
+        val block = IrNodeFactory.createBlock(0, 0, resultType, null)
+        val ctorSymbol = IrConstructorSymbolImpl()
+        ctx.constructorTypes[ctorSymbol] = "array:$elemDesc"
+        val dimExpr = typeMapper.intConst(values.size)
+        val createArray = IrNodeFactory.createConstructorCall(
+            0, 0, resultType, null,
+            arrayOf(dimExpr), emptyArray(), ctorSymbol,
+            SourceElement.NO_SOURCE, 0
+        )
+        val arrSymbol = IrVariableSymbolImpl()
+        val arrVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("arr$"),
+            resultType, arrSymbol, true, false, false
+        )
+        arrVar.initializer = createArray
+        (block.statements as MutableList<IrStatement>).add(arrVar)
+        for ((i, v) in values.withIndex()) {
+            // 引用元素数组（如 any[] = Object[]）装入原始值时先转型（后端据此装箱）。
+            val valExpr = if (elementType != null && (elemDesc.startsWith("L") || elemDesc.startsWith("["))) castToDeclared(elementType, v) else v
+            val setSymbol = IrSimpleFunctionSymbolImpl()
+            ctx.callNames[setSymbol] = "arraySet"
+            val setCall = IrNodeFactory.createCall(
+                0, 0, resultType, null,
+                arrayOf(
+                    IrNodeFactory.createGetValue(0, 0, resultType, arrSymbol, null),
+                    typeMapper.intConst(i),
+                    valExpr
+                ), emptyArray(), setSymbol, null
+            )
+            (block.statements as MutableList<IrStatement>).add(setCall)
+        }
+        (block.statements as MutableList<IrStatement>).add(
+            IrNodeFactory.createGetValue(0, 0, resultType, arrSymbol, null)
+        )
+        return block
+    }
+
+    /** 实参描述符与声明类型不同时包一层 CAST（后端据此装箱 / checkcast）；相同则原样返回。 */
+    private fun castToDeclared(declared: IrType, value: IrExpression): IrExpression =
+        if (typeMapper.jvmDescriptorFromIrType(declared) == typeMapper.jvmDescriptorFromIrType(value.type)) value
+        else IrTypeOperatorCallImpl(0, 0, declared, IrTypeOperator.CAST, declared, value)
 
     private fun translateLambda(expr: JasLambdaExpr, ctx: TranslationContext): IrExpression {
         val lambdaId = ctx.lambdaIdCounter++

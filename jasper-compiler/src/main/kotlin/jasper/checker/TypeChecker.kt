@@ -344,6 +344,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         val funcEnv = env.copy()
         checkTypeParameters(func.typeParameters, funcEnv, "function '${func.name}'")
         checkWhereConstraints(func.whereConstraints, funcEnv, "function '${func.name}'")
+        checkVarargsPosition(func.parameters, "function '${func.name}'")
         val params = mutableSetOf<String>()
         for (param in func.parameters) {
             // 形参名重复即报错；随后把形参登记进环境供函数体解析。
@@ -358,6 +359,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             // body=null 表示只有签名（内置/外部函数），无需检查语句。
             for (stmt in func.body!!.statements) {
                 checkStatement(stmt, funcEnv, func.returnType)
+            }
+        }
+    }
+
+    /** varargs 形参只允许出现在最后一个位置（否则调用点无法确定打包边界）。 */
+    private fun checkVarargsPosition(parameters: List<JasParameter>, owner: String) {
+        for ((i, param) in parameters.withIndex()) {
+            if (param.vararg && i != parameters.lastIndex) {
+                error("Varargs parameter '${param.name}' in $owner must be the last parameter", param)
             }
         }
     }
@@ -393,6 +403,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         for (ctor in cls.constructors) {
             // 构造器各自独立子环境；返回类型固定为 void，故传 JasUnitType。
             val ctorEnv = clsEnv.copy()
+            checkVarargsPosition(ctor.parameters, "constructor of class '${cls.name}'")
             val params = mutableSetOf<String>()
             for (param in ctor.parameters) {
                 if (!params.add(param.name)) {
@@ -671,7 +682,11 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                         JasAnyType
                     } else {
                         // 重载解析第一步：按实参个数（arity）过滤候选。
-                        val byArity = funcs.filter { it.parameters.size == expr.args.size }
+                        // varargs 函数接受「固定形参个数」及以上的任意实参个数。
+                        val byArity = funcs.filter { fn ->
+                            fn.parameters.size == expr.args.size ||
+                                (fn.parameters.lastOrNull()?.vararg == true && expr.args.size >= fn.parameters.size - 1)
+                        }
                         if (byArity.isEmpty()) {
                             error("Function '$name' expects ${funcs.joinToString(" or ") { it.parameters.size.toString() }} argument(s), got ${expr.args.size}", expr)
                             funcs.first().returnType ?: JasAnyType
@@ -679,13 +694,26 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                             // 第二步：在 arity 匹配的候选中找第一个「实参类型全部兼容」的重载。
                             // 兼容判定额外放行「形参是裸类型参数」的情形（留待 unify 推断），
                             // 以及任一侧类型为 null（推断失败）时的宽松放行。
-                            val compatible = byArity.firstOrNull { fn ->
-                                fn.parameters.zip(argTypes).all { (param, argType) ->
-                                    param.type == null || argType == null ||
-                                    typesCompatible(argType, param.type) ||
-                                    (param.type is JasNamedType && fn.typeParameters.any { tp -> tp.name == (param.type as JasNamedType).name && (param.type as JasNamedType).typeArguments.isEmpty() })
+                            /** 单个实参是否可传给该形参：兼容、任一侧未知、或形参是待推断的裸类型参数。 */
+                            fun paramAccepts(fn: JasFunction, paramType: JasType?, argType: JasType?): Boolean =
+                                paramType == null || argType == null ||
+                                typesCompatible(argType, paramType) ||
+                                (paramType is JasNamedType && fn.typeParameters.any { tp -> tp.name == paramType.name && paramType.typeArguments.isEmpty() })
+                            // 每个候选先决定 varargs 降级方式（无 varargs 时为 null），再逐参校验。
+                            val resolved = byArity.asSequence().mapNotNull { fn ->
+                                val vararg = resolveVarargCall(fn.parameters.map { it.type ?: JasAnyType }, fn.parameters.lastOrNull()?.vararg == true, argTypes)
+                                val ok = if (vararg == null) {
+                                    fn.parameters.size == argTypes.size &&
+                                        fn.parameters.zip(argTypes).all { (param, argType) -> paramAccepts(fn, param.type, argType) }
+                                } else {
+                                    val fixedOk = (0 until vararg.fixedCount).all { i -> paramAccepts(fn, fn.parameters[i].type, argTypes[i]) }
+                                    val tail = argTypes.drop(vararg.fixedCount)
+                                    fixedOk && (vararg.passThrough || tail.all { paramAccepts(fn, vararg.arrayType.inner, it) })
                                 }
-                            }
+                                if (ok) fn to vararg else null
+                            }.firstOrNull()
+                            val compatible = resolved?.first
+                            expr.varargCall = resolved?.second
                             if (compatible == null) {
                                 val signature = byArity.joinToString(" or ") { fn ->
                                     "(${fn.parameters.joinToString(", ") { p -> p.type?.let(::typeDisplayName) ?: "any" }})"
@@ -697,9 +725,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                                     // 泛型函数：用实参类型推断类型参数（unify 收集约束到 inferred）。
                                     val typeParamNames = compatible.typeParameters.map { it.name }.toSet()
                                     val inferred = mutableMapOf<String, JasType>()
-                                    for ((param, argType) in compatible.parameters.zip(argTypes)) {
-                                        if (param.type != null && argType != null) {
-                                            unify(argType, param.type, typeParamNames, inferred)
+                                    val vararg = expr.varargCall
+                                    for ((i, argType) in argTypes.withIndex()) {
+                                        // varargs 打包的尾部实参与「元素类型」统一，其余与对应形参统一。
+                                        val paramType = when {
+                                            vararg != null && !vararg.passThrough && i >= vararg.fixedCount -> vararg.arrayType.inner
+                                            else -> compatible.parameters.getOrNull(i)?.type
+                                        }
+                                        if (paramType != null && argType != null) {
+                                            unify(argType, paramType, typeParamNames, inferred)
                                         }
                                     }
                                     // 回填推断出的类型实参到 AST，供下游（如 translator）读取。
@@ -731,7 +765,28 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 } else {
                     // callee 不是简单标识符（如函数值/lambda 变量）：按函数类型逐参校验。
                     val targetType = inferExpression(expr.target, env)
-                    if (targetType is JasFunctionType) {
+                    val memberVararg = if (targetType is JasFunctionType) {
+                        resolveVarargCall(targetType.paramTypes, targetType.varargs, argTypes)
+                    } else null
+                    if (targetType is JasFunctionType && memberVararg != null) {
+                        // varargs 成员调用：固定形参逐个校验，尾部实参按元素类型（或数组直传）校验。
+                        expr.varargCall = memberVararg
+                        val fixed = memberVararg.fixedCount
+                        targetType.paramTypes.take(fixed).zip(argTypes).forEachIndexed { index, (expected, actual) ->
+                            if (actual != null && !typesCompatible(actual, expected)) {
+                                error("Function argument ${index + 1} type mismatch: expected ${typeDisplayName(expected)}, got ${typeDisplayName(actual)}", expr)
+                            }
+                        }
+                        if (!memberVararg.passThrough) {
+                            val element = memberVararg.arrayType.inner
+                            argTypes.drop(fixed).forEachIndexed { index, actual ->
+                                if (actual != null && !typesCompatible(actual, element)) {
+                                    error("Function argument ${fixed + index + 1} type mismatch: expected ${typeDisplayName(element)}, got ${typeDisplayName(actual)}", expr)
+                                }
+                            }
+                        }
+                        targetType.returnType
+                    } else if (targetType is JasFunctionType) {
                         if (targetType.paramTypes.size != expr.args.size) {
                             error("Function value expects ${targetType.paramTypes.size} argument(s), got ${expr.args.size}", expr)
                         } else {
@@ -887,7 +942,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             is JasProperty -> return indexed.type
             is JasFunction -> return JasFunctionType(
                 indexed.parameters.map { it.type ?: JasAnyType },
-                indexed.returnType ?: JasUnitType
+                indexed.returnType ?: JasUnitType,
+                indexed.parameters.lastOrNull()?.vararg == true
             )
             else -> {}
         }
@@ -898,7 +954,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             for (member in cls.members) {
                 if (member is JasProperty && member.name == memberName) return member.type
                 if (member is JasFunction && member.name == memberName) {
-                    return JasFunctionType(member.parameters.map { it.type ?: JasAnyType }, member.returnType ?: JasUnitType)
+                    return JasFunctionType(member.parameters.map { it.type ?: JasAnyType }, member.returnType ?: JasUnitType, member.parameters.lastOrNull()?.vararg == true)
                 }
             }
         }
@@ -908,7 +964,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             for (member in iface.members) {
                 if (member is JasProperty && member.name == memberName) return member.type
                 if (member is JasFunction && member.name == memberName) {
-                    return JasFunctionType(member.parameters.map { it.type ?: JasAnyType }, member.returnType ?: JasUnitType)
+                    return JasFunctionType(member.parameters.map { it.type ?: JasAnyType }, member.returnType ?: JasUnitType, member.parameters.lastOrNull()?.vararg == true)
                 }
             }
         }
@@ -985,7 +1041,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 val newParams = type.paramTypes.map { substitute(it, mapping) }
                 val newReturn = substitute(type.returnType, mapping)
                 if (newParams != type.paramTypes || newReturn != type.returnType) {
-                    JasFunctionType(newParams, newReturn)
+                    JasFunctionType(newParams, newReturn, type.varargs)
                 } else {
                     type
                 }
@@ -1028,6 +1084,28 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         is JasReferenceType -> "&${typeDisplayName(type.inner)}"
         else -> "unknown"
     }
+
+    /**
+     * 做什么：判断一次调用该如何走 varargs（真 varargs，语法裁决②）。
+     * 返回 null：被调函数没有 varargs 形参，或实参个数不足以覆盖固定形参。
+     * passThrough=true：实参个数恰好对齐且最后一个实参本身是兼容的数组 ⇒ 原样传入；
+     *   例外：元素为 any、实参是原始类型数组（如 int32[]）时不能当 Object[] 用，改为打包。
+     * 否则：把固定形参之后的全部实参（可以是 0 个）打包成新数组。
+     */
+    private fun resolveVarargCall(paramTypes: List<JasType>, isVarargs: Boolean, argTypes: List<JasType?>): JasVarargCall? {
+        if (!isVarargs) return null
+        val arrayType = paramTypes.lastOrNull() as? JasArrayType ?: return null
+        val fixed = paramTypes.size - 1
+        if (argTypes.size < fixed) return null
+        val last = if (argTypes.size == paramTypes.size) argTypes.last() else null
+        val passThrough = last is JasArrayType &&
+            typesCompatible(last, arrayType) &&
+            !(isAnyLike(arrayType.inner) && last.inner is JasPrimitiveType)
+        return JasVarargCall(fixed, arrayType, passThrough)
+    }
+
+    private fun isAnyLike(type: JasType): Boolean =
+        type is JasAnyType || (type is JasNamedType && type.name == "Any")
 
     private fun typesCompatible(actual: JasType, expected: JasType): Boolean {
         // 兼容性规则按顺序短路；顺序本身有意义（可空性先于 any 兜底等），勿随意调整。

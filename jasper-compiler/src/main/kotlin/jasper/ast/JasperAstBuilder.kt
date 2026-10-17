@@ -289,8 +289,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitFunctionParameter(ctx: JasperParser.FunctionParameterContext): JasNode? {
         val b = ctx.bind
         val name = b.name.text
-        val type = if (b.typeRef != null) visit(b.typeRef) as? JasType else null
+        val declared = if (b.typeRef != null) visit(b.typeRef) as? JasType else null
         val isVararg = ctx.ELLIPSIS() != null
+        // 真 varargs（语法裁决②）：`xs: T...` 在函数体内就是元素数组 `T[]`。
+        // 这里一次性把形参类型改写成数组，下游（检查器/翻译器/后端描述符）统一按数组处理，
+        // vararg 标记只留给调用点决定「是否把多余实参打包成数组」。
+        val type = if (isVararg && declared != null) JasArrayType(declared) else declared
         return JasParameter(name, type, isVararg, null).at(ctx)
     }
 

@@ -239,6 +239,7 @@ data class JasTypeConstraint(val typeParamName: String, val bound: JasType) : Ja
 /**
  * 形参：name 参数名；type 参数类型（null 表示待推导）；vararg 是否为可变参数；
  * defaultValue 默认值表达式（null 表示无默认值）。
+ * vararg=true 时 type 已是元素数组 `T[]`（由 AST 构建器改写），函数体内按数组使用。
  */
 data class JasParameter(val name: String, val type: JasType?, val vararg: Boolean = false, val defaultValue: JasExpression? = null) : JasNode()
 
@@ -479,7 +480,22 @@ class JasCall(
     val isSafe: Boolean = false
 ) : JasExpression() {
     var inferredTypeArgs: Map<String, JasType>? = null
+
+    /**
+     * varargs 调用点的解析结果（由类型检查器回填，翻译器只按它降级）：
+     * null 表示不是 varargs 调用；否则见 [JasVarargCall]。
+     */
+    var varargCall: JasVarargCall? = null
 }
+
+/**
+ * varargs 调用点的降级指令。
+ * fixedCount：被调函数的固定形参个数（不含 varargs 形参）；
+ * arrayType：varargs 形参的数组类型 `T[]`；
+ * passThrough：true 表示最后一个实参本身就是数组、原样传入；false 表示把
+ *   `args[fixedCount..]` 打包成新数组（可能为空数组）。
+ */
+data class JasVarargCall(val fixedCount: Int, val arrayType: JasArrayType, val passThrough: Boolean)
 
 /**
  * 属性访问表达式：target 访问对象；property 属性名；isSafe=true 表示安全访问（?.）。
@@ -663,9 +679,10 @@ data class JasNonNullType(val inner: JasType) : JasType()
 data class JasArrayType(val inner: JasType) : JasType()
 
 /**
- * 函数类型：paramTypes 形参类型列表；returnType 返回类型。
+ * 函数类型：paramTypes 形参类型列表；returnType 返回类型；
+ * varargs=true 表示最后一个形参是 varargs（其类型为数组 `T[]`）。
  */
-data class JasFunctionType(val paramTypes: List<JasType>, val returnType: JasType) : JasType()
+data class JasFunctionType(val paramTypes: List<JasType>, val returnType: JasType, val varargs: Boolean = false) : JasType()
 
 /**
  * 通配类型（泛型实参占位）：bound 边界类型（null 表示无界）；
