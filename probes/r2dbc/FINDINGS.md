@@ -58,7 +58,7 @@ Flux.declaredFields=[FETCH_SIZE]
 | `errorCollector.errorMessage=="deadlock"` | +1 | 错误走 `onError` 通道 |
 | `memoryConn.rollbacks()` | 1 | 事务回滚（`Mono` 订阅） |
 | `resultRows` | 3 | `ResultSet` 前向游标逐行读取 |
-| `taskValue()` | 7 | `Task` 同步占位（`await` 的替代形状，见 #1） |
+| `taskValue()` | 7 | `go` 启动任务 + `await` 取值（#1/#2 已修，`7e66eca`） |
 
 ## 二、严重度与类别
 
@@ -82,11 +82,19 @@ Flux.declaredFields=[FETCH_SIZE]
 
 > 另有 2 条在既有批次中**已修复/已可用**，作为回归守门保留在探针里，不计入上表摩擦点：
 > #7 跨文件接口实现赋值、#15 `defer` 泄漏到后续函数。
+>
+> 修复进度：**本批（commit `7e66eca`）** 修复 3 条 `③编译器缺陷`——#1（`await`）、
+> #4（`finally`）、#11（数组元素读类型）；并修复 `①语法层` #2 的**执行语义**
+> （`go` 任务体真的执行、副作用可观察）。#2 的另一半「`go` 可作普通标识符/方法名」
+> 受 `JasperLexer.g4` 硬关键字阻塞，**仍未修复**（需把 `Go` 改为软关键字，见第五节 #2）。
+> 修复详情见第五节各条目的「状态」行；回归守门见 `jasper.R2dbcDefectRegressionTest`。
 
 ## 四、探针为通过验收而采用的规避
 
 > 说明：下列规避是探针源码**编写时**为绕开缺陷所采用的写法，每条都对应第五节的一个编号。
 > 所有规避都只影响**探针自身写法**，不改动任何 `.g4` 或编译器实现。
+> 第 7 条（`finally` #4）已在**本批（commit `7e66eca`）** 修复后从探针中**移除**；
+> #1（`await`）、#2（`go` 执行语义）、#11（数组读）对应的规避（见第五节各条目）同样已移除。
 
 1. **元素类型固定为具体 `Row`，而不是泛型 `T`**（#3）。泛型形状保留在
    `ReactiveStreams.jas`（`Rx*` 前缀）中只作声明；运行路径全部走 `std` 包的
@@ -101,7 +109,9 @@ Flux.declaredFields=[FETCH_SIZE]
 5. **多态一律走接口，不做「子类赋给基类变量」**（#9）：`MemoryConnection` 先赋给
    `Connection` 接口再使用；`Task` 等不依赖类层次赋值。
 6. **订阅者不保存可空的接口字段**（#10）：取消需要的 `Subscription` 句柄通过参数即取即用。
-7. **资源释放统一用 `defer`**（#4），不使用 `finally`。
+7. ~~**资源释放统一用 `defer`**（#4），不使用 `finally`。~~ —— **已移除**：
+   `main()` 现用标准 `try/finally` 兜底释放 `statement`/`conn`，
+   `MemoryResultSet.getInt/getString` 用 `try/finally` 复位 `wasNull`（#4 已固定回归）。
 8. **多顶层类型文件把 `package` 放在文件首个非空白位置**（#12）：文件头注释若有，
    必须放在 `package` 之后或省略。
 
@@ -111,6 +121,10 @@ Flux.declaredFields=[FETCH_SIZE]
 
 #### 1. `await` 生成对 `unknown` 的调用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `7e66eca`）**——`await e` 现等价于「操作数同步求值完成」，
+  直接返回操作数的值，IR 类型即操作数类型；变化点隔离在
+  `JasperToIrTranslator.translateUnaryOp` 的 `"await"` 分支。
+  `jasper.R2dbcDefectRegressionTest.await value participates in arithmetic and string concatenation` 覆盖。
 - 现象：`await e` 能通过语法与类型检查，但降级为对名为 `unknown` 的方法的调用。
 - 触发代码：
 ```jasper
@@ -120,28 +134,42 @@ public function main(): int32 { var x: int32 = await compute(); return x; }
 ```
 - 期望：挂起等待 `compute()` 的结果，或至少报「不支持 await」的编译错误。
 - 实测：运行期 `NoSuchMethodError: 'int std.main.unknown(int)'`。
-- 探针规避：用同步占位 `Task`（`complete()`/`isDone()`/`join()`）表达「任务/挂起」形状，
-  `taskValue()` 断言其闭环；见 `MemoryR2dbc.jas` 的 `Task`。
+- 探针规避（**已移除**）：原用同步占位 `Task`（`complete()`/`isDone()`/`join()`）
+  表达「任务/挂起」形状。现 `taskValue()` 直接用 `await task.join()` 取值
+  （`go task.complete(...)` 启动任务），`main-result` 中 `taskValue()=7` 保持不变。
 
 #### 2. `go` 被保留为关键字且被执行语义破坏
 - 类别：`①语法层`
+- 状态：**执行语义已修复（commit `7e66eca`）**——AST 新增显式 `JasUnaryOp("go")`，
+  翻译器把语义编码进 `callNames`，后端 `"go"` 分支同步触发任务体的副作用并把结果
+  丢弃为 `Unit`，不再生成加载期校验失败的字节码。
+  `jasper.R2dbcDefectRegressionTest.go executes the task body and its side effect is observable` 覆盖。
+- 状态（后半）**仍未修复**：`go` 可作普通标识符/方法名——`JasperLexer.g4` 把 `Go`
+  定义为**硬关键字**，`t.go()` 在解析阶段即被拒绝。真实原因：软关键字需要改动 `.g4`
+  （`Go` 只能在语句起始处生效，或改为 `{_input.LA(1)==...}?` 谓词的软关键字）。
+  **本批任务硬约束禁止改动任何 `.g4`，故此处只作记录、不伪装修复**；回归测试
+  `go as an ordinary identifier is blocked by the hard keyword` 以「断言当前被拒绝」
+  的形式把该阻塞固定下来，一旦语法放开该用例会失败并提醒更新为正向断言。
 - 现象：`go` 不能作为标识符/方法名；`go f()` 能编译但生成的代码在加载时校验失败。
 - 触发代码：
 ```jasper
 package std;
 public var side: int32 = 0;
 public function bump(): void { side = side + 1; }
-public function main(): int32 { go bump(); return side; }      // 触发 VerifyError
+public function main(): int32 { go bump(); return side; }      // 修复前触发 VerifyError
 ```
 ```jasper
 package std;
-public class T { public function go(): int32 { return 1; } }   // 语法错误
+public class T { public function go(): int32 { return 1; } }   // 仍语法错误（阻塞）
 ```
 - 期望：`go` 作为异步调度原语（分离执行），或明确不支持并给编译错误；
   `go` 不应是保留字以至于不能当方法名。
-- 实测：前者 `VerifyError: Bad type on operand stack`；
+- 实测（修复前）：前者 `VerifyError: Bad type on operand stack`；
   后者 `Syntax error: mismatched input 'go' expecting Identifier`。
-- 探针规避：不使用 `go`，异步形状统一用订阅协议（`subscribe`/`onNext`）表达。
+- 实测（修复后）：`go bump();` 正常执行、副作用可观察；
+  `t.go()` 仍报 `mismatched input 'go' expecting Identifier`。
+- 探针规避（**执行语义部分已移除**）：`taskValue()` 现直接用 `go task.complete(...)`
+  启动任务；`go` 作方法名的写法仍不可用，异步形状依旧统一用订阅协议表达。
 
 #### 3. 泛型类型变量作形参/返回值 → 描述符为字面量 `LT;`
 - 类别：`③编译器缺陷`
@@ -166,6 +194,11 @@ public function main(): int32 {
 
 #### 4. `finally` 语义不可靠
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `7e66eca`）**——`JvmIrBackend` 对 try/catch/finally 统一生成
+  ①正常收尾、②异常兜底处理器、③`IrReturn` 返回前补跑（`MethodContext.finallyStack`
+  记录尚未执行的 finally），三条路径各执行一次；嵌套 try 按「内层处理器先登记」保证
+  匹配优先级。`jasper.R2dbcDefectRegressionTest.finally runs exactly once on normal
+  exception and early return paths` 覆盖。
 - 现象：`try { ... } finally { ... }` 生成的字节码在加载时校验失败；即使不崩，
   `finally` 也不会在 `return`/异常路径执行。
 - 触发代码：
@@ -177,7 +210,8 @@ public function main(): int32 { var r: int32 = f(); return r + flag; }
 ```
 - 期望：无论正常返回还是抛异常，`finally` 都执行（`flag==1`）。
 - 实测：`VerifyError: Bad type on operand stack`。
-- 探针规避：全部资源释放改用 `defer`（`conn.close()`/`statement.close()` 等）。
+- 探针规避（**已移除**）：原把全部资源释放改用 `defer`；`main()` 现改回标准
+  `try/finally` 释放 `statement`/`conn`，`MemoryResultSet` 亦用 `try/finally` 复位 wasNull。
 
 #### 14. 枚举比较触发编译器内部错误
 - 类别：`③编译器缺陷`
@@ -329,6 +363,10 @@ public function main(): int32 { return new H().get(); }
 
 #### 11. 数组元素读取的类型是 `void`，不能直接使用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `7e66eca`）**——`TypeMapper` 新增 `irArrayElementType`，
+  翻译器 `translateArrayAccess` 用它确定 `a[i]` 的元素类型（不再硬编码 `unit`），
+  使 `var x = a[i]` 立即推断出正确类型、数组读可直接做成员访问/比较操作数。
+  `jasper.R2dbcDefectRegressionTest.array element read is immediately usable` 覆盖。
 - 现象：`a[i]` 的 IR 类型被记为 `unit`（描述符 `V`）。直接把它当比较操作数、
   字段赋值右值或成员访问接收者时，生成 `V` 描述符的指令。
 - 触发代码：
@@ -353,7 +391,8 @@ public class T {
 - 实测：前者 `VerifyError: Bad type on operand stack`；
   后者 `ClassFormatError: Field "b" in class std/T has illegal signature "V"`。
 - 绕过：先赋给显式类型的局部变量再使用（`var x: string = a[0];`，实测可用）。
-- 探针规避：`MemoryResultSet.getInt/getString` 先把 `this.rows[cursor]` 读进 `Row` 局部变量。
+- 探针规避（**已移除**）：原 `MemoryResultSet.getInt/getString` 先把 `this.rows[cursor]`
+  读进 `Row` 局部变量再访问方法；现直接对 `this.rows[this.cursor]` 做成员访问。
 
 #### 13. 跨包同名类型不可共存
 - 类别：`③编译器缺陷`
@@ -472,14 +511,18 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 
 1. **`Publisher<T>` / `Mono<T>` / `Flux<T>` 泛型响应式协议** —— 类型变量描述符缺陷（#3），
    改用 `Row` 具体元素类型；泛型形状仅作声明（`ReactiveStreams.jas`）。
-2. **`await publisher` / 挂起取值** —— `await` 生成 `unknown` 调用（#1），
-   改用同步占位 `Task.join()`。
-3. **`go task` 分离调度** —— `go` 保留字且语义破坏（#2），不使用。
+2. ~~**`await publisher` / 挂起取值**~~ —— `await` 已修复（#1，`7e66eca`）：
+   `await e` 返回 `e` 的值，可参与算术/拼接；探针 `taskValue()` 已使用 `await`。
+   注意：当前仍**没有真正的挂起运行时**，`await` 只是「同步求值完成」。
+3. ~~**`go task` 分离调度**~~ —— `go` 的执行语义已修复（#2，`7e66eca`）：任务体同步
+   触发、副作用可观察；但**没有真正的调度器/线程切换**，且 `go` 作方法名仍被
+   硬关键字阻塞（未修）。
 4. **背压窗口 `request(n)`** —— 见第七节「未做」；当前用「订阅即尽力投递 + `cancel`」。
 5. **`Flux<T>.collect(): T[]` 物化结果集** —— 泛型返回（#3），改为 `collect(): Row[]`。
 6. **`Row.get(0, Int::class)` 之类的按列名/类型取值** —— 泛型 map 缺失（#16），
    改为强类型字段 + `id()`/`name()` 方法。
-7. **`finally { connection.close(); }` 资源兜底** —— `finally` 不可靠（#4），改用 `defer`。
+7. ~~**`finally { connection.close(); }` 资源兜底**~~ —— `finally` 已修复（#4，`7e66eca`），
+   探针 `main()` 已改用标准 `try/finally` 释放资源。
 8. **`Schedulers.parallel()` 切换执行线程** —— 无调度器标准库；见第七节。
 9. **用类层次表达错误分类并向上转型捕获/赋值** —— 子类赋给基类变量被拒（#9），
    多态走接口，错误只用 `Error` 的 `message()` 观测。
@@ -496,7 +539,9 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
   探针只体现「订阅即投递 + `cancel` 停止」；没有 `request`/`Subscription` 信用计数。
 - **调度器 / 事件循环**：没有 `Schedulers`、线程切换或 `publishOn/subscribeOn`；
   所有回调都在订阅调用的同一线程上同步发生。
-- **`await`/`go` 的真异步实现**：仅验证它们是缺陷（#1/#2），未构造可运行的异步运行时。
+- **`await`/`go` 的真异步实现**：#1/#2 的**语言语义**已修复（`7e66eca`），但只做到
+  「同步求值 / 同步触发副作用」，仍**没有真正的挂起运行时、调度器或线程切换**；
+  本探针未构造可运行的异步运行时。
 - **真实 `Row`/`Column` 元数据**：不实现按列名索引、类型协商、`null` 位图等。
 
 ## 八、结论
@@ -506,6 +551,9 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
   R2DBC 假实现，并压出订阅/取消/错误传播/资源释放的可观察行为（`main-result=35`）。
 - 但 18 个摩擦点里有 14 个是 `③编译器缺陷`，且大多是**静默的错误字节码**
   （`VerifyError`/`ClassFormatError`/`NoSuchMethodError`），而不是清晰的编译期报错；
-  这会诱导用户把编译器 bug 误当成自己代码的问题。
-- 与「异步 / 挂起」最相关的三条（`await` #1、`go` #2、泛型协议 #3）都属 `[表达不了]`：
-  当前语言**尚未具备真正写异步响应的能力**，探针只能用「同步占位 + 回调协议」逼近其形状。
+  这会诱导用户把编译器 bug 误当成自己代码的问题。本批已修复其中 3 条
+  （#1/#4/#11，commit `7e66eca`）并修复 #2 的执行语义。
+- 与「异步 / 挂起」最相关的 `await`（#1）、`go`（#2）现已可用其**语言语义**
+  （`await` 取值、`go` 触发副作用）；但**仍不具备真正的异步运行时**（无挂起、
+  无线程切换），泛型响应式协议（#3）仍属 `[表达不了]`——探针目前只能以
+  「同步语义 + 回调协议」逼近真实的异步响应形状。
