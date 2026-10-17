@@ -1,3 +1,16 @@
+// ============================================================================
+// JasperToIrTranslator —— 把 JasSourceFile（前端 AST）翻译成 Kotlin IR
+//   （TranslationResult：irFiles + 后端所需符号登记表）。
+// 所属层次：translator(2)。
+// 与谁协作：上游 compiler（JasperCompiler）调用 translate / translateAll；
+//   本文件依赖 ast（AST 节点）与 compiler.SymbolTable；产出 IR 交给后端
+//   （JVM：JvmIrBackend/archive.JvmBackend；native/实验：jasper-llvm.LlvmBackend）消费。
+// 对外契约：translate(ast, symbolTable?) / translateAll(asts, symbolTable?) -> TranslationResult。
+// 扩展点 / 已知限制：新增一种「派生成员」只放宽到两段式合成的 late body 生成入口
+//   （syntheticAccessorBody / syntheticEqualityBody / syntheticMapperBody）；
+//   当前把泛型按 TypeMapper 近似映射、闭包降级为匿名类 + invoke 方法。
+// ============================================================================
+
 @file:OptIn(org.jetbrains.kotlin.ir.symbols.UnsafeDuringIrConstructionAPI::class)
 
 package jasper.translator
@@ -29,12 +42,24 @@ import org.jetbrains.kotlin.types.Variance
  * `Action.accept`). They are semantic protocols: a call to one of these names on
  * a closure variable is routed to the closure's generated `invoke` method rather
  * than dispatched through the (abstract) protocol interface.
+ *
+ * 函数对象协议的方法名集合：对闭包变量调用这些名字时，路由到其生成的 invoke，而非协议接口分派。
  */
 private val PROTOCOL_METHODS = setOf("apply", "test", "reduce", "compare", "accept")
 
+/**
+ * 做什么：一次翻译的完整产出——IR 文件列表 + 后端渲染所需的各种「符号 -> 名字/类型」登记表。
+ * 什么时候用：translate / translateAll 返回；由后端（JVM/LLVM）消费以决定调用/字段的最终形态。
+ * 前置条件：调用方应对同一批 AST 只取用一次结果。
+ * 失败模式：本身不抛异常；翻译期的语义问题应在前端（checker/annotations）拦截。
+ * 为什么这样设计：IR 的符号没有内建「这个名字是哪种调用/哪个类型」的信息，
+ *   故在翻译期把后端需要的名字/类型旁路登记下来（见各字段注释），避免后端重新遍历 AST。
+ */
 data class TranslationResult(
     val irFiles: List<IrFile>,
+    // 调用点符号 -> 调用名：后端据此区分实例/静态/特殊调用与运算符。
     val callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap(),
+    // 构造器符号 -> 构造种类（"object"/"array:<elemDesc>"）：后端据此选择 new/数组创建指令。
     val constructorTypes: Map<IrConstructorSymbol, String> = emptyMap(),
     val typeMapper: TypeMapper? = null,
     val functionDescriptors: Map<IrSimpleFunctionSymbol, String> = emptyMap(),
@@ -45,46 +70,82 @@ data class TranslationResult(
     // Field symbols that must be emitted/accessed as JVM statics (interface
     // constants). Backend uses this for `GETSTATIC`/`PUTSTATIC` and for the
     // `public static final` field flags.
+    // 必须以 JVM 静态方式读写/发射的字段符号（接口常量）；后端据此发 GETSTATIC/PUTSTATIC 与 static final 标志。
     val staticFieldSymbols: Set<IrFieldSymbol> = emptySet()
 )
 
+/**
+ * 做什么：单次翻译的共享可变状态（符号表、类型环境、当前类/函数/包、循环栈、defer 栈等）。
+ * 什么时候用：translate/translateAll 内创建并贯穿整个翻译过程；不跨调用复用。
+ * 前置条件：翻译开始时 pkg/currentPkg 已设；进入类/函数时更新 currentClassName/currentFunction。
+ * 失败模式：不抛异常；查找失败时各 translate* 会回退到 Unit 类型/新符号（可能掩盖前端漏检，见各处注释）。
+ * 为什么这样设计：翻译需要「先声明后使用」的全局可见性，故用一张可变上下文而非纯函数递归传递，
+ *   以便成员/字段/函数符号在声明时登记、在后续表达式里查得到。
+ */
 data class TranslationContext(
+    // 局部变量/参数名 -> IR 值符号。翻译语句时写入，标识符求值时读出。
     val symbols: MutableMap<String, IrValueSymbol> = mutableMapOf(),
+    // 局部变量/参数名 -> IR 类型。与 symbols 平行维护，供取址/运算推导类型（缺失会退化为 Unit）。
     val varTypes: MutableMap<String, IrType> = mutableMapOf(),
+    // 顶层/成员函数名 -> 函数符号。顶层函数在 predeclareTopLevelFunctions 预登记（先声明后调用）。
     val functionSymbols: MutableMap<String, IrSimpleFunctionSymbol> = mutableMapOf(),
+    // 函数名 -> 返回类型；last-writer-wins，跨同名函数时被后者覆盖（故另有按类型索引的 memberReturnTypesByType）。
     val functionReturnTypes: MutableMap<String, IrType> = mutableMapOf(),
+    // 函数名 -> 形参类型列表；成员调用实参加宽时按此对齐声明类型。
     val functionParamTypes: MutableMap<String, List<IrType>> = mutableMapOf(),
+    // 调用点符号 -> 调用名（与 TranslationResult.callNames 同义，translate 完成时拷出）。
     val callNames: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
+    // 构造器符号 -> 构造种类（"object"/"array:<desc>"）。
     val constructorTypes: MutableMap<IrConstructorSymbol, String> = mutableMapOf(),
     val typeMapper: TypeMapper? = null,
+    // 仍在作用域内的 lambda 变量名 -> 其 AST。用于兼容旧的「内联展开 lambda」路径。
     val lambdas: MutableMap<String, JasLambdaExpr> = mutableMapOf(),
+    // 被当作闭包对象处理的变量名集合（lambda 或方法引用初始化）。
     val lambdaVarNames: MutableSet<String> = mutableSetOf(),
     // Closure variable name -> its generated `invoke` return type. Keyed per
     // variable (not the global `functionReturnTypes["invoke"]`) so two closures
     // with different shapes in the same scope do not clobber each other.
+    // 闭包变量名 -> 其 invoke 返回类型。按变量名索引（而非全局 invoke），
+    // 否则同作用域里两个不同形状的闭包会互相覆盖（last-writer-wins 冲突）。
     val lambdaInvokeReturnTypes: MutableMap<String, IrType> = mutableMapOf(),
     // Member-return index: JVM-style class/interface name -> member name ->
     // return type. Used by the iteration protocol lowering to type the loop
     // variable from the concrete iterable's `next()` member.
+    // 成员返回类型索引：JVM 风格类/接口名 -> 成员名 -> 返回类型。
+    // 供迭代协议 lowering 依据具体可迭代类型的 next() 推断循环变量类型（避免全局映射被覆盖）。
     val memberReturnTypesByType: MutableMap<String, MutableMap<String, IrType>> = mutableMapOf(),
+    // 类名 -> 类符号。
     val classSymbols: MutableMap<String, IrClassSymbol> = mutableMapOf(),
+    // 字段名 -> 字段符号（全局按名索引，作为按类索引失败时的回退）。
     val fieldSymbols: MutableMap<String, IrFieldSymbol> = mutableMapOf(),
+    // 字段名 -> 字段类型（全局回退）。
     val fieldTypes: MutableMap<String, IrType> = mutableMapOf(),
     // Per-class field indexes (JVM-style class name -> field name -> symbol/type).
     // Needed so a property read/write resolves the field owner from the
     // *receiver's* declared type rather than globally by name; without this two
     // classes that share a property name (e.g. a mapper's source and target)
     // would collide on the last-registered symbol.
+    // 按类的字段索引：类名 -> 字段名 -> 符号/类型。属性读写据此从「接收者声明类型」定位字段宿主，
+    // 否则两个类共用同一属性名（如 mapper 的源/目标）会在全局映射上撞成最后登记的那个。
     val fieldSymbolsByClass: MutableMap<String, MutableMap<String, IrFieldSymbol>> = mutableMapOf(),
     val fieldTypesByClass: MutableMap<String, MutableMap<String, IrType>> = mutableMapOf(),
+    // 当前正在翻译的类（JVM 风格限定名）；this/super 的接收者类型与按类字段索引都依赖它。
     var currentClassName: String = "",
+    // 循环栈：break/continue 指向栈顶最近循环。
     val loopStack: MutableList<IrLoop> = mutableListOf(),
+    // 当前函数内累积的 defer 体；return/yield 时逆序展开。由 scopedDefers 保证不泄漏到相邻函数。
     val deferredBodies: MutableList<IrBlock> = mutableListOf(),
+    // 当前函数；return 的目标符号与 defer 作用域依赖它。
     var currentFunction: IrSimpleFunction? = null,
+    // 当前 IR 文件；匿名类（lambda/方法引用）在翻译中即时追加到这里。
     var currentFile: IrFile? = null,
+    // 匿名闭包类名自增计数器（Lambda$N）。
     var lambdaIdCounter: Int = 0,
+    // 当前类的父类（JVM 内部名）；构造器 super() 委托需要。
     var currentSuperclassName: String = "",
+    // 当前包名；限定字段/类型内部名时用。
     var currentPkg: String = "",
+    // 类名 -> 父类 JVM 内部名（导出到 TranslationResult）。
     val classSuperclassNames: MutableMap<String, String> = mutableMapOf(),
     val interfaceNames: MutableMap<String, MutableList<String>> = mutableMapOf(), // class/interface -> implemented/extends interface names
     val interfaceDeclNames: MutableSet<String> = mutableSetOf(), // names of types declared as interfaces
@@ -92,20 +153,44 @@ data class TranslationContext(
     // from @EqualsAndHashCode); used by the late @EqualsAndHashCode body
     // generator to decide between `.hash()` and `.hashCode()` for nested
     // object fields.
+    // 提供 hash() 成员的类名集合（手写或 @EqualsAndHashCode 合成）；供 equals/hash 的 late body
+    // 决定嵌套对象字段用 .hash()（值语义）还是 .hashCode()（默认/身份语义）。
     val hashableClassNames: MutableSet<String> = mutableSetOf(),
     // Field symbols for interface constants (`public static final` fields).
+    // 接口常量（public static final 字段）的字段符号集合，导出给后端发静态指令。
     val staticFieldSymbols: MutableSet<IrFieldSymbol> = mutableSetOf()
 )
 
+/**
+ * 做什么：Jasper 前端 AST 到 Kotlin IR 的翻译器入口（translator 层核心）。
+ * 什么时候用：compiler 在前端检查通过后调用 translate（单文件）或 translateAll（多文件）。
+ * 前置条件：传入的 AST 已经过注解阶段（合成成员签名已在位）与类型检查；symbolTable 可选，当前实现主要靠自身预登记。
+ * 失败模式：不抛异常；查不到的符号/类型会回退到 Unit 或新建符号（可能把前端漏检掩盖成后端错误，见各方法注释）。
+ * 为什么这样设计：翻译分两遍——先登记顶层函数/类型/字段符号，再翻译声明体；
+ *   这样「先声明后使用」与跨文件引用都能解析，同时保持每个符号在后端有一致的名字/类型。
+ */
 class JasperToIrTranslator {
     private val typeMapper = TypeMapper()
     private val factory = IrFactory(StageController())
 
+    /**
+     * 做什么：翻译单个源文件为一份 IR 文件，返回 [TranslationResult]。
+     * 什么时候用：单文件编译路径（CompilePipeline）。
+     * 前置条件：ast 已过注解/类型检查；symbolTable 设了也暂不深入使用（保留扩展位）。
+     * 失败模式：不抛异常；未识别的顶层声明被跳过（translateTopLevelDeclaration 返回 null）。
+     * 为什么这样设计：先做「预登记」（内建函数/可哈希类/成员返回类型/顶层函数）再逐声明翻译，
+     *   保证方法体里引用到尚未翻译到的声明时也有符号可用。
+     */
     fun translate(ast: JasSourceFile, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
         val pkg = ast.packageName ?: ""
         ctx.currentPkg = pkg
         typeMapper.currentPkg = pkg
+        // 第一遍（预登记）：不翻译任何声明体，先把「翻译体时会用到的信息」就位：
+        //   - 内建函数 hashCode/equals 的签名（合成体要按正确描述符调用）
+        //   - 可哈希类名（决定嵌套字段用 .hash() 还是 .hashCode()）
+        //   - 按类型的成员返回类型（迭代协议据此推断循环变量）
+        //   - 顶层函数符号（先声明后调用）
         predeclareRuntimeBuiltins(ctx)
         collectHashableClassNames(listOf(ast), ctx)
         collectMemberReturnTypes(ast, ctx)
@@ -114,12 +199,15 @@ class JasperToIrTranslator {
         val fileSymbol = IrFileSymbolImpl()
         val file = IrFileImpl(fileEntry, fileSymbol, FqName(pkg))
         ctx.currentFile = file
+        // 第二遍（翻译声明）：逐条顶层声明翻译成 IR，追加进文件。
+        // 跳过返回 null 的声明（注解成员/构造器/属性/导入等在顶层不直接产出 IR）。
         for (decl in ast.declarations) {
             val irDecl = translateTopLevelDeclaration(decl, ctx)
             if (irDecl != null) {
                 file.declarations.add(irDecl)
             }
         }
+        // 把上下文里累积的符号登记表拷成不可变快照交给后端。
         return TranslationResult(listOf(file), ctx.callNames.toMap(), ctx.constructorTypes.toMap(), typeMapper,
             classSuperclassNames = ctx.classSuperclassNames.toMap(),
             classInterfaceNames = ctx.interfaceNames.mapValues { it.value.toList() }.toMap(),
@@ -127,9 +215,18 @@ class JasperToIrTranslator {
             staticFieldSymbols = ctx.staticFieldSymbols.toSet())
     }
 
+    /**
+     * 做什么：把多份源文件翻译成一组 IR 文件（多文件编译路径）。
+     * 什么时候用：compileAll 这类批量编译；跨文件同名引用依赖同一 ctx 的「全局可见」。
+     * 前置条件：asts 已全部过注解与类型检查；文件顺序即输出顺序。
+     * 失败模式：不抛异常；未识别声明被跳过；同名符号仍是 last-writer-wins（后遍历者覆盖）。
+     * 为什么这样设计：所有 AST 共享一个 [TranslationContext]，先对全部文件做预登记再逐文件翻译，
+     *   使文件 A 的方法体能引用文件 B 里后声明的类型/函数。
+     */
     fun translateAll(asts: List<JasSourceFile>, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
         predeclareRuntimeBuiltins(ctx)
+        // 第一遍：对全部文件做预登记（保证跨文件的先声明后使用）。
         for (ast in asts) {
             ctx.currentPkg = ast.packageName ?: ""
             typeMapper.currentPkg = ctx.currentPkg
@@ -139,6 +236,7 @@ class JasperToIrTranslator {
         }
 
         val files = mutableListOf<IrFile>()
+        // 第二遍：逐文件逐声明翻译；每个文件单独一个 IrFile，currentFile 指向当前文件。
         for ((index, ast) in asts.withIndex()) {
             val pkg = ast.packageName ?: ""
             ctx.currentPkg = pkg
@@ -163,6 +261,8 @@ class JasperToIrTranslator {
             staticFieldSymbols = ctx.staticFieldSymbols.toSet())
     }
 
+    // 预登记顶层函数的符号与签名：先建符号、登记调用名/返回/形参类型。
+    // 用 getOrPut/putIfAbsent 保证重复预登记（如多文件路径）不会覆盖已有信息（first-writer-wins，等价于声明顺序优先）。
     private fun predeclareTopLevelFunctions(declarations: List<JasDeclaration>, ctx: TranslationContext) {
         for (decl in declarations) {
             if (decl is JasFunction) {
@@ -179,6 +279,11 @@ class JasperToIrTranslator {
      * member bodies relies on. `hashCode()` is the universal JVM object-hash
      * entry point (inherited by every class); its return type must be known so
      * member calls to it lower with an `I` return descriptor instead of `V`.
+     *
+     * 做什么：预登记合成成员体所依赖的运行时内建函数签名（hashCode / equals）。
+     * 什么时候用：翻译开始前（translate/translateAll 的第一遍）。
+     * 前置条件：无；对同一 ctx 重复调用是幂等的（直接赋值覆盖为同一形状）。
+     * 为什么这样设计：合成体的 .hashCode()/.equals() 调用若没有已知签名，后端会退化成错误的描述符（如 V 或 (String)V）。
      */
     private fun predeclareRuntimeBuiltins(ctx: TranslationContext) {
         ctx.functionReturnTypes["hashCode"] = typeMapper.intType()
@@ -197,6 +302,12 @@ class JasperToIrTranslator {
      * synthesized from `@EqualsAndHashCode`. The late equality body generator
      * calls `.hash()` on nested fields of such classes (value-based) and
      * `.hashCode()` on everything else (identity/default).
+     *
+     * 做什么：收集「提供 hash() 成员」的类名（手写 hash 或带 @EqualsAndHashCode）。
+     * 什么时候用：第一遍预登记（translate/translateAll）。
+     * 前置条件：AST 已过注解阶段（@EqualsAndHashCode 合成的 hash() 已在成员里）。
+     * 为什么这样设计：equals/hash 的 late body 生成嵌套对象字段时需在 .hash()（值语义）与
+     *   .hashCode()（身份/默认语义）间选择，此集合即该决策依据。
      */
     private fun collectHashableClassNames(asts: List<JasSourceFile>, ctx: TranslationContext) {
         for (ast in asts) {
@@ -222,9 +333,21 @@ class JasperToIrTranslator {
      * iteration protocol lowering reads `next()` from this index so the loop
      * variable is typed from the *concrete* iterable rather than the global,
      * last-writer-wins `functionReturnTypes` map.
+     *
+     * 做什么：按「声明类型」索引成员返回类型（JVM 风格限定名）。
+     * 什么时候用：第一遍预登记。
+     * 前置条件：pkg 取自 AST 的包名（null 视为空包）。
+     * 为什么这样设计：迭代协议 lowering 需要从「具体可迭代类型」的 next() 取类型，
+     *   而全局 functionReturnTypes 是 last-writer-wins 的，同名成员会互相覆盖。
      */
     private fun collectMemberReturnTypes(ast: JasSourceFile, ctx: TranslationContext) {
         val pkg = ast.packageName ?: ""
+        /**
+         * 做什么：把一个类型的成员(name->返回类型)写入按类型的成员返回索引。
+         * 什么时候用：本函数遍历到 JasClass/JasInterface 时各调用一次。
+         * 前置条件：pkg 已在上层闭包捕获，用于拼 JVM 风格限定名。
+         * 失败模式：无；index 用 putIfAbsent，重复名字保留先登记者（first-writer-wins）。
+         */
         fun record(typeName: String, members: List<JasDeclaration>) {
             val qualified = if (pkg.isNotEmpty()) "$pkg/$typeName" else typeName
             val index = ctx.memberReturnTypesByType.getOrPut(qualified) { mutableMapOf() }
@@ -277,6 +400,14 @@ class JasperToIrTranslator {
             irTp
         }
         // Helper to resolve JasNamedType referring to a type parameter to an IrTypeParameterSymbol-based type
+        // 泛型作用域内的类型解析：名字命中本函数类型形参的 JasNamedType 要解析成「形参符号类型」，
+        // 否则后续按普通命名类型映射会丢失去参数化信息。
+        /**
+         * 做什么：解析函数内的类型，把引用本函数类型形参的 JasNamedType 映射为对应 IR 形参类型。
+         * 什么时候用：翻译返回类型、形参类型以及体内类型时。
+         * 前置条件：irTypeParams 已创建（类型形参在被引用前先建好）。
+         * 失败模式：无匹配形参时退回 typeMapper.mapType（普通映射；可能被近似/擦除）。
+         */
         fun resolveTypeParam(type: JasType?): IrType {
             if (type is JasNamedType && type.typeArguments.isEmpty()) {
                 val matching = irTypeParams.find { it.name.toString() == type.name }
@@ -363,12 +494,20 @@ class JasperToIrTranslator {
      * the property's backing field symbol (`ctx.fieldSymbols`) and the setter
      * parameter symbol are available, so the body is lowered through the normal
      * statement pipeline (`return this.prop` / `this.prop = value`).
+     *
+     * 做什么：为注解合成的 getter/setter 生成「方法体」（两段式合成的第二段）。
+     * 什么时候用：translateFunction 发现 func.syntheticAccessor != null 时。
+     * 前置条件：属性后端字段符号已登记进 ctx（方法体经正常语句管线翻译成 this.prop 读写）。
+     * 失败模式：无；即使没有参数（setter 异常输入）也退回参数名 "value"。
+     * 为什么这样设计：注解阶段只出签名（否则生成的方法在类型检查时不可见）；
+     *   体推迟到这里，是因为只有 lowering 时才知道属性字段的真实 IR 形态。
      */
     private fun syntheticAccessorBody(
         accessor: JasSyntheticAccessor,
         func: JasFunction
     ): List<JasStatement> {
         val thisField = JasPropertyAccess(JasIdentifier("this"), accessor.propertyName)
+        // getter：return this.prop；setter：this.prop = value（形参名取自签名，缺省 "value"）。
         return if (accessor.isGetter) {
             listOf(JasReturn(thisField))
         } else {
@@ -384,6 +523,12 @@ class JasperToIrTranslator {
      * before type checking; these bodies are lowered here directly because the
      * source syntax has no type-test expression (`other is Foo`), so the
      * instanceof guard can only be expressed at the AST→IR boundary.
+     *
+     * 做什么：为 @EqualsAndHashCode 合成的 equals/hash 生成方法体（两段式合成的第二段）。
+     * 什么时候用：translateFunction 发现 func.syntheticEquality != null 时。
+     * 前置条件：JasSyntheticEquality 携带 className 与参与字段清单。
+     * 为什么这样设计：源码语法没有「类型测试表达式」（如 other is Foo），instanceof 守卫
+     *   只能在 AST→IR 边界表达，故必须在 lowering 阶段直接构造。
      */
     private fun syntheticEqualityBody(eq: JasSyntheticEquality, ctx: TranslationContext): List<JasStatement> =
         if (eq.isEquals) syntheticEqualsBody(eq) else syntheticHashBody(eq, ctx)
@@ -397,6 +542,12 @@ class JasperToIrTranslator {
      * ```
      * The instanceof guard also rejects `null` (instanceof null is false), so
      * different-class comparisons return false without throwing.
+     *
+     * 做什么：生成 equals 体：先 instanceof 守卫，再逐字段 == 相与。
+     * 什么时候用：syntheticEqualityBody 判定 isEquals 时。
+     * 前置条件：fields 已按资格判定筛选。
+     * 失败模式：无字段时返回 true（空类 equals）。
+     * 为什么这样设计：instanceof 对 null 也为 false，故守卫天然拒绝 null 与异类，无需额外判空/判型。
      */
     private fun syntheticEqualsBody(eq: JasSyntheticEquality): List<JasStatement> {
         val clsType = JasNamedType(eq.className)
@@ -424,6 +575,11 @@ class JasperToIrTranslator {
      * `h = h * 31 + fieldHash`, then `return h`. Deterministic, no randomness
      * and no object-identity dependence beyond what `equals` itself treats as
      * value (e.g. nested objects that only have identity equality).
+     *
+     * 做什么：生成 hash 体：h 初值 17，逐字段 h = h*31 + fieldHash，返回 h。
+     * 什么时候用：syntheticEqualityBody 判定非 equals 时。
+     * 前置条件：字段哈希由 fieldHashExpr 依字段类型给出确定的 int32 贡献。
+     * 为什么这样设计：31 乘子与初值 17 是确定性约定，避免随机性与对象身份依赖，使等价对象哈希一致。
      */
     private fun syntheticHashBody(eq: JasSyntheticEquality, ctx: TranslationContext): List<JasStatement> {
         val stmts = mutableListOf<JasStatement>()
@@ -441,6 +597,7 @@ class JasperToIrTranslator {
     }
 
     /** int32 contribution of one field to the `hash` accumulator. */
+    // 单字段的 int32 哈希贡献：按声明类型选择混合方式，保证等价字段贡献一致（不依赖身份/随机）。
     private fun fieldHashExpr(field: JasEqualityField, ctx: TranslationContext): JasExpression {
         val thisField = JasPropertyAccess(JasIdentifier("this"), field.name)
         return when (val type = field.type) {
@@ -462,9 +619,12 @@ class JasperToIrTranslator {
             is JasArrayType -> {
                 // Arrays compare by identity in `equals`; their length is a
                 // deterministic, identity-free contribution.
+                // 数组在 equals 里按身份比较，故这里只用其长度作为确定性、无身份的哈希贡献。
                 nullGuardedMemberHash(thisField, "length")
             }
             is JasNamedType -> {
+                // 命名类型：若该类带 hash()（手写或 @EqualsAndHashCode 合成）用 .hash()（值语义），
+                // 否则用 .hashCode()（身份/默认语义）。判定依据是预登记的可哈希类名集合。
                 val hashMethod = if (type.name.substringAfterLast('.') in ctx.hashableClassNames) "hash" else "hashCode"
                 nullGuardedMemberHash(thisField, hashMethod)
             }
@@ -475,8 +635,14 @@ class JasperToIrTranslator {
     /**
      * `field == null ? 0 : field.member()` — null fields hash to 0 instead of
      * throwing. `length` is lowered as ARRAYLENGTH by the property-access path.
+     *
+     * 做什么：生成「字段为 null 时贡献 0，否则调用 member 取哈希」的三元表达式。
+     * 什么时候用：fieldHashExpr 对引用类型字段（string/数组/命名类型/其它）使用。
+     * 前置条件：member 为 "hashCode"/"hash"/"length"。
+     * 为什么这样设计：null 字段必须贡献固定值而非抛出，才能让 equals 认为相等但字段为 null 的对象哈希一致。
      */
     private fun nullGuardedMemberHash(fieldAccess: JasPropertyAccess, member: String): JasExpression {
+        // length 走属性访问（后端降为 ARRAYLENGTH）；其余走成员调用 field.member()。
         val useExpr: JasExpression = if (member == "length") {
             JasPropertyAccess(fieldAccess, "length")
         } else {
@@ -501,6 +667,12 @@ class JasperToIrTranslator {
      * ...
      * return result;
      * ```
+     *
+     * 做什么：为 @Mapper 合成的方法生成体：新建目标对象、逐条属性赋值、返回它（两段式合成的第二段）。
+     * 什么时候用：translateFunction 发现 func.syntheticMapper != null 时。
+     * 前置条件：assignments 已在注解阶段校验通过（源属性存在、类型一致）。
+     * 为什么这样设计：注解阶段只出签名与映射计划；体推迟到这里，经正常语句管线翻译，
+     *   从而复用既有的 new/属性读写/返回 lowering，无需为 Mapper 另设一套后端逻辑。
      */
     private fun syntheticMapperBody(mapper: JasSyntheticMapper): List<JasStatement> {
         val resultName = "result$"
@@ -539,13 +711,16 @@ class JasperToIrTranslator {
             false, false, false, false, false, false, false, false,
             SourceElement.NO_SOURCE
         )
+        // 登记类符号（按简单名），供后续类型映射/成员翻译查找。
         ctx.classSymbols[cls.name] = symbol
         // Track the enclosing class so `this.prop` and receiver-typed property
         // accesses resolve their field owner during member translation.
+        // 记录当前类（JVM 风格限定名），使翻译类成员时 this.prop 与接收者类型属性访问能定位字段宿主。
         val qualifiedClassName = if (ctx.currentPkg.isNotEmpty()) "${ctx.currentPkg}/${cls.name}" else cls.name
         val previousClassName = ctx.currentClassName
         ctx.currentClassName = qualifiedClassName
         // Record implemented interfaces
+        // 记录实现的接口（补全为 JVM 风格内部名）；导出给后端决定接口表/校验。
         val ifaceNames = cls.interfaces.mapNotNull { iface ->
             if (iface is JasNamedType) {
                 val raw = iface.name
@@ -556,10 +731,12 @@ class JasperToIrTranslator {
             } else null
         }
         ctx.interfaceNames[cls.name] = ifaceNames.toMutableList()
+        // 泛型形参先建 IR 形参，再翻成员——保证成员签名里能引用它们。
         for (tp in cls.typeParameters) {
             val irTp = translateTypeParameter(tp, ctx)
             irCls.typeParameters = irCls.typeParameters + irTp
         }
+        // 逐成员翻译；属性额外把其后备字段一并加入类声明（IR 要求字段独立于属性节点出现在类体里）。
         for (member in cls.members) {
             val irMember = translateClassMember(member, ctx, symbol)
             if (irMember != null) {
@@ -569,6 +746,8 @@ class JasperToIrTranslator {
                 }
             }
         }
+        // 解析父类内部名（无显式父类则 Object），补全为限定名后登记，
+        // 供构造器 super() 委托与后端决定继承/描述符使用。
         val rawSuper = if (cls.superclass != null) typeMapper.jvmInternalNameFromType(cls.superclass) else "java/lang/Object"
         val qualifiedSuper = if (rawSuper.contains("/")) rawSuper else {
             val p = ctx.currentPkg
@@ -578,6 +757,7 @@ class JasperToIrTranslator {
         ctx.classSuperclassNames[cls.name] = qualifiedSuper
         if (cls.constructors.isEmpty()) {
             // Generate a default no-arg constructor
+            // 无显式构造器时补一个默认无参 <init>；否则类无法被 new（后端要求至少一个可调用构造器）。
             val defaultCtorSymbol = IrConstructorSymbolImpl()
             val defaultCtor = factory.createConstructor(
                 0, 0, IrDeclarationOrigin.DEFINED,
@@ -595,6 +775,7 @@ class JasperToIrTranslator {
                 irCls.declarations.add(irCtor)
             }
         }
+        // 恢复外层上下文（支持嵌套类/匿名类），保证翻译兄弟声明时状态不串。
         ctx.currentSuperclassName = ""
         ctx.currentClassName = previousClassName
         return irCls
@@ -632,8 +813,11 @@ class JasperToIrTranslator {
         }
         val body = irCtor.body as? IrBlockBody ?: factory.createBlockBody(0, 0)
         // Emit delegate call (super() or this()) if present
+        // 显式委托调用（super(...) / this(...)）必须在构造器体最前发射；这里把 this 作为第 0 实参，
+        // 以便后端生成 ALOAD 0 作为接收者。
         val delegateCall = ctor.delegateCall
         if (delegateCall != null) {
+            // 用特殊调用名标注委托目标：super:<父类内部名> 或 this；后端据此选择 invokespecial 目标。
             val delegateTarget = if (delegateCall.isSuper) "super:${ctx.currentSuperclassName}" else "this"
             val delegateSymbol = IrSimpleFunctionSymbolImpl()
             ctx.callNames[delegateSymbol] = "ctor_delegate:$delegateTarget"
@@ -679,8 +863,10 @@ class JasperToIrTranslator {
             SourceElement.NO_SOURCE
         )
         ctx.classSymbols[iface.name] = symbol
+        // 登记「这是接口」：后端据此决定接口标志、默认方法/抽象方法处理，以及类型引用用接口描述符。
         ctx.interfaceDeclNames.add(iface.name)
         // Record extended interfaces
+        // 记录继承的父接口（补全为 JVM 风格内部名），导出给后端生成接口表。
         val ifaceNames = iface.extends.mapNotNull { ext ->
             if (ext is JasNamedType) {
                 val raw = ext.name
@@ -701,6 +887,8 @@ class JasperToIrTranslator {
             // not be silently dropped (the previous behavior), because a missing
             // declaration is exactly the kind of failure that hides a compiler
             // bug as a user error.
+            // 接口常量降为 public static final 字段并携带声明初值；绝不能静默丢弃——
+            // 缺失声明会把「编译器 bug」伪装成「用户错误」，正是要避免的失败模式。
             if (member is JasProperty && member.isConst) {
                 irCls.declarations.add(translateInterfaceConstant(member, ctx))
                 continue
@@ -721,6 +909,12 @@ class JasperToIrTranslator {
      * `<clinit>` assignment. The field symbol is registered globally *and* in
      * the static-field set so member reads (`Statement.MAX_ROWS`) lower to
      * `GETSTATIC` rather than `GETFIELD`.
+     *
+     * 做什么：把接口常量降为 JVM public static final 字段，并把符号登记进全局字段表与静态字段集合。
+     * 什么时候用：translateInterface 遇到 const 属性时。
+     * 前置条件：属性带声明类型；初值可有可无。
+     * 为什么这样设计：把符号同时放进全局表与 staticFieldSymbols，后端读到 Statement.MAX_ROWS
+     *   才会发 GETSTATIC 而非 GETFIELD；初值留在 IrField 上供后端发 ConstantValue 或 clinit 赋值。
      */
     private fun translateInterfaceConstant(prop: JasProperty, ctx: TranslationContext): IrField {
         val propType = typeMapper.mapType(prop.type)
@@ -845,6 +1039,8 @@ class JasperToIrTranslator {
             false
         )
         irProp.backingField = irField
+        // 属性字段同时登记到「全局按名」和「按类」两张表：按类表用于从接收者类型定位字段宿主，
+        // 避免两个类共用属性名时在后端撞成同一个字段（全局表仅作回退）。
         ctx.fieldSymbols[prop.name] = fieldSymbol
         ctx.fieldTypes[prop.name] = propType
         if (ctx.currentClassName.isNotEmpty()) {
@@ -940,6 +1136,8 @@ class JasperToIrTranslator {
 
     // ── statements ──
 
+    // 语句分派：按 AST 语句节点类型路由到对应 translate*；未识别的返回 null（上层会跳过）。
+    // 这一段等价于对 JasStatement sealed 层次的穷举式分派（Visitor 的集中版）。
     private fun translateStatement(stmt: JasStatement, ctx: TranslationContext): IrStatement? {
         return when (stmt) {
             is JasBlock -> translateBlock(stmt, ctx)
@@ -980,6 +1178,8 @@ class JasperToIrTranslator {
     }
 
     private fun translateVariableStatement(stmt: JasVariableStatement, ctx: TranslationContext): IrVariable {
+        // 若是 lambda / 方法引用初始化，先登记变量名到 lambda 表（供旧的「内联展开」路径识别）。
+        // 前置条件：这些名字在变量作用域内唯一；越界/重名由前端保证。
         if (stmt.initializer is JasLambdaExpr) {
             ctx.lambdas[stmt.name] = stmt.initializer
             ctx.lambdaVarNames.add(stmt.name)
@@ -989,18 +1189,23 @@ class JasperToIrTranslator {
         }
         val varSymbol = IrVariableSymbolImpl()
         // Translate the initializer once to avoid double-creating anonymous classes
+        // 初始化表达式只翻译一次：否则 lambda 字面量会被求值两次，生成两个匿名类（符号不一致）。
         val translatedInit = if (stmt.initializer != null) translateExpression(stmt.initializer!!, ctx) else null
         // A closure assigned to a protocol-typed variable is lowered to an
         // anonymous class; the variable must carry that concrete class type so a
         // later protocol call routes to the generated `invoke` method instead of
         // dispatching on the (abstract) declared protocol interface.
+        // 赋给协议类型变量的闭包会降级为匿名类；变量必须带「具体匿名类」类型，
+        // 这样后续协议调用才会路由到生成的 invoke，而不是按（抽象）协议接口分派。
         val isClosureInit = stmt.initializer is JasLambdaExpr || stmt.initializer is JasMethodReference
         if (isClosureInit) {
             // Snapshot the just-generated closure's `invoke` return type under the
             // variable's name; the global `functionReturnTypes["invoke"]` entry is
             // overwritten by every subsequent lambda.
+            // 把刚生成闭包的 invoke 返回类型按「变量名」快照下来；全局 invoke 条目会被后续每个 lambda 覆盖。
             ctx.functionReturnTypes["invoke"]?.let { ctx.lambdaInvokeReturnTypes[stmt.name] = it }
         }
+        // 变量类型优先级：闭包初值用其具体类型 > 显式声明类型 > 初值类型 > Unit（兜底）。
         val varType = if (isClosureInit && translatedInit != null) translatedInit.type
             else if (stmt.type != null) typeMapper.mapType(stmt.type)
             else translatedInit?.type ?: typeMapper.unitType()
@@ -1096,6 +1301,8 @@ class JasperToIrTranslator {
         // as an instance of the iteration protocol (`hasNext()` / `next()`); any
         // other/unknown shape falls back to the array lowering to preserve the
         // previous behaviour.
+        // 分派规则：数组描述符以 "[ " 开头 → 按下标循环；对象描述符以 "L" 开头 → 按迭代协议（hasNext/next）；
+        // 其余/未知形态回退到数组 lowering，保持既有行为（不引入新的语法）。
         return when {
             desc.startsWith("[") -> translateForInArray(stmt, iterableExpr, ctx)
             desc.startsWith("L") -> translateForInIterator(stmt, iterableExpr, ctx)
@@ -1228,6 +1435,12 @@ class JasperToIrTranslator {
      * The element type comes from the `next()` member discovered while lowering
      * the concrete iterable type. This consumes the protocol through the existing
      * `for ... in` syntax; no new grammar is introduced.
+     *
+     * 做什么：把「对象类型的 for-in」降为迭代协议（hasNext/next）循环，并支持 then/else（至少执行一次）。
+     * 什么时候用：translateForIn 判定可迭代类型是对象（描述符以 L 开头）时。
+     * 前置条件：具体可迭代类型的 next() 返回类型已进 memberReturnTypesByType（否则回退 Any）。
+     * 为什么这样设计：不改语法即可消费标准库迭代协议；循环变量类型取自「具体类型」的 next()，
+     *   避免全局 functionReturnTypes 的 last-writer-wins 冲突。
      */
     private fun translateForInIterator(stmt: JasForInStatement, iterableExpr: IrExpression, ctx: TranslationContext): IrStatement {
         val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.FOR_LOOP)
@@ -1326,6 +1539,7 @@ class JasperToIrTranslator {
     }
 
     private fun translateSwitch(stmt: JasSwitch, ctx: TranslationContext): IrWhen {
+        // switch 降为 when：每个 case 值生成一条 subject == value 分支，用相等调用实现（无跳转表优化）。
         val irWhen = IrNodeFactory.createWhen(0, 0, typeMapper.unitType(), IrStatementOrigin.WHEN)
         val subject = translateExpression(stmt.expression, ctx)
         for (case in stmt.cases) {
@@ -1346,6 +1560,7 @@ class JasperToIrTranslator {
             }
         }
         val hasDefault = stmt.cases.any { it.values.isEmpty() }
+        // 无 default 时补一个「恒真且返回 Unit」的兜底分支，保证 when 总有分支命中（IR 需要一个最终 true 分支）。
         if (!hasDefault) {
             irWhen.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), typeMapper.unitExpr()))
         }
@@ -1354,6 +1569,8 @@ class JasperToIrTranslator {
 
     private fun translateReturn(stmt: JasReturn, ctx: TranslationContext): IrReturn {
         var value = if (stmt.value != null) translateExpression(stmt.value!!, ctx) else typeMapper.unitExpr()
+        // defer 展开：按声明的逆序（后声明先执行，LIFO）把已累积的 defer 体塞进一个块，
+        // 最后再放返回值，使 defer 在 return 求值之后、真正返回之前执行。
         if (ctx.deferredBodies.isNotEmpty()) {
             val block = IrNodeFactory.createBlock(0, 0, value.type, null)
             for (body in ctx.deferredBodies.reversed()) {
@@ -1369,6 +1586,7 @@ class JasperToIrTranslator {
     }
 
     private fun translateBreak(stmt: JasBreakStatement, ctx: TranslationContext): IrStatement {
+        // break 绑定到最近的循环（loopStack 栈顶）；无循环时退化为 no-op（防越界）。
         if (ctx.loopStack.isNotEmpty()) {
             val loop = ctx.loopStack.last()
             return IrNodeFactory.createBreak(0, 0, typeMapper.unitType(), loop)
@@ -1377,6 +1595,7 @@ class JasperToIrTranslator {
     }
 
     private fun translateContinue(stmt: JasContinueStatement, ctx: TranslationContext): IrStatement {
+        // continue 同理绑定最近循环；无循环时 no-op。
         if (ctx.loopStack.isNotEmpty()) {
             val loop = ctx.loopStack.last()
             return IrNodeFactory.createContinue(0, 0, typeMapper.unitType(), loop)
@@ -1406,6 +1625,8 @@ class JasperToIrTranslator {
             // other member accesses on the caught value resolve their receiver
             // type. Without this the receiver falls back to `Unit` and the
             // backend emits `L<package>/void;` as the owner (NoClassDefFoundError).
+            // 必须登记 catch 变量的声明类型：否则 e.message() 等成员访问的接收者退化为 Unit，
+            // 后端会发出 `L<包>/void;` 作为宿主（NoClassDefFoundError）。
             ctx.varTypes[catchClause.parameter.name] = paramType
             irCatch.result = translateBlock(catchClause.body, ctx)
             irTry.catches.add(irCatch)
@@ -1421,6 +1642,7 @@ class JasperToIrTranslator {
     }
 
     private fun translateDefer(stmt: JasDefer, ctx: TranslationContext): IrBlock {
+        // defer 体先翻译成 IR 块并压栈；自身不产生运行时代码（返回空块），只在 return/yield 处逆序展开。
         val defBlock = translateBlock(stmt.body, ctx)
         ctx.deferredBodies.add(defBlock)
         return IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
@@ -1431,6 +1653,12 @@ class JasperToIrTranslator {
      * afterwards. `defer` belongs strictly to the function that declares it;
      * without this the deferred bodies accumulate in the shared translation
      * context and leak into every later function's `return`.
+     *
+     * 做什么：在一个「全新 defer 作用域」里执行 body，结束后恢复外层 defer 栈。
+     * 什么时候用：翻译函数/构造函数/lambda/属性访问器的体时（进入前调用）。
+     * 前置条件：进入体之前 ctx.deferredBodies 保存的是外层的 defer。
+     * 为什么这样设计：defer 只属于声明它的那个函数；不隔离的话延迟体会滞留在共享 ctx 里，
+     *   泄漏到之后每个函数的 return 中（跨函数污染）。
      */
     private inline fun <T> scopedDefers(ctx: TranslationContext, body: () -> T): T {
         val enclosing = ctx.deferredBodies.toMutableList()

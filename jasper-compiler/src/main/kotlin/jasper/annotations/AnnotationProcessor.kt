@@ -1,3 +1,17 @@
+// ============================================================================
+// AnnotationProcessor —— 注解处理阶段：把 @Getter/@Setter/@EqualsAndHashCode/@Mapper
+//   合成为类成员（签名）或整块实现类，供后续类型检查与 lowering 使用。
+// 所属层次：annotations(2)。运行时机在 AST 构建之后、TypeChecker 之前。
+// 与谁协作：上游 compiler（JasperCompiler.compileToPipeline/compileAll 等）调用 process()；
+//   本文件只依赖 ast；下游先由 SymbolTable / TypeChecker 看「签名」做语义检查，
+//   再由 translator/JasperToIrTranslator 消费 JasSynthetic* 标记生成「方法体」。
+// 对外契约：process(JasSourceFile) -> AnnotatedSourceFile（改写后的 AST + AnnotationIndex + 错误）。
+// 扩展点 / 已知限制：新增一种注解（派生成员）只需在 Registry 分派处按注解名加一个分支，
+//   主流程（遍历声明→登记→返回）不变，隔离了「新增一种注解」的变化点；
+//   当前只合成签名、不生成方法体（体在 lowering 生成，见两段式合成）；
+//   @Mapper 仅支持同源文件内已声明的类、单源参数、同名/显式属性映射（v1 限制）。
+// ============================================================================
+
 package jasper.annotations
 
 import jasper.ast.JasAnnotationArgument
@@ -35,6 +49,12 @@ import jasper.ast.JasSourceFile
  * This is deliberately a plain data record (no compilation state) so that it can
  * later be serialized into the `.jaso` manifest as a service/extension-point
  * index without changing the compiler core.
+ *
+ * 做什么：记录「一次注解使用」的纯数据快照（注解简单名 + 目标种类 + 目标名 + 原始实参）。
+ * 什么时候用：注解阶段识别到注解时，由 [AnnotationProcessor.record] 登记一条，供 [AnnotationIndex] 汇总。
+ * 前置条件：不携带任何编译期状态，可跨阶段安全传递。
+ * 为什么这样设计：刻意保持为无状态普通数据类，未来可原样序列化进 `.jaso` 清单，
+ *   不必为了导出注解索引而改动编译器核心。
  */
 data class AnnotationRecord(
     val annotationName: String,
@@ -52,8 +72,19 @@ data class AnnotationRecord(
  * declaration name, and the raw arguments. This is exactly the data a future
  * `.jaso` manifest needs for a service/extension-point index; it is produced now
  * because the data is already in the compiler's hands.
+ *
+ * 做什么：注解索引，形状为 `类名 -> 有序的注解记录列表`（类自身或其成员上的注解）。
+ * 什么时候用：注解阶段结束后随 [AnnotatedSourceFile] 一起返回；供未来生成 `.jaso` 服务/扩展点清单。
+ * 前置条件：键为类的简单名；记录顺序与源码声明顺序一致。
+ * 为什么这样设计：数据本就在编译器手里，现在顺手产出，避免将来为导出清单再遍历一遍 AST。
  */
 data class AnnotationIndex(val byClass: Map<String, List<AnnotationRecord>>) {
+    /**
+     * 做什么：查询某个类名下的全部注解记录。
+     * 什么时候用：需要按类读取注解索引时。
+     * 前置条件：入参为类的简单名（与 [byClass] 的键一致）。
+     * 失败模式：类不存在时返回空列表（而非抛异常），调用方无需判空。
+     */
     fun forClass(className: String): List<AnnotationRecord> = byClass[className] ?: emptyList()
 
     companion object {
@@ -61,7 +92,14 @@ data class AnnotationIndex(val byClass: Map<String, List<AnnotationRecord>>) {
     }
 }
 
-/** Result of running the annotation phase: the rewritten AST plus the index. */
+/**
+ * Result of running the annotation phase: the rewritten AST plus the index.
+ *
+ * 做什么：注解阶段的产出封装（改写后的 AST + 注解索引 + 注解诊断列表）。
+ * 什么时候用：compiler 调用 [AnnotationProcessor.process] 后立即得到；AST 继续流入检查/翻译，index 供清单导出。
+ * 前置条件：ast 是「可能已追加合成声明」的新 AST；无注解时与输入可能是同一个实例。
+ * 失败模式：errors 非空表示注解语义错误（如 @Mapper 目标属性未映射），由 compiler 映射为 CompileError。
+ */
 data class AnnotatedSourceFile(
     val ast: JasSourceFile,
     val index: AnnotationIndex,
@@ -73,6 +111,11 @@ data class AnnotatedSourceFile(
  * an unmapped target property of an `@Mapper` method). It is position-carrying
  * like [jasper.compiler.SymbolError]; the compiler maps it into the structured
  * `CompileError` hierarchy.
+ *
+ * 做什么：注解阶段产生的编译期诊断（如 @Mapper 方法的目标属性没有对应源）。
+ * 什么时候用：注解语义可仅凭签名判定时立即产生，汇集进 [AnnotatedSourceFile.errors]。
+ * 前置条件：line/column 为源码位置，缺省为 0 表示无位置信息。
+ * 为什么这样设计：与 [jasper.compiler.SymbolError] 一样携带位置，compiler 可无损映射为 CompileError。
  */
 data class AnnotationError(val message: String, val line: Int = 0, val column: Int = 0)
 
@@ -95,9 +138,27 @@ data class AnnotationError(val message: String, val line: Int = 0, val column: I
  *
  * Code without these annotations is returned unchanged (same AST instance where
  * possible) so the existing path is byte-for-byte identical.
+ *
+ * 做什么：注解处理阶段的入口类，读取注解并合成它们隐含的「成员签名」/「实现类」。
+ * 什么时候用：始终位于 AST 构建之后、TypeChecker 之前。
+ * 前置条件：传入的是解析完成、尚未类型检查的 AST。
+ * 失败模式：语义问题（如 @Mapper 目标属性未映射、@Mapping 类型不匹配）不抛异常，而是收集进 [AnnotatedSourceFile.errors]。
+ * 为什么这样设计（两段式合成）：本类只合成「签名」——因为生成的方法必须在类型检查时可见；
+ *   而「方法体」需要类型信息，故推迟到 lowering 阶段，由
+ *   `JasperToIrTranslator` 依据 [JasSyntheticAccessor]/[JasSyntheticEquality]/[JasSyntheticMapper] 生成。
+ *   这样把「签名先于实现可用」这一变化点隔离在注解阶段，避免了在注解阶段重造类型系统。
  */
 class AnnotationProcessor {
 
+    /**
+     * 做什么：扫描整份源文件，按注解名分派处理：类上合成 getter/setter/equals/hash 签名，
+     *   接口上按 @Mapper 合成 `<Interface>Impl` 实现类；同时登记注解索引。
+     * 什么时候用：编译器流水线中紧接解析之后调用一次。
+     * 前置条件：ast 为未类型检查的 AST；不要求 @Mapper 的源/目标类型已注册进 SymbolTable（v1 只认同文件声明的类）。
+     * 失败模式：不抛异常；语义错误累加进返回值的 errors；错误时相关成员/实现类不生成（不产出半成品）。
+     * 为什么这样设计：Registry 分派按「注解简单名」路由，新增一种注解只加一个分支，
+     *   隔离了「新增一种注解」的变化点，主流程（遍历声明 → 处理 → 汇总）保持稳定。
+     */
     fun process(ast: JasSourceFile): AnnotatedSourceFile {
         val records = linkedMapOf<String, MutableList<AnnotationRecord>>()
         val errors = mutableListOf<AnnotationError>()
@@ -105,6 +166,8 @@ class AnnotationProcessor {
         // Index class property lists and all declared type names up front so
         // @Mapper methods can resolve their source/target shapes (v1: types must
         // be classes declared in the same source file).
+        // 为什么预先索引：@Mapper 需要按「类名」查其属性集合与类型是否存在，若边遍历边查会依赖声明顺序；
+        // 先整体建索引使处理与声明顺序无关。边界：v1 只认同源文件内已声明的类/接口/枚举/注解类型。
         val classProperties = linkedMapOf<String, List<JasProperty>>()
         val declaredTypeNames = mutableSetOf<String>()
         for (decl in ast.declarations) {
@@ -150,14 +213,20 @@ class AnnotationProcessor {
         records: MutableMap<String, MutableList<AnnotationRecord>>
     ): JasClass {
         val classAnnotations = cls.modifiers.filterIsInstance<JasAnnotationUse>()
+        // Registry 分派（按注解简单名路由）：类级注解先解析出「是否启用某类派生成员」的开关。
+        // 用 simpleName 去掉限定前缀，使 @Getter 与 @some.pkg.Getter 等价；这里不建显式表，
+        // 而是用一组布尔开关承接，新增注解时只需在此加一个开关 + 一个生成分支。
         val classHasGetter = classAnnotations.any { simpleName(it.name) == GETTER }
         val classHasSetter = classAnnotations.any { simpleName(it.name) == SETTER }
         val classHasEquality = classAnnotations.any { simpleName(it.name) == EQUALS_AND_HASH_CODE }
 
+        // 登记所有类级注解（纯索引，不影响语义）。
         for (annotation in classAnnotations) {
             record(records, cls.name, "class", cls.name, annotation)
         }
 
+        // 手写方法名集合：作为「资格判定」的最后一道闸。注解合成的成员若与手写同名则不再生成，
+        // 保证幂等（重复处理同一 AST 不会叠加），也让手写实现始终覆盖派生实现（last-writer-wins 的镜像）。
         val existingFunctionNames = cls.members
             .filterIsInstance<JasFunction>()
             .map { it.name }
@@ -172,14 +241,19 @@ class AnnotationProcessor {
                     for (annotation in propAnnotations) {
                         record(records, cls.name, "property", member.name, annotation)
                     }
+                    // 属性级 @EqualsAndHashCode：只登记「参与相等性」的字段，稍后并进 equals/hash 计划。
+                    // 资格：有声明类型且非 static（见 isEligibleForEquality）。
                     if (propAnnotations.any { simpleName(it.name) == EQUALS_AND_HASH_CODE } &&
                         isEligibleForEquality(member)
                     ) {
                         propertyLevelEqualityFields.add(JasEqualityField(member.name, member.type))
                     }
+                    // 可见性优先级：类级开关置位则所有合格属性都要，否则仅属性自身标注的才要。
                     val wantGetter = classHasGetter || propAnnotations.any { simpleName(it.name) == GETTER }
                     val wantSetter = classHasSetter || propAnnotations.any { simpleName(it.name) == SETTER }
 
+                    // 命名规则：get + 首字母大写属性名（setter 同理）。资格：有类型且非 static；setter 还要求非 const。
+                    // existingFunctionNames.add(name) 返回 false 表示已存在同名（手写或已生成），跳过以保证唯一性。
                     if (wantGetter && isEligibleForGetter(member)) {
                         val name = accessorName("get", member.name)
                         if (existingFunctionNames.add(name)) {
@@ -206,7 +280,11 @@ class AnnotationProcessor {
         // `equals` / `hash` *signatures*. Handwritten methods always win: if a
         // function with the same name already exists, the respective member is
         // not generated (idempotence).
+        // 两段式合成：这里只合成 equals/hash 的「签名」，字段清单写进 JasSyntheticEquality，
+        // 「函数体」由 lowering 阶段（JasperToIrTranslator.syntheticEqualityBody）依据字段类型生成。
+        // 为什么体要推迟：equals 需要 instanceof 守卫与字段级哈希混合，只有拿到类型/IR 形态才好表达。
         if (classHasEquality || propertyLevelEqualityFields.isNotEmpty()) {
+            // 类级注解：参与字段 = 全部合格实例属性；仅属性级注解：只用已登记的字段（顺序即声明顺序）。
             val fields = if (classHasEquality) {
                 cls.members.filterIsInstance<JasProperty>()
                     .filter { isEligibleForEquality(it) }
@@ -222,7 +300,9 @@ class AnnotationProcessor {
             }
         }
 
+        // 无任何派生成员时原样返回（可能返回同一实例），保证「无注解路径」字节级不变。
         if (generated.isEmpty()) return cls
+        // 追加生成的成员；原有成员顺序不变（last-writer-wins 语义由 existingFunctionNames 保证）。
         return cls.copy(members = cls.members + generated)
     }
 
@@ -236,6 +316,13 @@ class AnnotationProcessor {
      * body (bodies are generated during lowering).
      *
      * Returns the synthesized impl class, or null when nothing was generated.
+     *
+     * 做什么：处理单个接口声明；非 @Mapper 接口只登记注解并返回 null；@Mapper 接口另合成一个 `<Interface>Impl` 实现类。
+     * 什么时候用：process() 遍历到接口声明时调用。
+     * 前置条件：classProperties/declaredTypeNames 已建好（@Mapper 靠它们解析源/目标类型）。
+     * 失败模式：返回 null 表示未生成实现类（非 @Mapper、已有同名 Impl、含泛型参数、无合格方法）；错误写进 errors。
+     * 为什么这样设计：把「接口 → 实现类」的整块合成收敛在此处，方法体同样推迟到 lowering，
+     *   与 getter/setter/equals 的两段式合成保持一致的契约。
      */
     private fun processInterface(
         iface: JasInterface,
@@ -260,13 +347,16 @@ class AnnotationProcessor {
             }
         }
 
+        // Registry 分派：只有接口带 @Mapper（按简单名匹配）才继续，否则本阶段对它无事可做。
         if (annotations.none { simpleName(it.name) == MAPPER }) return null
 
         val implName = iface.name + MAPPER_IMPL_SUFFIX
         // Idempotence: never synthesize the same impl twice (e.g. re-processing
         // an AST that was already through this phase).
+        // 幂等：若 <Interface>Impl 已被声明，直接跳过，避免同一 AST 被重复处理时叠加实现类。
         if (implName in declaredTypeNames) return null
 
+        // v1 限制：泛型接口的映射实现需要类型擦除/桥接方法支持，暂不支持，显式报错而非静默生成错误代码。
         if (iface.typeParameters.isNotEmpty()) {
             errors.add(AnnotationError(
                 "@Mapper interface '${iface.name}' must not declare type parameters (v1 limitation)",
@@ -279,9 +369,11 @@ class AnnotationProcessor {
         for (member in iface.members) {
             if (member !is JasFunction) continue
             if (member.body != null) continue // only abstract mapper methods
+            // 每个抽象方法合成一个签名（含 JasSyntheticMapper 计划）；任一方法失败则它返回 null，不产生半成品。
             buildMapperFunction(iface.name, member, classProperties, errors)?.let { implFunctions.add(it) }
         }
 
+        // 没有任何可映射方法时不生成空实现类。
         if (implFunctions.isEmpty()) return null
 
         return JasClass(
@@ -299,6 +391,11 @@ class AnnotationProcessor {
      * Builds the impl-side signature for one mapper method and validates the
      * mapping plan. On any problem an [AnnotationError] is recorded and null is
      * returned (no half-built method is emitted).
+     *
+     * 做什么：为一个 @Mapper 方法构造实现侧签名，并校验映射计划（参数/返回类型、@Mapping、同名自动映射）。
+     * 什么时候用：processInterface 遍历抽象方法时逐条调用。
+     * 前置条件：方法须恰有一个形参；源参数与返回类型须是同文件已声明的「类」（v1）。
+     * 失败模式：任一问题都记录 AnnotationError 并返回 null；用 errors 计数变化判断「本次是否新增了错误」，避免发出半成品。
      */
     private fun buildMapperFunction(
         interfaceName: String,
@@ -352,6 +449,8 @@ class AnnotationProcessor {
         }
 
         // Explicit rename mappings: target property -> source property.
+        // 显式 @Mapping(source=..., target=...) 优先于同名自动映射；这里只登记「合法的重命名」，
+        // 不合法者逐条记录错误并 continue（只跳过该条，不影响其它映射）。
         val explicitByTarget = linkedMapOf<String, String>()
         for (mapping in method.modifiers.filterIsInstance<JasAnnotationUse>()
             .filter { simpleName(it.name) == MAPPING }) {
@@ -392,6 +491,8 @@ class AnnotationProcessor {
         }
 
         // Auto-mapping: same-name, same-type source property.
+        // 自动映射：对每个目标属性，若无显式重命名，则找同名源属性；同名但类型不同 → 报错；
+        // 找不到同名 → 报「未映射目标属性」（@Mapper 的关键诊断）。
         val assignments = mutableListOf<JasMapperAssignment>()
         for (tProp in targetProps) {
             val explicitSource = explicitByTarget[tProp.name]
@@ -417,8 +518,11 @@ class AnnotationProcessor {
             assignments.add(JasMapperAssignment(tProp.name, autoSource.name))
         }
 
+        // 只要本次调用新增过错误，就整体放弃该方法（不发出半成品）。
         if (errors.size > before) return null
 
+        // 两段式合成：只产出「签名 + JasSyntheticMapper 映射计划」，body 留 null；
+        // 计划由 lowering 阶段（JasperToIrTranslator.syntheticMapperBody）消费成具体赋值语句。
         return JasFunction(
             name = method.name,
             parameters = method.parameters,
@@ -437,6 +541,11 @@ class AnnotationProcessor {
      * Structural equality for the v1 "same type" rule (primitives, `string`,
      * named types without type arguments). Nullable wrappers are transparent so
      * `string?` and `string` are treated as the same source shape in v1.
+     *
+     * 做什么：v1 的「同类型」结构相等判定（原始类型、string、无类型实参的命名类型）。
+     * 什么时候用：@Mapping 校验与自动映射时判断源/目标属性类型是否一致。
+     * 前置条件：null 视为不匹配（返回 false）。
+     * 边界：可空包装（`string?` 与 `string`）在 v1 被视为同一形态，不区分可空性。
      */
     private fun sameSimpleType(a: JasType?, b: JasType?): Boolean {
         val ka = typeKey(a) ?: return false
@@ -484,6 +593,13 @@ class AnnotationProcessor {
      * arrives as a `JasAnnotationPositionalArg` wrapping a `JasAssignment`. Both
      * spellings are accepted here so the annotation reads the same either way.
      * (`.g4` files are locked; this adapter is the correct place to absorb it.)
+     *
+     * 做什么：抽取注解的 `name = "value"` 字符串实参，返回 名字->值 映射。
+     * 什么时候用：解析 @Mapping 的 source/target 实参。
+     * 前置条件：只取值为字符串字面量的实参；其余实参忽略。
+     * 为什么这样写（边界）：`.g4` 文件被锁定，`@Mapping(source=..., target=...)` 被 ANTLR 判为位置参数分支，
+     *   因此要同时接受 JasAnnotationNamedArg 和「位置参数里包着 JasAssignment」两种形态；
+     *   此适配器正是吸收语法歧义的正确位置，避免把语法细节泄漏给调用方。
      */
     private fun annotationStringArgs(annotation: JasAnnotationUse): Map<String, String> {
         val result = linkedMapOf<String, String>()
@@ -510,6 +626,12 @@ class AnnotationProcessor {
     /**
      * Synthesizes the *signature only* of a getter: `getFoo(): T`, body = null.
      * The body is produced later by the translator from [JasSyntheticAccessor].
+     *
+     * 做什么：合成 getter 的「签名」（`getFoo(): T`），body 置空。
+     * 什么时候用：processClass 判定某属性需要 getter 时。
+     * 前置条件：属性已通过 isEligibleForGetter。
+     * 为什么这样设计：两段式合成——这里只出签名供类型检查；体由 lowering 阶段
+     *   依据 [JasSyntheticAccessor]（propertyName + isGetter）生成 `return this.prop`。
      */
     private fun getterSignature(name: String, prop: JasProperty): JasFunction = JasFunction(
         name = name,
@@ -523,6 +645,11 @@ class AnnotationProcessor {
     /**
      * Synthesizes the *signature only* of a setter: `setFoo(value: T): void`,
      * body = null. The body is produced later by the translator.
+     *
+     * 做什么：合成 setter 的「签名」（`setFoo(value: T): void`），body 置空。
+     * 什么时候用：processClass 判定某属性需要 setter 时。
+     * 前置条件：属性已通过 isEligibleForSetter（有类型、非 static、非 const）。
+     * 为什么这样设计：与 getter 同理的两段式；体由 lowering 依据 [JasSyntheticAccessor] 生成 `this.prop = value`。
      */
     private fun setterSignature(name: String, prop: JasProperty): JasFunction = JasFunction(
         name = name,
@@ -537,6 +664,12 @@ class AnnotationProcessor {
      * Synthesizes the *signature only* of a `@EqualsAndHashCode` member:
      * `equals(other: any): bool` or `hash(): int32`. The body is produced later
      * by the translator from [JasSyntheticEquality].
+     *
+     * 做什么：合成 @EqualsAndHashCode 成员的「签名」——`equals(other: any): bool` 或 `hash(): int32`。
+     * 什么时候用：类级或属性级 @EqualsAndHashCode 生效且同名手写方法不存在时。
+     * 前置条件：fields 为已判定的合格实例字段列表（类级=全部合格属性，属性级=被标注者）。
+     * 为什么这样设计：签名需在类型检查时可见；字段清单随签名一起塞进 [JasSyntheticEquality]，
+     *   让 lowering 阶段生成函数体时无需重新推导类结构。
      */
     private fun equalitySignature(isEquals: Boolean, className: String, fields: List<JasEqualityField>): JasFunction {
         val marker = JasSyntheticEquality(isEquals = isEquals, className = className, fields = fields)
@@ -561,6 +694,10 @@ class AnnotationProcessor {
         }
     }
 
+    // 资格判定（Getter/Setter/Equality 共用一套「可用属性」概念）：
+    //   1) 必须有声明类型——合成器无法为「待推导类型」生成签名；
+    //   2) 必须是实例字段——static 无 this 接收者，访问器/相等性都无意义。
+    // Setter 额外排除 const（常量不可写）。
     private fun isEligibleForGetter(prop: JasProperty): Boolean =
         prop.type != null && !isStatic(prop)
 
@@ -568,12 +705,14 @@ class AnnotationProcessor {
         prop.type != null && !isStatic(prop) && !prop.isConst
 
     /** Equality/hash participation: typed instance fields only (no statics). */
+    // equals/hash 参与资格：仅有类型的实例字段（排除 static）。
     private fun isEligibleForEquality(prop: JasProperty): Boolean =
         prop.type != null && !isStatic(prop)
 
     private fun isStatic(prop: JasProperty): Boolean =
         prop.modifiers.any { it is String && it == "static" }
 
+    // 命名规则：前缀 + 属性名首字母大写（如 foo -> getFoo）。空名特判保证不会越界取 propName[0]。
     private fun accessorName(prefix: String, propName: String): String {
         if (propName.isEmpty()) return prefix
         return prefix + propName[0].uppercaseChar() + propName.substring(1)
@@ -581,6 +720,8 @@ class AnnotationProcessor {
 
     private fun simpleName(qualified: String): String = qualified.substringAfterLast('.')
 
+    // 注解索引登记：把一次注解使用追加进 `类名 -> 记录列表`。只做记录、不改 AST 语义，
+    // 因此任何注解（无论是否被本阶段处理）都会被登记，供 `.jaso` 清单/扩展点索引用。
     private fun record(
         records: MutableMap<String, MutableList<AnnotationRecord>>,
         className: String,
@@ -598,6 +739,8 @@ class AnnotationProcessor {
         )
     }
 
+    // Registry 分派的「注解名常量表」：主流程按这些简单名做相等比较来路由到对应处理器分支。
+    // 新增一种注解时，只在此加常量 + 在分派处加一个分支，隔离了「新增一种注解」的变化点。
     companion object {
         const val GETTER = "Getter"
         const val SETTER = "Setter"

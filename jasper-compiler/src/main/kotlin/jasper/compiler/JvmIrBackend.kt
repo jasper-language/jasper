@@ -1,3 +1,27 @@
+// ============================================================================
+// JvmIrBackend —— 把 Kotlin IR 翻译成 JVM 字节码并写出 .class 文件
+// 所属层次：compiler（编排层）内的 backend 组件；物理位置在 jasper.compiler 包，
+//           职责只做「IR → 字节码」，不参与语法/语义分析，也不编排流水线。
+// 与谁协作：上游 = jasper.translator 产出的 TranslationResult（IR 文件列表、
+//           调用名映射、构造器类型映射、超类/接口表、接口名集合、静态字段符号集）；
+//           下游 = ASM 库（org.jetbrains.org.objectweb.asm 的 ClassWriter/MethodVisitor）
+//           与文件系统（java.io.File / java.nio.file.Path 落盘）。
+//           类型 → JVM 描述符/内部名/泛型签名统一委托给 jasper.translator.TypeMapper。
+// 对外契约：JvmIrBackend(typeMapper).generate(translationResult, outputDir)：
+//           按包名建立目录，为每个顶层函数/类写出 <Name>.class；无返回值，失败以
+//           异常向上抛（由 JasperCompiler 捕获为 CompileError.Internal）。
+//           另有只读旁路 getGraalvmWarnings()，回报扫描到的 GraalVM 风险点。
+// 扩展点 / 已知限制：
+//   - 所有类统一用 V1_8（class 文件版本 52）生成，取 Java 8 作为下限以兼容
+//     Android/D8；不使用 invokedynamic（没有 lambda metafactory，也没有字符串
+//     concat factory），因此 GraalVM native-image 的配置负担较小。
+//   - 使用 ClassWriter.COMPUTE_FRAMES：栈帧与 max_locals/max_stack 交给 ASM 计算，
+//     代价是 ASM 必须能解析公共父类；因此不手工维护栈映射帧。
+//   - 局部变量复用非常保守：每次声明或临时值都顺延 nextSlot、不回收作用域，用
+//     局部变量表体积换「绝不会踩到仍在使用的槽位」这一字节码验证器安全性。
+//   - 常量池、泛型 Signature、字段/方法描述符尽量交给 ASM 与 TypeMapper；本文件
+//     只决定「是否需要写签名」以及拼出描述符字符串。
+// ============================================================================
 @file:OptIn(org.jetbrains.kotlin.ir.symbols.UnsafeDuringIrConstructionAPI::class)
 
 package jasper.compiler
@@ -14,11 +38,44 @@ import org.jetbrains.org.objectweb.asm.*
 import java.io.File
 import java.nio.file.Path
 
+/**
+ * 做什么：JVM 字节码后端（Strategy 模式里「JVM 目标」的实现）。把 translator 产出的
+ *   Kotlin IR 逐声明翻译成 ASM 可写出的字节码，并按包名落盘为 .class 文件。
+ *
+ * 什么时候用：`JasperCompiler.compileToDirWithIr` / `compileAllToDir` 在翻译阶段之后
+ *   调用一次。什么时候不该用：不要拿孤立/手工拼的 IR 文件调用——generate() 依赖先
+ *   建立好的全局符号表（符号→名字/owner、超类、接口），缺了会退化成默认值。
+ *
+ * 前置条件：typeMapper 必须已按当前编译单元配置好类型名映射；outputDir 必须可写，
+ *   包目录不存在时会 mkdirs()。本类持有可变全局状态，**不可并发/重入**调用。
+ *
+ * 失败模式：不做诊断恢复——出现不支持的 IR 形态或拼不出描述符时会抛异常（内部含
+ *   `!!`、强制类型转换、下标越界等），由 JasperCompiler 包成 CompileError.Internal；
+ *   本类自己不抛 CompileException，也不返回错误码。
+ *
+ * 为什么这样设计：只依赖 TypeMapper 这一「类型→描述符」转换器，把 JVM 细节收口在
+ *   本文件；换后端（archive/JvmBackend、jasper-llvm）只需替换本类，不动翻译层。
+ *   IR 节点用 when 穷举分派而非 Visitor，是因为节点集合由 translator 固定产出，希望
+ *   在一处读全「哪种 IR 形态对应哪些指令」的映射。
+ */
 class JvmIrBackend(private val typeMapper: TypeMapper) {
+    // GraalVM native-image 兼容性告警的累积区：generate() 开头扫描 IR 时填充，
+    // 外部通过 getGraalvmWarnings() 只读取走；不参与 class 生成。
     private val graalvmWarnings = mutableListOf<String>()
 
+    /**
+     * 做什么：返回上一次 generate() 扫描到的 GraalVM 告警（例如 IR 中出现了
+     *   invokedynamic，native-image 可能需要在配置里反射/动态代理注册）。
+     *
+     * 什么时候用：编译结束后由上层读取，用于提示用户补 native-image 配置。
+     *   前置条件：需在 generate() 之后调用，generate() 每次会先 clear 再重扫。
+     * 失败模式：不抛异常；从未 generate 过时返回空列表。返回值是副本，调用方修改
+     *   不会影响内部状态。
+     */
     fun getGraalvmWarnings(): List<String> = graalvmWarnings.toList()
 
+    // 只读预扫描：遍历所有 IR 声明，把风险点累积进 graalvmWarnings。
+    // 放在 generate() 最前面，保证告警反映本次输入；不改变任何生成结果。
     private fun checkGraalvmHostilePatterns(translationResult: TranslationResult) {
         for (file in translationResult.irFiles) {
             for (decl in file.declarations) {
@@ -27,6 +84,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 声明级递归：函数只看 body 的语句；类递归进成员。其它声明（字段等）忽略——
+    // 字段初始化器不可能含 invokedynamic，属性体由 getter/setter 覆盖。
     private fun checkIrDeclarationForGraalvm(decl: IrDeclaration) {
         when (decl) {
             is IrSimpleFunction -> {
@@ -46,6 +105,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 语句级分派：块展开成语句序列，表达式交给表达式扫描，其它（如变量声明）跳过——
+    // 变量的初始化器即便含 invoke 也会经由表达式的 IrCall 分支被看到。
     private fun checkIrStatementForGraalvm(stmt: IrStatement) {
         when (stmt) {
             is IrBlock -> stmt.statements.forEach { checkIrStatementForGraalvm(it) }
@@ -54,9 +115,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 表达式级扫描入口：重点看 IrCall 的「调用名」——translator 把语义写进 callNames，
+    // 只有名字为 "invokedynamic" 才是 native-image 风险点。其它表达式类型做结构下降，
+    // 覆盖 when 的分支与 lambda 体，避免漏掉嵌在里面的调用。
     private fun checkIrExpressionForGraalvm(expr: IrExpression) {
         when (expr) {
             is IrCall -> {
+                // 先用 translator 的语义名（callNames），退化到函数符号名。
                 val name = callNames[expr.symbol] ?: functionSymbolToName[expr.symbol]
                 if (name == "invokedynamic") {
                     graalvmWarnings.add("invokedynamic detected in IR call — GraalVM native-image may require additional configuration")
@@ -85,39 +150,87 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    /**
+     * 做什么：一个局部变量槽位的登记项：源码名、IR 类型、以及它占用的 JVM 槽号。
+     *
+     * 什么时候用：生成函数/构造器时把参数和声明出的变量登记进 MethodContext.locals，
+     *   供 load/store 时反查「这个名字的描述符是什么」。
+     * 前置条件：slot 必须遵守 JVM 槽位规则——long/double 占 2 个槽，其余占 1 个。
+     * 失败模式：无（纯数据）；irType 允许为 null（例如 "this"，不需要再取描述符）。
+     */
     data class LocalInfo(val name: String, val irType: IrType?, val slot: Int)
+    /**
+     * 做什么：单个方法/构造器体的生成上下文，聚合「写字节码的 MethodVisitor」与
+     *   局部变量状态（槽位分配、名字→槽、符号→名字、循环标签栈）。
+     *
+     * 什么时候用：每个函数/构造器/<clinit> 各建一个，交给 generateIrStatement /
+     *   generateIrExpression 递归传递。什么时候不该用：不可跨方法复用——它描述的是
+     *   一个 Code 属性的局部状态。
+     * 前置条件：locals/variables/symbolToName 至少含参数；nextSlot 必须已是「未使用
+     *   的最小槽号」（实例方法从 1 起、静态方法从 0 起）。
+     * 失败模式：无；查不到名字时生成侧会退化（如 ALOAD 0 / 丢值），因此登记必须完整。
+     * 为什么这样设计：把可变状态集中到一个对象，避免在递归签名里穿 5 个参数。
+     */
     data class MethodContext(
         val mv: MethodVisitor,
+        // 已分配槽位的扁平列表，用于按名字反查 IR 类型（描述符可能被拓宽/装箱）。
         val locals: MutableList<LocalInfo>,
+        // 变量名 → 槽号；IR 里 IrGetValue/IrSetValue 通过 symbolToName 归一化到名字。
         val variables: MutableMap<String, Int>,
+        // 值符号 → 生成用名字，弥合「IR 用 Symbol 标识、字面量用名字标识」的差异。
         val symbolToName: MutableMap<IrValueSymbol, String>,
+        // 下一个可用槽号；每次新声明/临时值都顺延，不回收，换取验证器安全。
         var nextSlot: Int,
+        // 当前方法的返回类型，用于决定 return 指令与返回前的拓宽/装箱。
         val returnType: IrType?,
+        // 是否静态方法：决定参数槽起点，以及「无接收者的 IrGetValue」是否回退到 this。
         val isStatic: Boolean,
+        // 循环标签栈，元素为 (continue 目标, break 目标)；IrBreak/IrContinue 取栈顶。
         val loopStack: MutableList<Pair<Label, Label>> = mutableListOf(),
+        // 延迟生成的语句块（预留给 translator 的延迟体机制；当前后端未消费）。
         val deferredBodies: MutableList<IrBlock> = mutableListOf()
     )
 
+    // 当前正在生成的包名（以 '/' 分隔的内部名形式），决定 class 内部名与字段 owner 兜底。
     private var currentPkg: String = ""
+    // —— 以下 5 张表在 generate() 第一遍里按符号填入，第二遍生成时只读 ——
+    // 函数符号 → 方法名（跨文件引用时用来写 INVOKESTATIC 的名字）。
     private val functionSymbolToName = mutableMapOf<IrSimpleFunctionSymbol, String>()
+    // 函数符号 → owner 内部名（顶层函数是 "<pkg>/<fun>"，成员函数是其类的内部名）。
     private val functionSymbolToOwner = mutableMapOf<IrSimpleFunctionSymbol, String>()
+    // 字段符号 → 字段名（GETFIELD/PUTFIELD/GETSTATIC/PUTSTATIC 的名字部分）。
     private val fieldSymbolToName = mutableMapOf<IrFieldSymbol, String>()
+    // 字段符号 → owner 内部名（声明该字段的类）。
     private val fieldOwnerMap = mutableMapOf<IrFieldSymbol, String>()
+    // 类名（简单名）→ 超类内部名；来自 translator，未登记时默认 java/lang/Object。
     private var classSuperclassNames: Map<String, String> = emptyMap()
+    // 类名（简单名）→ 直接实现的接口内部名列表；注解类强制实现 Annotation。
     private var classInterfaceNames: Map<String, List<String>> = emptyMap()
+    // 被声明为 interface 的类型名集合（含简单名与内部名两种写法），用于选 INVOKEINTERFACE。
     private var interfaceDeclNames: Set<String> = emptySet()
+    // 需按 JVM 静态字段发射/访问的字段符号（接口常量 public static final）。
     private var staticFieldSymbols: Set<IrFieldSymbol> = emptySet()
+    // 函数符号 → translator 赋予的语义调用名（"+"、"v:foo"、"ctor_delegate:" 等）；
+    // 这是后端与 translator 之间的核心协议，决定走哪条专用生成路径。
     private var callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap()
+    // 构造器符号 → 构造器类型标记（如 "array:<elemDesc>" 表示数组新建而非对象新建）。
     private var constructorTypes: Map<IrConstructorSymbol, String> = emptyMap()
 
+    // 由字段符号反查 owner 内部名；查不到时退化为当前包，避免写出空 owner 导致
+    // ClassWriter 抛异常（宁可生成一个可能 NoSuchFieldError 的引用，也不崩在生成期）。
     private fun resolveFieldOwnerFromSymbol(symbol: IrFieldSymbol): String {
         return fieldOwnerMap[symbol] ?: currentPkg.replace('.', '/')
     }
 
+    // 语义化重载：保留独立入口，便于「按符号解析」与「按接收者解析」两条路径分开演进。
     private fun resolveFieldOwner(symbol: IrFieldSymbol): String {
         return resolveFieldOwnerFromSymbol(symbol)
     }
 
+    // 按接收者表达式推断字段 owner 的兜底策略：当字段符号未登记时，若接收者是
+    // IrGetValue 且其静态类型可解析为一个具体类，就用它当 owner；否则退回当前包。
+    // 注意：本文件内目前无人调用（字段访问都用符号重载），属于待接线/待清理的
+    // 兜底实现；保留仅为不改变行为。
     private fun resolveFieldOwner(receiver: IrExpression): String {
         // If receiver is a GetValue for a local variable, try to determine its type
         if (receiver is IrGetValue) {
@@ -130,15 +243,35 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return currentPkg
     }
 
+    // 数组类型判定：委托 TypeMapper 求描述符，凡以 '[' 开头的即为数组。
+    // 用在 IrGetField 上——数组的 .length 要生成 ARRAYLENGTH 而不是 GETFIELD。
     private fun isArrayType(type: IrType): Boolean =
         typeMapper.jvmDescriptorFromIrType(type).startsWith("[")
 
+    /**
+     * 做什么：后端唯一入口。先扫描 GraalVM 风险点，再用一遍遍历建立「符号→名字/owner」
+     *   全局索引，最后按包目录逐声明生成并写出 class 文件。
+     *
+     * 什么时候用：翻译阶段完成后调用一次；同一实例可重复调用（会先 clear 旧索引并
+     *   重新装载 callNames 等映射）。什么时候不该用：不要并发调用——全局状态保存在
+     *   可变字段里，本类不可重入。
+     *
+     * 前置条件：translationResult.irFiles 的每个 packageFqName 已就绪；outputDir 可写。
+     * 失败模式：不支持的 IR 形态会抛异常；写盘失败向上抛 IO 异常且不回滚，已写出的
+     *   class 会残留（编译失败时上层会丢弃整个输出目录）。
+     *
+     * 为什么这样设计：两遍遍历是必需的——字节码里方法调用/字段访问必须写死 owner 的
+     *   内部名，而 owner 往往定义在别的 IR 文件里；先全量收集索引才能让跨文件与前向
+     *   引用都解析成功。
+     */
     fun generate(translationResult: TranslationResult, outputDir: Path) {
+        // 清空上一次运行留下的索引，保证重复调用/多编译单元时不串味。
         functionSymbolToName.clear()
         functionSymbolToOwner.clear()
         fieldSymbolToName.clear()
         fieldOwnerMap.clear()
         graalvmWarnings.clear()
+        // 装载 translator 侧提供的映射；这些是只读输入，后端不回写。
         callNames = translationResult.callNames
         constructorTypes = translationResult.constructorTypes
         classSuperclassNames = translationResult.classSuperclassNames
@@ -146,6 +279,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         interfaceDeclNames = translationResult.interfaceDeclNames
         staticFieldSymbols = translationResult.staticFieldSymbols
         checkGraalvmHostilePatterns(translationResult)
+        // 第 1 遍：建立符号 → 名字 / owner 索引。owner 用「包名内部名/类名」的 JVM 约定，
+        // 顶层函数则以其自身为 owner（等价于文件名即类名，makeClass 时补建 main 桥）。
         for (file in translationResult.irFiles) {
             for (decl in file.declarations) {
                 when (decl) {
@@ -160,6 +295,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             when (classDecl) {
                                 is IrSimpleFunction -> {
                                     functionSymbolToName[classDecl.symbol] = classDecl.name.toString()
+                                    // 成员函数的 owner 是其所属类，而不是包。
                                     functionSymbolToOwner[classDecl.symbol] = internalName
                                 }
                                 is IrField -> {
@@ -174,6 +310,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
         }
+        // 第 2 遍：真正生成。每个 IR 文件按包名建目录，逐顶层声明写出 <Name>.class。
         for (file in translationResult.irFiles) {
             currentPkg = file.packageFqName?.toString()?.replace('.', '/') ?: ""
             val dir = outputDir.resolve(currentPkg).toFile()
@@ -184,6 +321,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 顶层声明的分派：函数与类各自生成一个 class 文件，其它声明（字段等）在顶层无意义，忽略。
     private fun generateTopLevelDeclaration(decl: IrDeclaration, dir: File) {
         when (decl) {
             is IrSimpleFunction -> generateTopLevelFunction(decl, dir)
@@ -192,12 +330,19 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 顶层函数没有宿主类，按 JVM 约定为它单独生成一个「以函数名命名」的类，
+    // 函数本身作为静态方法放进去，于是 `foo()` 变成 `foo.foo()`。
     private fun generateTopLevelFunction(func: IrSimpleFunction, dir: File) {
         val name = func.name.toString()
         val internalName = "$currentPkg/$name"
          val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
+        // V1_8：class 版本 52，兼容 Android/D8；ACC_SUPER 是所有现代 JVM 类的约定标志。
+        // 超类是 Object，签名传 null（顶层函数所在类没泛型参数）。
         cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, internalName, null, "java/lang/Object", emptyArray())
         generateIrFunction(cw, func, internalName, true)
+        // 若函数名是 main 且无参，补一个标准入口桥 `main(String[])`（JVM 启动器只认
+        // 这个签名），内部转调无参 main。参数为空是必要条件，避免与用户显式声明的
+        // `main(String[])` 冲突而生成重复方法。
         if (name == "main" && func.valueParameters.isEmpty()) {
             val mv = cw.visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "main", "([Ljava/lang/String;)V", null, null)
             mv.visitCode()
@@ -211,40 +356,56 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         dir.resolve("$name.class").writeBytes(bytes)
     }
 
+    // 生成一个类/接口/枚举/注解的 ClassFile：决定 access 标志、超类、直接接口与
+    // 泛型 Signature，然后分派成员，最后按需补 <clinit> 与枚举基础设施。
+    // 注意：类名只用简单名 + currentPkg 拼内部名，因此不支持嵌套类的外部名（Outer$Inner）。
     private fun generateIrClass(cls: IrClass, dir: File) {
         val name = cls.name.toString()
         val internalName = "$currentPkg/$name"
+        // COMPUTE_FRAMES：让 ASM 依据控制流计算 StackMapTable/帧与 max_locals、max_stack。
+        // 因为分支（when/短路/循环）都是裸跳转拼出来的，手写帧极易出错，交给 ASM 更稳。
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
         val isInterface = cls.kind == ClassKind.INTERFACE
         val isEnum = cls.kind == ClassKind.ENUM_CLASS
         val isAnnotation = cls.kind == ClassKind.ANNOTATION_CLASS
+        // access 标志必须与超类一致：接口必须 ABSTRACT 且不能有 ACC_SUPER；枚举要 ACC_ENUM；
+        // 注解类型在 classfile 里是「implements Annotation 的接口」。标志写错验证器/加载器会拒绝。
         val classFlags = when {
             isInterface -> Opcodes.ACC_PUBLIC or Opcodes.ACC_INTERFACE or Opcodes.ACC_ABSTRACT
             isEnum -> Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER or Opcodes.ACC_ENUM
             isAnnotation -> Opcodes.ACC_PUBLIC or Opcodes.ACC_ANNOTATION or Opcodes.ACC_INTERFACE or Opcodes.ACC_ABSTRACT
             else -> Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER
         }
+        // 超类：枚举一律继承 java/lang/Enum（枚举常量的 name/ordinal 由它提供）；普通类查
+        // translator 交来的超类表（值已是内部名）；查不到按 Object。接口的 super 在 classfile
+        // 里仍写 java/lang/Object（JVM 规范要求）。
         val superName = when {
             isEnum -> "java/lang/Enum"
             classSuperclassNames.containsKey(cls.name.toString()) -> classSuperclassNames[cls.name.toString()]!!
             else -> "java/lang/Object"
         }
+        // 直接接口列表：注解类型强制实现 java/lang/annotation/Annotation；其余查映射表。
         val interfaceNames = when {
             isAnnotation -> arrayOf("java/lang/annotation/Annotation")
             classInterfaceNames.containsKey(cls.name.toString()) -> classInterfaceNames[cls.name.toString()]!!.toTypedArray()
             else -> emptyArray()
         }
+        // 泛型 Signature（类级 <T:...>LSuper;...）：只有类有类型参数时才非 null；
+        // 无泛型时写 null，避免 ASM 发出多余但合法的 Signature 属性。
         val classSig = typeMapper.buildClassSignature(cls, superName)
         cw.visit(Opcodes.V1_8, classFlags, internalName, classSig, superName, interfaceNames)
 
+        // 成员分派：方法、构造器、字段、属性；其余（如伴生对象等未支持形态）忽略。
         for (decl in cls.declarations) {
             when (decl) {
                 is IrSimpleFunction -> {
+                    // 接口方法只能是 public abstract（没有 Code 属性）；普通类方法默认 public。
                     val methodFlags = if (isInterface) Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT else Opcodes.ACC_PUBLIC
                     generateIrFunction(cw, decl, internalName, false, methodFlags)
                 }
                 is IrConstructor -> {
                     // Handle enum constructors: they need synthetic (String, int) prefix
+                    // 枚举构造器多两个隐式前导参数 (name, ordinal)，必须走专用分支。
                     if (isEnum) {
                         generateEnumConstructor(cw, decl, internalName)
                     } else {
@@ -256,6 +417,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // Interface constant: `public static final`, with a
                         // ConstantValue attribute when the initializer is a
                         // compile-time literal (otherwise `<clinit>` assigns it).
+                        // 中文：接口常量写成 public static final；初始化器是编译期字面量时
+                        // 直接落成 ConstantValue 属性（无需 <clinit>），否则留给 <clinit> 赋值。
                         cw.visitField(
                             Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL,
                             decl.name.toString(),
@@ -264,6 +427,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             staticFieldConstantValue(decl)
                         )
                     } else {
+                        // 枚举常量字段必须是 public static final ENUM；普通实例字段 public。
+                        // 泛型信息（如 List<T>）作为字段 Signature 单独写出，描述符仍走擦除。
                         val fieldFlags = if (isEnum) Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL or Opcodes.ACC_ENUM
                             else Opcodes.ACC_PUBLIC
                         val fieldDesc = typeMapper.jvmDescriptorFromIrType(decl.type)
@@ -275,6 +440,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     // Property access is handled directly via IrGetField/IrSetField at the IR level.
                     // Accessor functions (getter/setter) are for custom accessor bodies only.
                     // Skip if body is null to avoid generating illegal JVM names like <getter-foo>.
+                    // 中文：属性读写一般在 IR 层直接编译成 IrGetField/IrSetField（后端不生成
+                    // getter/setter 调用）；只有自定义了访问器体的属性才需要发射对应方法。
+                    // getter/setter 体为 null 时必须跳过——否则会生成 `<getter-foo>` 这类非法 JVM 名。
                     val getter = decl.getter
                     if (getter != null && getter.body != null) {
                         generateIrFunction(cw, getter, internalName, false)
@@ -290,6 +458,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         if (isEnum) {
             generateEnumInfrastructure(cw, cls, internalName)
         }
+        // 只有当存在「非常量初始化器的静态字段」时才生成 <clinit>，避免发出空的、
+        // 但合法的 <clinit> 属性（多余代码、也有害于 class 体积与工具分析）。
         val staticFields = cls.declarations.filterIsInstance<IrField>().filter { it.symbol in staticFieldSymbols }
         if (staticFields.any { staticFieldConstantValue(it) == null && it.initializer != null }) {
             generateStaticFieldInitializer(cw, staticFields, internalName)
@@ -299,7 +469,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         dir.resolve("$name.class").writeBytes(bytes)
     }
 
-    /** Compile-time constant value of a static field initializer, if any. */
+    /**
+     * Compile-time constant value of a static field initializer, if any.
+     * 中文：取静态字段初始化器的「编译期常量值」。只有初始化器恰好是一个字面量
+     * （IrConstImpl）时才返回非 null，用于把它写成 field 上的 ConstantValue 属性。
+     * 边界：Char 转成 int 码点（ConstantValue 里 char 也以 int 表示）；Null/其它
+     * 常量种类返回 null，交由 <clinit> 在运行期赋值。前置条件：field.initializer
+     * 允许为 null（无初始化器 → 返回 null）。
+     */
     private fun staticFieldConstantValue(field: IrField): Any? {
         val expr = field.initializer?.expression as? IrConstImpl ?: return null
         return when (expr.kind) {
@@ -318,10 +495,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      * Emits a `<clinit>` that initializes static fields whose initializer is not
      * a compile-time literal (literals are emitted as ConstantValue attributes
      * directly on the field).
+     * 中文：为一个类发射 <clinit>，按声明顺序把「初始化器不是编译期字面量」的静态
+     * 字段逐个求值并 PUTSTATIC（字面量已作为 ConstantValue 直接写在字段上，绝不重复）。
+     *
+     * 边界/前置条件：<clinit> 必须无参、返回 void、ACC_STATIC；调用方保证至少有一个
+     * 需要运行期初始化的字段（否则不该生成它）。失败模式：字段初始化表达式求值出错
+     * 时由 generateIrExpression 抛出，<clinit> 会处于半写状态并被上层整体丢弃。
      */
     private fun generateStaticFieldInitializer(cw: ClassWriter, fields: List<IrField>, owner: String) {
         val mv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null)
         mv.visitCode()
+        // <clinit> 是静态的，所以参数槽从 0 开始；返回值类型为 void（null）也不需要接收者。
         val ctx = MethodContext(mv, mutableListOf(), mutableMapOf(), mutableMapOf(), 0, null, true)
         for (field in fields) {
             val body = field.initializer ?: continue
@@ -337,6 +521,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitEnd()
     }
 
+    // 为一个枚举类补齐 JVM 层面的枚举基础设施：<clinit> 里实例化各常量并填
+    // `__jasper_values` 缓存数组，再生成合成的 `values()` 与 `valueOf(String)`。
+    // 为什么需要：语言层只声明了常量与构造器；values()/valueOf() 是 Java 枚举协议
+    // 要求的方法，用户代码可能调用，必须由后端合成。
+    // 已知限制：靠「字段名首字母大写」来识别枚举常量（启发式）；没有覆盖任何常量的
+    // 枚举直接返回不生成；常量名以非大写字母开头时会被漏掉。
     private fun generateEnumInfrastructure(cw: ClassWriter, cls: IrClass, internalName: String) {
         val enumConstNames = mutableListOf<String>()
         for (decl in cls.declarations) {
@@ -346,12 +536,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
         if (enumConstNames.isEmpty()) return
         val n = enumConstNames.size
+        // values() 返回的数组元素类型：枚举类自身的引用数组描述符。
         val valuesDesc = "[L$internalName;"
+        // 合成缓存字段：private static final synthetic，避免与用户字段/继承冲突。
         cw.visitField(Opcodes.ACC_PRIVATE or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL or Opcodes.ACC_SYNTHETIC,
             "__jasper_values", valuesDesc, null, null)
+        // <clinit> 里先实例化常量，再装填缓存数组——顺序不能反，数组元素引用的是常量字段。
         val clMv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null)
         clMv.visitCode()
         for ((i, constName) in enumConstNames.withIndex()) {
+            // NEW + DUP 保留一份引用供 <init> 消耗；枚举构造器的前两个隐式参数是
+            // (name, ordinal)，这里用 LDC 常量名与 SIPUSH 序号压栈。
             clMv.visitTypeInsn(Opcodes.NEW, internalName)
             clMv.visitInsn(Opcodes.DUP)
             clMv.visitLdcInsn(constName)
@@ -359,6 +554,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             clMv.visitMethodInsn(Opcodes.INVOKESPECIAL, internalName, "<init>", "(Ljava/lang/String;I)V", false)
             clMv.visitFieldInsn(Opcodes.PUTSTATIC, internalName, constName, "L$internalName;")
         }
+        // 构造长度为 n 的数组，然后逐元素 DUP-压索引-GETSTATIC-AASTORE 填充。
         clMv.visitIntInsn(Opcodes.BIPUSH, n)
         clMv.visitTypeInsn(Opcodes.ANEWARRAY, internalName)
         for ((i, constName) in enumConstNames.withIndex()) {
@@ -371,6 +567,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         clMv.visitInsn(Opcodes.RETURN)
         clMv.visitMaxs(0, 0)
         clMv.visitEnd()
+        // values()：返回缓存数组的 clone()，保证调用方改不到内部数组（与 Java 语义一致）。
         val vMv = cw.visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "values", "()[L$internalName;", null, null)
         vMv.visitCode()
         vMv.visitFieldInsn(Opcodes.GETSTATIC, internalName, "__jasper_values", valuesDesc)
@@ -379,6 +576,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         vMv.visitInsn(Opcodes.ARETURN)
         vMv.visitMaxs(0, 0)
         vMv.visitEnd()
+        // valueOf(String)：直接转调 java/lang/Enum.valueOf(Class,String)，由 JDK 做
+        // 常量表查找与 IllegalArgumentException 语义，避免自己维护名字表。
         val vfMv = cw.visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "valueOf", "(Ljava/lang/String;)L$internalName;", null, null)
         vfMv.visitCode()
         vfMv.visitLdcInsn(org.jetbrains.org.objectweb.asm.Type.getType("L$internalName;"))
@@ -390,6 +589,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         vfMv.visitEnd()
     }
 
+    // 枚举构造器：JVM 要求枚举类的 <init> 前两个参数固定是 (String name, int ordinal)，
+    // 且必须先把它们转交给 java/lang/Enum.<init> 完成常量注册。用户声明的参数排在
+    // 这两个之后，因此局部槽从 3 起（this=0, name=1, ordinal=2）。
+    // 注意：构造器固定为 ACC_PRIVATE（枚举常量的构造只能由类自身触发）。
     private fun generateEnumConstructor(cw: ClassWriter, ctor: IrConstructor, owner: String) {
         // Enum constructors need synthetic (String name, int ordinal) prefix before user params
         val paramDescs = ctor.valueParameters.joinToString("") {
@@ -398,6 +601,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         val desc = "(Ljava/lang/String;I$paramDescs)V"
         val mv = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", desc, null, null)
         mv.visitCode()
+        // this.name / this.ordinal 由 <clinit> 在 NEW 时压栈传入，这里原样透传给超类。
         mv.visitVarInsn(Opcodes.ALOAD, 0)
         mv.visitVarInsn(Opcodes.ALOAD, 1)
         mv.visitVarInsn(Opcodes.ILOAD, 2)
@@ -415,6 +619,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 locals.add(LocalInfo(pName, p.type, slot))
                 variables[pName] = slot
                 symbolToName[p.symbol] = pName
+                // long/double 参数占两个槽位，必须按类型宽度顺延。
                 slot += irTypeSlots(p.type)
             }
             val ctx = MethodContext(mv, locals, variables, symbolToName, slot, null, false)
@@ -427,14 +632,21 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitEnd()
     }
 
+    // 生成一个方法（含顶层函数、成员函数、getter/setter）。isStatic 决定参数槽起点与
+    // access 里的 ACC_STATIC；methodFlags >= 0 时完全接管 access（接口方法用
+    // public abstract）。返回类型决定 return 指令并在缺 return 时补一条。
+    // 抽象方法（interface 方法）按 JVM 规则**不写 Code 属性**，只 visitMethod 后 visitEnd。
     private fun generateIrFunction(cw: ClassWriter, func: IrSimpleFunction, owner: String, isStatic: Boolean, methodFlags: Int = -1) {
         val desc = irMethodDescriptor(func)
         val access = if (methodFlags >= 0) methodFlags else (Opcodes.ACC_PUBLIC or (if (isStatic) Opcodes.ACC_STATIC else 0))
+        // 泛型签名：类型参数或有泛型参数/返回时才写 Signature，否则保持 null（擦除即可）。
         val methodSig = if (func.typeParameters.isNotEmpty() || typeMapper.hasGenericParams(func)) {
             typeMapper.buildMethodSignature(func)
         } else null
         val mv = cw.visitMethod(access, func.name.toString(), desc, methodSig, null)
         // For abstract methods (e.g., interface methods), don't emit a Code attribute
+        // 中文：抽象方法（如接口方法）没有方法体，绝不能调用 visitCode，否则生成的
+        // class 会被校验器拒绝（抽象方法不得带 Code）。
         if ((access and Opcodes.ACC_ABSTRACT) != 0) {
             mv.visitEnd()
             return
@@ -445,36 +657,49 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             val locals = mutableListOf<LocalInfo>()
             val variables = mutableMapOf<String, Int>()
             val symbolToName = mutableMapOf<IrValueSymbol, String>()
+            // 实例方法的槽 0 是 this，参数从 1 起；静态方法参数从 0 起。
             var slot = if (isStatic) 0 else 1
             for (p in func.valueParameters) {
                 val pName = p.name.toString()
                 locals.add(LocalInfo(pName, p.type, slot))
                 variables[pName] = slot
                 symbolToName[p.symbol] = pName
+                // long/double 参数占两个槽，必须按宽度顺延后续参数槽号。
                 slot += irTypeSlots(p.type)
             }
             val ctx = MethodContext(mv, locals, variables, symbolToName, slot, func.returnType, isStatic)
             generateIrBlockBody(mv, body, ctx, owner)
+            // IR 体若没有显式 return（例如函数末尾是表达式语句），补齐一条符合返回类型的
+            // return；否则字节码会「走到方法末尾却没有返回指令」，验证时直接报错。
             if (!hasIrReturn(body)) {
                 generateIrReturn(mv, func.returnType)
             }
         } else {
+            // 没有 body（理论上不该出现；抽象方法已在上面提前返回）时，生成裸 return
+            // 保持方法结构完整，避免 visitMaxs/visitEnd 之间没有指令。
             generateIrReturn(mv, func.returnType)
         }
         mv.visitMaxs(0, 0)
         mv.visitEnd()
     }
 
+    // 普通类构造器：访问标志固定 ACC_PUBLIC，返回 void，名字固定 <init>。
+    // 如果 IR 体的第一条语句不是 ctor_delegate 调用（即用户没写 this(...)/super(...)），
+    // 就自动补一条对超类无参 <init> 的调用——JVM 要求构造器必须先初始化超类。
     private fun generateIrConstructor(cw: ClassWriter, ctor: IrConstructor, owner: String) {
         val desc = irConstructorDescriptor(ctor)
         val mv = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", desc, null, null)
         mv.visitCode()
         val body = ctor.body
         // Check if constructor has delegation (first statement is a ctor_delegate call)
+        // 中文：translator 把显式 this(...)/super(...) 编码成名为 "ctor_delegate:..." 的
+        // 调用且放在第一条；据此判断是否需要合成隐式 super()。
         val hasDelegate = body is IrBlockBody && body.statements.isNotEmpty() &&
             body.statements[0] is IrCall &&
             callNames[(body.statements[0] as IrCall).symbol]?.startsWith("ctor_delegate:") == true
         if (!hasDelegate) {
+            // 隐式 super()：ALOAD 0 + INVOKESPECIAL Super.<init>()V。超类名用简单名查表
+            // （owner 是内部名，表以简单名为键），查不到回落 Object。
             mv.visitVarInsn(Opcodes.ALOAD, 0)
             val simpleName = owner.substringAfterLast('/')
             val superName = classSuperclassNames[simpleName] ?: "java/lang/Object"
@@ -484,6 +709,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             val locals = mutableListOf<LocalInfo>()
             val variables = mutableMapOf<String, Int>()
             val symbolToName = mutableMapOf<IrValueSymbol, String>()
+            // 构造器一定是实例方法：槽 0 是 this，参数从 1 起。
             locals.add(LocalInfo("this", null, 0))
             var slot = 1
             for (p in ctor.valueParameters) {
@@ -501,18 +727,24 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitEnd()
     }
 
+    // 顺序发射块体里所有语句；异常/控制流语义由各语句自己的生成逻辑负责。
     private fun generateIrBlockBody(mv: MethodVisitor, body: IrBlockBody, ctx: MethodContext, owner: String) {
         for (stmt in body.statements) {
             generateIrStatement(mv, stmt, ctx, owner)
         }
     }
 
+    // 语句生成分派：每种 IR 语句对应一组字节码指令，末尾必须保持「操作数栈为空且
+    // 控制流合法」的不变量——这也是下面大量「表达式语句后补 POP」存在的原因。
+    // 与 translator 的协议：语义化的调用名（callNames）在这里决定走哪条专用路径。
     private fun generateIrStatement(mv: MethodVisitor, stmt: IrStatement, ctx: MethodContext, owner: String) {
         when (stmt) {
             is IrVariable -> {
                 val name = stmt.name.toString()
                 val desc = typeMapper.jvmDescriptorFromIrType(stmt.type)
+                // 槽位只增不减：不复用已离开作用域的槽，避免与仍存活的值别名。
                 val slot = ctx.nextSlot
+                // long/double 占两个槽；这里按描述符而非 IR 类型判断，与 loadLocal 一致。
                 ctx.nextSlot += if (desc == "J" || desc == "D") 2 else 1
                 ctx.variables[name] = slot
                 ctx.locals.add(LocalInfo(name, stmt.type, slot))
@@ -520,6 +752,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val init = stmt.initializer
                 if (init != null) {
                     generateIrExpression(mv, init, ctx, owner)
+                    // 初始化器类型可能与变量声明类型不同（如 int 字面量赋给 long/double）：
+                    // 先按数值拓宽、必要时再装箱，最后才 store，保证槽里的值类型与描述符一致。
                     val initDesc = typeMapper.jvmDescriptorFromIrType(init.type)
                     widenIfNeeded(mv, initDesc, desc)
                     emitBoxingIfNeeded(mv, initDesc, desc)
@@ -528,11 +762,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
             is IrReturn -> {
                 val value = stmt.value
+                // translator 用 IrConst(Null) 表示「无返回值」，此时不能再压栈，直接 return。
                 if (!isIrVoidExpr(value)) {
                     generateIrExpression(mv, value, ctx, owner)
                     val valueDesc = typeMapper.jvmDescriptorFromIrType(value.type)
                     val retType = ctx.returnType
                     if (retType != null) {
+                        // 返回值同样要拓宽/装箱到方法声明的返回类型，否则类型不匹配
+                        // （例如返回 Object 却压了个 int，ARETURN 会校验失败）。
                         val returnDesc = typeMapper.jvmReturnDescriptorFromIrType(retType)
                         widenIfNeeded(mv, valueDesc, returnDesc)
                         emitBoxingIfNeeded(mv, valueDesc, returnDesc)
@@ -541,18 +778,23 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 generateIrReturn(mv, ctx.returnType)
             }
             is IrBlock -> {
+                // 语句位置的块：顺序展开，不做值语义（其最后一条表达式的值是丢弃的）。
                 for (s in stmt.statements) {
                     generateIrStatement(mv, s, ctx, owner)
                 }
             }
             is IrWhen -> generateIrWhen(mv, stmt, ctx, owner)
             is IrWhileLoop -> {
+                // while(cond) body 的模板（先判条件、后跳回）：
+                //   loop: cond; IFEQ end; body; GOTO loop; end:
+                // continue 跳 loopLabel（重新判条件），break 跳 endLabel。
                 val loopLabel = Label()
                 val endLabel = Label()
                 ctx.loopStack.add(Pair(loopLabel, endLabel))
                 mv.visitLabel(loopLabel)
                 val cond = stmt.condition
                 generateIrExpression(mv, cond, ctx, owner)
+                // 条件为「非 0/true」才进体，故 false 时 IFEQ 直接跳出。
                 mv.visitJumpInsn(Opcodes.IFEQ, endLabel)
                 val loopBody = stmt.body
                 if (loopBody is IrBlock) {
@@ -562,9 +804,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
                 mv.visitJumpInsn(Opcodes.GOTO, loopLabel)
                 mv.visitLabel(endLabel)
+                // 出循环后弹栈，恢复上层的 break/continue 目标。
                 ctx.loopStack.removeLast()
             }
             is IrDoWhileLoop -> {
+                // do body while(cond)：体至少执行一次，条件在末尾判断。
+                //   loop: body; cond; IFNE loop; end:
+                // continue 跳 loopLabel 会**跳过条件**直接回体，这是与 while 的已知差异
+                // （由 translator 生成 IR 的方式决定，后端照此翻译）。
                 val loopLabel = Label()
                 val endLabel = Label()
                 ctx.loopStack.add(Pair(loopLabel, endLabel))
@@ -577,11 +824,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
                 val cond = stmt.condition
                 generateIrExpression(mv, cond, ctx, owner)
+                // 条件非 0/true 则回到循环头（IFNE）。
                 mv.visitJumpInsn(Opcodes.IFNE, loopLabel)
                 mv.visitLabel(endLabel)
                 ctx.loopStack.removeLast()
             }
             is IrTry -> {
+                // 无 catch 的 try（只有 try/finally）：不需要异常表，直接把 try 体与
+                // finally 体顺序内联。这不满足「异常路径也执行 finally」的语义，是已知
+                // 简化；正常路径语义与源码一致。
                 if (stmt.catches.isEmpty()) {
                     val tryBody = stmt.tryResult
                     if (tryBody is IrBlock) {
@@ -596,12 +847,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                     } else if (finallyExpr != null) {
                         generateIrExpression(mv, finallyExpr, ctx, owner)
+                        // finally 值只作副作用时留在栈上的值必须弹掉，保持栈平衡。
                         if (typeMapper.jvmDescriptorFromIrType(finallyExpr.type) != "V") {
                             mv.visitInsn(Opcodes.POP)
                         }
                     }
                     return
                 }
+                // 有 catch：构造异常表 tryStart..tryEnd → catchStart，异常类型取第一个
+                // catch 参数的类型（多 catch 时后续类型只做 CHECKCAST，见下）。
                 val tryStart = Label()
                 val tryEnd = Label()
                 val catchStart = Label()
@@ -619,16 +873,23 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     }
                 }
                 mv.visitLabel(tryEnd)
+                // try 正常结束要跳过所有 catch 体，直达 endLabel。
                 mv.visitJumpInsn(Opcodes.GOTO, endLabel)
                 mv.visitLabel(catchStart)
+                // 进入 catch 时操作数栈顶是抛出的异常对象；每个 catch 参数都必须从它
+                // 取值。下面为每个 catch 子句分配一个槽并 ASTORE（先按 Throwable 存，
+                // 具体类型不足时再 CHECKCAST 回写），最后按 catch 顺序生成体。
                 for (catchClause in stmt.catches) {
                     val param = catchClause.catchParameter
                     val pName = param.name.toString()
                     val paramDesc = typeMapper.jvmDescriptorFromIrType(param.type)
                     val paramInternal = typeMapper.jvmInternalNameFromIrType(param.type)
                     val catchSlot = ctx.nextSlot
+                    // 异常对象是引用，占 1 个槽（即便类型是 long/double 也不会出现在这里）。
                     ctx.nextSlot += 1
                     storeLocal(mv, "Ljava/lang/Throwable;", catchSlot)
+                    // 声明的异常类型比 Throwable 更具体时，需 checkcast 后按真实类型
+                    // 重存，后续 loadLocal 才能用正确的描述符取值。
                     if (paramInternal != "java/lang/Throwable" && paramInternal != "throwable") {
                         loadLocal(mv, "Ljava/lang/Throwable;", catchSlot)
                         mv.visitTypeInsn(Opcodes.CHECKCAST, paramInternal)
@@ -649,29 +910,40 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitLabel(endLabel)
             }
             is IrThrow -> {
+                // 先把异常对象压栈，再 ATHROW；之后代码不可达，无需清理栈。
                 generateIrExpression(mv, stmt.value, ctx, owner)
                 mv.visitInsn(Opcodes.ATHROW)
             }
             is IrBreak -> {
+                // 目标取最内层循环的「结束」标签；循环外出现 break（IR 不该有）则静默忽略。
                 ctx.loopStack.lastOrNull()?.second?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
             }
             is IrContinue -> {
+                // 目标取最内层循环的「循环头」标签（while 会重判条件、do-while 直接回体）。
                 ctx.loopStack.lastOrNull()?.first?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
             }
             is IrSetValue -> {
+                // 赋值语句形态：符号 → 名字 → 槽，找不到槽就什么都不生成（例如
+                // 该符号是字段而非局部变量，真正的写走 IrSetField 路径）。
                 val name = ctx.symbolToName[stmt.symbol] ?: ""
                 val slot = ctx.variables[name]
                 if (slot != null) {
                     val local = ctx.locals.find { it.name == name }
+                    // 以登记的 IR 类型为准（可能已拓宽），退化到语句自身的类型。
                     val desc = typeMapper.jvmDescriptorFromIrType(local?.irType ?: stmt.type)
                     generateIrExpression(mv, stmt.value, ctx, owner)
                     storeLocal(mv, desc, slot)
                 }
             }
             is IrSetField -> {
+                // 字段写：复用表达式的 IrSetField 生成逻辑（它会完成 receiver/值/putfield），
+                // 但这里作为「语句」使用，无需保留结果值。
                 generateIrExpression(mv, stmt as IrExpression, ctx, owner)
             }
             else -> {
+                // 兜底：表达式语句——生成后 POP 掉它留给栈的值，维持语句边界栈为空。
+                // 前提是各生成器都遵守「表达式恰好留一个值」的约定（void 调用用 ACONST_NULL
+                // 占位），否则这里会栈下溢。
                 if (stmt is IrExpression) {
                     generateIrExpression(mv, stmt as IrExpression, ctx, owner)
                     mv.visitInsn(Opcodes.POP)
@@ -680,6 +952,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // while/if 链的语句位置生成：条件求值 → IFEQ 到 nextLabel → 分支体 → GOTO end。
+    // 识别「恒真条件」作为 else 分支（translator 用 Bool 字面量 true 表示 else），
+    // 避免把 else 当成普通条件再加一次判断。
     private fun generateIrWhen(mv: MethodVisitor, irWhen: IrWhen, ctx: MethodContext, owner: String) {
         val endLabel = Label()
         val nonElseBranches = irWhen.branches.filter { !isAlwaysTrue(it.condition) }
@@ -687,6 +962,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         for (branch in nonElseBranches) {
             val nextLabel = Label()
             generateIrExpression(mv, branch.condition, ctx, owner)
+            // 条件为假跳到下一个分支的判定点。
             mv.visitJumpInsn(Opcodes.IFEQ, nextLabel)
             val result = branch.result
             if (result is IrBlock) {
@@ -694,9 +970,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     generateIrStatement(mv, s, ctx, owner)
                 }
             } else {
+                // 分支体是单个表达式：它作为一个值留下，语句位置必须弹掉。
                 generateIrExpression(mv, result, ctx, owner)
                 mv.visitInsn(Opcodes.POP)
             }
+            // 命中分支后跳过其余分支。
             mv.visitJumpInsn(Opcodes.GOTO, endLabel)
             mv.visitLabel(nextLabel)
         }
@@ -714,13 +992,21 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitLabel(endLabel)
     }
 
+    // 「恒真条件」判定：translator 用布尔字面量 true 表示 when 的 else/默认分支。
+    // 只认 Bool(true)，不认常量折叠后的表达式——IR 由 translator 规范化保证。
     private fun isAlwaysTrue(cond: IrExpression?): Boolean {
         return cond is IrConstImpl && cond.kind == IrConstKind.Boolean && cond.value == true
     }
 
+    // 表达式生成分派：调用方约定「生成结束后操作数栈顶恰好是表达式的一个值」，
+    // 语句位置由调用方负责 POP。这里集中定义 IR 形态 → 指令序列的映射；
+    // 关键变化点是 irName（translator 的语义调用名），它把后端与翻译策略解耦。
     private fun generateIrExpression(mv: MethodVisitor, expr: IrExpression, ctx: MethodContext, owner: String) {
         when (expr) {
             is IrConstImpl -> {
+                // 常量：负数优先用 ICONST/BIPUSH/SIPUSH/LDC 的最短编码（pushInt 内部判断）；
+                // boolean 压 0/1，char 压其 int 码点，null 压 ACONST_NULL。
+                // 未知常量种类（如 IrConstKind 的新增项）按 null 处理，保证栈上仍有一个值。
                 when (expr.kind) {
                     IrConstKind.Int -> pushInt(mv, (expr.value as Number).toInt())
                     IrConstKind.Long -> mv.visitLdcInsn(expr.value as Long)
@@ -734,6 +1020,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrGetValue -> {
+                // 读值：符号 → 名字 → 槽。查得到就按登记类型 LLOAD/ILOAD/...；
+                // 查不到时做保守兜底——实例方法压 this（ALOAD 0，对应隐式接收者/this 引用），
+                // 静态方法压 null（避免读到未定义槽导致验证失败）。
                 val name = ctx.symbolToName[expr.symbol] ?: ""
                 val slot = ctx.variables[name]
                 if (slot != null) {
@@ -747,17 +1036,22 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrSetValue -> {
+                // 赋值表达式：与语句版不同，赋值本身也产生一个值，因此 store 后再 load
+                // 一份留在栈上（Java 的 a = b 也是表达式）。
                 val name = ctx.symbolToName[expr.symbol] ?: ""
                 val slot = ctx.variables[name]
                 if (slot != null) {
                     val local = ctx.locals.find { it.name == name }
                     val desc = typeMapper.jvmDescriptorFromIrType(local?.irType ?: expr.type)
                     generateIrExpression(mv, expr.value, ctx, owner)
+                    // 按目标槽的描述符拓宽，避免窄类型 store 进宽槽后读出来类型不符。
                     val valueDesc = typeMapper.jvmDescriptorFromIrType(expr.value.type)
                     widenIfNeeded(mv, valueDesc, desc)
                     storeLocal(mv, desc, slot)
                     loadLocal(mv, desc, slot)
                 } else if (!ctx.isStatic) {
+                    // 符号没登记：这通常意味着它是 this 的字段写入，真正的路径是 IrSetField。
+                    // 这里仅求值 value 并压回栈，保持「表达式留一个值」的约定。
                     mv.visitVarInsn(Opcodes.ALOAD, 0)
                     generateIrExpression(mv, expr.value, ctx, owner)
                     // This case handles this.x = v via IrSetField, not IrSetValue
@@ -767,9 +1061,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrCall -> {
+                // 调用分派的核心：translator 把「这次调用在语义上是什么」编码进 callNames，
+                // 于是同一棵 IR 能落到不同指令序列上。这是后端与翻译层之间最关键、
+                // 也最容易受影响的契约（新增语义名要在此处补分支，否则落到 else 的静态调用）。
                 val irName = callNames[expr.symbol] ?: functionSymbolToName[expr.symbol] ?: "invoke"
                 when (irName) {
                     "invoke_lambda" -> {
+                        // 闭包调用：translator 把 lambda 编译成一个带 invoke 方法的匿名类，
+                        // 这里退化为对接收者的 INVOKEVIRTUAL invoke(...)。接收者类型的
+                        // 内部名可能已是全限定名（含 '/'）或只是简单名，后者按当前包补全。
                         val receiver = expr.dispatchReceiver
                         if (receiver != null) {
                             generateIrExpression(mv, receiver, ctx, owner)
@@ -786,12 +1086,20 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // Void closures (e.g. `Action.accept`) leave no value on
                             // the stack, but the statement emitter always expects one
                             // to POP. Mirror the member-call contract with a dummy null.
+                            // 中文：void 闭包（如 Action.accept）调用后栈上没有值，但语句
+                            // 生成器总期望有一个值可 POP；用 ACONST_NULL 占位是全部调用
+                            // 分支共同遵守的约定。
                             if (returnDesc == "V") {
                                 mv.visitInsn(Opcodes.ACONST_NULL)
                             }
                         }
                     }
                     "println", "print" -> {
+                        // 打印：GETSTATIC System.out，把参数统一转成 String 后调用
+                        // PrintStream.print/println(String)。int-like 只需一种 valueOf 重载
+                        // （JVM 上 boolean/byte/short/char 都是 int）；long/float/double 各自
+                        // 用对应重载。无参时 arg==null，直接调用 out.println()... 语法要求
+                        // 至少一个参数，故实际是 println("") —— 由 translator 保证有实参。
                         mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;")
                         val arg = expr.getValueArgument(0)
                         if (arg != null) {
@@ -809,12 +1117,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             }
                         }
                         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", irName, "(Ljava/lang/String;)V", false)
+                        // PrintStream.print/println 返回 void，补 null 维持「留一个值」约定。
                         mv.visitInsn(Opcodes.ACONST_NULL)
                     }
                     "toString" -> {
                         emitToString(mv, expr, ctx, owner)
                     }
                     "__jasper_pow__" -> {
+                        // 幂运算：JVM 没有整数幂指令，统一转 double 走 Math.pow 再转回 int。
+                        // 因此 Jasper 的整数幂语义是「先转 double 计算再截断」，大数会丢精度。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         mv.visitInsn(Opcodes.I2D)
                         generateIrExpression(mv, expr.getValueArgument(1)!!, ctx, owner)
@@ -823,10 +1134,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitInsn(Opcodes.D2I)
                     }
                     "negate" -> {
+                        // 一元取负：直接 INEG（long 的取负由 translator 拆成 0L - x 之类，
+                        // 不会走到这里；若将来遇到 long 需另加 LNEG）。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         mv.visitInsn(Opcodes.INEG)
                     }
                     "not" -> {
+                        // 逻辑非：用「IFEQ 为真」分支把非 0 归 1、0 归 0，避免依赖
+                        // 具体数值，只关心零/非零，符合布尔语义。
                         val trueLabel = Label()
                         val endLabel = Label()
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
@@ -838,10 +1153,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitLabel(endLabel)
                     }
                     "size" -> {
+                        // 数组长度：数组引用压栈后 ARRAYLENGTH（不是字段读取）。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         mv.visitInsn(Opcodes.ARRAYLENGTH)
                     }
                     "get" -> {
+                        // 数组取元素：arr、idx 依次压栈，再按「元素描述符」选 xALOAD。
+                        // 元素类型从数组自身的描述符（形如 "[I"）去掉前导 '[' 得到；
+                        // 解析不出时按引用元素处理（AALOAD）。
                         val arr = expr.getValueArgument(0)!!
                         val idx = expr.getValueArgument(1)!!
                         generateIrExpression(mv, arr, ctx, owner)
@@ -851,6 +1170,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitInsn(arrayLoadOpcode(elemDesc))
                     }
                     "arraySet" -> {
+                        // 数组写元素且表达式有值（a[i] = v 的值是 v）：先算 rhs 存进临时槽，
+                        // 再压 arr、idx，取出 rhs 做 xASTORE，最后再 load 一份 rhs 留栈上。
+                        // 为什么绕一圈：xASTORE 会消耗栈上的 rhs，但表达式语义要求结果仍是 v。
                         val arr = expr.getValueArgument(0)!!
                         val idx = expr.getValueArgument(1)!!
                         val rhs = expr.getValueArgument(2)!!
@@ -867,6 +1189,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         loadLocal(mv, rhsDesc, rhsSlot)
                     }
                     "put" -> {
+                        // Map.put：receiver/key/rhs 依次压栈，key 与 value 都先装箱成
+                        // Object（HashMap 只接受引用），最后调用 put 返回旧值。
                         val receiver = expr.getValueArgument(0)!!
                         val key = expr.getValueArgument(1)!!
                         val rhs = expr.getValueArgument(2)!!
@@ -878,6 +1202,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", false)
                     }
                     "inc" -> {
+                        // 自增：long 用 LADD（常量 1 用 LCONST_1），其余用 IADD。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         val arg0 = expr.getValueArgument(0)!!
                         val argDesc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
@@ -890,6 +1215,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                     }
                     "dec" -> {
+                        // 自减：与 inc 对称，long 用 LSUB，其余用 ISUB。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         val arg0 = expr.getValueArgument(0)!!
                         val argDesc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
@@ -902,6 +1228,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                     }
                     "inv" -> {
+                        // 按位取反：JVM 没有 NOT 指令，等价于 x XOR -1（全 1 掩码），
+                        // long 用 LC 常量 -1L + LXOR，int 用 ICONST_M1 + IXOR。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         val arg0 = expr.getValueArgument(0)!!
                         val argDesc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
@@ -914,6 +1242,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                     }
                     "unaryPlus" -> {
+                        // 一元正号是纯 no-op：只求值并保留在栈上，不生成任何指令。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         // No-op: unary plus just returns the value
                     }
@@ -921,15 +1250,21 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         emitStringConcatCall(mv, expr, ctx, owner)
                     }
                     "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>" -> {
+                        // 二元算术/位/移位。先把两侧拓宽到同一「更宽」描述符（int/float/long/double
+                        // 的选择见 binaryOpWiderDesc），再按操作符选具体 opcode。
                         val arg0 = expr.getValueArgument(0)!!
                         val arg1 = expr.getValueArgument(1)!!
                         val desc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
                         val desc1 = typeMapper.jvmDescriptorFromIrType(arg1.type)
+                        // 左操作数是字符串时整条表达式退化为字符串拼接（+ 的重载解析结果）。
                         if (desc0 == "Ljava/lang/String;" || desc0 == "Ljava/lang/String") {
                             emitStringConcatCall(mv, expr, ctx, owner)
                         } else {
                             // JVM shift instructions take (long, int): the shift
                             // count must stay int even when the value is long.
+                            // 中文：JVM 移位指令的操作数类型是 (long, int)——即便被移位值
+                            // 是 long，移位位数也必须是 int，所以左侧按自身类型拓宽、
+                            // 右侧保持原样，不能一起提升到 wider。
                             val isShift = irName == "<<" || irName == ">>" || irName == ">>>"
                             val wider = if (isShift) desc0 else binaryOpWiderDesc(desc0, desc1)
                             generateIrExpression(mv, arg0, ctx, owner)
@@ -940,6 +1275,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                     }
                     "==", "!=", "<", ">", "<=", ">=" -> {
+                        // 比较：两侧先拓宽到同一描述符，再交给 emitCompare。引用类型走
+                        // Objects.equals（值相等语义），基本类型走 xCMP + 条件跳转。
                         val arg0 = expr.getValueArgument(0)!!
                         val arg1 = expr.getValueArgument(1)!!
                         val desc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
@@ -952,6 +1289,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         emitCompare(mv, irName, wider)
                     }
                     "&&" -> {
+                        // 短路与：第一个为假立即得 0（不再求值右侧，副作用也被跳过）；
+                        // 否则看第二个，都为真得 1。用跳转而非位运算以保持短路语义。
                         val falseLabel = Label()
                         val endLabel = Label()
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
@@ -965,6 +1304,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitLabel(endLabel)
                     }
                     "||" -> {
+                        // 短路或：第一个为真立即得 1（右侧不求值）；否则看第二个。
                         val trueLabel = Label()
                         val endLabel = Label()
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
@@ -978,7 +1318,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitLabel(endLabel)
                     }
                     else -> {
+                        // 非语义化名字的调用，按「谁调谁」再分三类：
+                        //   1) ctor_delegate: 构造器委托（this(...)/super(...)）；
+                        //   2) v: 成员虚调用（含接口/类两种派发）；
+                        //   3) 其它 = 静态函数调用（含跨文件）。
                         if (irName.startsWith("ctor_delegate:")) {
+                            // 形如 "ctor_delegate:super:<Owner>" 或 "ctor_delegate:<...>"。
+                            // super: 前缀显式给出目标类；否则是 this(...) 委托，目标就是本类。
                             val remainder = irName.substring("ctor_delegate:".length)
                             val targetInternal = if (remainder.startsWith("super:")) {
                                 remainder.substring("super:".length)
@@ -986,8 +1332,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 owner
                             }
                             // Emit ALOAD 0 (this) first
+                            // 构造器委托是实例调用，接收者固定为槽 0 的 this。
                             mv.visitVarInsn(Opcodes.ALOAD, 0)
                             // Build descriptor from arg types (skip first arg which is `this`)
+                            // 第 0 个实参是 this（translator 约定），真正参数从 1 开始。
                             val paramSb = StringBuilder()
                             for (i in 1 until expr.valueArgumentsCount) {
                                 val arg = expr.getValueArgument(i) ?: continue
@@ -996,14 +1344,20 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             }
                             mv.visitMethodInsn(Opcodes.INVOKESPECIAL, targetInternal, "<init>", "($paramSb)V", false)
                             // Leave a dummy null on stack so POP (from IrExpression statement handler) works
+                            // 中文：<init> 返回 void，但语句生成器会 POP，补 null 占位。
                             mv.visitInsn(Opcodes.ACONST_NULL)
                         } else if (irName.startsWith("v:")) {
+                            // 成员调用：真实方法名是去掉 "v:" 前缀后的部分。第 0 个实参
+                            // 是接收者，其余是参数。
                             val realName = irName.substring(2)
                             val receiver = expr.getValueArgument(0)!!
                             val rawReceiverInternal = typeMapper.jvmInternalNameFromIrType(receiver.type)
                             val receiverInternal = if (rawReceiverInternal.contains("/")) rawReceiverInternal else "$currentPkg/$rawReceiverInternal"
                             val receiverDesc = typeMapper.jvmDescriptorFromIrType(receiver.type)
                             // Determine if receiver is an interface
+                            // 接口方法必须用 INVOKEINTERFACE（且参数 isInterface=true，
+                            // 末尾 4 字节要求 count 参数），用错会导致 IncompatibleClassChangeError。
+                            // 判定用「原始内部名」与其简单名两种写法，兼容 translator 的命名差异。
                             val isInterfaceTarget = interfaceDeclNames.contains(rawReceiverInternal) ||
                                 interfaceDeclNames.contains(rawReceiverInternal.substringAfterLast('/'))
                             // Generate receiver
@@ -1015,6 +1369,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 generateIrExpression(mv, arg, ctx, owner)
                                 paramSb.append(typeMapper.jvmDescriptorFromIrType(arg.type))
                             }
+                            // 返回描述符有特例：StringBuilder.append/set/get/remove 等
+                            // 链式 API 返回接收者类型本身，而不是 IR 记录的静态类型；
+                            // toString 固定返回 String；其余按 IR 调用类型擦除。
                             val returnDesc = if (realName == "toString") "Ljava/lang/String;"
                                 else if (realName.startsWith("append") || realName == "set" || realName == "get" || realName == "remove") receiverDesc
                                 else typeMapper.jvmReturnDescriptorFromIrType(expr.type)
@@ -1026,12 +1383,16 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // Void member calls (e.g. generated setters) leave no value on
                             // the stack, but the statement emitter always expects one to POP.
                             // Mirror the print/println contract by leaving a dummy null.
+                            // 中文：void 成员调用（如生成的 setter）不留值，补 null 维持约定。
                             if (returnDesc == "V") {
                                 mv.visitInsn(Opcodes.ACONST_NULL)
                             }
                         } else {
+                            // 静态函数调用（含跨文件顶层函数与用户声明的静态方法）。
                             val func = try { expr.symbol.owner } catch (e: Exception) { null }
                             // Generate arguments with boxing
+                            // 参数按 IR 类型求值后，若与目标形参描述符不一致则补装箱
+                            // （例如调用参数声明为 Object 但实参是 int）。
                             for (i in 0 until expr.valueArgumentsCount) {
                                 val arg = expr.getValueArgument(i) ?: continue
                                 generateIrExpression(mv, arg, ctx, owner)
@@ -1041,10 +1402,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                     emitBoxingIfNeeded(mv, argDesc, paramDesc)
                                 }
                             }
+                            // 描述符用被调函数的声明类型（擦除后），拿不到符号时退回实参类型；
+                            // owner 同理退回当前文件（顶层函数同文件调用的情况）。
                             val desc = irCallDescriptor(expr)
                             val targetOwner = functionSymbolToOwner[expr.symbol] ?: owner
                             mv.visitMethodInsn(Opcodes.INVOKESTATIC, targetOwner, irName, desc, false)
                             // Handle return type mismatch between erasure and call-site IR type.
+                            // 中文：调用点 IR 类型与被调函数真实返回类型可能不同（泛型擦除：
+                            // 被调返回 Object，调用点静态类型是具体引用类型），需补 CHECKCAST；
+                            // 或基本类型 ↔ Object 之间补拆箱/装箱，保证栈上值类型与 IR 一致。
                             val callReturnDesc = typeMapper.jvmDescriptorFromIrType(expr.type)
                             val funcReturnDesc = typeMapper.jvmReturnDescriptorFromIrType(
                                 try { func?.returnType } catch (e: Exception) { null } ?: expr.type
@@ -1063,6 +1429,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // the member-call / println contract with a dummy null
                             // (`invokestatic ...)V` followed by an unconditional POP
                             // otherwise underflows the operand stack).
+                            // 中文：void 静态调用同样补 null，否则语句位置的 POP 会栈下溢。
                             if (funcReturnDesc == "V") {
                                 mv.visitInsn(Opcodes.ACONST_NULL)
                             }
@@ -1071,9 +1438,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrConstructorCall -> {
+                // 构造器调用有两种形态，用 translator 给的 constructorTypes 标记区分：
+                //   "array:<elemDesc>" = 数组新建；否则 = 对象新建（NEW+DUP+<init>）。
                 val ctorType = constructorTypes[expr.symbol]
                 if (ctorType != null && ctorType.startsWith("array:")) {
                     val elemDesc = ctorType.substring("array:".length)
+                    // 单参数 = 只给长度：NEWARRAY/ANEWARRAY。多维数组由 translator 编码成
+                    // 多参数（每维一个长度），走 MULTIANEWARRAY。
                     if (expr.valueArgumentsCount == 1) {
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         emitNewArray(mv, elemDesc)
@@ -1082,9 +1453,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             val arg = expr.getValueArgument(i) ?: continue
                             generateIrExpression(mv, arg, ctx, owner)
                         }
+                        // 描述符形如 "[[I"，维数即参数个数；MULTIANEWARRAY 要求维数 ≤ 255。
                         mv.visitMultiANewArrayInsn("[".repeat(expr.valueArgumentsCount) + elemDesc, expr.valueArgumentsCount)
                     }
                 } else {
+                    // 对象新建的标准序列：NEW 压入未初始化引用 → DUP 留一份给 <init> 消耗
+                    // → 求值各实参 → INVOKESPECIAL <init>。漏掉 DUP 会导致没引用可用。
                     val rawName = typeMapper.jvmInternalNameFromIrType(expr.type)
                     val internalName = if (rawName.contains("/")) rawName else "$currentPkg/$rawName"
                     val desc = irNewDescriptor(expr)
@@ -1098,6 +1472,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrGetField -> {
+                // 字段读取：先看是否为接口常量（static final），走 GETSTATIC；
+                // 否则求接收者后 GETFIELD。字段名兜底为 "field"（符号表缺失时不至于崩）。
                 val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
                 if (expr.symbol in staticFieldSymbols) {
                     val fieldOwner = resolveFieldOwner(expr.symbol)
@@ -1108,6 +1484,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val receiver = expr.receiver
                 if (receiver != null) generateIrExpression(mv, receiver, ctx, owner)
                 // Handle array.length: emit ARRAYLENGTH instead of GETFIELD
+                // 中文：`arr.length` 在 JVM 里是 ARRAYLENGTH 指令，不是字段访问——IR 把它
+                // 表达成对数组的字段读取，这里必须改写指令，否则会写出不存在的 length 字段。
                 if (receiver != null && isArrayType(receiver.type)) {
                     mv.visitInsn(Opcodes.ARRAYLENGTH)
                     return
@@ -1117,6 +1495,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitFieldInsn(Opcodes.GETFIELD, fieldOwner, fieldName, fieldDesc)
             }
             is IrSetField -> {
+                // 字段写：静态走 PUTSTATIC（无接收者）；实例先压接收者再压值，最后 PUTFIELD。
+                // 描述符取被写值的类型（与字段声明类型在 translator 侧已对齐）。
                 val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
                 if (expr.symbol in staticFieldSymbols) {
                     generateIrExpression(mv, expr.value, ctx, owner)
@@ -1133,6 +1513,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitFieldInsn(Opcodes.PUTFIELD, fieldOwner, fieldName, fieldDesc)
             }
             is IrBlock -> {
+                // 表达式位置的块：前 n-1 条按语句生成（丢弃值），最后一条决定整块的
+                // 值——表达式则保留在栈上，否则按语句生成（此时块本身无值）。
                 val stmts = expr.statements
                 for (i in 0 until stmts.size - 1) {
                     generateIrStatement(mv, stmts[i], ctx, owner)
@@ -1147,6 +1529,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrWhen -> {
+                // 表达式位置的 when：每个非 else 分支命中后把结果值留在栈上并 GOTO end，
+                // 未命中则落到下一个分支判定点（branchEnd）；else 分支不跳转，直接产出值。
+                // 与语句位置版本的区别：这里不 POP 结果，也不允许分支体丢值。
                 val endLabel = Label()
                 val nonElseBranches = expr.branches.filter { !isAlwaysTrue(it.condition) }
                 val elseBranch = expr.branches.firstOrNull { isAlwaysTrue(it.condition) }
@@ -1196,11 +1581,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitLabel(endLabel)
             }
             is IrFunctionExpression -> {
+                // 已废弃路径：lambda 现在由 translator 翻译成匿名 IrClass，不再用
+                // IrFunctionExpression。这里只做兜底（压 null），保证不崩且栈平衡。
                 emitLambda(mv, expr, ctx, owner)
             }
             is IrTypeOperatorCall -> {
+                // 类型算子：非空断言、instanceof、cast。其它算子（IMPLICIT_CAST 等）
+                // 一律退化为「原样求值」——它们的语义在 JVM 层没有指令，只影响静态类型。
                 when (expr.operator) {
                     IrTypeOperator.IMPLICIT_NOTNULL -> {
+                        // 非空断言：JVM 无专用指令，这里生成「非 null → 1，否则 0」的布尔值。
+                        // 注意：这不是抛异常的断言，只是把非空性表达成一个布尔结果。
                         val trueLabel = Label()
                         val endLabel = Label()
                         generateIrExpression(mv, expr.argument, ctx, owner)
@@ -1212,11 +1603,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitLabel(endLabel)
                     }
                     IrTypeOperator.INSTANCEOF -> {
+                        // x is T：压值后直接 INSTANCEOF T，结果天然是 0/1。
                         generateIrExpression(mv, expr.argument, ctx, owner)
                         val internalName = typeMapper.jvmInternalNameFromIrType(expr.typeOperand)
                         mv.visitTypeInsn(Opcodes.INSTANCEOF, internalName)
                     }
                     IrTypeOperator.CAST -> {
+                        // 类型转换矩阵（源类型 × 目标类型）：
+                        //   目标引用 + 源基本类型 → 先装箱再 CHECKCAST（验证器要求栈上是引用）；
+                        //                            目标是 Object/Serializable 时无需 checkcast；
+                        //   目标引用 + 源引用     → 直接 CHECKCAST；
+                        //   目标基本 + 源基本     → 数值转换（int-like 之间是 no-op）；
+                        //   目标基本 + 源引用     → CHECKCAST 到包装类再调 xxxValue 拆箱。
                         val argument = expr.argument
                         generateIrExpression(mv, argument, ctx, owner)
                         val srcDesc = typeMapper.jvmDescriptorFromIrType(argument.type)
@@ -1239,6 +1637,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         } else {
                             // Reference -> primitive: checkcast to the box
                             // type, then unbox.
+                            // 中文：引用转基本类型——先 checkcast 到包装类，再调 xxxValue。
                             emitUnboxingFromRef(mv, dstDesc)
                         }
                     }
@@ -1249,14 +1648,20 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // translator 用 IrConst(Null) 占位表示「这个表达式没有值」（如 void return）。
+    // 生成 return 时据此决定要不要压返回值。
     private fun isIrVoidExpr(expr: IrExpression): Boolean {
         return expr is IrConstImpl && expr.kind == IrConstKind.Null
     }
 
+    // 方法体顶层是否已有 return 语句：没有则由 generateIrFunction 补一条。
+    // 只检查顶层（不递归进 if/loop）——嵌套分支的 return 由各分支自己发射。
     private fun hasIrReturn(body: IrBlockBody): Boolean {
         return body.statements.any { it is IrReturn }
     }
 
+    // 按返回类型选 return 指令：void→RETURN、int-like→IRETURN、long→LRETURN、
+    // float/double→FRETURN/DRETURN、引用/数组→ARETURN。returnType 为 null 视作 void。
     private fun generateIrReturn(mv: MethodVisitor, returnType: IrType?) {
         val d = if (returnType != null) typeMapper.jvmReturnDescriptorFromIrType(returnType) else "V"
         when {
@@ -1269,6 +1674,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 方法描述符：形如 (参数描述符...)返回描述符。参数按声明顺序拼接（擦除后），
+    // 不使用泛型信息——这正是 JVM 方法签名的定义。
     private fun irMethodDescriptor(func: IrSimpleFunction): String {
         val paramDescs = func.valueParameters.joinToString("") {
             typeMapper.jvmDescriptorFromIrType(it.type)
@@ -1277,6 +1684,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return "($paramDescs)$rd"
     }
 
+    // 构造器描述符：参数同方法，返回固定 V（<init> 永远返回 void）。
     private fun irConstructorDescriptor(ctor: IrConstructor): String {
         val paramDescs = ctor.valueParameters.joinToString("") {
             typeMapper.jvmDescriptorFromIrType(it.type)
@@ -1287,6 +1695,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private fun irCallDescriptor(call: IrCall): String {
         // Use the function's declared parameter types for the descriptor (erasure),
         // falling back to argument types if the target function is not found.
+        // 中文：优先用被调函数的声明参数类型（擦除后）——这才是 JVM 里的真实签名；
+        // 符号解析不到（跨模块未登记）时退回实参类型，保证至少能拼出可用的描述符。
         val func = try { call.symbol.owner } catch (e: Exception) { null }
         if (func != null) {
             return irMethodDescriptor(func)
@@ -1299,6 +1709,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return "($paramDescs)$returnDesc"
     }
 
+    // NEW 之后的构造器描述符：只能从实参类型推断（构造器没有可直接取用的描述符表），
+    // 返回固定 V。实参缺失时按 Object 兜底。
     private fun irNewDescriptor(ctor: IrConstructorCall): String {
         val paramDescs = (0 until ctor.valueArgumentsCount).joinToString("") {
             val arg = ctor.getValueArgument(it)
@@ -1307,11 +1719,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return "($paramDescs)V"
     }
 
+    // 局部变量占用的槽位数：long/double 是宽类型，各占 2 个槽，其余 1 个。
+    // 这是所有槽位推进（参数、变量、临时值）的唯一依据，写错会导致变量互相覆盖。
     private fun irTypeSlots(type: IrType): Int {
         val desc = typeMapper.jvmDescriptorFromIrType(type)
         return if (desc == "J" || desc == "D") 2 else 1
     }
 
+    // 按描述符选 load 指令：int-like（含 boolean/byte/short/char，JVM 上都以 int 存）
+    // 用 ILOAD，long/float/double 各自 LLOAD/FLOAD/DLOAD，其余（引用/数组）ALOAD。
     private fun loadLocal(mv: MethodVisitor, desc: String, slot: Int) {
         when (desc) {
             "I", "Z", "B", "S", "C" -> mv.visitVarInsn(Opcodes.ILOAD, slot)
@@ -1322,6 +1738,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 与 loadLocal 对称的 store 指令选择。
     private fun storeLocal(mv: MethodVisitor, desc: String, slot: Int) {
         when (desc) {
             "I", "Z", "B", "S", "C" -> mv.visitVarInsn(Opcodes.ISTORE, slot)
@@ -1332,6 +1749,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 压入 int 常量并按编码宽度选最短指令：-1..5 用 ICONST_*，byte 范围用 BIPUSH，
+    // short 范围用 SIPUSH，更大用 LDC（常量池）。纯体积优化，语义等价。
     private fun pushInt(mv: MethodVisitor, value: Int) {
         when (value) {
             -1 -> mv.visitInsn(Opcodes.ICONST_M1)
@@ -1347,6 +1766,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 数值拓宽：只做 JVM 支持的「向上」转换（I→J/F/D、J→F/D、F→D），不做窄化。
+    // 用途是让二元运算两侧类型一致；窄化必须走 emitNumericConversion（cast 语义）。
     private fun widenIfNeeded(mv: MethodVisitor, sourceDesc: String, targetDesc: String) {
         if (sourceDesc == targetDesc) return
         when (sourceDesc) {
@@ -1365,6 +1786,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 基本类型描述符判定：单字符且在 IJFDBSCZ 之内（I=int, J=long, F=float, D=double,
+    // B=byte, S=short, C=char, Z=boolean）。注意 'V' 不在其中（void 不是值类型）。
     private fun isPrimitiveDesc(desc: String): Boolean =
         desc.length == 1 && desc[0] in "IJFDBSCZ"
 
@@ -1372,6 +1795,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      * Primitive-to-primitive numeric conversion used by `cast` lowering.
      * Boolean/byte/short/char all live on the JVM stack as ints, so
      * conversions among the int-like descriptors are no-ops.
+     * 中文：cast 降低所需的基本类型互转。boolean/byte/short/char 在 JVM 栈上都以
+     * int 存在，因此 int-like 之间的转换是空操作（直接 return）；其余按 12 种
+     * 组合查表选指令。边界：不支持的组合 opcode 为 -1，静默不发指令。
      */
     private fun emitNumericConversion(mv: MethodVisitor, srcDesc: String, dstDesc: String) {
         if (srcDesc == dstDesc) return
@@ -1396,6 +1822,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     }
 
     /** Reference -> primitive: checkcast to the box type, then unbox. */
+    // 中文：引用 → 基本类型：先 CHECKCAST 到对应包装类（栈上是 Object，验证器需要具体类型），
+    // 再 INVOKEVIRTUAL xxxValue 取标量。目标描述符不在表内（非基本类型）时静默返回。
     private fun emitUnboxingFromRef(mv: MethodVisitor, dstDesc: String) {
         val (boxInternal, getter) = when (dstDesc) {
             "I" -> "java/lang/Integer" to "intValue"
@@ -1412,6 +1840,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, boxInternal, getter, "()$dstDesc", false)
     }
 
+    // 只在「目标是 Object/Serializable」时装箱：这两个是调用/赋值中最常见的
+    // 「擦除到引用」目标；更具体的引用目标（如 List）不在这里处理，由调用点的
+    // 描述符与 IR 类型对齐保证。byte/short/char 不在表内（它们以 int 形式装箱）。
     private fun emitBoxingIfNeeded(mv: MethodVisitor, fromDesc: String, toDesc: String) {
         if (toDesc == "Ljava/lang/Object;" || toDesc == "Ljava/io/Serializable;") {
             when (fromDesc) {
@@ -1424,6 +1855,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 拆箱：用于「返回值从 Object（擦除）回到具体基本类型」的调用点修正。
+    // 与 emitBoxingIfNeeded 方向相反；同样只处理 Object/Serializable 这一种来源。
     private fun emitUnboxingIfNeeded(mv: MethodVisitor, fromDesc: String, toDesc: String) {
         if (fromDesc == "Ljava/lang/Object;" || fromDesc == "Ljava/io/Serializable;") {
             when (toDesc) {
@@ -1451,6 +1884,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 二元运算的操作数提升：返回两者中「更宽」的描述符。优先级 I(0) < F/J(1) < D(2)，
+    // 同优先级取 desc1（因此 long+float 会提升为 long，是既定的近似策略）。
+    // 注意：表里没有的（引用类型）直接返回对方，调用方需自行保证两侧同类型。
     private fun binaryOpWiderDesc(desc1: String, desc2: String): String {
         if (desc1 == desc2) return desc1
         val priority = mapOf("I" to 0, "F" to 1, "J" to 1, "D" to 2)
@@ -1459,6 +1895,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return if (p1 >= p2) desc1 else desc2
     }
 
+    // 按「已提升后的描述符 + 操作符」选算术/位/移位指令。前面调用方已把两侧
+    // 拓宽到同一 desc，因此这里只需按 desc 在 long/double/float/int 四套指令里选。
     private fun emitBinaryArithmeticOp(mv: MethodVisitor, op: String, desc: String) {
         val isLong = desc == "J"
         val isDouble = desc == "D"
@@ -1478,12 +1916,19 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 比较生成布尔结果（0/1），栈上两个操作数已被拓宽到同一 desc。
+    //   引用/数组：用 Objects.equals 做值相等——因此 <、> 等序比较对引用类型无意义，
+    //             这里统一返回 0（源码层对引用类型本就不该出现序比较）。
+    //   long/float/double：先 LCMP/DCMPG/FCMPG 压成一个 int 再条件跳转；
+    //   int-like：直接 IF_ICMPxx 比较。
+    // 三段结构：条件真 → trueLabel(压 1)；否则落 0 → GOTO end。
     private fun emitCompare(mv: MethodVisitor, op: String, desc: String) {
         if (desc.startsWith("L") || desc.startsWith("[")) {
             mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z", false)
             if (op == "==") {
                 return
             } else if (op == "!=") {
+                // equals 结果取反：1 XOR 结果（0→1, 1→0）。
                 mv.visitInsn(Opcodes.ICONST_1)
                 mv.visitInsn(Opcodes.IXOR)
                 return
@@ -1497,6 +1942,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         val isLong = desc == "J"
         val isDouble = desc == "D"
         val isFloat = desc == "F"
+        // 宽类型先归一化成 int（-1/0/1）再比较。用 xCMPG（NaN 当最大）使 NaN 比较
+        // 结果偏「大」，与浮点比较规则中的 NaN 语义近似。
         if (isLong) {
             mv.visitInsn(Opcodes.LCMP)
         } else if (isDouble || isFloat) {
@@ -1526,6 +1973,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitLabel(endLabel)
     }
 
+    // 字符串拼接（"string_plus"）：new StringBuilder → 逐参数 append → toString。
+    // 不使用 invokedynamic（StringConcatFactory）以避开 class 版本与 native-image
+    // 配置问题；代价是体积略大、性能略低于 JIT 优化后的 makeConcatWithConstants。
+    // 每个参数先经 String.valueOf 归一成 String，再走 append(String)。
     private fun emitStringConcatCall(mv: MethodVisitor, expr: IrCall, ctx: MethodContext, owner: String) {
         mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder")
         mv.visitInsn(Opcodes.DUP)
@@ -1545,6 +1996,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false)
     }
 
+    // 单值 toString：基本类型走 String.valueOf 的对应重载，引用类型走
+    // String.valueOf(Object)（内部对 null 返回 "null"，因此无需显式判空）。
     private fun emitToString(mv: MethodVisitor, expr: IrCall, ctx: MethodContext, owner: String) {
         val arg = expr.getValueArgument(0)!!
         val desc = typeMapper.jvmDescriptorFromIrType(arg.type)
@@ -1559,6 +2012,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", valueOfMethod, false)
     }
 
+    // 把「栈顶那一个值」按描述符装箱成包装类（覆盖全部 8 种基本类型）。
+    // 与 emitBoxingIfNeeded 的区别：这里不判断目标类型，只要基本类型就装箱，
+    // 专用于 Map.put 这类「两个参数都必须是 Object」的场景。
     private fun boxTopOfStack(mv: MethodVisitor, desc: String) {
         when (desc) {
             "I" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", false)
@@ -1572,11 +2028,16 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 从数组表达式的描述符（"[I" / "[Ljava/lang/String;"）取出元素描述符；
+    // 不是数组时按 Object 兜底（调用方应先确认，否则会选错 xALOAD）。
+    // 注意：本文件内目前无人调用——"get" 分支内联了同样的 substring 逻辑，
+    // 属于重复实现，待清理；保留仅为不改变行为。
     private fun arrayElementDesc(arrExpr: IrExpression): String {
         val desc = typeMapper.jvmDescriptorFromIrType(arrExpr.type)
         return if (desc.startsWith("[")) desc.substring(1) else "Ljava/lang/Object;"
     }
 
+    // 数组读指令选择：按元素描述符选 xALOAD。boolean/byte 共用 BALOAD（栈上都以 int 表示）。
     private fun arrayLoadOpcode(desc: String): Int {
         return when (desc) {
             "I" -> Opcodes.IALOAD; "J" -> Opcodes.LALOAD; "F" -> Opcodes.FALOAD
@@ -1585,6 +2046,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 数组写指令选择：与 arrayLoadOpcode 对称（boolean/byte 共用 BASTORE）。
     private fun arrayStoreOpcode(desc: String): Int {
         return when (desc) {
             "I" -> Opcodes.IASTORE; "J" -> Opcodes.LASTORE; "F" -> Opcodes.FASTORE
@@ -1593,6 +2055,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // 新建一维数组：基本类型用 NEWARRAY + 类型码，引用类型用 ANEWARRAY+内部名。
+    // 调用前栈上必须已压好长度（int）。elemDesc 是元素描述符而非数组描述符。
     private fun emitNewArray(mv: MethodVisitor, elemDesc: String) {
         when (elemDesc) {
             "I" -> mv.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_INT)
@@ -1604,12 +2068,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             "S" -> mv.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_SHORT)
             "C" -> mv.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_CHAR)
             else -> {
+                // 引用元素：把 "Ljava/lang/String;" 还原成 "java/lang/String" 内部名。
                 val internalName = elemDesc.removePrefix("L").removeSuffix(";").replace('.', '/')
                 mv.visitTypeInsn(Opcodes.ANEWARRAY, internalName)
             }
         }
     }
 
+    // lambda 兜底：lambda 已改由 translator 生成匿名 IrClass，故此路径理论上不再
+    // 出现；真出现时只压 null，保证不抛异常且栈平衡（缺方法体是静默退化）。
     private fun emitLambda(mv: MethodVisitor, expr: IrFunctionExpression, ctx: MethodContext, owner: String) {
         // Lambdas are now translated as anonymous IrClass declarations in the translator.
         // IrFunctionExpression is deprecated; use the anonymous class path instead.
@@ -1617,6 +2084,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitInsn(Opcodes.ACONST_NULL)
     }
 
+    // 返回指令映射的「按描述符」版本：与 generateIrReturn 的 when 逻辑重复。
+    // 注意：本文件内目前无人调用（generateIrReturn 直接内联了同样的映射），
+    // 属于待清理的重复/死代码；保留仅为不改变行为，抽出时应与 generateIrReturn 合并。
     private fun returnOpcode(desc: String): Int {
         return when {
             desc == "I" || desc == "Z" || desc == "B" || desc == "S" || desc == "C" -> Opcodes.IRETURN
@@ -1627,6 +2097,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
+    // load 指令映射的「返回 opcode」版本：与 loadLocal 重复。
+    // 注意：本文件内目前无人调用（loadLocal 直接 visitVarInsn），同为待清理的死代码。
     private fun loadOpcode(desc: String): Int {
         return when {
             desc == "I" || desc == "Z" || desc == "B" || desc == "S" || desc == "C" -> Opcodes.ILOAD
