@@ -1,0 +1,37 @@
+// =============================================================================
+// Row.jas —— R2DBC 的行载荷（可运行形状的具体元素类型）
+// =============================================================================
+// 做什么：一行结果的具体类型。R2DBC 的 Row 是「列名 -> 值」的映射；Jasper 当前
+//   没有可用的泛型 map 类型（见 FINDINGS #16），故这里用固定的两个强类型字段
+//   （id、name）表达最常见的两列。
+// 什么时候用：作为 Publisher/Subscriber 的元素类型被逐行传递。
+// 为什么不用泛型：`Publisher<T>` 无法实现与分派（见 ReactiveStreams.jas 说明）。
+//
+// 为什么字段私有、只暴露 id()/name() 取值方法：
+//   跨文件读取**公有字段**只有在「声明字段的文件先于读取者被翻译」时才可用；
+//   文件翻译顺序按文件名排序，Row 排在 MemoryR2dbc 之后，于是 `row.id` 会生成
+//   对名为 "field"、签名 "V" 的伪字段访问，加载类时抛 ClassFormatError
+//   （见 FINDINGS #5「跨文件字段读取依赖文件翻译顺序」）。改用方法调用可绕开该缺陷：
+//   成员方法的返回类型在翻译第一遍就已跨文件登记，与文件顺序无关。
+// =============================================================================
+package std;
+
+public class Row {
+    private var idValue: int32;
+    private var nameValue: string;
+
+    public constructor(id: int32, name: string) {
+        this.idValue = id;
+        this.nameValue = name;
+    }
+
+    // 行首列（主键）——R2DBC 的 `row.get(0, Int::class)` 形状的本探针替代。
+    public function id(): int32 {
+        return this.idValue;
+    }
+
+    // 第二列（文本）——对应 `row.get(1, String::class)`。
+    public function name(): string {
+        return this.nameValue;
+    }
+}

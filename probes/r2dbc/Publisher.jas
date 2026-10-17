@@ -1,0 +1,41 @@
+package std;
+
+// =============================================================================
+// Publisher.jas —— 发布者协议族（Publisher / Mono / Flux）
+// =============================================================================
+// 做什么：定义 R2DBC/Reactive Streams 的发布端形状：
+//   Publisher.subscribe(subscriber)      —— 订阅入口；
+//   Mono  extends Publisher + block()    —— 单值流（begin/commit/rollback 的返回）；
+//   Flux  extends Publisher + collect()  —— 多值流（一次查询的行集）。
+// 什么时候用：Connection/Statement 的方法返回 Mono/Flux；调用方用 Publisher
+//   的多态类型统一 subscribe。
+// 失败模式：subscribe 必须恰好回调 subscriber 一次；本项目由内存实现保证。
+//
+// 为什么继承而不是各写一份 subscribe 签名：
+//   Mono/Flux 都是 Publisher 的特化，用「接口继承」表达 is-a 关系，避免把
+//   subscribe 重复声明三遍（重复逻辑抽到正确层次）。调用方因此可以只写一次
+//   订阅流程，面向 Publisher 编程——这是本探针最主要的「低耦合」点：
+//   订阅流程完全不知道背后是单值还是多值、内存还是网络。
+//
+// 文件结构说明：多顶层类型文件须 `package` 开头（见 Connection.jas 与 FINDINGS 第 12 条）。
+// =============================================================================
+
+public interface Publisher {
+    public function subscribe(subscriber: Subscriber): void;
+}
+
+// 单值流：订阅后要么给出 0/1 个元素再 onComplete，要么直接 onError。
+// block() 是同步的「拿一次值」——在真正的异步模型里它应当挂起等待，
+// 但 `await` 当前不可用（见 FINDINGS 第 1 条），故这里是同步语义。
+public interface Mono extends Publisher {
+    public function block(): Row;
+}
+
+// 多值流：一次查询的结果集。
+public interface Flux extends Publisher {
+    // 接口常量：期望的抓取窗口大小（RFC/驱动器惯用）。
+    public const FETCH_SIZE: int32 = 256;
+
+    // 把整个流物化成数组（内存实现可直接给出；网络实现需先缓冲）。
+    public function collect(): Row[];
+}

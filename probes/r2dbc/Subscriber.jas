@@ -1,0 +1,28 @@
+// =============================================================================
+// Subscriber.jas —— 订阅者协议（onSubscribe / onNext / onError / onComplete）
+// =============================================================================
+// 做什么：定义 R2DBC/Reactive Streams 的四段式订阅者协议。
+//   生命周期严格有序：onSubscribe(subscription) 先到，随后是 0..N 个 onNext，
+//   最后**要么** onComplete **要么** onError（互斥且只来一次）。
+// 什么时候用：任何想消费查询结果的组件实现它；发布者在 subscribe() 里回调它。
+// 前置条件：实现方必须先在 onSubscribe 里拿到 Subscription 才能取消。
+// 失败模式：协议顺序由发布者保证；语言层不强制，顺序错误由实现方负责。
+//
+// 为什么元素类型是具体 `Row` 而不是泛型 `T`：
+//   `Subscriber<T>.onNext(T)` 现在无法工作——T 的描述符被写成 `LT;` 而非擦除后的
+//   `Ljava/lang/Object;`，调用点会 NoSuchMethodError（见 FINDINGS 第 3 条）。
+//   故可运行形状把元素类型固定为 Row；理想泛型形状保留在 ReactiveStreams.jas。
+//
+// 为什么 onError 收的是 R2dbcException（import 自 probes.r2dbc）：
+//   验证跨包类型可以作为接口方法形参被引用与链接。
+// =============================================================================
+package std;
+
+import probes.r2dbc.R2dbcException;
+
+public interface Subscriber {
+    public function onSubscribe(subscription: Subscription): void;
+    public function onNext(row: Row): void;
+    public function onError(error: R2dbcException): void;
+    public function onComplete(): void;
+}

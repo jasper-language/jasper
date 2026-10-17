@@ -1,0 +1,21 @@
+// =============================================================================
+// Subscription.jas —— 订阅句柄（取消 + 资源释放）
+// =============================================================================
+// 做什么：Reactive Streams 的 Subscription 形状——订阅者通过它取消订阅，
+//   `isCancelled()` 让发布者知道应在下一个边界停止推送。
+// 什么时候用：Subscriber.onSubscribe(subscription) 收到它；发布者在每个
+//   投递边界检查 isCancelled()，从而实现「取消后释放资源」。
+// 为什么额外有 isReleased()：R2DBC/Reactive Streams 本身没有这个方法；
+//   它是本探针为「可观察资源释放」加的观测点——取消订阅时必须把底层资源
+//   （连接/游标）关掉，测试据此断言取消确实触发了释放。
+// 变化点（Strategy）：真正如何释放资源由实现类决定；取消协议保持稳定。
+// =============================================================================
+package std;
+
+public interface Subscription {
+    public function cancel(): void;
+    public function isCancelled(): bool;
+
+    // 探针专用观测点：底层资源是否已因取消而释放。
+    public function isReleased(): bool;
+}

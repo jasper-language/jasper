@@ -1,0 +1,524 @@
+package std;
+
+import probes.r2dbc.R2dbcException;
+import probes.r2dbc.TransientR2dbcException;
+
+// =============================================================================
+// MemoryR2dbc.jas —— R2DBC 形状的内存假实现 + 探针驱动器
+// =============================================================================
+// 做什么：给出 Publisher/Subscriber/Mono/Flux/Connection/Statement 的一整套内存
+//   实现，并用 main() 走一遍「订阅 -> 逐行 -> 完成 / 取消 / 错误传播 / 事务边界 /
+//   游标读取」的完整链路。返回值是可断言的整数聚合结果（由 R2dbcProbeTest 断言）。
+//
+// 所属层次与依赖方向（单向，无环）：
+//   本文件（实现层）依赖同包的接口文件（Connection/MemoryResultSet/Publisher/
+//   Subscriber/Subscription/Row）与 probes.r2dbc.R2dbcException。
+//   接口层不反向依赖实现层——把接口与实现分开，实现可整体替换（Strategy）。
+//
+// 用到的设计模式与它们隔离的变化点：
+//   * Strategy：Subscription 的资源释放、Publisher 的实现细节被接口隔离；
+//     main 面向 Publisher 编程，不知道背后是内存还是网络。
+//   * Decorator：TakeFlux 包裹任意 Flux，在不改动被包裹对象的前提下加「只取前 N 个」
+//     的算子——新增算子不再触碰 ArrayFlux/Statement。
+//   * Observer：Subscriber 的四段回调就是观察者；发布者只对接口发事件。
+//
+// 规避说明（每条都在 FINDINGS.md 有对应条目）：
+//   * 元素类型固定为 Row，而不是泛型 T（描述符 LT; 缺陷，FINDINGS #3）。
+//   * 把具体实现先赋给接口类型局部变量，再传给接口形参/字段，而不是直接传/存
+//     具体类型表达式：成员调用的形参描述符与字段赋值描述符都取**实参/右值**的静态
+//     类型，未宽化到声明的接口类型（FINDINGS #8）；例如
+//     `var s: Subscriber = sub; pub.subscribe(s);` 与 TakeFlux 的 seedSub。
+//   * 跨文件读取**字段**需声明文件的翻译顺序在前，否则描述符退化成 "field"/V
+//     （FINDINGS #5）；本文件改用 Row 的 id()/name() 取值方法绕开。
+//   * 在子类类型接收者上调用**继承来的**方法，返回描述符会退化为 void
+//     （FINDINGS #6）；errorState 用 R2dbcException 声明类型接收者。
+//   * 子类实例不能赋给基类类型变量（FINDINGS #9）；本探针不做类层次多态赋值，
+//     多态一律走接口。
+//   * 订阅者不保存可空的 Subscription 字段（可空引用字段描述符错误，FINDINGS #10），
+//     取消所需的句柄通过参数即取即用。
+//   * `finally` 在本后端不可靠（FINDINGS #4），资源释放统一用 `defer`。
+//
+// 文件结构说明：多顶层类型文件须 `package` 开头（见 FINDINGS 第 12 条）。
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// 资源与订阅
+// ---------------------------------------------------------------------------
+
+// 可观察的底层资源（连接/游标）。cancel() 必须把它关掉——这是「取消即释放」的落点。
+public class Resource {
+    private var closedFlag: bool;
+
+    public constructor() {
+        this.closedFlag = false;
+    }
+
+    public function close(): void {
+        this.closedFlag = true;
+    }
+
+    public function closed(): bool {
+        return this.closedFlag;
+    }
+}
+
+public class MemorySubscription implements Subscription {
+    private var cancelled: bool;
+    private var resource: Resource;
+
+    public constructor(resource: Resource) {
+        this.cancelled = false;
+        this.resource = resource;
+    }
+
+    public function cancel(): void {
+        this.cancelled = true;
+        // 取消的同时释放底层资源：Reactive Streams 要求取消能停止上游并释放。
+        this.resource.close();
+    }
+
+    public function isCancelled(): bool {
+        return this.cancelled;
+    }
+
+    public function isReleased(): bool {
+        return this.resource.closed();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 发布端实现
+// ---------------------------------------------------------------------------
+
+// 多值流：把一个 Row[] 逐行推给订阅者；每个投递边界检查取消。
+public class ArrayFlux implements Flux {
+    private var rows: Row[];
+    private var resource: Resource;
+
+    public constructor(rows: Row[]) {
+        this.rows = rows;
+        this.resource = new Resource();
+    }
+
+    public function subscribe(subscriber: Subscriber): void {
+        // 先发 Subscription，再开始投递（协议要求）。
+        var sub: Subscription = new MemorySubscription(this.resource);
+        subscriber.onSubscribe(sub);
+        var i: int32 = 0;
+        while (i < this.rows.length) {
+            if (sub.isCancelled()) {
+                // 取消后立即停止投递（资源已在 cancel() 里释放）。
+                return;
+            }
+            var row: Row = this.rows[i];
+            subscriber.onNext(row);
+            i = i + 1;
+        }
+        subscriber.onComplete();
+    }
+
+    public function collect(): Row[] {
+        return this.rows;
+    }
+}
+
+// 单值流：订阅后给出 0/1 个元素再 onComplete。
+public class SingleMono implements Mono {
+    private var row: Row;
+    private var resource: Resource;
+
+    public constructor(row: Row) {
+        this.row = row;
+        this.resource = new Resource();
+    }
+
+    public function subscribe(subscriber: Subscriber): void {
+        var sub: Subscription = new MemorySubscription(this.resource);
+        subscriber.onSubscribe(sub);
+        if (!sub.isCancelled()) {
+            subscriber.onNext(this.row);
+            subscriber.onComplete();
+        }
+    }
+
+    public function block(): Row {
+        return this.row;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 算子（Decorator）：只取前 limit 个，然后取消上游并向下游完成
+// ---------------------------------------------------------------------------
+
+// 把上游事件转交给下游，同时做「最多转发 limit 个」的限流；达到上限后取消上游。
+// seed 是一个占位订阅句柄：Jasper 不能保存可空的接口字段，故用构造参数注入一个
+// 非空初值，onSubscribe 到达后再替换为真实句柄。
+public class GatedSubscriber implements Subscriber {
+    private var downstream: Subscriber;
+    private var remaining: int32;
+    private var upstream: Subscription;
+    private var completed: bool;
+
+    public constructor(downstream: Subscriber, limit: int32, seed: Subscription) {
+        this.downstream = downstream;
+        this.remaining = limit;
+        this.upstream = seed;
+        this.completed = false;
+    }
+
+    public function onSubscribe(subscription: Subscription): void {
+        this.upstream = subscription;
+        // 透传订阅句柄，让下游也可以取消。
+        this.downstream.onSubscribe(subscription);
+    }
+
+    public function onNext(row: Row): void {
+        if (this.remaining <= 0) {
+            this.upstream.cancel();
+            if (!this.completed) {
+                this.completed = true;
+                this.downstream.onComplete();
+            }
+            return;
+        }
+        this.remaining = this.remaining - 1;
+        this.downstream.onNext(row);
+    }
+
+    public function onError(error: R2dbcException): void {
+        this.downstream.onError(error);
+    }
+
+    public function onComplete(): void {
+        if (!this.completed) {
+            this.completed = true;
+            this.downstream.onComplete();
+        }
+    }
+}
+
+public class TakeFlux implements Flux {
+    private var source: Flux;
+    private var limit: int32;
+    private var seed: Subscription;
+
+    public constructor(source: Flux, limit: int32) {
+        this.source = source;
+        this.limit = limit;
+        // 占位句柄：见 GatedSubscriber 说明。
+        // 先赋给接口类型局部变量再入字段：直接把 `new MemorySubscription(...)` 赋给
+        // `Subscription` 字段会按**具体**类型生成字段描述符，运行期抛 NoSuchFieldError
+        // （见 FINDINGS #8「具体类型的实参/右值未宽化到声明的接口类型」）。
+        var seedSub: Subscription = new MemorySubscription(new Resource());
+        this.seed = seedSub;
+    }
+
+    public function subscribe(subscriber: Subscriber): void {
+        var gate: GatedSubscriber = new GatedSubscriber(subscriber, this.limit, this.seed);
+        var gateSubscriber: Subscriber = gate;
+        this.source.subscribe(gateSubscriber);
+    }
+
+    public function collect(): Row[] {
+        return this.source.collect();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 连接 / 语句
+// ---------------------------------------------------------------------------
+
+public class MemoryStatement implements Statement {
+    private var rows: Row[];
+
+    public constructor(rows: Row[]) {
+        this.rows = rows;
+    }
+
+    public function executeQuery(sql: string): Flux {
+        // 返回接口类型：调用方只见到 Flux，见不到 ArrayFlux。
+        var flux: Flux = new ArrayFlux(this.rows);
+        return flux;
+    }
+
+    public function executeUpdate(sql: string): Mono {
+        var mono: Mono = new SingleMono(new Row(this.rows.length, "updated"));
+        return mono;
+    }
+
+    public function close(): void { }
+}
+
+public class MemoryConnection implements Connection {
+    private var rows: Row[];
+    private var commitCount: int32;
+    private var rollbackCount: int32;
+    private var closeCount: int32;
+
+    public constructor(rows: Row[]) {
+        this.rows = rows;
+        this.commitCount = 0;
+        this.rollbackCount = 0;
+        this.closeCount = 0;
+    }
+
+    public function begin(): Mono {
+        var mono: Mono = new SingleMono(new Row(0, "begin"));
+        return mono;
+    }
+
+    public function commit(): Mono {
+        this.commitCount = this.commitCount + 1;
+        var mono: Mono = new SingleMono(new Row(this.commitCount, "commit"));
+        return mono;
+    }
+
+    public function rollback(): Mono {
+        this.rollbackCount = this.rollbackCount + 1;
+        var mono: Mono = new SingleMono(new Row(this.rollbackCount, "rollback"));
+        return mono;
+    }
+
+    public function createStatement(sql: string): Statement {
+        var statement: Statement = new MemoryStatement(this.rows);
+        return statement;
+    }
+
+    public function close(): void {
+        this.closeCount = this.closeCount + 1;
+    }
+
+    // 以下三个是内存实现特有的观测点，不属于 Connection 契约。
+    public function commits(): int32 { return this.commitCount; }
+    public function rollbacks(): int32 { return this.rollbackCount; }
+    public function closes(): int32 { return this.closeCount; }
+}
+
+// ---------------------------------------------------------------------------
+// 订阅者实现
+// ---------------------------------------------------------------------------
+
+// 汇总订阅者：累加 id 之和、行数，并记录是否完成 / 是否收到错误。
+public class CollectingSubscriber implements Subscriber {
+    public var sum: int32;
+    public var count: int32;
+    public var completed: int32;
+    public var errorMessage: string;
+
+    public constructor() {
+        this.sum = 0;
+        this.count = 0;
+        this.completed = 0;
+        this.errorMessage = "";
+    }
+
+    public function onSubscribe(subscription: Subscription): void { }
+
+    public function onNext(row: Row): void {
+        this.sum = this.sum + row.id();
+        this.count = this.count + 1;
+    }
+
+    public function onError(error: R2dbcException): void {
+        this.errorMessage = error.message();
+    }
+
+    public function onComplete(): void {
+        this.completed = 1;
+    }
+}
+
+// 一订阅就取消的订阅者：用于验证「取消后不再收到元素，且资源被释放」。
+public class CancellingSubscriber implements Subscriber {
+    public var seen: int32;
+    public var released: bool;
+
+    public constructor() {
+        this.seen = 0;
+        this.released = false;
+    }
+
+    public function onSubscribe(subscription: Subscription): void {
+        subscription.cancel();
+        // 句柄是接口类型，可以安全地调用 isReleased()。
+        this.released = subscription.isReleased();
+    }
+
+    public function onNext(row: Row): void {
+        this.seen = this.seen + 1;
+    }
+
+    public function onError(error: R2dbcException): void { }
+
+    public function onComplete(): void { }
+}
+
+// 失败发布者：订阅后立刻走 onError 通道，验证错误传播。
+public class FailingPublisher implements Publisher {
+    private var message: string;
+
+    public constructor(message: string) {
+        this.message = message;
+    }
+
+    public function subscribe(subscriber: Subscriber): void {
+        var resource: Resource = new Resource();
+        var sub: Subscription = new MemorySubscription(resource);
+        subscriber.onSubscribe(sub);
+        var error: R2dbcException = new R2dbcException("40001", this.message);
+        subscriber.onError(error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 「任务 / 挂起」形状（同步占位）
+// ---------------------------------------------------------------------------
+// 想要写的是：`var row: Row = await task;` 或 `go load(task);`。
+// 当前 `await` 会生成对 `unknown` 的调用、`go` 被静默丢弃（FINDINGS #1/#2），
+// 因此这里给出同步占位 Task：调用方用 join() 取结果。它只用于表达形状与对照。
+public class Task {
+    private var done: bool;
+    private var row: Row;
+
+    public constructor() {
+        this.done = false;
+        this.row = new Row(0, "");
+    }
+
+    public function complete(row: Row): void {
+        this.done = true;
+        this.row = row;
+    }
+
+    public function isDone(): bool {
+        return this.done;
+    }
+
+    public function join(): Row {
+        return this.row;
+    }
+}
+
+// 同步任务的小闭环；返回值由 R2dbcProbeTest 断言。
+public function taskValue(): int32 {
+    var task: Task = new Task();
+    task.complete(new Row(7, "task"));
+    if (task.isDone()) {
+        var row: Row = task.join();
+        return row.id();
+    }
+    return 0;
+}
+
+// 错误层次 + 跨包链接的观测点：构造错误并读取 SQLSTATE。
+// 接收者静态类型取**声明该方法的类** R2dbcException：在子类类型接收者上调用从基类
+// 继承的方法，返回描述符会退化成 void（见 FINDINGS #6「继承来的方法：返回描述符退化为 void」），
+// 且「子类赋给基类变量」当前被类型检查器拒绝（见 FINDINGS #9「类继承不参与赋值子类型」），
+// 故此处直接构造基类实例。
+public function errorState(): string {
+    var error: R2dbcException = new R2dbcException("40001", "deadlock");
+    return error.sqlState();
+}
+
+// 二级错误层次的实例化观测点：构造瞬时错误子类并调用继承自 std.Error 的 message()，
+// 证明子类可实例化、可跨包链接（返回消息文本由测试断言）。
+public function transientMessage(): string {
+    var error: TransientR2dbcException = new TransientR2dbcException("40001", "deadlock");
+    return error.message();
+}
+
+// 证明嵌套泛型「类型」可解析（`>>` 需以空格收尾），与 JDBC 探针同款；
+// 不构造运行期值，因为 List 还不是可实例化的标准库类型。
+public function buildNested(): List<List<Row> > {
+    return new List<List<Row> >();
+}
+
+// ---------------------------------------------------------------------------
+// 驱动器：走完整条 R2DBC 形状链路，返回可断言的整数聚合结果。
+//
+// 放在文件最后：`defer` 在本后端曾泄漏到后续函数（FINDINGS #15 已修），
+// 这里保持原始写法作为对照。
+// ---------------------------------------------------------------------------
+public function main(): int32 {
+    var rows: Row[] = new Row[3];
+    rows[0] = new Row(1, "ada");
+    rows[1] = new Row(2, "grace");
+    rows[2] = new Row(3, "linus");
+
+    // 具体类型保留一份，用于读取内存实现特有的计数；接口类型用于走协议。
+    var memoryConn: MemoryConnection = new MemoryConnection(rows);
+    var conn: Connection = memoryConn;
+    defer { conn.close(); }
+
+    // (1) 事务开始：begin() 返回 Mono，用 Publisher 多态订阅。
+    var beginMono: Mono = conn.begin();
+    var beginPublisher: Publisher = beginMono;
+    var beginCollector: CollectingSubscriber = new CollectingSubscriber();
+    var beginSubscriber: Subscriber = beginCollector;
+    beginPublisher.subscribe(beginSubscriber);
+
+    // (2) 查询：executeQuery() 返回 Flux，逐行推送。
+    var statement: Statement = conn.createStatement("select id, name from people");
+    defer { statement.close(); }
+
+    var flux: Flux = statement.executeQuery("select id, name from people");
+    var queryPublisher: Publisher = flux;
+    var collector: CollectingSubscriber = new CollectingSubscriber();
+    var querySubscriber: Subscriber = collector;
+    queryPublisher.subscribe(querySubscriber);
+
+    // (3) 算子组合：TakeFlux 包裹同一个 Flux，只取前两行（Decorator）。
+    var limited: Flux = new TakeFlux(flux, 2);
+    var limitedCollector: CollectingSubscriber = new CollectingSubscriber();
+    var limitedSubscriber: Subscriber = limitedCollector;
+    var limitedPublisher: Publisher = limited;
+    limitedPublisher.subscribe(limitedSubscriber);
+
+    // (4) 取消：订阅即取消，不应收到任何行，且资源已释放。
+    var cancelling: CancellingSubscriber = new CancellingSubscriber();
+    var cancellingSubscriber: Subscriber = cancelling;
+    var cancelPublisher: Publisher = flux;
+    cancelPublisher.subscribe(cancellingSubscriber);
+
+    // (5) 错误传播：onError 通道带回 R2dbcException。
+    var failing: FailingPublisher = new FailingPublisher("deadlock");
+    var failingPublisher: Publisher = failing;
+    var errorCollector: CollectingSubscriber = new CollectingSubscriber();
+    var errorSubscriber: Subscriber = errorCollector;
+    failingPublisher.subscribe(errorSubscriber);
+
+    // (6) 事务回滚：rollback() 返回 Mono，同样可订阅。
+    var rollbackMono: Mono = conn.rollback();
+    var rollbackPublisher: Publisher = rollbackMono;
+    var rollbackCollector: CollectingSubscriber = new CollectingSubscriber();
+    var rollbackSubscriber: Subscriber = rollbackCollector;
+    rollbackPublisher.subscribe(rollbackSubscriber);
+
+    // (7) 结果集游标：逐行读取（独立文件里的 MemoryResultSet 实现）。
+    var resultSet: ResultSet = new MemoryResultSet(rows);
+    var resultRows: int32 = 0;
+    while (resultSet.next()) {
+        resultRows = resultRows + 1;
+    }
+    resultSet.close();
+
+    // ---- 聚合可观察结果（每条都对应一个已覆盖的形状）----
+    var total: int32 = 0;
+    total = total + collector.sum;                 // 1+2+3 = 6
+    total = total + collector.count;               // 3
+    total = total + collector.completed;           // 1
+    total = total + limitedCollector.count;        // 只取 2
+    total = total + limitedCollector.completed;    // 1
+    total = total + cancelling.seen;               // 取消后 0
+    if (cancelling.released) {
+        total = total + 10;                        // 取消释放资源
+    }
+    if (errorCollector.errorMessage == "deadlock") {
+        total = total + 1;                         // 错误传播命中
+    }
+    total = total + memoryConn.rollbacks();        // 1
+    total = total + resultRows;                    // 3
+    total = total + taskValue();                   // 7
+
+    return total;
+}

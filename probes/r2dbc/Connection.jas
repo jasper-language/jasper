@@ -1,0 +1,46 @@
+package std;
+
+// =============================================================================
+// Connection.jas —— 连接/语句/结果集三条 R2DBC 契约
+// =============================================================================
+// 做什么：把「连接 -> 事务 -> 语句 -> 结果集」这条 R2DBC 主干写成三个接口：
+//   Connection ：begin()/commit()/rollback() 返回 Mono；createStatement 造语句；
+//   Statement  ：executeQuery() 返回 Flux；executeUpdate() 返回 Mono；
+//   ResultSet  ：前向游标 + 逐列读取（R2DBC 也保留 JDBC 式的 wasNull 侧信道）。
+// 什么时候用：由内存假实现（MemoryR2dbc.jas / MemoryResultSet.jas）实现；
+//   调用方只依赖接口。
+// 失败模式：真实驱动里这些方法会因网络/超时失败并走 onError；内存实现绝不失败，
+//   失败路径由专门的 FailingPublisher 演示。
+//
+// 为什么 begin/commit/rollback 返回 Mono 而不是 void：
+//   这是 R2DBC 的关键形状——事务边界本身是异步操作，也要能被 await/订阅，
+//   从而进入同一条背压/取消/错误传播通道。即便探针里它是同步完成的，接口形状
+//   与真实 R2DBC 对齐，方便后续替换为真异步实现。
+//
+// 文件结构说明：本文件有多个顶层类型，必须把 `package` 放在文件首个非空白
+//   位置——严格语法只接受「一个顶层类型」，多类型依赖兼容包装路径，而该路径
+//   的头部正则不跳过 `package` 之前的注释（见 FINDINGS 第 12 条）。
+// =============================================================================
+
+@ProbeApi("r2dbc-connection")
+public interface Connection {
+    public function begin(): Mono;
+    public function commit(): Mono;
+    public function rollback(): Mono;
+    public function createStatement(sql: string): Statement;
+    public function close(): void;
+}
+
+public interface Statement {
+    public function executeQuery(sql: string): Flux;
+    public function executeUpdate(sql: string): Mono;
+    public function close(): void;
+}
+
+public interface ResultSet {
+    public function next(): bool;
+    public function getInt(col: int32): int32;
+    public function getString(col: int32): string;
+    public function wasNull(): bool;
+    public function close(): void;
+}

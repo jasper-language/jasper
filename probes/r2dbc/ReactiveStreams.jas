@@ -1,0 +1,57 @@
+package probes.r2dbc.rx;
+
+import probes.r2dbc.R2dbcException;
+
+// =============================================================================
+// ReactiveStreams.jas —— 「理想形状」：泛型响应式协议（只声明，不参与运行）
+// =============================================================================
+// 做什么：把 R2DBC / Reactor 最自然的泛型形状原样写出来：
+//   RxPublisher<T>.subscribe(RxSubscriber<T>) ；RxSubscriber<T>.onNext(T) ；
+//   RxMono<T>.block(): T ；RxFlux<T>.collect(): T[] 。
+// 什么时候用：作为对照基线——「我们想要写成什么样」。
+//
+// 为什么名字带 `Rx` 前缀：符号表按**简单名**去重，`Publisher`/`Subscriber`/
+//   `Mono`/`Flux`/`Subscription` 这些名字已被可运行的 std 形状占用；一旦同名，
+//   编译报「Duplicate interface declaration」。即「跨包同名类型不可共存」，
+//   见 FINDINGS 第 13 条。故泛型形状加 `Rx` 前缀以示区分。
+//
+// 现状（关键）：这些声明能解析、能通过类型检查，但无法被实现或分派。
+//   类型变量 `T` 直接作为方法形参/返回值时，JVM 描述符被写成字面量 `LT;`，
+//   而不是擦除后的 `Ljava/lang/Object;`（反汇编可见 `onNext(T)` 的 descriptor
+//   为 `(LT;)V`）。于是调用点生成的 `onNext(int)` / `onNext(Object)` / `block()`
+//   全都找不到对应方法：运行期 NoSuchMethodError / VerifyError。详见 FINDINGS 第 3 条。
+//
+// 因此本文件只作「形状声明」，`MemoryR2dbc.jas` 的运行路径改用 std 包下
+//   Row 具体类型的 Publisher/Subscriber/Mono/Flux。
+//
+// 文件结构说明：多顶层类型文件须 `package` 开头（见 FINDINGS 第 12 条）。
+// =============================================================================
+
+public interface RxPublisher<T> {
+    public function subscribe(subscriber: RxSubscriber<T>): void;
+}
+
+public interface RxSubscriber<T> {
+    public function onSubscribe(subscription: RxSubscription): void;
+    public function onNext(item: T): void;
+    public function onError(error: R2dbcException): void;
+    public function onComplete(): void;
+}
+
+// 单值流：R2DBC 的 begin()/commit()/rollback() 返回的就是 Mono<Void>，
+// 这里写成 RxMono<T> 以保持形状。
+public interface RxMono<T> extends RxPublisher<T> {
+    public function block(): T;
+}
+
+// 多值流：一次查询返回 0..N 行。
+public interface RxFlux<T> extends RxPublisher<T> {
+    public const FETCH_SIZE: int32 = 256;
+    public function collect(): T[];
+}
+
+// 订阅句柄：取消订阅并释放资源。
+public interface RxSubscription {
+    public function cancel(): void;
+    public function isCancelled(): bool;
+}

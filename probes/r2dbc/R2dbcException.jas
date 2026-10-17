@@ -1,0 +1,44 @@
+package probes.r2dbc;
+
+import std.Error;
+
+// =============================================================================
+// R2dbcException.jas —— R2DBC 形状的错误层次
+// =============================================================================
+// 做什么：定义 R2DBC 的错误类型与一个瞬时错误子类，构成两级错误层次。
+// 什么时候用：`onError(error: R2dbcException)` 回调、`throw` / `try` / `catch`
+//   的错误通道。
+// 前置条件：`std.Error` 是语言级错误基类（见标准库），本类通过 `extends` 扩展它。
+// 失败模式：Jasper 的 `throws` 只是签名元信息、不做受检异常（见 FINDINGS #20），
+//   因此实际的错误传播完全依赖 `throw` + `try`/`catch`。
+//
+// 为什么单独成包 `probes.r2dbc` 并 `import std.Error`：
+//   这是「跨包链接」的回归守门（对齐 JDBC 探针的 SQLException 做法）——用户
+//   异常在自己的包里继承 std.Error，其它包（这里是 `std`）通过 import 引用它。
+//   如果 import/跨包链接回退，本文件与消费方都会立刻链接失败。
+//
+// 文件结构说明：多顶层类型文件须 `package` 开头（见 FINDINGS 第 12 条）。
+// =============================================================================
+
+public class R2dbcException extends Error {
+    // SQLSTATE：R2DBC/JDBC 用五字符状态码区分错误种类，是可恢复性判断的依据。
+    private var state: string;
+
+    public constructor(sqlState: string, message: string) {
+        super(message);
+        this.state = sqlState;
+    }
+
+    // 返回 SQLSTATE；与 message() 一起构成错误的两条信息。
+    public function sqlState(): string {
+        return this.state;
+    }
+}
+
+// 瞬时错误（如死锁/连接重置）：调用方可重试。用它验证「按子类分派/按基类捕获」
+// 两条路径都能工作（catch(e: Error)）。
+public class TransientR2dbcException extends R2dbcException {
+    public constructor(sqlState: string, message: string) {
+        super(sqlState, message);
+    }
+}
