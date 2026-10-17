@@ -1,0 +1,127 @@
+// =============================================================================
+// Repository.jas —— 泛型仓储接口 + 内存实现（本探针泛型压力的核心）
+// =============================================================================
+// 做什么：给出 Spring Data 风格的仓储形状，并给出可在内存里真跑的实现：
+//   * `Repository<T, ID>`：**理想泛型形状**（save/findById/findAll/count）；
+//   * `PersonRepository`：**可运行期分派的窄接口**（把元素/主键固定为
+//     Person/int32，方法签名不含类型变量）；
+//   * `MemoryPersonRepository`：PersonRepository 的内存实现（Person[] 存储）；
+//   * `MemoryGenericRepository`：`Repository<Person, int32>` 的内存实现，用来
+//     证明「泛型接口确实可被实现」，但**只能在具体类型接收者上调用**。
+//
+// 为什么要拆成「理想泛型形状」和「可运行窄接口」两份（核心发现，见 FINDINGS #1）：
+//   实测：`Repository<T, ID>` 的方法经**接口类型变量**调用时会生成错误的
+//   方法描述符——`save(T)` 的调用点找不到方法（`NoSuchMethodError:
+//   'void Repository.save(Person)'`），含 `T` 返回值时更严重
+//   （`ClassNotFoundException: T`）。但把实现赋给**具体类型变量**再调用则完全正常
+//   （`MemoryGenericRepository` 走的就是这条路）。因此：
+//     泛型接口 = 声明的「理想」，窄接口 = 运行期真正分派的「现实」。
+//   这正是探针要撞出来的「注解体系与泛型的摩擦点」。
+//
+// 设计模式：
+//   * Strategy：仓储实现（内存 / 将来的真数据库）藏在接口之后，调用方只依赖接口；
+//     隔离的变化点 = 「存储介质」。
+//   * 依赖倒置：驱动代码依赖 PersonRepository 抽象，不依赖 MemoryPersonRepository。
+//
+// 依赖方向：Person.jas（实体）。单向。
+// =============================================================================
+package probes.jpa;
+
+// 理想泛型仓储形状。声明/实现均可，但**经接口类型变量调用不可用**（见文件头 FINDINGS #1）。
+public interface Repository<T, ID> {
+    public function save(entity: T): void;
+    public function findById(id: ID): T;
+    public function findAll(): T[];
+    public function count(): int32;
+}
+
+// 运行期可用的仓储契约：类型变量被替换为具体类型 Person/int32，故接口分派正常。
+public interface PersonRepository {
+    public function save(entity: Person): void;
+    public function findById(id: int32): Person;
+    public function findByName(name: string): Person;
+    public function findAll(): Person[];
+    public function count(): int32;
+}
+
+// PersonRepository 的内存实现。
+public class MemoryPersonRepository implements PersonRepository {
+    private var store: Person[];
+    private var size: int32;
+
+    public constructor() {
+        this.store = new Person[16];
+        this.size = 0;
+    }
+
+    public function save(entity: Person): void {
+        this.store[this.size] = entity;
+        this.size = this.size + 1;
+    }
+
+    // 按主键查找：用 Identifiable.entityId() 读取主键，不直接读跨文件字段
+    // （跨文件读公有字段会生成非法字节码，FINDINGS #4）。
+    public function findById(id: int32): Person {
+        var i: int32 = 0;
+        while (i < this.size) {
+            var current: Person = this.store[i];
+            if (current.entityId() == id) {
+                return current;
+            }
+            i = i + 1;
+        }
+        // 规避 `return null`（FINDINGS #3）：返回首元素占位。
+        return this.store[0];
+    }
+
+    // 按姓名查找：派生查询（好比 Spring Data 的 findByXxx）。
+    public function findByName(name: string): Person {
+        var i: int32 = 0;
+        while (i < this.size) {
+            var current: Person = this.store[i];
+            if (current.fullName() == name) {
+                return current;
+            }
+            i = i + 1;
+        }
+        return this.store[0];
+    }
+
+    public function findAll(): Person[] { return this.store; }
+
+    public function count(): int32 { return this.size; }
+}
+
+// `Repository<Person, int32>` 的内存实现：证明泛型接口**可被实现**。
+// 注意：调用点必须使用具体类型（`MemoryGenericRepository`）接收者，
+// 不能赋给 `Repository<Person, int32>` 接口变量后调用（见文件头 FINDINGS #1）。
+public class MemoryGenericRepository implements Repository<Person, int32> {
+    private var store: Person[];
+    private var size: int32;
+
+    public constructor() {
+        this.store = new Person[16];
+        this.size = 0;
+    }
+
+    public function save(entity: Person): void {
+        this.store[this.size] = entity;
+        this.size = this.size + 1;
+    }
+
+    public function findById(id: int32): Person {
+        var i: int32 = 0;
+        while (i < this.size) {
+            var current: Person = this.store[i];
+            if (current.entityId() == id) {
+                return current;
+            }
+            i = i + 1;
+        }
+        return this.store[0];
+    }
+
+    public function findAll(): Person[] { return this.store; }
+
+    public function count(): int32 { return this.size; }
+}

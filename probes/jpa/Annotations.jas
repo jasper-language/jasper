@@ -1,0 +1,52 @@
+// =============================================================================
+// Annotations.jas —— JPA 注解族（实体映射元数据的声明面）
+// =============================================================================
+// 做什么：声明 JPA 惯用的注解类型：@Entity / @Table / @Id / @Column /
+//   @GeneratedValue / @OneToMany / @ManyToOne / @PrePersist / @PostLoad。
+//   这些注解只做**声明**：它们标注在实体类与属性/方法上，由编译器的注解处理
+//   阶段登记进 `AnnotationIndex`（`JpaProbeTest` 会断言索引内容）。
+//
+// 什么时候用：任何实体类用它们描述「表名 / 主键 / 列名 / 关系 / 生命周期」。
+//
+// 为什么注解「驱动」不到运行期（重要，见 FINDINGS）：
+//   Jasper 目前没有「运行期读取注解」的反射能力，注解只在编译期被索引。
+//   因此下面这些注解在运行期**不产生任何效果**：真正的映射语义由
+//   `Mapping.jas` 里的手写元数据（`EntityMetadata`）承担，运行期实体行为由
+//   `Contracts.jas` 的 `Identifiable`/`Lifecycled` 接口承担。
+//   换句话说：注解 = 可被编译期审计的「文档」；接口 = 可被运行期分派的「契约」。
+//   这个「声明面与运行期分离」正是本探针最想暴露的摩擦点。
+//
+// 边界：注解集中在一个文件、同类不再拆散；Jasper 的注解类型没有 @Retention /
+//   @Target 元注解，也没有「注解值必须是常量」的强制校验——参数类型只能靠
+//   约定（见 FINDINGS）。
+// =============================================================================
+package probes.jpa;
+
+// 标记一个类是持久化实体。
+public @interface Entity { }
+
+// 指定实体映射到的表名。
+public @interface Table { public string name() default ""; }
+
+// 标记实体的主键属性。缺少它时映射注册器会在运行期报错（见 Mapping.jas）。
+public @interface Id { }
+
+// 指定属性映射到哪一列。
+public @interface Column { public string name() default ""; }
+
+// 标记主键由容器生成（identity/sequence/...）。
+// 注：JPA 用枚举 `GenerationType`，此处只能用 string —— Jasper 当前枚举不可比较
+// （见 FINDINGS #11），用 string 表达策略。
+public @interface GeneratedValue { public string strategy() default "auto"; }
+
+// 一对多关系（本探针只做单向：Person -> Address[]）。
+public @interface OneToMany { public string targetEntity() default ""; }
+
+// 多对一关系（本探针只做单向：Address -> Person 主键引用）。
+public @interface ManyToOne { public string targetEntity() default ""; }
+
+// 生命周期回调：persist 之前调用。
+public @interface PrePersist { }
+
+// 生命周期回调：从存储加载之后调用。
+public @interface PostLoad { }

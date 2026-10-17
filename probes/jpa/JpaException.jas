@@ -1,0 +1,35 @@
+// =============================================================================
+// JpaException.jas —— JPA 形状的错误层次（跨包链接回归守门）
+// =============================================================================
+// 做什么：定义两级错误：`JpaException`（JPA 错误基类，继承语言级 `Error`）与
+//   `JpaMappingException`（映射配置错误，例如实体缺少 @Id）。
+//
+// 什么时候用：
+//   * 映射注册器（Mapping.jas）在实体元数据缺主键时抛 JpaMappingException；
+//   * 调用方用 `try { ... } catch (e: Error) { ... }` 读取 message()。
+//
+// 为什么单独成包 `probes.jpa.error` 并 `import std.Error`：
+//   这是「跨包链接 + 多段包名」的回归守门（对齐 JDBC 的 SQLException、R2DBC 的
+//   R2dbcException）：用户错误在自己的包里继承 `std.Error`，主探针包通过
+//   `import` 引用它。若 import/跨包链接回退，本文件与消费方都会立即链接失败。
+//
+// 失败模式：Jasper 的 `throws` 只是签名元信息、不做受检异常（见 FINDINGS），
+//   真正的错误传播完全依赖 `throw` + `try`/`catch`。
+// =============================================================================
+package probes.jpa.error;
+
+import std.Error;
+
+// JPA 形状的错误基类。
+public class JpaException extends Error {
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+// 映射/元数据配置错误：例如实体没有 @Id。运行期在映射注册时抛出（见 Mapping.jas）。
+public class JpaMappingException extends JpaException {
+    public constructor(message: string) {
+        super(message);
+    }
+}

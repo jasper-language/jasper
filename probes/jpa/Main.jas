@@ -1,0 +1,139 @@
+// =============================================================================
+// Main.jas —— JPA 探针驱动器（真实运行入口）
+// =============================================================================
+// 做什么：把整条 JPA 形状链路串起来真跑一遍，并暴露若干「可被 Kotlin 测试断言」
+//   的观测函数：
+//   * `main()`             —— 聚合整数结果（落库/查回/关系/回调/仓储/映射/删除/刷写）；
+//   * `roundTripName()`    —— 断言点 ①：实体落库再查回，字段值一致（返回姓名）；
+//   * `addressTraversal()` —— 断言点 ②：@OneToMany 关系可遍历；
+//   * `missingIdError()`   —— 断言点 ③：实体缺 @Id 时的**明确运行期错误**消息。
+//
+// 什么时候用：`JpaProbeTest` 通过 URLClassLoader 加载本文件产出的类并调用上述函数。
+//
+// 为什么把观测拆成多个函数：单个 `main()` 只能给一个整数，无法区分「哪一段退化」；
+//   分开后某一环失败时能精确指出（也便于 FINDINGS 的证据引用）。
+//
+// 规避（见 FINDINGS）：跨文件字段全部走访问器；不用 `return null`；
+//   删除用 `removeById`；关系/多态只走接口或多态窄接口，不走类继承。
+//
+// 依赖方向：Contracts / Person / Address / EntityManager / Repository / Mapping /
+//   error 包。单向，无环。`main` 放最后，保持与其它探针一致的排布习惯。
+// =============================================================================
+package probes.jpa;
+
+import std.Error;
+import probes.jpa.error.JpaException;
+
+// 断言点 ①：把 Person 落库、查回，返回其姓名字段，证明字段值一致。
+public function roundTripName(): string {
+    var addrs: Address[] = new Address[1];
+    addrs[0] = new Address(0, "beijing", 0);
+    var person: Person = new Person(0, "ada", addrs);
+
+    var em: EntityManager = new MemoryEntityManager();
+    var pid: int32 = em.persist(person);
+    var found: any = em.find("Person", pid);
+    var loaded: Person = cast found as Person;
+    return loaded.fullName();
+}
+
+// 断言点 ②：@OneToMany 关系可遍历——统计归属本人（ownerId == personId）的地址数。
+// 返回 `命中数 * 10 + 关系总数`，便于一眼看出两个维度。
+public function addressTraversal(): int32 {
+    var addrs: Address[] = new Address[2];
+    addrs[0] = new Address(0, "beijing", 1);
+    addrs[1] = new Address(0, "shanghai", 1);
+    var person: Person = new Person(1, "ada", addrs);
+
+    var matched: int32 = 0;
+    var i: int32 = 0;
+    while (i < person.addressList().length) {
+        var addr: Address = person.addressList()[i];
+        if (addr.ownerId() == person.entityId()) {
+            matched = matched + 1;
+        }
+        i = i + 1;
+    }
+    return matched * 10 + person.addressList().length;
+}
+
+// 断言点 ③：实体缺 @Id 时的明确错误消息。
+// 用「没有主键字段」的元数据注册，捕获 JpaMappingException，返回其 message。
+public function missingIdError(): string {
+    var registry: MappingRegistry = new MappingRegistry();
+    var bad: EntityMetadata = new EntityMetadata("Legacy", "legacy", "", false, 1);
+    try {
+        registry.register(bad);
+        return "no-error";
+    } catch (e: Error) {
+        return e.message();
+    }
+}
+
+// 辅助：注册一条合法映射 + 一条缺主键映射，返回「合法映射数」。
+// 命中缺 @Id 报错时返回 1（证明错误被抛出且先前的合法注册仍在），否则返回 0。
+public function missingIdGuard(): int32 {
+    var registry: MappingRegistry = new MappingRegistry();
+    var good: EntityMetadata = new EntityMetadata("Person", "person", "id", true, 3);
+    registry.register(good);
+    var bad: EntityMetadata = new EntityMetadata("Legacy", "legacy", "", false, 1);
+    try {
+        registry.register(bad);
+        return 0;
+    } catch (e: JpaException) {
+        return registry.count();
+    }
+}
+
+// 驱动器：聚合整条 JPA 形状链路，返回可断言的整数。
+public function main(): int32 {
+    var total: int32 = 0;
+
+    // (1) 落库：两个实体，主键由 @GeneratedValue(identity) 生成 -> 1、2。
+    var addrs: Address[] = new Address[2];
+    addrs[0] = new Address(0, "beijing", 0);
+    addrs[1] = new Address(0, "shanghai", 0);
+    var person: Person = new Person(0, "ada", addrs);
+    var em: EntityManager = new MemoryEntityManager();
+    var pid: int32 = em.persist(person);
+    var aid: int32 = em.persist(addrs[0]);
+    total = total + pid + aid;
+
+    // (2) 查回：字段值一致 + 加载后回调 + 持久化前回调 + 受管数量。
+    var found: any = em.find("Person", pid);
+    var loaded: Person = cast found as Person;
+    if (loaded.fullName() == "ada") {
+        total = total + 10;
+    }
+    total = total + loaded.persistCount();
+    total = total + loaded.loadCount();
+    total = total + em.managedCount();
+
+    // (3) 关系遍历。
+    total = total + addressTraversal();
+
+    // (4) 仓储：窄接口（接口变量分派）。
+    var repo: MemoryPersonRepository = new MemoryPersonRepository();
+    repo.save(new Person(7, "grace", addrs));
+    var byName: Person = repo.findByName("grace");
+    if (byName.entityId() == 7) {
+        total = total + 100;
+    }
+    total = total + repo.count();
+
+    // (5) 泛型仓储：实现 Repository<Person,int32>，只能在具体类型接收者上调用。
+    var generic: MemoryGenericRepository = new MemoryGenericRepository();
+    generic.save(new Person(9, "linus", addrs));
+    total = total + generic.findById(9).entityId();
+
+    // (6) 映射注册：合法 + 缺 @Id 报错。
+    total = total + missingIdGuard();
+
+    // (7) 刷写 + 删除。
+    total = total + em.flush();
+    if (em.removeById("Person", pid)) {
+        total = total + 1000;
+    }
+
+    return total;
+}

@@ -1,0 +1,86 @@
+// =============================================================================
+// Mapping.jas —— 实体映射元数据 + 注册器（@Id 缺失的运行期报错点）
+// =============================================================================
+// 做什么：把「实体 -> 表名 / 主键字段 / 是否自增 / 列数」的映射写成显式元数据
+//   对象 `EntityMetadata`，并由 `MappingRegistry` 注册校验：
+//   **实体元数据没有主键字段时，抛出 JpaMappingException（不许静默）**。
+//
+// 什么时候用：
+//   * 想在运行期知道某个实体的映射描述（表名、主键、列数）；
+//   * 需要演示「注解缺 @Id」的明确报错路径（本探针的验收点 ③）。
+//
+// 为什么元数据是手写的、而不是从注解读出（关键规避，见 FINDINGS #7/#8）：
+//   Jasper 的注解只在编译期被登记进 `AnnotationIndex`，运行期没有读取注解的
+//   反射能力，所以「从 @Id 自动推导主键」在当前语言下表达不了。探针的替代方案是
+//   把映射显式声明成元数据，并在注册时校验主键非空——`@Id` 缺省对应的正是
+//   `idField == ""`，于是缺 @Id 会得到一个**明确的运行期错误**，而不是静默放行。
+//
+// 为什么不用 `dict<string, EntityMetadata>` 做注册表：
+//   `dict<K,V>` 目前不能作**类型**（见 FINDINGS #9），也不能可靠地 get/size。
+//   故改用「对象数组 + 计数」的显式表，符合语言现状且可读。
+//
+// 依赖方向：error 包（JpaMappingException）。无环。
+// =============================================================================
+package probes.jpa;
+
+import probes.jpa.error.JpaMappingException;
+
+// 一个实体的映射描述。字段全部私有，通过方法读取（跨文件/低耦合）。
+public class EntityMetadata {
+    private var entityName: string;
+    private var tableName: string;
+    private var idField: string;
+    private var generated: bool;
+    private var columnCount: int32;
+
+    public constructor(
+        entityName: string,
+        tableName: string,
+        idField: string,
+        generated: bool,
+        columnCount: int32
+    ) {
+        this.entityName = entityName;
+        this.tableName = tableName;
+        this.idField = idField;
+        this.generated = generated;
+        this.columnCount = columnCount;
+    }
+
+    public function entityNameValue(): string { return this.entityName; }
+    public function tableNameValue(): string { return this.tableName; }
+    public function idFieldValue(): string { return this.idField; }
+    public function isGenerated(): bool { return this.generated; }
+    public function columnCountValue(): int32 { return this.columnCount; }
+}
+
+// 映射注册器：注册实体元数据，并在缺主键时抛明确错误。
+//
+// 变化点（Strategy）：将来若改为「从注解/配置自动装配元数据」，只需替换注册来源，
+//   EntityManager 读取元数据的方式不变。
+public class MappingRegistry {
+    private var metas: EntityMetadata[];
+    private var size: int32;
+
+    public constructor() {
+        this.metas = new EntityMetadata[8];
+        this.size = 0;
+    }
+
+    // 注册一条实体映射。
+    // 前置条件：meta 已构造；idFieldValue() 为非空字符串。
+    // 失败模式：idFieldValue() 为空即抛 JpaMappingException —— 这就是「实体缺 @Id」
+    //   对应的运行期明确错误（本探针验收点 ③）。
+    public function register(meta: EntityMetadata): void {
+        if (meta.idFieldValue() == "") {
+            throw new JpaMappingException(
+                "Entity '" + meta.entityNameValue() + "' declares no @Id mapping"
+            );
+        }
+        this.metas[this.size] = meta;
+        this.size = this.size + 1;
+    }
+
+    // 已成功注册的映射数量。
+    public function count(): int32 { return this.size; }
+}

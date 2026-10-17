@@ -1,0 +1,119 @@
+// =============================================================================
+// EntityManager.jas —— 实体管理器接口 + 内存假实现
+// =============================================================================
+// 做什么：给出 JPA 的 EntityManager 形状与一个无需数据库就能真跑的内存实现：
+//   * 契约 `EntityManager`：persist / find / removeById / flush / managedCount；
+//   * 实现 `MemoryEntityManager`：用 `any[]` 作为持久化上下文，用 `Identifiable`
+//     写主键、用 `Lifecycled` 触发回调、用自增计数器模拟 @GeneratedValue。
+//
+// 什么时候用：主驱动器（Main.jas）用它演示「落库 -> 查回 -> 关系 -> 生命周期 ->
+//   删除 -> 刷写」的完整闭环。
+//
+// 设计要点与设计模式：
+//   * Strategy / 依赖倒置：EntityManager 只依赖 Identifiable/Lifecycled 两个窄接口，
+//     不认识任何具体实体；新增实体不需要改本文件（开闭原则）。隔离的变化点 =
+//     「实体种类」。
+//   * 存储用 `any[]` + `string` 实体名判别（走 Identifiable.entityName()），
+//     因为本语言没有 `dict<K,V>` 类型（FINDINGS #9），也没有运行期泛型。
+//
+// 规避（每条都在 FINDINGS 有对应条目）：
+//   * 删除方法命名为 `removeById` 而非 JPA 惯用的 `remove`：接口接收者上名为
+//     `remove` 的方法会生成非法字节码（VerifyError，FINDINGS #2）。
+//   * 「查不到」不用 `return null`（返回 any 的 `return null` 会生成
+//     VerifyError 操作数栈下溢，FINDINGS #3），改为返回数组首元素占位。
+//   * 不使用静态字段保存全局自增值（静态字段不可用，FINDINGS #10），
+//     自增计数器是实例字段。
+//
+// 依赖方向：Contracts.jas + errors。无环。
+// =============================================================================
+package probes.jpa;
+
+// 实体管理器契约。
+public interface EntityManager {
+    // 持久化一个实体（接受 `any`，内部按 Identifiable/Lifecycled 处理），返回其主键。
+    public function persist(entity: any): int32;
+
+    // 按实体名 + 主键查回实体（返回 `any`，调用方 cast 到具体类型），并触发 @PostLoad。
+    public function find(entityName: string, id: int32): any;
+
+    // 按实体名 + 主键删除，返回是否命中。
+    public function removeById(entityName: string, id: int32): bool;
+
+    // 刷写持久化上下文，返回累计刷写次数。
+    public function flush(): int32;
+
+    // 当前受管实体数量。
+    public function managedCount(): int32;
+}
+
+// EntityManager 的内存实现。
+public class MemoryEntityManager implements EntityManager {
+    private var store: any[];
+    private var size: int32;
+    private var nextId: int32;
+    private var flushCount: int32;
+
+    public constructor() {
+        this.store = new any[32];
+        this.size = 0;
+        // identity 生成器的起点；对应 @GeneratedValue(strategy = "identity")。
+        this.nextId = 1;
+        this.flushCount = 0;
+    }
+
+    public function persist(entity: any): int32 {
+        // 生命周期：先触发 @PrePersist（经 Lifecycled 接口分派）。
+        var hook: Lifecycled = cast entity as Lifecycled;
+        hook.prePersist();
+
+        // @GeneratedValue：主键未分配（<=0）时分配自增值。
+        var ident: Identifiable = cast entity as Identifiable;
+        if (ident.entityId() <= 0) {
+            ident.assignId(this.nextId);
+            this.nextId = this.nextId + 1;
+        }
+
+        this.store[this.size] = entity;
+        this.size = this.size + 1;
+        return ident.entityId();
+    }
+
+    public function find(entityName: string, id: int32): any {
+        var i: int32 = 0;
+        while (i < this.size) {
+            var current: any = this.store[i];
+            var ident: Identifiable = cast current as Identifiable;
+            if (ident.entityName() == entityName and ident.entityId() == id) {
+                // 生命周期：加载后触发 @PostLoad（经 Lifecycled 接口分派）。
+                var hook: Lifecycled = cast current as Lifecycled;
+                hook.postLoad();
+                return current;
+            }
+            i = i + 1;
+        }
+        // 规避 `return null`（FINDINGS #3）：返回首元素占位；调用方在命中时才使用结果。
+        return this.store[0];
+    }
+
+    public function removeById(entityName: string, id: int32): bool {
+        var i: int32 = 0;
+        while (i < this.size) {
+            var ident: Identifiable = cast this.store[i] as Identifiable;
+            if (ident.entityName() == entityName and ident.entityId() == id) {
+                // 用尾元素回填删除位置：删除是 O(1)，顺序不保证（内存实现取舍）。
+                this.store[i] = this.store[this.size - 1];
+                this.size = this.size - 1;
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public function flush(): int32 {
+        this.flushCount = this.flushCount + 1;
+        return this.flushCount;
+    }
+
+    public function managedCount(): int32 { return this.size; }
+}

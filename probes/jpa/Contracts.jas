@@ -1,0 +1,44 @@
+// =============================================================================
+// Contracts.jas —— 运行期可用的实体契约（注解办不到的那部分）
+// =============================================================================
+// 做什么：定义两个**可运行期分派**的接口，作为注解的运行期替身：
+//   * `Identifiable`：实体对「自己的标识」的回答 —— 这是 @Id 的运行期投影，
+//     让 EntityManager 能在不认识具体实体类型（只拿到 `any`）时读写主键；
+//   * `Lifecycled`：实体对「生命周期」的回答 —— 这是 @PrePersist/@PostLoad
+//     的运行期投影，让 EntityManager 能触发回调。
+//
+// 什么时候用：所有实体类都实现这两个接口；EntityManager/Repository 只面向
+//   接口编程，不依赖任何具体实体类型（低耦合）。
+//
+// 为什么需要它（设计动机）：
+//   理想 JPA 里 `EntityManager.persist(Object)` 靠**运行期反射注解**找到主键与
+//   回调。Jasper 没有运行期注解反射（见 Annotations.jas / FINDINGS），于是把
+//   这两件事显式提升为接口方法：注解继续贴在实体上（供编译期索引审计），
+//   接口则承担运行期分派。变化点是「实体元数据如何被读出」——它被隔离在
+//   这两个窄接口之后，EntityManager 无需随新增实体而改动（开闭原则）。
+//
+// 依赖方向：本文件不依赖任何实体/管理器；实体依赖本文件。单向，无环。
+// =============================================================================
+package probes.jpa;
+
+// 实体对自身标识的回答。EntityManager 只通过它读写主键，因此不必认识具体实体类型。
+public interface Identifiable {
+    // 当前主键值；未分配时为 0。
+    public function entityId(): int32;
+
+    // 实体类型名（对应 JPA 的实体名），用于在混合存储里区分实体种类。
+    public function entityName(): string;
+
+    // 写回主键，供 @GeneratedValue（identity）在 persist 时分配自增值。
+    public function assignId(value: int32): void;
+}
+
+// 实体的生命周期回调契约。实现类在对应方法上仍贴 @PrePersist/@PostLoad 注解，
+// 但运行期真正被调用的是这两个接口方法（注解本身运行期不可读）。
+public interface Lifecycled {
+    // 持久化之前调用。
+    public function prePersist(): void;
+
+    // 从存储加载之后调用。
+    public function postLoad(): void;
+}

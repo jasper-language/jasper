@@ -1,0 +1,66 @@
+// =============================================================================
+// Person.jas ——「一对多」侧的聚合根实体（Person -> Address[]）
+// =============================================================================
+// 做什么：JPA 里最常见的实体形状：类级 @Entity/@Table，属性级 @Id/@GeneratedValue
+//   /@Column/@OneToMany，方法级 @PrePersist/@PostLoad。
+//
+// 什么时候用：EntityManager 落库/查回场景；@OneToMany 目标由 Address 承担。
+//
+// 设计说明与规避（每条都对应 FINDINGS）：
+//   * `addresses: Address[]` 用**对象数组**表达 @OneToMany —— 这正是 JDBC 探针
+//     修复后 (#1) 可用的形状；数组元素描述符带包名。
+//   * 所有字段读取都提供访问器：跨文件读公有字段会生成非法字节码（FINDINGS #4）。
+//   * 生命周期计数放在私有字段，回调方法负责累加：注解只做标注，
+//     真正的回调分派由 `Lifecycled` 接口承担（FINDINGS #7）。
+//
+// 依赖方向：Contracts.jas（接口）+ Address.jas（关系目标）+ Annotations.jas。
+//   无环：Address 不反向持有 Person 对象，只持有其主键 int32。
+// =============================================================================
+package probes.jpa;
+
+@Entity
+@Table(name = "person")
+public class Person implements Identifiable, Lifecycled {
+    @Id
+    @GeneratedValue(strategy = "identity")
+    public var id: int32;
+
+    @Column(name = "full_name")
+    public var name: string;
+
+    // @OneToMany：单向，Person 持有 Address 数组；Address 不反向持有 Person 对象。
+    @OneToMany(targetEntity = "Address")
+    public var addresses: Address[];
+
+    // @PrePersist / @PostLoad 回调计数（观测点）。
+    private var persists: int32;
+    private var loads: int32;
+
+    public constructor(id: int32, name: string, addresses: Address[]) {
+        this.id = id;
+        this.name = name;
+        this.addresses = addresses;
+        this.persists = 0;
+        this.loads = 0;
+    }
+
+    public function entityId(): int32 { return this.id; }
+    public function entityName(): string { return "Person"; }
+    public function assignId(value: int32): void { this.id = value; }
+
+    // 列值读取（跨文件安全）。
+    public function fullName(): string { return this.name; }
+
+    // 关系读取：返回 @OneToMany 的地址集合，供关系遍历。
+    public function addressList(): Address[] { return this.addresses; }
+
+    // 生命周期观测点。
+    public function persistCount(): int32 { return this.persists; }
+    public function loadCount(): int32 { return this.loads; }
+
+    @PrePersist
+    public function prePersist(): void { this.persists = this.persists + 1; }
+
+    @PostLoad
+    public function postLoad(): void { this.loads = this.loads + 1; }
+}

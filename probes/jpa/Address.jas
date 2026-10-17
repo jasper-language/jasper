@@ -1,0 +1,67 @@
+// =============================================================================
+// Address.jas ——「多对一」侧的实体（Address -> Person）
+// =============================================================================
+// 做什么：一个具体实体类，演示 JPA 注解贴在属性/方法上：
+//   @Entity/@Table 标注类，@Id/@GeneratedValue 标注主键属性，
+//   @Column 标注普通列，@ManyToOne 标注「指向 Person 的外键」，
+//   @PrePersist/@PostLoad 标注生命周期回调方法。
+//
+// 什么时候用：作为 Person 的 @OneToMany 目标，串联「关系遍历」场景。
+//
+// 为什么外键用 `personId: int32` 而不是 `person: Person`：
+//   * 本语言「子类实例不能赋给基类变量」（见 FINDINGS #6 复核），对象图的
+//     双向/自引用引用会立刻触发它；用主键 id 关联可画出单向关系且无环；
+//   * 用 id 也避免 `Address <-> Person` 的对象环（禁止环）。
+//
+// 为什么所有字段都配一个访问器方法（id()/city()/ownerId()/loadCount()）：
+//   跨文件读取**公有字段**当前会生成非法字节码（`ClassFormatError: illegal
+//   signature "V"`，见 FINDINGS #4）；方法调用不受影响，故对外只暴露方法。
+//   字段本身保持 public 以贴合 JPA 实体的形状。
+//
+// 依赖方向：依赖 Contracts.jas（Identifiable/Lifecycled）与 Annotations.jas。单向。
+// =============================================================================
+package probes.jpa;
+
+@Entity
+@Table(name = "address")
+public class Address implements Identifiable, Lifecycled {
+    @Id
+    @GeneratedValue(strategy = "identity")
+    public var id: int32;
+
+    @Column(name = "city")
+    public var city: string;
+
+    // @ManyToOne：本行指向 Person 的主键。单向、按 id 关联。
+    @ManyToOne(targetEntity = "Person")
+    public var personId: int32;
+
+    // @PostLoad 回调计数：观测「加载后回调确实跑了」。
+    private var loads: int32;
+
+    public constructor(id: int32, city: string, personId: int32) {
+        this.id = id;
+        this.city = city;
+        this.personId = personId;
+        this.loads = 0;
+    }
+
+    public function entityId(): int32 { return this.id; }
+    public function entityName(): string { return "Address"; }
+    public function assignId(value: int32): void { this.id = value; }
+
+    // 列值读取（跨文件安全：走方法而非字段）。
+    public function cityName(): string { return this.city; }
+
+    // 外键读取：本 Address 归属的 Person 主键。
+    public function ownerId(): int32 { return this.personId; }
+
+    // @PostLoad 的观测点。
+    public function loadCount(): int32 { return this.loads; }
+
+    @PrePersist
+    public function prePersist(): void { }
+
+    @PostLoad
+    public function postLoad(): void { this.loads = this.loads + 1; }
+}
