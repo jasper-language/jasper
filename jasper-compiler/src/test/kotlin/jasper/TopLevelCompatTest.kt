@@ -59,4 +59,62 @@ class TopLevelCompatTest {
             "block-comment",
         )
     }
+
+    /** 块注释+package+两个顶层类 */
+    @Test
+    fun `block comment and package with two top-level classes compiles`() {
+        assertCompiles(
+            """
+            /* 块注释
+               说明内容 */
+            package test;
+            public class A { public function v(): int32 { return 1; } }
+            public class B { public function v(): int32 { return 2; } }
+            """.trimIndent(),
+            "block-comment-two-classes",
+        )
+    }
+
+    /** 无package+行注释+顶层函数 */
+    @Test
+    fun `no package line comment and top-level function compiles`() {
+        assertCompiles(
+            """
+            // 行注释
+            function topLevelFunction(): int32 {
+                return 42;
+            }
+            """.trimIndent(),
+            "no-package-line-comment",
+        )
+    }
+
+    /** 注释在 package 之后 */
+    @Test
+    fun `comments after package compiles`() {
+        assertCompiles(
+            """
+            package test;
+            // 行注释
+            /* 块注释 */
+            public class A { public function v(): int32 { return 1; } }
+            """.trimIndent(),
+            "comments-after-package",
+        )
+    }
+
+    /** 空行缩进混排+行注释+package */
+    @Test
+    fun `mixed whitespace and line comment with package compiles`() {
+        assertCompiles(
+            """
+            
+
+            // 行注释
+            package test;
+            public class A { public function v(): int32 { return 1; } }
+            """.trimIndent(),
+            "mixed-whitespace",
+        )
+    }
 }
