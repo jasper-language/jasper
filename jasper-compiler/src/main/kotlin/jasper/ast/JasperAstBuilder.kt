@@ -238,7 +238,22 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return JasInterface(ctx.name.text, mods, typeParams, extends, members).at(ctx)
     }
 
-    override fun visitInterfaceMemberConst(ctx: JasperParser.InterfaceMemberConstContext): JasNode? = visit(ctx.decl)
+    override fun visitInterfaceMemberConst(ctx: JasperParser.InterfaceMemberConstContext): JasNode? {
+        // An interface constant (`const MAX_ROWS: int32 = 100;`) is a declaration,
+        // not a statement: it must survive into the AST so the translator can
+        // emit a `public static final` field. Build a JasProperty (which carries
+        // its initializer) instead of delegating to the statement-shaped
+        // `visitConstantDeclaration`, which previously made the declaration
+        // silently disappear (only `JasDeclaration`s are kept as interface
+        // members).
+        val decl = ctx.decl
+        val mods = doExtractMods(decl.modifier())
+        val binding = decl.tail.variableBinding().firstOrNull() ?: return null
+        val core = binding.core
+        val type = if (core.typeRef != null) visit(core.typeRef) as? JasType else null
+        val init = if (binding.`init` != null) visit(binding.`init`) as? JasExpression else null
+        return JasProperty(core.name.text, type, mods, null, null, true, init).at(ctx)
+    }
     override fun visitInterfaceMemberProperty(ctx: JasperParser.InterfaceMemberPropertyContext): JasNode? = visit(ctx.decl)
     override fun visitInterfaceMemberMethod(ctx: JasperParser.InterfaceMemberMethodContext): JasNode? = visit(ctx.decl)
     override fun visitInterfaceMemberAbstractMethod(ctx: JasperParser.InterfaceMemberAbstractMethodContext): JasNode? = visit(ctx.decl)

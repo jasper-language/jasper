@@ -106,6 +106,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private var classSuperclassNames: Map<String, String> = emptyMap()
     private var classInterfaceNames: Map<String, List<String>> = emptyMap()
     private var interfaceDeclNames: Set<String> = emptySet()
+    private var staticFieldSymbols: Set<IrFieldSymbol> = emptySet()
     private var callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap()
     private var constructorTypes: Map<IrConstructorSymbol, String> = emptyMap()
 
@@ -143,6 +144,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         classSuperclassNames = translationResult.classSuperclassNames
         classInterfaceNames = translationResult.classInterfaceNames
         interfaceDeclNames = translationResult.interfaceDeclNames
+        staticFieldSymbols = translationResult.staticFieldSymbols
         checkGraalvmHostilePatterns(translationResult)
         for (file in translationResult.irFiles) {
             for (decl in file.declarations) {
@@ -250,11 +252,24 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     }
                 }
                 is IrField -> {
-                    val fieldFlags = if (isEnum) Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL or Opcodes.ACC_ENUM
-                        else Opcodes.ACC_PUBLIC
-                    val fieldDesc = typeMapper.jvmDescriptorFromIrType(decl.type)
-                    val fieldSig = typeMapper.buildFieldSignature(decl)
-                    cw.visitField(fieldFlags, decl.name.toString(), fieldDesc, fieldSig, null)
+                    if (decl.symbol in staticFieldSymbols) {
+                        // Interface constant: `public static final`, with a
+                        // ConstantValue attribute when the initializer is a
+                        // compile-time literal (otherwise `<clinit>` assigns it).
+                        cw.visitField(
+                            Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL,
+                            decl.name.toString(),
+                            typeMapper.jvmDescriptorFromIrType(decl.type),
+                            null,
+                            staticFieldConstantValue(decl)
+                        )
+                    } else {
+                        val fieldFlags = if (isEnum) Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL or Opcodes.ACC_ENUM
+                            else Opcodes.ACC_PUBLIC
+                        val fieldDesc = typeMapper.jvmDescriptorFromIrType(decl.type)
+                        val fieldSig = typeMapper.buildFieldSignature(decl)
+                        cw.visitField(fieldFlags, decl.name.toString(), fieldDesc, fieldSig, null)
+                    }
                 }
                 is IrProperty -> {
                     // Property access is handled directly via IrGetField/IrSetField at the IR level.
@@ -275,9 +290,51 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         if (isEnum) {
             generateEnumInfrastructure(cw, cls, internalName)
         }
+        val staticFields = cls.declarations.filterIsInstance<IrField>().filter { it.symbol in staticFieldSymbols }
+        if (staticFields.any { staticFieldConstantValue(it) == null && it.initializer != null }) {
+            generateStaticFieldInitializer(cw, staticFields, internalName)
+        }
         cw.visitEnd()
         val bytes = cw.toByteArray()
         dir.resolve("$name.class").writeBytes(bytes)
+    }
+
+    /** Compile-time constant value of a static field initializer, if any. */
+    private fun staticFieldConstantValue(field: IrField): Any? {
+        val expr = field.initializer?.expression as? IrConstImpl ?: return null
+        return when (expr.kind) {
+            IrConstKind.Int -> (expr.value as Number).toInt()
+            IrConstKind.Long -> expr.value as Long
+            IrConstKind.Float -> expr.value as Float
+            IrConstKind.Double -> expr.value as Double
+            IrConstKind.Boolean -> expr.value as Boolean
+            IrConstKind.Char -> (expr.value as Char).code
+            IrConstKind.String -> expr.value as String
+            else -> null
+        }
+    }
+
+    /**
+     * Emits a `<clinit>` that initializes static fields whose initializer is not
+     * a compile-time literal (literals are emitted as ConstantValue attributes
+     * directly on the field).
+     */
+    private fun generateStaticFieldInitializer(cw: ClassWriter, fields: List<IrField>, owner: String) {
+        val mv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null)
+        mv.visitCode()
+        val ctx = MethodContext(mv, mutableListOf(), mutableMapOf(), mutableMapOf(), 0, null, true)
+        for (field in fields) {
+            val body = field.initializer ?: continue
+            if (staticFieldConstantValue(field) != null) continue
+            generateIrExpression(mv, body.expression, ctx, owner)
+            mv.visitFieldInsn(
+                Opcodes.PUTSTATIC, owner, field.name.toString(),
+                typeMapper.jvmDescriptorFromIrType(field.type)
+            )
+        }
+        mv.visitInsn(Opcodes.RETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
     }
 
     private fun generateEnumInfrastructure(cw: ClassWriter, cls: IrClass, internalName: String) {
@@ -1001,6 +1058,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                     emitBoxingIfNeeded(mv, funcReturnDesc, callReturnDesc)
                                 }
                             }
+                            // A void static call leaves no value on the stack, but
+                            // the statement emitter always expects one to POP. Mirror
+                            // the member-call / println contract with a dummy null
+                            // (`invokestatic ...)V` followed by an unconditional POP
+                            // otherwise underflows the operand stack).
+                            if (funcReturnDesc == "V") {
+                                mv.visitInsn(Opcodes.ACONST_NULL)
+                            }
                         }
                     }
                 }
@@ -1033,9 +1098,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
             is IrGetField -> {
+                val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
+                if (expr.symbol in staticFieldSymbols) {
+                    val fieldOwner = resolveFieldOwner(expr.symbol)
+                    val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.type)
+                    mv.visitFieldInsn(Opcodes.GETSTATIC, fieldOwner, fieldName, fieldDesc)
+                    return
+                }
                 val receiver = expr.receiver
                 if (receiver != null) generateIrExpression(mv, receiver, ctx, owner)
-                val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
                 // Handle array.length: emit ARRAYLENGTH instead of GETFIELD
                 if (receiver != null && isArrayType(receiver.type)) {
                     mv.visitInsn(Opcodes.ARRAYLENGTH)
@@ -1046,9 +1117,16 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitFieldInsn(Opcodes.GETFIELD, fieldOwner, fieldName, fieldDesc)
             }
             is IrSetField -> {
+                val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
+                if (expr.symbol in staticFieldSymbols) {
+                    generateIrExpression(mv, expr.value, ctx, owner)
+                    val fieldOwner = resolveFieldOwner(expr.symbol)
+                    val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.value.type)
+                    mv.visitFieldInsn(Opcodes.PUTSTATIC, fieldOwner, fieldName, fieldDesc)
+                    return
+                }
                 val receiver = expr.receiver
                 if (receiver != null) generateIrExpression(mv, receiver, ctx, owner)
-                val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
                 val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.value.type)
                 generateIrExpression(mv, expr.value, ctx, owner)
                 val fieldOwner = resolveFieldOwner(expr.symbol)

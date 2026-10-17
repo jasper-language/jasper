@@ -13,6 +13,7 @@ import jasper.translator.TypeMapper
 import org.antlr.v4.runtime.CharStreams
 import org.jetbrains.kotlin.ir.declarations.IrFile
 import org.jetbrains.kotlin.ir.symbols.IrConstructorSymbol
+import org.jetbrains.kotlin.ir.symbols.IrFieldSymbol
 import org.jetbrains.kotlin.ir.symbols.IrSimpleFunctionSymbol
 import java.io.File
 import java.nio.file.Files
@@ -141,6 +142,7 @@ class JasperCompiler {
             val mergedSuperClasses = mutableMapOf<String, String>()
             val mergedInterfaces = mutableMapOf<String, List<String>>()
             val mergedIfaceDeclNames = mutableSetOf<String>()
+            val mergedStaticFields = mutableSetOf<IrFieldSymbol>()
 
             for ((_, pipeline) in results) {
                 val tr = pipeline.ir
@@ -150,6 +152,7 @@ class JasperCompiler {
                 mergedSuperClasses.putAll(tr.classSuperclassNames)
                 mergedInterfaces.putAll(tr.classInterfaceNames)
                 mergedIfaceDeclNames.addAll(tr.interfaceDeclNames)
+                mergedStaticFields.addAll(tr.staticFieldSymbols)
             }
 
             val typeMapper = results.values.firstOrNull()?.ir?.typeMapper ?: TypeMapper()
@@ -159,7 +162,8 @@ class JasperCompiler {
                 constructorTypes = mergedCtorTypes,
                 classSuperclassNames = mergedSuperClasses,
                 classInterfaceNames = mergedInterfaces,
-                interfaceDeclNames = mergedIfaceDeclNames
+                interfaceDeclNames = mergedIfaceDeclNames,
+                staticFieldSymbols = mergedStaticFields
             )
 
             val backend = JvmIrBackend(typeMapper)
@@ -271,7 +275,8 @@ class JasperCompiler {
                 parameterDescriptors = translated.parameterDescriptors,
                 classSuperclassNames = translated.classSuperclassNames,
                 classInterfaceNames = translated.classInterfaceNames,
-                interfaceDeclNames = translated.interfaceDeclNames
+                interfaceDeclNames = translated.interfaceDeclNames,
+                staticFieldSymbols = translated.staticFieldSymbols
             )
             pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir, annotationIndexes[filename] ?: AnnotationIndex.EMPTY)
         }

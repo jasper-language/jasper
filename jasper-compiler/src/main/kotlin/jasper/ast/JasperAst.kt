@@ -88,7 +88,15 @@ data class JasExplicitConstructorInvocation(
 data class JasProperty(
     val name: String, val type: JasType?, val modifiers: List<Any>,
     val getter: JasPropertyAccessor?, val setter: JasPropertyAccessor?,
-    val isConst: Boolean = false
+    val isConst: Boolean = false,
+    /**
+     * Initializer expression for a declaration-site constant, e.g. an
+     * interface constant `const MAX_ROWS: int32 = 100;`. Class property
+     * declarations currently leave this null (instance fields are assigned in
+     * constructors); interface constants carry it so a `public static final`
+     * field can be emitted with the constant value.
+     */
+    val initializer: JasExpression? = null
 ) : JasDeclaration()
 
 data class JasPropertyAccessor(

@@ -41,7 +41,11 @@ data class TranslationResult(
     val parameterDescriptors: Map<IrValueSymbol, String> = emptyMap(),
     val classSuperclassNames: Map<String, String> = emptyMap(), // className -> jvmInternalName
     val classInterfaceNames: Map<String, List<String>> = emptyMap(), // className -> jvmInternalName list
-    val interfaceDeclNames: Set<String> = emptySet() // names of types declared as interfaces
+    val interfaceDeclNames: Set<String> = emptySet(), // names of types declared as interfaces
+    // Field symbols that must be emitted/accessed as JVM statics (interface
+    // constants). Backend uses this for `GETSTATIC`/`PUTSTATIC` and for the
+    // `public static final` field flags.
+    val staticFieldSymbols: Set<IrFieldSymbol> = emptySet()
 )
 
 data class TranslationContext(
@@ -88,7 +92,9 @@ data class TranslationContext(
     // from @EqualsAndHashCode); used by the late @EqualsAndHashCode body
     // generator to decide between `.hash()` and `.hashCode()` for nested
     // object fields.
-    val hashableClassNames: MutableSet<String> = mutableSetOf()
+    val hashableClassNames: MutableSet<String> = mutableSetOf(),
+    // Field symbols for interface constants (`public static final` fields).
+    val staticFieldSymbols: MutableSet<IrFieldSymbol> = mutableSetOf()
 )
 
 class JasperToIrTranslator {
@@ -117,7 +123,8 @@ class JasperToIrTranslator {
         return TranslationResult(listOf(file), ctx.callNames.toMap(), ctx.constructorTypes.toMap(), typeMapper,
             classSuperclassNames = ctx.classSuperclassNames.toMap(),
             classInterfaceNames = ctx.interfaceNames.mapValues { it.value.toList() }.toMap(),
-            interfaceDeclNames = ctx.interfaceDeclNames.toSet())
+            interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
+            staticFieldSymbols = ctx.staticFieldSymbols.toSet())
     }
 
     fun translateAll(asts: List<JasSourceFile>, symbolTable: SymbolTable? = null): TranslationResult {
@@ -152,7 +159,8 @@ class JasperToIrTranslator {
         return TranslationResult(files, ctx.callNames.toMap(), ctx.constructorTypes.toMap(), typeMapper,
             classSuperclassNames = ctx.classSuperclassNames.toMap(),
             classInterfaceNames = ctx.interfaceNames.mapValues { it.value.toList() }.toMap(),
-            interfaceDeclNames = ctx.interfaceDeclNames.toSet())
+            interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
+            staticFieldSymbols = ctx.staticFieldSymbols.toSet())
     }
 
     private fun predeclareTopLevelFunctions(declarations: List<JasDeclaration>, ctx: TranslationContext) {
@@ -175,6 +183,13 @@ class JasperToIrTranslator {
     private fun predeclareRuntimeBuiltins(ctx: TranslationContext) {
         ctx.functionReturnTypes["hashCode"] = typeMapper.intType()
         ctx.functionParamTypes["hashCode"] = emptyList()
+        // `equals` is the universal value-equality entry point (`String.equals`,
+        // user-class `equals(other: any)` synthesized by @EqualsAndHashCode, and
+        // any class that overrides Object.equals). Declaring its shape up front
+        // lets a member call `s.equals(o)` lower with an `Object` parameter and a
+        // `bool` (Z) return instead of falling back to `(String)V`.
+        ctx.functionReturnTypes["equals"] = typeMapper.boolType()
+        ctx.functionParamTypes["equals"] = listOf(typeMapper.type("kotlin.Any"))
     }
 
     /**
@@ -320,10 +335,12 @@ class JasperToIrTranslator {
             val prevFunc = ctx.currentFunction
             ctx.currentFunction = irFunc
             val body = irFunc.body as? IrBlockBody ?: factory.createBlockBody(0, 0)
-            for (stmt in bodyStatements) {
-                val irStmt = translateStatement(stmt, ctx)
-                if (irStmt != null) {
-                    (body.statements as MutableList<IrStatement>).add(irStmt)
+            scopedDefers(ctx) {
+                for (stmt in bodyStatements) {
+                    val irStmt = translateStatement(stmt, ctx)
+                    if (irStmt != null) {
+                        (body.statements as MutableList<IrStatement>).add(irStmt)
+                    }
                 }
             }
             irFunc.body = body
@@ -633,10 +650,12 @@ class JasperToIrTranslator {
             (body.statements as MutableList<IrStatement>).add(delegateCallExpr)
         }
         if (ctor.body != null) {
-            for (stmt in ctor.body!!.statements) {
-                val irStmt = translateStatement(stmt, ctx)
-                if (irStmt != null) {
-                    (body.statements as MutableList<IrStatement>).add(irStmt)
+            scopedDefers(ctx) {
+                for (stmt in ctor.body!!.statements) {
+                    val irStmt = translateStatement(stmt, ctx)
+                    if (irStmt != null) {
+                        (body.statements as MutableList<IrStatement>).add(irStmt)
+                    }
                 }
             }
         }
@@ -677,12 +696,57 @@ class JasperToIrTranslator {
             irCls.typeParameters = irCls.typeParameters + irTp
         }
         for (member in iface.members) {
+            // An interface constant (`const MAX_ROWS: int32 = 100;`) becomes a
+            // `public static final` field carrying its declared value. It must
+            // not be silently dropped (the previous behavior), because a missing
+            // declaration is exactly the kind of failure that hides a compiler
+            // bug as a user error.
+            if (member is JasProperty && member.isConst) {
+                irCls.declarations.add(translateInterfaceConstant(member, ctx))
+                continue
+            }
             val irMember = translateClassMember(member, ctx, symbol)
             if (irMember != null) {
                 irCls.declarations.add(irMember)
             }
         }
         return irCls
+    }
+
+    /**
+     * Lowers an interface constant to a JVM `public static final` field.
+     *
+     * The declaration-site initializer is preserved on the [IrField] so the
+     * backend can emit a `ConstantValue` attribute (for literals) or an
+     * `<clinit>` assignment. The field symbol is registered globally *and* in
+     * the static-field set so member reads (`Statement.MAX_ROWS`) lower to
+     * `GETSTATIC` rather than `GETFIELD`.
+     */
+    private fun translateInterfaceConstant(prop: JasProperty, ctx: TranslationContext): IrField {
+        val propType = typeMapper.mapType(prop.type)
+        val fieldSymbol = IrFieldSymbolImpl()
+        val irField = factory.createField(
+            0, 0,
+            IrDeclarationOrigin.DEFINED,
+            Name.identifier(prop.name),
+            DescriptorVisibilities.PUBLIC,
+            fieldSymbol,
+            propType,
+            true,   // isFinal
+            true,   // isStatic
+            false   // isLateinit
+        )
+        if (prop.initializer != null) {
+            irField.initializer = factory.createExpressionBody(0, 0, translateExpression(prop.initializer!!, ctx))
+        }
+        ctx.fieldSymbols[prop.name] = fieldSymbol
+        ctx.fieldTypes[prop.name] = propType
+        if (ctx.currentClassName.isNotEmpty()) {
+            ctx.fieldSymbolsByClass.getOrPut(ctx.currentClassName) { mutableMapOf() }[prop.name] = fieldSymbol
+            ctx.fieldTypesByClass.getOrPut(ctx.currentClassName) { mutableMapOf() }[prop.name] = propType
+        }
+        ctx.staticFieldSymbols.add(fieldSymbol)
+        return irField
     }
 
     // ── enum ──
@@ -842,10 +906,12 @@ class JasperToIrTranslator {
             val prevFunc = ctx.currentFunction
             ctx.currentFunction = irFunc
             val body = irFunc.body as? IrBlockBody ?: factory.createBlockBody(0, 0)
-            for (stmt in accessor.body!!.statements) {
-                val irStmt = translateStatement(stmt, ctx)
-                if (irStmt != null) {
-                    (body.statements as MutableList<IrStatement>).add(irStmt)
+            scopedDefers(ctx) {
+                for (stmt in accessor.body!!.statements) {
+                    val irStmt = translateStatement(stmt, ctx)
+                    if (irStmt != null) {
+                        (body.statements as MutableList<IrStatement>).add(irStmt)
+                    }
                 }
             }
             irFunc.body = body
@@ -1360,6 +1426,23 @@ class JasperToIrTranslator {
         return IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
     }
 
+    /**
+     * Runs [body] with a fresh `defer` scope, restoring the enclosing scope
+     * afterwards. `defer` belongs strictly to the function that declares it;
+     * without this the deferred bodies accumulate in the shared translation
+     * context and leak into every later function's `return`.
+     */
+    private inline fun <T> scopedDefers(ctx: TranslationContext, body: () -> T): T {
+        val enclosing = ctx.deferredBodies.toMutableList()
+        ctx.deferredBodies.clear()
+        try {
+            return body()
+        } finally {
+            ctx.deferredBodies.clear()
+            ctx.deferredBodies.addAll(enclosing)
+        }
+    }
+
     private fun translateLock(stmt: JasLock, ctx: TranslationContext): IrBlock {
         val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
         val monitorExpr = translateExpression(stmt.expression, ctx)
@@ -1618,7 +1701,15 @@ class JasperToIrTranslator {
     private fun translateIdentifier(expr: JasIdentifier, ctx: TranslationContext): IrGetValue {
         val foundSymbol = ctx.symbols[expr.name]
         val symbol = foundSymbol ?: IrValueParameterSymbolImpl()
-        val type = ctx.varTypes[expr.name] ?: typeMapper.unitType()
+        val type = ctx.varTypes[expr.name]
+            // `this` (and `super`) is not a declared local; its receiver type is
+            // the enclosing class. Without this the receiver defaults to `Unit`
+            // and a member call `this.m()` lowers to `invokevirtual <pkg>/void.m`.
+            ?: if ((expr.name == "this" || expr.name == "super") && ctx.currentClassName.isNotEmpty()) {
+                typeMapper.type(ctx.currentClassName)
+            } else {
+                typeMapper.unitType()
+            }
         return IrNodeFactory.createGetValue(0, 0, type, symbol, IrStatementOrigin.GET_PROPERTY)
     }
 
@@ -2063,10 +2154,12 @@ class JasperToIrTranslator {
         val body = factory.createBlockBody(0, 0)
         val prevFunc = ctx.currentFunction
         ctx.currentFunction = irFunc
-        for (stmt in expr.body.statements) {
-            val irStmt = translateStatement(stmt, ctx)
-            if (irStmt != null) {
-                (body.statements as MutableList<IrStatement>).add(irStmt)
+        scopedDefers(ctx) {
+            for (stmt in expr.body.statements) {
+                val irStmt = translateStatement(stmt, ctx)
+                if (irStmt != null) {
+                    (body.statements as MutableList<IrStatement>).add(irStmt)
+                }
             }
         }
         // Add return if needed
