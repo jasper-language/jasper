@@ -1,5 +1,7 @@
 package std;
 
+import probes.jdbc.SQLException;
+
 // JDBC shape: a statement executes SQL.
 //
 // Two friction points are deliberately kept here in their real JDBC shape:

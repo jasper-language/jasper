@@ -56,8 +56,59 @@ class TypeMapper {
     /**
      * 当前正在翻译的 Jasper 包名（形如 `a/b`）。mapType 把非内建的 JasNamedType 映射为 JVM 内部名时
      * 会前缀它；为空串时不补包归属，要求调用方给出的名字已完整。
+     *
+     * 兼容性说明：历史调用方（translator）传入的是**点分**包名（如 `a.b`），本类在
+     * [resolveNamedTypeName] 内统一把 `.` 换成 `/` 后再拼内部名，因此两种写法都接受。
      */
     var currentPkg: String = ""
+
+    /**
+     * 当前源文件的**精确 import 表**：`简单名/别名 -> 被导入的全限定名（点分）`。
+     *
+     * 做什么：把 `import a.b.Thing;`（或 `import a.b.Thing as T;`）登记的映射交给类型解析，
+     *   使后续代码生成把 `Thing` 链接到 `a/b/Thing` 而不是「当前包 + Thing」。
+     * 什么时候用：翻译每个源文件前由 translator 安装（[JasperToIrTranslator] 负责装配）。
+     * 前置条件：键既可能是简单名也可能是别名；值必须是点分全限定名。
+     * 失败模式：未命中时退回「当前包 + 简单名」的旧规则；不抛异常。
+     * 为什么这样设计：import 解析是「名字 → 内部名」这一变化点的一部分，集中到本类
+     *   可让 mapType / jvmDescriptorFromType / jvmInternalNameFromType 三条路径共用同一规则，
+     *   避免它们在各自实现里各写一份（正是 #14 的根因）。
+     */
+    var currentImports: Map<String, String> = emptyMap()
+
+    /**
+     * 当前源文件的**通配 import 包前缀**（点分，如 `a.b`）。
+     *
+     * 已知限制：通配导入无法在「不知道包内容」的前提下确定某个简单名到底属于哪个包，
+     *   因此当前实现只记录、不在解析时自动展开（避免猜测出错误的全限定名，把
+     *   「未解析」静默变成「链接到错误类」）。探针与标准写法均使用精确 import。
+     */
+    var currentWildcardPackages: List<String> = emptyList()
+
+    /**
+     * 本次编译中**已被声明过的用户类型简单名**集合（类/接口/枚举/注解）。
+     *
+     * 做什么：给 [isTypeParamLike] 一个判据，把「真实的单字母类名」（如用户定义的
+     *   `class S`）与「泛型形参」（如 `Mapper<A,B>` 里的 `A`）区分开。
+     * 什么时候用：翻译开始前由 translator 一次性登记；之后所有名字解析都查它。
+     * 前置条件：登记的名字是**简单名**；不需要包信息（只用于「是不是类型参数」的判断）。
+     * 失败模式：未登记时单字母名会被当成类型参数、不加包前缀（旧行为），可能链接失败；
+     *   不抛异常。
+     * 为什么这样设计：历史上用「单大写字母 == 类型参数」的启发式，会把用户定义的
+     *   单字母类（如接口 `S`）误判为类型参数，导致接口表写出裸名 `S`、运行时
+     *   NoClassDefFoundError（#7 的隐藏根因）。登记真实声明后，该启发式只在
+     *   「确实不是已声明类型」时生效，兼顾泛型与真实单字母类型。
+     */
+    val knownTypeNames: MutableSet<String> = mutableSetOf()
+
+    /**
+     * 登记一个已声明的用户类型简单名，供 [isTypeParamLike] 判定使用。
+     * 什么时候用：翻译开始前由 translator 扫描全部 AST 的顶层类型声明时调用。
+     * 失败模式：无（重复登记是幂等的）。
+     */
+    fun registerKnownType(name: String) {
+        knownTypeNames.add(name)
+    }
 
     // 名字 → IR 类符号 的缓存：同一名字复用同一符号，保证 IR 中同名类型「身份相等」，
     // 后端才能凭 classifier 从 symbolToName 反查回名字。
@@ -244,6 +295,34 @@ class TypeMapper {
     }
 
     /**
+     * 做什么：把一个**用户类型名**解析为 JVM 内部名（`a/b/Thing` 形式），统一 import / 包归属规则。
+     *
+     * 解析优先级（顺序即语义，勿随意调整）：
+     *   1. 已含 `/` 的名字视为已是内部名，原样返回；
+     *   2. 已含 `.` 的名字视为已限定的全限定名，只把 `.` 换成 `/`；
+     *   3. 命中精确 import（简单名或别名），用被导入的全限定名；
+     *   4. 有当前包且不是类型参数（单个大写字母），前缀当前包；
+     *   5. 兜底：原样返回（交给调用方的下游规则处理）。
+     *
+     * 什么时候用：所有「命名类型 → 内部名」的路径（mapType / jvmDescriptorFromType /
+     *   jvmInternalNameFromType）以及 translator 计算接口表/父类时都应经过这里。
+     * 前置条件：若希望规则 3/4 生效，调用方须先设置 [currentPkg] 与 [currentImports]。
+     * 失败模式：不校验名字是否真实存在；无法解析时按规则 5 原样返回（不抛异常），
+     *   因此调用方若拿到可疑名字应自行通过后端验证器或符号表兜底。
+     * 为什么这样设计：把「名字 → 内部名」这一变化点收敛到唯一函数，依赖单向，
+     *   任何一条代码生成路径都不会再各自拼包名（#14/#12 的统一修法）。
+     */
+    fun resolveNamedTypeName(name: String): String {
+        if (name.contains('/')) return name
+        if (name.contains('.')) return name.replace('.', '/')
+        currentImports[name]?.let { return it.replace('.', '/') }
+        if (currentPkg.isNotEmpty() && !isTypeParamLike(name)) {
+            return "${currentPkg.replace('.', '/')}/$name"
+        }
+        return name
+    }
+
+    /**
      * 做什么：JasType → IrType 的总入口，覆盖 Jasper 全部类型种类。
      *
      * 什么时候用：翻译器把声明/表达式的 Jas 类型翻成 IR 类型时。
@@ -263,13 +342,9 @@ class TypeMapper {
             is JasNamedType -> {
                 val rawName = type.name
                 val builtin = builtinTypes[rawName.lowercase()]
-                // 命名类型解析优先级：内建名 > （有包上下文时）补包前缀 > 原样保留。
+                // 命名类型解析优先级：内建名 > resolveNamedTypeName（import > 包归属 > 原样）。
                 // 单大写字母（如 T）视为类型参数，不补包前缀，否则会破坏泛型引用。
-                val jvmName = builtin ?: (
-                    if (currentPkg.isNotEmpty() && !isLikelyTypeParam(rawName) && !rawName.contains('.') && !rawName.contains('/'))
-                        "$currentPkg/$rawName"
-                    else rawName
-                    )
+                val jvmName = builtin ?: resolveNamedTypeName(rawName)
                 val base = type(jvmName)
                 if (type.typeArguments.isEmpty()) {
                     base
@@ -310,6 +385,16 @@ class TypeMapper {
     // 这是启发式，不查作用域；因此名字恰好是单大写字母的普通类型会被误判为类型参数。
     private fun isLikelyTypeParam(name: String): Boolean {
         return name.length == 1 && name[0].isUpperCase()
+    }
+
+    /**
+     * 做什么：判断名字应当被当作「泛型形参」（不加包前缀）还是「真实类型」（加包前缀）。
+     * 判据：形如单大写字母**且未被登记为用户类型**才视为泛型形参。
+     * 为什么需要：单纯看名字长度会把用户定义的单字母类（如 `class S`）误判为类型参数，
+     *   使其名字失去包限定（#7）。登记真实声明后再判断即可两者兼顾。
+     */
+    private fun isTypeParamLike(name: String): Boolean {
+        return isLikelyTypeParam(name) && name !in knownTypeNames
     }
 
     /**
@@ -435,7 +520,7 @@ class TypeMapper {
         if (type == null) return "V"
         return when (type) {
             is JasNamedType -> {
-                val mapped = builtinTypes[type.name.lowercase()] ?: type.name
+                val mapped = builtinTypes[type.name.lowercase()] ?: resolveNamedTypeName(type.name)
                 jvmDescriptor(mapped)
             }
             is JasPrimitiveType -> {
@@ -482,7 +567,7 @@ class TypeMapper {
         if (type == null) return "void"
         return when (type) {
             is JasNamedType -> {
-                val mapped = builtinTypes[type.name.lowercase()] ?: type.name
+                val mapped = builtinTypes[type.name.lowercase()] ?: resolveNamedTypeName(type.name)
                 jvmInternalName(mapped)
             }
             is JasPrimitiveType -> {

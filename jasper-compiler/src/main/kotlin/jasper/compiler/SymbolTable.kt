@@ -153,7 +153,10 @@ class SymbolTable {
         // 注意它与下面的 classes.containsKey 检查是两条独立路径：前者覆盖跨 kind 冲突，
         // 后者覆盖同 kind 的重复；两条都可能命中，因此重复声明可能产生两条诊断。
         val seenTypes = mutableMapOf<String, String>() // name -> kind
-        for (decl in ast.declarations) {
+        // 注意：`ast.imports` 与 `ast.declarations` 是**两个**独立列表（前者由 AST 构建
+        // 器单独填充），只遍历 declarations 会整体漏掉 import —— 这正是「import 被忽略」
+        // 的根因之一。这里把两者合并遍历，让 import 也进入符号索引。
+        for (decl in ast.declarations + ast.imports) {
             when (decl) {
                 is JasFunction -> {
                     // 函数按名字聚合为「重载列表」，同名不同参数个数是合法的。

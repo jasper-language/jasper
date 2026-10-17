@@ -183,9 +183,8 @@ class JasperToIrTranslator {
      */
     fun translate(ast: JasSourceFile, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
-        val pkg = ast.packageName ?: ""
-        ctx.currentPkg = pkg
-        typeMapper.currentPkg = pkg
+        registerDeclaredTypeNames(listOf(ast))
+        installFileContext(ast, ctx)
         // 第一遍（预登记）：不翻译任何声明体，先把「翻译体时会用到的信息」就位：
         //   - 内建函数 hashCode/equals 的签名（合成体要按正确描述符调用）
         //   - 可哈希类名（决定嵌套字段用 .hash() 还是 .hashCode()）
@@ -197,7 +196,7 @@ class JasperToIrTranslator {
         predeclareTopLevelFunctions(ast.declarations, ctx)
         val fileEntry = NaiveSourceBasedFileEntryImpl("<main>", intArrayOf(), 0)
         val fileSymbol = IrFileSymbolImpl()
-        val file = IrFileImpl(fileEntry, fileSymbol, FqName(pkg))
+        val file = IrFileImpl(fileEntry, fileSymbol, FqName(ctx.currentPkg))
         ctx.currentFile = file
         // 第二遍（翻译声明）：逐条顶层声明翻译成 IR，追加进文件。
         // 跳过返回 null 的声明（注解成员/构造器/属性/导入等在顶层不直接产出 IR）。
@@ -225,11 +224,11 @@ class JasperToIrTranslator {
      */
     fun translateAll(asts: List<JasSourceFile>, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
+        registerDeclaredTypeNames(asts)
         predeclareRuntimeBuiltins(ctx)
         // 第一遍：对全部文件做预登记（保证跨文件的先声明后使用）。
         for (ast in asts) {
-            ctx.currentPkg = ast.packageName ?: ""
-            typeMapper.currentPkg = ctx.currentPkg
+            installFileContext(ast, ctx)
             collectHashableClassNames(listOf(ast), ctx)
             collectMemberReturnTypes(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
@@ -238,9 +237,8 @@ class JasperToIrTranslator {
         val files = mutableListOf<IrFile>()
         // 第二遍：逐文件逐声明翻译；每个文件单独一个 IrFile，currentFile 指向当前文件。
         for ((index, ast) in asts.withIndex()) {
-            val pkg = ast.packageName ?: ""
-            ctx.currentPkg = pkg
-            typeMapper.currentPkg = pkg
+            installFileContext(ast, ctx)
+            val pkg = ctx.currentPkg
             val fileEntry = NaiveSourceBasedFileEntryImpl("<file$index>", intArrayOf(), 0)
             val fileSymbol = IrFileSymbolImpl()
             val file = IrFileImpl(fileEntry, fileSymbol, FqName(pkg))
@@ -259,6 +257,72 @@ class JasperToIrTranslator {
             classInterfaceNames = ctx.interfaceNames.mapValues { it.value.toList() }.toMap(),
             interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
             staticFieldSymbols = ctx.staticFieldSymbols.toSet())
+    }
+
+    /**
+     * 做什么：扫描一组源文件的顶层类型声明，把它们的**简单名**登记进 [TypeMapper]，
+     *   供名字解析区分「真实单字母类型」与「泛型形参」。
+     *
+     * 什么时候用：translate / translateAll 开始翻译前调用一次（必须早于任何 mapType，
+     *   否则解析已经用错判据）。
+     * 前置条件：asts 已完成解析。
+     * 失败模式：不抛异常；只登记 class/interface/enum/annotation 四类顶层声明，
+     *   嵌套类型暂不登记（当前语言与探针均不依赖）。
+     * 为什么这样设计：`isLikelyTypeParam` 的单字母启发式无法自行分辨用户类型与形参，
+     *   在翻译前把「有哪些真实类型」一次性告诉 TypeMapper，是最小改动且依赖单向的做法。
+     */
+    private fun registerDeclaredTypeNames(asts: List<JasSourceFile>) {
+        for (ast in asts) {
+            for (decl in ast.declarations) {
+                when (decl) {
+                    is JasClass -> typeMapper.registerKnownType(decl.name)
+                    is JasInterface -> typeMapper.registerKnownType(decl.name)
+                    is JasEnum -> typeMapper.registerKnownType(decl.name)
+                    is JasAnnotationType -> typeMapper.registerKnownType(decl.name)
+                    else -> {}
+                }
+            }
+        }
+    }
+
+    /**
+     * 做什么：为「正在翻译的某个源文件」安装包与 import 上下文，供 translator 与
+     *   [TypeMapper] 共用，使后续所有名字解析都在正确的命名空间里发生。
+     *
+     * 什么时候用：translate / translateAll 处理每个文件前调用一次（第一遍预登记与
+     *   第二遍翻译各调用一次，保证两遍看到相同的包/import 视图）。
+     * 前置条件：ast 已完成解析；import 列表来自 [JasSourceFile.imports]（与
+     *   `declarations` 分开存放，故必须单独遍历，否则 import 会被整体忽略——#14 的根因之一）。
+     * 失败模式：不抛异常。无法识别的 import 形态被跳过；未安装时退回「当前包 + 简单名」。
+     * 为什么这样设计：包名与 import 表都是**每个文件各自**的命名空间，而 translator 在
+     *   多文件路径下共享一个 ctx/typeMapper，因此必须在切换文件时显式重装，不能只在
+     *   构造时设置一次——否则跨文件编译会串包。
+     */
+    private fun installFileContext(ast: JasSourceFile, ctx: TranslationContext) {
+        val pkg = ast.packageName ?: ""
+        ctx.currentPkg = pkg
+        typeMapper.currentPkg = pkg
+        // 精确 import：简单名/别名 -> 点分全限定名。
+        val exact = mutableMapOf<String, String>()
+        // 通配 import 的包前缀（当前仅记录，不在解析时猜测展开，见 TypeMapper 注释）。
+        val wildcard = mutableListOf<String>()
+        for (decl in ast.imports) {
+            if (decl !is JasImport) continue
+            if (decl.isOnDemand) {
+                // `import a.b.*`（name="a.b.*"）与 `from a.b { * }`（name="*", fromSource="a.b"）两种形态。
+                val wildcardPkg = if (decl.name != "*") decl.name.removeSuffix(".*") else decl.fromSource
+                if (!wildcardPkg.isNullOrEmpty()) wildcard.add(wildcardPkg)
+            } else {
+                // 单条 import 的 name 已是全限定名；from-import 的 name 是简单名、fromSource 是包前缀。
+                val fqn = if (decl.fromSource != null) "${decl.fromSource}.${decl.name}" else decl.name
+                val simple = decl.alias ?: fqn.substringAfterLast('.')
+                exact[simple] = fqn
+                // 别名与简单名并存：两种写法都解析到同一全限定名。
+                if (decl.alias != null) exact[decl.alias!!] = fqn
+            }
+        }
+        typeMapper.currentImports = exact
+        typeMapper.currentWildcardPackages = wildcard
     }
 
     // 预登记顶层函数的符号与签名：先建符号、登记调用名/返回/形参类型。
@@ -341,15 +405,17 @@ class JasperToIrTranslator {
      *   而全局 functionReturnTypes 是 last-writer-wins 的，同名成员会互相覆盖。
      */
     private fun collectMemberReturnTypes(ast: JasSourceFile, ctx: TranslationContext) {
-        val pkg = ast.packageName ?: ""
         /**
          * 做什么：把一个类型的成员(name->返回类型)写入按类型的成员返回索引。
          * 什么时候用：本函数遍历到 JasClass/JasInterface 时各调用一次。
-         * 前置条件：pkg 已在上层闭包捕获，用于拼 JVM 风格限定名。
+         * 前置条件：调用前已通过 installFileContext 安装当前文件的包/import 上下文，
+         *   否则 resolveNamedTypeName 无法得到正确的限定名。
          * 失败模式：无；index 用 putIfAbsent，重复名字保留先登记者（first-writer-wins）。
          */
         fun record(typeName: String, members: List<JasDeclaration>) {
-            val qualified = if (pkg.isNotEmpty()) "$pkg/$typeName" else typeName
+            // 用中央解析得到与运行时一致的内部分名（处理点分包名与 import），
+            // 否则键会与 irTypeClassName 反查出的名字对不上（如 "a.b/T" vs "a/b/T"）。
+            val qualified = typeMapper.resolveNamedTypeName(typeName)
             val index = ctx.memberReturnTypesByType.getOrPut(qualified) { mutableMapOf() }
             for (member in members) {
                 if (member is JasFunction) {
@@ -716,19 +782,16 @@ class JasperToIrTranslator {
         // Track the enclosing class so `this.prop` and receiver-typed property
         // accesses resolve their field owner during member translation.
         // 记录当前类（JVM 风格限定名），使翻译类成员时 this.prop 与接收者类型属性访问能定位字段宿主。
-        val qualifiedClassName = if (ctx.currentPkg.isNotEmpty()) "${ctx.currentPkg}/${cls.name}" else cls.name
+        // 用 typeMapper.resolveNamedTypeName 统一解析：它会把点分包名换成 '/' 并尊重 import，
+        // 因此多段包名（如 a.b.c）不会再生成 "a.b.c/Impl" 这种非法内部名（#12）。
+        val qualifiedClassName = typeMapper.resolveNamedTypeName(cls.name)
         val previousClassName = ctx.currentClassName
         ctx.currentClassName = qualifiedClassName
         // Record implemented interfaces
         // 记录实现的接口（补全为 JVM 风格内部名）；导出给后端决定接口表/校验。
+        // 接口名同样走中央解析（import/点分包名），否则会写出 "pkg/Sink" 非法名。
         val ifaceNames = cls.interfaces.mapNotNull { iface ->
-            if (iface is JasNamedType) {
-                val raw = iface.name
-                if (raw.contains("/")) raw else {
-                    val p = ctx.currentPkg
-                    if (p.isNotEmpty()) "$p/$raw" else raw
-                }
-            } else null
+            if (iface is JasNamedType) typeMapper.resolveNamedTypeName(iface.name) else null
         }
         ctx.interfaceNames[cls.name] = ifaceNames.toMutableList()
         // 泛型形参先建 IR 形参，再翻成员——保证成员签名里能引用它们。
@@ -748,11 +811,8 @@ class JasperToIrTranslator {
         }
         // 解析父类内部名（无显式父类则 Object），补全为限定名后登记，
         // 供构造器 super() 委托与后端决定继承/描述符使用。
-        val rawSuper = if (cls.superclass != null) typeMapper.jvmInternalNameFromType(cls.superclass) else "java/lang/Object"
-        val qualifiedSuper = if (rawSuper.contains("/")) rawSuper else {
-            val p = ctx.currentPkg
-            if (p.isNotEmpty()) "$p/$rawSuper" else rawSuper
-        }
+        // jvmInternalNameFromType 现已走中央解析（import/点分包名），返回的已是完整内部名。
+        val qualifiedSuper = if (cls.superclass != null) typeMapper.jvmInternalNameFromType(cls.superclass) else "java/lang/Object"
         ctx.currentSuperclassName = qualifiedSuper
         ctx.classSuperclassNames[cls.name] = qualifiedSuper
         if (cls.constructors.isEmpty()) {
@@ -867,14 +927,9 @@ class JasperToIrTranslator {
         ctx.interfaceDeclNames.add(iface.name)
         // Record extended interfaces
         // 记录继承的父接口（补全为 JVM 风格内部名），导出给后端生成接口表。
+        // 父接口名走中央解析（import/点分包名），避免非法内部名。
         val ifaceNames = iface.extends.mapNotNull { ext ->
-            if (ext is JasNamedType) {
-                val raw = ext.name
-                if (raw.contains("/")) raw else {
-                    val p = ctx.currentPkg
-                    if (p.isNotEmpty()) "$p/$raw" else raw
-                }
-            } else null
+            if (ext is JasNamedType) typeMapper.resolveNamedTypeName(ext.name) else null
         }
         ctx.interfaceNames[iface.name] = ifaceNames.toMutableList()
         for (tp in iface.typeParameters) {
@@ -2088,9 +2143,23 @@ class JasperToIrTranslator {
             }
         }
         val irArgs = args.toTypedArray()
-        // Compute the call's return type: use inferred type arguments to substitute
-        // type parameters in the function's return type.
-        val baseReturnType = ctx.functionReturnTypes[name] ?: typeMapper.unitType()
+        // Compute the call's return type. Prefer the *receiver-typed* member index
+        // (`memberReturnTypesByType`) so a member call is typed by the declared type
+        // of its receiver, rather than by whichever same-named function was
+        // translated globally last. Without this, splitting an implementation into
+        // its own file can let an unrelated declaration win (e.g. `Iterator<T>.next()`
+        // clobbering `ResultSet.next()` when they are in different files), silently
+        // producing a wrong call descriptor and a VerifyError.
+        // 中文：优先用「接收者声明类型」索引取返回类型，避免全局同名 last-writer-wins
+        // 把无关签名（如 Iterator.next）串到 ResultSet.next 上；接收者类型未知时才回退全局表。
+        val memberReturnType = if (expr.target is JasPropertyAccess) {
+            args.firstOrNull()?.type?.let { receiverType ->
+                typeMapper.irTypeClassName(receiverType)?.let { owner ->
+                    ctx.memberReturnTypesByType[owner]?.get(name)
+                }
+            }
+        } else null
+        val baseReturnType = memberReturnType ?: ctx.functionReturnTypes[name] ?: typeMapper.unitType()
         val returnType = if (expr.inferredTypeArgs != null && expr.inferredTypeArgs!!.isNotEmpty()) {
             substituteIrType(baseReturnType, expr.inferredTypeArgs!!)
         } else {
@@ -2245,7 +2314,12 @@ class JasperToIrTranslator {
 
     private fun translateArrayCreation(expr: JasArrayCreation, ctx: TranslationContext): IrExpression {
         val resultType = typeMapper.mapType(JasArrayType(expr.type))
-        val elemDesc = typeMapper.jvmDescriptorFromType(expr.type)
+        // 数组元素描述符从已解析的数组类型反推（去掉前导 '['），复用 mapType 的包/import 解析；
+        // 若直接用 jvmDescriptorFromType(expr.type) 会丢掉包名，导致用户类对象数组
+        // 生成无包名的 ANEWARRAY（#1）。
+        val arrayDesc = typeMapper.jvmDescriptorFromIrType(resultType)
+        val elemDesc = if (arrayDesc.startsWith("[")) arrayDesc.substring(1)
+            else typeMapper.jvmDescriptorFromType(expr.type)
         if (expr.init is JasArrayInitValues) {
             val values = expr.init.values
             val block = IrNodeFactory.createBlock(0, 0, resultType, null)

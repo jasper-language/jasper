@@ -15,7 +15,7 @@
  * 与谁协作：
  *   - 调用方：jasper.compiler 的 JasperCompiler.compileAllWithStdlib，
  *     把本对象返回的「文件名 -> 源码文本」映射并入本次编译的输入。
- *   - 资源来源：编译产物 classpath 下的 `/stdlib/*.jas`（由构建脚本打进
+ *   - 资源来源：编译产物 classpath 下的 `/stdlib/<name>.jas`（由构建脚本打进
  *     resources），文件名与 FILES 一一对应。
  *
  * 对外契约：

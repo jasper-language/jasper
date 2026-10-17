@@ -1,10 +1,16 @@
-package std;
-
 // JDBC-shaped error. Jasper's `throws` is signature metadata only, so the real
 // error channel is the language `Error` hierarchy (`throw` + `try`/`catch`).
-// NOTE: this file declares `package std;` only because the current compiler does
-// not link cross-package type references (imports are ignored by codegen), so a
-// user type can only extend `std.Error` when it physically lives in `std`.
+//
+// This file deliberately lives in its OWN multi-segment package and imports
+// `std.Error`, instead of being parked in `package std;` alongside the rest of
+// the probe. It is the regression guard for cross-package linking (FINDINGS #14)
+// and dotted-package class naming (#12): the previous workaround existed only
+// because `import` was ignored by codegen and a user type could not extend
+// `std.Error` from another package.
+package probes.jdbc;
+
+import std.Error;
+
 public class SQLException extends Error {
     public constructor(message: string) {
         super(message);

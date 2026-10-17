@@ -94,29 +94,55 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         // First pass: collect class hierarchy (interfaces, implements)
         // 第一遍只收集「类->接口」「接口->父接口」的层次信息，供后续子类型判定使用，
         // 必须先于声明检查完成，否则 isSubtype 会拿不到关系。
-        for (decl in sourceFile.declarations) {
-            when (decl) {
-                is JasClass -> {
-                    // 只认 JasNamedType 形式的接口名；其它类型（如泛型实参）这里不展开。
-                    val ifaces = decl.interfaces.mapNotNull { iface ->
-                        if (iface is JasNamedType) iface.name else null
-                    }
-                    classImplements[decl.name] = ifaces
-                }
-                is JasInterface -> {
-                    val parents = decl.extends.mapNotNull { ext ->
-                        if (ext is JasNamedType) ext.name else null
-                    }
-                    interfaceExtends[decl.name] = parents
-                }
-                else -> {}
-            }
-        }
+        collectHierarchyFromDeclarations(sourceFile.declarations)
+        // 跨文件：SymbolTable 汇聚了本次编译全部文件的类/接口声明，必须把它也并入层次图，
+        // 否则「接口类型赋值点」与「实现类」分处不同文件时 isSubtype 查不到关系，
+        // 会误报 Type mismatch（#7）。这里用「不覆盖」语义，保证当前文件的声明优先。
+        symbolTable?.classes?.values?.forEach { collectClassHierarchy(it) }
+        symbolTable?.interfaces?.values?.forEach { collectInterfaceHierarchy(it) }
         // 第二遍：每个顶层声明在全新的空环境中检查（局部作用域由各检查函数自行派生）。
         for (decl in sourceFile.declarations) {
             checkDeclaration(decl, TypeEnvironment())
         }
         return errors.toList()
+    }
+
+    /**
+     * 做什么：从一组顶层声明中收集「类——implements——>接口」「接口——extends——>父接口」关系。
+     *
+     * 什么时候用：[check] 的第一遍，先处理当前文件的声明。
+     * 前置条件：无；只读取 AST 上已解析的接口名。
+     * 失败模式：不抛异常；非 JasNamedType 的接口引用被忽略（无法静态判定）。
+     * 为什么单独抽出：跨文件修复（#7）需要对「当前文件」与「符号表里的其它文件」用
+     *   同一套收集逻辑，抽成函数避免两处重复实现。
+     */
+    private fun collectHierarchyFromDeclarations(declarations: List<JasDeclaration>) {
+        for (decl in declarations) {
+            when (decl) {
+                is JasClass -> collectClassHierarchy(decl)
+                is JasInterface -> collectInterfaceHierarchy(decl)
+                else -> {}
+            }
+        }
+    }
+
+    /** 记录一个类的 implements 列表；已存在的条目不被覆盖（当前文件优先）。 */
+    private fun collectClassHierarchy(cls: JasClass) {
+        if (classImplements.containsKey(cls.name)) return
+        // 只认 JasNamedType 形式的接口名；其它类型（如泛型实参）这里不展开。
+        val ifaces = cls.interfaces.mapNotNull { iface ->
+            if (iface is JasNamedType) iface.name else null
+        }
+        classImplements[cls.name] = ifaces
+    }
+
+    /** 记录一个接口的 extends 列表；已存在的条目不被覆盖（当前文件优先）。 */
+    private fun collectInterfaceHierarchy(iface: JasInterface) {
+        if (interfaceExtends.containsKey(iface.name)) return
+        val parents = iface.extends.mapNotNull { ext ->
+            if (ext is JasNamedType) ext.name else null
+        }
+        interfaceExtends[iface.name] = parents
     }
 
     private fun error(message: String, node: JasNode? = null) {
