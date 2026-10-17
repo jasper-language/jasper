@@ -1132,17 +1132,6 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // 也最容易受影响的契约（新增语义名要在此处补分支，否则落到 else 的静态调用）。
                 val irName = callNames[expr.symbol] ?: functionSymbolToName[expr.symbol] ?: "invoke"
                 when (irName) {
-                    "go" -> {
-                        // 分离调度原语（FINDINGS #2）：没有真实调度运行时时，「启动任务」= 同步触发
-                        // 任务体的副作用。任务体表达式无论返回什么（含 void 调用留下的 null 占位），
-                        // 在这里都统一 POP 丢弃，再补一个 null 占位，满足「表达式恰好留一个值」的约定。
-                        val task = expr.getValueArgument(0)
-                        if (task != null) {
-                            generateIrExpression(mv, task, ctx, owner)
-                            mv.visitInsn(Opcodes.POP)
-                        }
-                        mv.visitInsn(Opcodes.ACONST_NULL)
-                    }
                     "invoke_lambda" -> {
                         // 闭包调用：translator 把 lambda 编译成一个带 invoke 方法的匿名类，
                         // 这里退化为对接收者的 INVOKEVIRTUAL invoke(...)。接收者类型的

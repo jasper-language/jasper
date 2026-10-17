@@ -17,10 +17,10 @@
 //   这四条都属「异步 / 挂起模型的形状地基」，是 R2DBC 探针里最影响可写性的缺陷；
 //   把它们集中在一处，后续改动翻译器/后端时一眼能看出是否回归。
 //
-// 已知阻塞（明确记录，不伪装成通过）：
-//   #2 的后半「`go` 可作普通标识符/方法名」受 `.g4` 硬关键字约束，无法在不动语法的
-//   前提下修复（见下 `go as an ordinary identifier...` 用例）。该用例断言当前**仍被拒绝**，
-//   作为阻塞标记：一旦 `Go` 改为软关键字，此用例会失败并提醒更新。
+// 历史裁决（2026-10-17，用户选 A）：
+//   `go` 前缀运算符已从语法中删除，启动任务改由标准库 Task 协议承担
+//   （`Task<T>` + `ImmediateTask.run`）。因此 #2 的两半都在本轮收口：
+//   执行语义不再需要（没有该运算符），"能否作标识符"变成正向断言。
 // =============================================================================
 
 package jasper
@@ -99,53 +99,27 @@ class R2dbcDefectRegressionTest {
     }
 
     /**
-     * #2（前半）：`go task()` 必须真的执行任务体的副作用，而不是被静默丢弃。
+     * #2（收口，2026-10-17 裁决 A）：`go` 关键字已从语言中移除，现为**普通标识符**。
      *
-     * 为什么这样断言：旧实现把 `go` 直接转发给目标，语义不可观测；本用例让 `go` 调用一个
-     * 会修改对象字段的方法，随后读取该字段，副作用发生则结果非 0。
+     * 为什么这样断言：原先是硬关键字，`t.go()` 在解析阶段就被拒绝（FINDINGS #2 后半）。
+     * 用户裁决"删掉 `go` 语法糖、启动任务交给标准库 Task"后，最直接的回归就是：
+     * 方法名、局部变量名都能叫 `go`，且调用结果正确。
+     *
+     * 取值说明：`t.go()` 返回 1，局部变量 `go = 40`，相加得 41。
      */
     @Test
-    fun `go executes the task body and its side effect is observable`() {
-        val source = """
-            package test;
-            public class Counter {
-                public var hits: int32;
-                public constructor() { this.hits = 0; }
-                public function bump(): void { this.hits = this.hits + 1; }
-            }
-            public function main(): int32 {
-                var c: Counter = new Counter();
-                go c.bump();
-                return c.hits;
-            }
-        """.trimIndent()
-        val out = compile(source, "go-executes")
-        assertEquals(1, invokeStatic(out, "test.main", "main"))
-    }
-
-    /**
-     * #2（后半，阻塞标记）：`go` 目前是 `.g4` 里的硬关键字，不能作普通标识符/方法名。
-     *
-     * 期望行为：`t.go()` 合法。
-     * 当前行为：解析阶段报 `mismatched input 'go' expecting Identifier`。
-     * 本用例**断言当前被拒绝**，把「语法层阻塞」固定下来；修复方式必须改动
-     * `JasperLexer.g4`（把 `Go` 改为软关键字或仅在语句起始处生效），而本次任务硬约束
-     * 禁止改动任何 `.g4`，故此处只作记录。一旦语法放开，此用例会失败并提示更新为正向断言。
-     */
-    @Test
-    fun `go as an ordinary identifier is blocked by the hard keyword`() {
+    fun `go is an ordinary identifier after keyword removal`() {
         val source = """
             package test;
             public class T { public function go(): int32 { return 1; } }
-            public function main(): int32 { var t: T = new T(); return t.go(); }
+            public function main(): int32 {
+                var t: T = new T();
+                var go: int32 = 40;
+                return t.go() + go;
+            }
         """.trimIndent()
-        val result = JasperCompiler().compileToDirWithIr(source, scratchDir("go-identifier"))
-        val error = result as? JasperCompiler.CompileResult.Error
-            ?: fail("expected `go` to be rejected as an identifier while it stays a hard lexer keyword")
-        assertTrue(
-            error.message.contains("go"),
-            "expected a syntax diagnostic mentioning `go`, got: ${error.message}"
-        )
+        val out = compile(source, "go-identifier")
+        assertEquals(41, invokeStatic(out, "test.main", "main"))
     }
 
     /**

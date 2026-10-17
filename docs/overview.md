@@ -48,8 +48,8 @@ switch (x) {
 并发和延迟：
 
 ```jasper
-go task();
-var result = await future;
+var task: Task<int32> = startWorker();   // 启动任务：标准库 Task（工厂待定稿）
+var result = await task.join();
 defer cleanup();
 ```
 

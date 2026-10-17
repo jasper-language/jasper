@@ -2039,18 +2039,9 @@ class JasperToIrTranslator {
             // 变化点被隔离在此：将来引入真正的 async/Task 运行时，只需在这里改成
             // 「按目标类型调用阻塞式取值」，不影响其它一元运算。
             "await" -> return translateExpression(expr.operand, ctx)
-            // go：分离调度原语。没有调度器时，「启动任务」等价于同步触发任务体的副作用，
-            // 结果丢弃为 Unit。这里只把语义编码进 callNames，具体指令序列交给后端 "go" 分支，
-            // 保持「翻译层定语义、后端定指令」的单向契约。
-            "go" -> {
-                val task = translateExpression(expr.operand, ctx)
-                val goSymbol = ctx.functionSymbols["go"] ?: IrSimpleFunctionSymbolImpl()
-                ctx.callNames[goSymbol] = "go"
-                return IrNodeFactory.createCall(
-                    0, 0, typeMapper.unitType(), null,
-                    arrayOf(task), emptyArray(), goSymbol, null
-                )
-            }
+            // 注意：`go` 前缀运算符已于 2026-10-17 从语言中移除（用户裁决 A）。
+            // 启动任务改由标准库 `Task.run(...)` 提供，返回 Task 句柄，配合 `await` 取值。
+            // 这样任务有句柄 ⇒ 可取消、可跟踪模块归属（.jaso 卸载依赖活跃引用）。
         }
         val operand = translateExpression(expr.operand, ctx)
         val funcName = when (expr.op) {

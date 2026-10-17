@@ -407,10 +407,11 @@ public class Task {
 }
 
 // 任务小闭环；返回值由 R2dbcProbeTest 断言。
-// `go` 启动任务（同步触发副作用）、`await` 等待并取回结果（FINDINGS #1/#2 已修）。
+// `go` 关键字已于 2026-10-17 移除：启动任务改由标准库 Task 承担；
+// 这里直接完成任务再 await 取值，保留"句柄 + 等待"的形状（FINDINGS #1 已修）。
 public function taskValue(): int32 {
     var task: Task = new Task();
-    go task.complete(new Row(7, "task"));
+    task.complete(new Row(7, "task"));
     if (task.isDone()) {
         var row: Row = await task.join();
         return row.id();
