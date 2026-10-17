@@ -16,9 +16,10 @@
 | `Statement.jas` | `Statement` 接口：`executeQuery/executeUpdate`、接口常量 `MAX_ROWS`、`throws SQLException`、`args: any...` |
 | `PreparedStatement.jas` | `PreparedStatement extends Statement`（接口继承 + 重载 `executeQuery()`） |
 | `ResultSet.jas` | `ResultSet` 接口（游标 + `wasNull()` 侧信道） |
-| `SQLException.jas` | 用户异常 `extends std.Error` |
+| `SQLException.jas` | 用户异常 `extends std.Error`（独立多段包 `probes.jdbc` + `import std.Error`） |
 | `ProbeApi.jas` | 注解类型 `@interface ProbeApi` |
-| `MemoryJdbc.jas` | 全部具体实现类 + `main()` + `buildMeta()` + `buildNested()` |
+| `MemoryResultSet.jas` | `ResultSet` 的具体实现类（独立文件，验证跨文件接口实现） |
+| `MemoryJdbc.jas` | 其余具体实现类 + `main()` + `buildMeta()` + `buildNested()` |
 
 覆盖到的语言特性：接口与接口继承、多实现、类继承、构造器、方法重载、注解、
 `defer`、`try/catch`、`throw`、自定义 `Error` 子类、`dict{...}` 字面量、
@@ -48,26 +49,34 @@
 | 略有不便 | 3 | 1 | 2 | 0 |
 | **合计** | **18** | **4** | **2** | **12** |
 
-> 修复进度（commit `dbe8f17`）：已修复 5 条——`③编译器缺陷` #4/#5/#15、
-> `①语法层` #11、`②标准库缺失` #17；剩余未修复 13 条。修复详情见第五节各条目
-> 的「状态」行。
+> 修复进度：**第一批（commit `dbe8f17`）** 已修复 5 条局部缺陷——`③编译器缺陷`
+> #4/#5/#15、`①语法层` #11、`②标准库缺失` #17；
+> **第二批（commit `e544e5a`）** 已修复 4 条「跨包/链接」缺陷——`③编译器缺陷`
+> #14/#12/#1/#7。剩余未修复 9 条。修复详情见第五节各条目的「状态」行。
 
-## 四、探针为通过验收而采用的规避（共 5 处）
+## 四、探针为通过验收而采用的规避（原 5 处；第 1、2 条已随本批修复移除）
 
-> 说明：下列规避是探针源码**编写时**为绕开缺陷所采用的写法，探针源码保持原样。
-> 其中第 5 条与 #4、#15 相关，二者已在 commit `dbe8f17` 修复，此规避不再必要。
+> 说明：下列规避是探针源码**编写时**为绕开缺陷所采用的写法。
+> 第 1、2 条已在**第二批（commit `e544e5a`）** 修复后从探针中**移除**（见下）；
+> 第 5 条与 #4、#15 相关，二者已在第一批（`dbe8f17`）修复，该规避不再必要，
+> 但探针仍保留其原始写法。
 
-1. **全部探针文件放在 `package std;`**：跨包类型引用会被解析成 `<包名>/Error`
-   这类不存在的类（见 #14 / #1），所以用户类型只有物理位于 `std` 才能 `extends Error`。
-2. **全部具体实现放在同一个文件 `MemoryJdbc.jas`**：`implements` 关系按文件记录，
-   接口类型赋值要求「赋值点」和「实现类」在同一文件（见 #8）。
+1. ~~**全部探针文件放在 `package std;`**~~ —— **已移除**：`SQLException.jas` 现位于
+   `package probes.jdbc;` 并通过 `import std.Error;` 扩展 `std.Error`，
+   `Statement.jas` / `MemoryJdbc.jas` 用 `import probes.jdbc.SQLException;` 引用它。
+   这同时验证了 #14（跨包链接）与 #12 的包名规范化。
+2. ~~**全部具体实现放在同一个文件 `MemoryJdbc.jas`**~~ —— **已移除**：
+   `MemoryResultSet`（`implements ResultSet`）已拆到独立文件 `MemoryResultSet.jas`，
+   而接口类型的赋值点仍在 `MemoryJdbc.jas`，跨文件多态赋值成立（#7）。
 3. **存储用 `int32[]`/`string[]`/`bool[]` 三组并行数组，而不是 `Row[]`**：
-   用户类对象数组丢失包名（见 #1）。
-4. **数组填充拆成「每个函数只处理一种元素类型」的辅助函数**：
-   同方法内多元素类型数组赋值会产生非法字节码（见 #3）。
+   这是该假实现的**设计选择**，不再是缺陷规避——用户类对象数组已可正确读写
+   （#1）；探针保留并行数组仅为可读性。
+4. **数组填充拆成「每个函数只处理一种元素类型」的辅助函数**：仍需要，
+   同方法内多元素类型数组赋值会产生非法字节码（见 #3，未修）。
 5. **不写 `this.方法()`，并把含 `defer` 的 `main` 放到文件最后**：
    `this.m()` 的接收者类型错误（见 #4），`defer` 会泄漏到后续函数（见 #15）。
-   ——两者均已在 `dbe8f17` 修复，此规避不再必要。
+   ——两者均已在 `dbe8f17` 修复，此规避不再必要，但探针保留原始写法。
+
 
 ---
 
@@ -77,6 +86,9 @@
 
 #### 1. 用户类对象数组丢失包名
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `e544e5a`）**——数组元素描述符改从 `mapType(JasArrayType)`
+  的结果反推（去掉前导 `[`），不再用会丢包名的 `jvmDescriptorFromType(元素类型)`。
+  `jasper.CrossPackageLinkageTest.user class object array keeps package and round-trips fields` 覆盖。
 - 现象：`new Row[n]`（`Row` 是包内用户类）运行期找不到类；数组元素描述符丢失包名。
 - 触发代码：
 ```jasper
@@ -219,6 +231,10 @@ public function main(): int32 {
 
 #### 7. 跨文件接口子类型赋值失败
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `e544e5a`）**——`TypeChecker` 在收集层次关系时除当前文件外，
+  还从共享 `SymbolTable` 汇总本次编译全部文件的 `implements`/`extends`；同时修正
+  「单大写字母名 = 类型参数」的启发式：只有在名字不是已声明用户类型时才按形参处理，
+  于是接口 `S` 不再被误判。`jasper.CrossPackageLinkageTest.interface implementation in a separate file is assignable` 覆盖。
 - 现象：`implements` 关系按**文件**记录。若「接口类型赋值点」与「实现类」不在同一
   文件，类型检查报错。
 - 触发代码（`S.jas` 声明接口与实现，`main.jas` 使用）：
@@ -313,6 +329,9 @@ public interface Statement {
 
 #### 12. 点分包名 + 接口实现 → 非法类名
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `e544e5a`）**——类的内部名、实现的接口名、父接口名、父类名
+  统一走 `TypeMapper.resolveNamedTypeName`，点分包名一律换成 `/`；探针的
+  `SQLException` 已改放多段包 `probes.jdbc`。`jasper.CrossPackageLinkageTest.dotted package name with interface implementation is legal` 覆盖。
 - 现象：`classInterfaceNames` 里的接口名没有把 `.` 换成 `/`，生成非法内部名。
 - 触发代码：
 ```jasper
@@ -353,6 +372,11 @@ public function main(): int32 { var p = new P(); return p.q() + p.q("x"); }
 
 #### 14. `import` 被忽略，跨包类型不可链接
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `e544e5a`）**——`TypeMapper` 新增 `currentImports` 与
+  `resolveNamedTypeName`，translator 逐文件安装 import 上下文；`SymbolTable` 改为
+  同时采集 `ast.imports`（此前只遍历 `declarations`，整体漏掉 import）。
+  探针的 `SQLException` 现位于 `probes.jdbc` 并 `import std.Error`。
+  `jasper.CrossPackageLinkageTest.imported type from another package links and runs` 覆盖。
 - 现象：代码生成不使用导入信息，跨包类型引用被解析成「当前包 + 类名」。
 - 触发代码：
 ```jasper
@@ -463,7 +487,8 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 
 以下 JDBC 惯用写法在当前语言下无法直接表达，探针只能降级：
 
-1. **`Row[]` 结果集缓存** —— 用户类对象数组丢包名（#1），只能用并行数组。
+1. **`Row[]` 结果集缓存** —— 用户类对象数组已修复（#1，`e544e5a`），可用 `Row[]`；
+   探针沿用并行数组只是设计选择。
 2. **`Map<String,Integer>` 列名 → 列号表** —— 泛型 map 类型缺失（#16），
    `getStringByLabel` 固定列号。
 3. **`ResultSet` 内部私有辅助方法 `cellIndex(col)`** —— `this.方法()` 曾不可用
@@ -476,18 +501,24 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 7. **`throws SQLException` 声明** —— 被忽略（#18），用 `Error` 层次代替。
 8. **`executeUpdate(sql, a, b, c)` 展开调用、`args.length`** —— varargs 不可用（#10），
    只传单个数组并忽略 `args`。
-9. **跨文件的接口实现（如 `PreparedStatement` 实现在独立文件）** —— 需与赋值点同文件（#7）。
+9. **跨文件的接口实现（如 `PreparedStatement` 实现在独立文件）** —— 已修复（#7，`e544e5a`）：
+   实现类可与赋值点分处不同文件，探针已把 `MemoryResultSet` 拆到独立文件。
 
 ## 七、结论
 
-- **修复更新（commit `dbe8f17`）**：本文 #4、#5、#11、#15、#17 五个缺陷已修复，
-  并新增 `jasper.ProbeDefectRegressionTest`（5 个测试，每缺陷 1 个）逐一回归；
-  `jasper.JdbcProbeTest` 仍通过。剩余 13 条仍未修复。
+- **修复更新**：
+  - 第一批（commit `dbe8f17`）：#4、#5、#11、#15、#17 五个缺陷已修复，并新增
+    `jasper.ProbeDefectRegressionTest`（5 个测试，每缺陷 1 个）逐一回归。
+  - 第二批（commit `e544e5a`）：#14、#12、#1、#7 四个「跨包/链接」缺陷已修复
+    （统一「类型名 → JVM 内部名」解析 + 跨文件层次汇总），并新增
+    `jasper.CrossPackageLinkageTest`（4 个测试，每缺陷 1 个）回归；
+    探针据此**去掉两处规避**（`SQLException` 独立成包 + `import`、`MemoryResultSet`
+    拆到独立文件）。`jasper.JdbcProbeTest` 始终通过。剩余 9 条仍未修复。
 - 探针可编译并运行，说明 Jasper 已具备「接口契约 + 类实现 + 内存状态 + 异常 + 资源
   清理 + 字面量集合」的表达能力，足以拼出一个可运行的 JDBC 假实现。
 - 但 18 个摩擦点里有 12 个是 `③编译器缺陷`，且多为**静默错误字节码**
   （`VerifyError`/`ClassFormatError`/`NoSuchMethodError`/`NPE`），而不是清晰的编译期报错；
   这会让用户把编译器 bug 误当成自己代码的问题。
-- 最影响「写不出 JDBC 形状」的是前 8 条：用户类对象数组（#1）、数组读类型（#2）、
+- 最影响「写不出 JDBC 形状」的是前 8 条：用户类对象数组（#1，已修复）、数组读类型（#2）、
   多类型数组赋值（#3）、`this.方法()`（#4，已修复）、void 自由函数（#5，已修复）、
-  枚举（#6）、跨文件接口赋值（#7）、静态字段（#8）。
+  枚举（#6）、跨文件接口赋值（#7，已修复）、静态字段（#8）。
