@@ -1,0 +1,10 @@
+package std;
+
+// JDBC shape: a statement with bound parameters. Note the overloaded
+// `executeQuery()` (no-arg) versus the inherited `executeQuery(sql)`.
+public interface PreparedStatement extends Statement {
+    public function setInt(index: int32, value: int32): void;
+    public function setString(index: int32, value: string): void;
+    public function setNull(index: int32): void;
+    public function executeQuery(): ResultSet;
+}

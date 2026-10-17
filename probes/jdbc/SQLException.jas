@@ -1,0 +1,12 @@
+package std;
+
+// JDBC-shaped error. Jasper's `throws` is signature metadata only, so the real
+// error channel is the language `Error` hierarchy (`throw` + `try`/`catch`).
+// NOTE: this file declares `package std;` only because the current compiler does
+// not link cross-package type references (imports are ignored by codegen), so a
+// user type can only extend `std.Error` when it physically lives in `std`.
+public class SQLException extends Error {
+    public constructor(message: string) {
+        super(message);
+    }
+}

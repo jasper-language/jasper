@@ -1,0 +1,11 @@
+package std;
+
+// JDBC shape: a connection owns statements and a transaction.
+public interface Connection {
+    public function close(): void;
+    public function createStatement(): Statement;
+    public function prepareStatement(sql: string): PreparedStatement;
+    public function commit(): void;
+    public function rollback(): void;
+    public function setAutoCommit(autoCommit: bool): void;
+}

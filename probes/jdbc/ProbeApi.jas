@@ -1,0 +1,7 @@
+package std;
+
+// Probe-only annotation type used to check that annotations can mark the
+// JDBC-shaped API (the task's "注解" pressure point).
+@interface ProbeApi {
+    public string value() default "";
+}

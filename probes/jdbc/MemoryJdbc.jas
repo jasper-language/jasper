@@ -1,0 +1,348 @@
+package std;
+
+//
+// In-memory fake JDBC provider + the probe driver.
+//
+// Everything concrete lives in this single file on purpose: the current
+// TypeChecker records a class's `implements` relation per source file, so an
+// interface-typed assignment (`var s: Statement = new MemoryStatement()`) only
+// type-checks when the implementing class is declared in the same file as the
+// assignment. See FINDINGS.md, finding "跨文件接口子类型检查".
+//
+// Storage uses parallel primitive/string/bool arrays rather than `Row[]`,
+// because `new T[]` for a user class loses its package in the backend (see
+// FINDINGS.md, finding "用户类对象数组元素类型丢失包名"). `dict{...}` literals do
+// work and are exercised by `buildMeta()` below.
+//
+// Several workarounds are visible here; each is documented in FINDINGS.md:
+//   * array cells are filled by helper functions that return the array, and
+//     each helper touches a single element type, because (a) two array-element
+//     assignments of different element types in one method collide on the
+//     reused temporary local, and (b) a *void* free function called as a
+//     statement emits an extra POP and fails verification at load time;
+//   * no method calls itself through `this.` because `this.m()` currently
+//     resolves the receiver owner to `std/void`.
+//
+
+// ---------------------------------------------------------------------------
+// Array builders. One element type per function, and a non-void return on
+// purpose (see header note).
+// ---------------------------------------------------------------------------
+
+function makeIntCells(): int32[] {
+    var a: int32[] = new int32[6];
+    a[0] = 1;
+    a[1] = 2;
+    a[2] = 0;
+    a[3] = 7;
+    a[4] = 9;
+    a[5] = 9;
+    return a;
+}
+
+function makeStrCells(): string[] {
+    var a: string[] = new string[6];
+    a[0] = "ada";
+    a[1] = "grace";
+    a[2] = "";
+    a[3] = "linus";
+    a[4] = "kb";
+    a[5] = "thor";
+    return a;
+}
+
+function makeNullCells(): bool[] {
+    var a: bool[] = new bool[6];
+    a[0] = false;
+    a[1] = false;
+    a[2] = true;
+    a[3] = false;
+    a[4] = false;
+    a[5] = false;
+    return a;
+}
+
+function oneIntCell(v: int32): int32[] {
+    var a: int32[] = new int32[1];
+    a[0] = v;
+    return a;
+}
+
+function oneStrCell(v: string): string[] {
+    var a: string[] = new string[1];
+    a[0] = v;
+    return a;
+}
+
+function oneBoolCell(v: bool): bool[] {
+    var a: bool[] = new bool[1];
+    a[0] = v;
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+
+public class MemoryResultSet implements ResultSet {
+    private var intCells: int32[];
+    private var strCells: string[];
+    private var nullCells: bool[];
+    private var colCount: int32;
+    private var rowCount: int32;
+    private var cursor: int32;
+    private var lastNull: bool;
+
+    public constructor(intCells: int32[], strCells: string[], nullCells: bool[], colCount: int32, rowCount: int32) {
+        this.intCells = intCells;
+        this.strCells = strCells;
+        this.nullCells = nullCells;
+        this.colCount = colCount;
+        this.rowCount = rowCount;
+        this.cursor = 0 - 1;
+        this.lastNull = false;
+    }
+
+    public function next(): bool {
+        this.cursor = this.cursor + 1;
+        return this.cursor < this.rowCount;
+    }
+
+    // A real driver keeps a private `cellIndex(col)` helper; the flat-index
+    // arithmetic is inlined here because `this.method()` is not callable. See header.
+    public function getInt(col: int32): int32 {
+        var i: int32 = this.cursor * this.colCount + col;
+        var isNull: bool = this.nullCells[i];
+        this.lastNull = isNull;
+        return this.intCells[i];
+    }
+
+    public function getString(col: int32): string {
+        var i: int32 = this.cursor * this.colCount + col;
+        var isNull: bool = this.nullCells[i];
+        this.lastNull = isNull;
+        return this.strCells[i];
+    }
+
+    // A real driver maps a column label to an index through a per-statement
+    // label table. Jasper has no working generic map today (`dict<K,V>` as a
+    // *type* maps to a non-existent class), so this fake only supports the
+    // second column. See FINDINGS.md, finding "dict<K,V> 不能作类型".
+    public function getStringByLabel(columnName: string): string {
+        var i: int32 = this.cursor * this.colCount + 1;
+        var isNull: bool = this.nullCells[i];
+        this.lastNull = isNull;
+        return this.strCells[i];
+    }
+
+    public function wasNull(): bool {
+        return this.lastNull;
+    }
+
+    public function close(): void { }
+}
+
+public class MemoryStatement implements Statement {
+    private var intCells: int32[];
+    private var strCells: string[];
+    private var nullCells: bool[];
+    private var colCount: int32;
+    private var rowCount: int32;
+
+    public constructor(intCells: int32[], strCells: string[], nullCells: bool[], colCount: int32, rowCount: int32) {
+        this.intCells = intCells;
+        this.strCells = strCells;
+        this.nullCells = nullCells;
+        this.colCount = colCount;
+        this.rowCount = rowCount;
+    }
+
+    public function executeQuery(sql: string): ResultSet {
+        return new MemoryResultSet(this.intCells, this.strCells, this.nullCells, this.colCount, this.rowCount);
+    }
+
+    // `args` is the JDBC `...args` slot. Jasper accepts the declaration but the
+    // varargs argument is typed as its *element* type, not an array, so it can
+    // be neither indexed nor measured here. See FINDINGS.md.
+    public function executeUpdate(sql: string, args: any...): int32 {
+        return this.rowCount;
+    }
+
+    public function close(): void { }
+}
+
+public class MemoryPreparedStatement implements PreparedStatement {
+    private var intParam: int32;
+    private var strParam: string;
+    private var nullParam: int32;
+
+    public constructor() {
+        this.intParam = 0;
+        this.strParam = "";
+        this.nullParam = 0;
+    }
+
+    public function setInt(index: int32, value: int32): void {
+        this.intParam = value;
+    }
+
+    public function setString(index: int32, value: string): void {
+        this.strParam = value;
+    }
+
+    public function setNull(index: int32): void {
+        this.nullParam = index + 1;
+    }
+
+    public function executeQuery(): ResultSet {
+        var intCells: int32[] = oneIntCell(this.intParam);
+        var strCells: string[] = oneStrCell(this.strParam);
+        var nullCells: bool[] = oneBoolCell(this.nullParam > 0);
+        return new MemoryResultSet(intCells, strCells, nullCells, 1, 1);
+    }
+
+    // Would delegate to `this.executeQuery()` in ordinary code; the body is
+    // duplicated because `this.method()` is not currently callable. See header.
+    public function executeQuery(sql: string): ResultSet {
+        var intCells: int32[] = oneIntCell(this.intParam);
+        var strCells: string[] = oneStrCell(this.strParam);
+        var nullCells: bool[] = oneBoolCell(this.nullParam > 0);
+        return new MemoryResultSet(intCells, strCells, nullCells, 1, 1);
+    }
+
+    public function executeUpdate(sql: string, args: any...): int32 {
+        return 1;
+    }
+
+    public function close(): void { }
+}
+
+public class MemoryConnection implements Connection {
+    private var autoCommit: bool;
+    private var commitCount: int32;
+    private var rollbackCount: int32;
+    private var statement: MemoryStatement;
+
+    public constructor() {
+        this.autoCommit = true;
+        this.commitCount = 0;
+        this.rollbackCount = 0;
+        this.statement = new MemoryStatement(makeIntCells(), makeStrCells(), makeNullCells(), 2, 3);
+    }
+
+    public function close(): void { }
+
+    public function createStatement(): Statement {
+        return this.statement;
+    }
+
+    public function prepareStatement(sql: string): PreparedStatement {
+        return new MemoryPreparedStatement();
+    }
+
+    public function commit(): void {
+        this.commitCount = this.commitCount + 1;
+    }
+
+    public function rollback(): void {
+        this.rollbackCount = this.rollbackCount + 1;
+    }
+
+    public function setAutoCommit(autoCommit: bool): void {
+        this.autoCommit = autoCommit;
+    }
+
+    public function commitCountValue(): int32 {
+        return this.commitCount;
+    }
+
+    public function rollbackCountValue(): int32 {
+        return this.rollbackCount;
+    }
+}
+
+public class MemoryDataSource implements DataSource {
+    private var connection: MemoryConnection;
+
+    public constructor() {
+        this.connection = new MemoryConnection();
+    }
+
+    public function getConnection(): Connection {
+        return this.connection;
+    }
+
+    public function concreteConnection(): MemoryConnection {
+        return this.connection;
+    }
+}
+
+// Proves `dict{...}` literals lower to a real collection at runtime.
+public function buildMeta(): java.util.HashMap {
+    return dict{ "driver": 1, "jdbc": 2 };
+}
+
+// Proves nested generic *types* parse (the `>>` case needs a space). The value
+// is never constructed at runtime because `List` is not a real stdlib type yet.
+public function buildNested(): List<List<int32> > {
+    return new List<List<int32> >();
+}
+
+// Exercises the JDBC shape end-to-end; the returned int is asserted by
+// JdbcProbeTest.
+//
+// This function is deliberately the *last* one in the file: `defer` bodies are
+// not reset between functions, so a deferred block leaks into every function
+// translated after the one that declared it (see FINDINGS.md, finding
+// "defer 泄漏到后续函数"). Keeping `main` last confines the leak to nothing.
+public function main(): int32 {
+    var ds: DataSource = new MemoryDataSource();
+    var conn: Connection = ds.getConnection();
+    conn.setAutoCommit(false);
+
+    var st: Statement = conn.createStatement();
+    var rs: ResultSet = st.executeQuery("select id, name from people");
+    defer { rs.close(); }
+
+    var sum: int32 = 0;
+    var rows: int32 = 0;
+    var first: string = "";
+    while (rs.next()) {
+        var id: int32 = rs.getInt(0);
+        var name: string = rs.getString(1);
+        if (rs.wasNull()) {
+            rows = rows + 100;
+        }
+        sum = sum + id;
+        if (rows == 0) {
+            first = name;
+        }
+        rows = rows + 1;
+    }
+
+    var ps: PreparedStatement = conn.prepareStatement("insert into people values (?, ?)");
+    ps.setInt(1, 7);
+    ps.setString(2, "linus");
+    ps.setNull(1);
+    var rs2: ResultSet = ps.executeQuery();
+    var inserted: int32 = 0;
+    if (rs2.next()) {
+        inserted = rs2.getInt(0);
+    }
+    rs2.close();
+
+    var extra: any[] = new any[2];
+    var updated: int32 = st.executeUpdate("delete from people", extra);
+
+    conn.commit();
+    conn.close();
+
+    var caught: int32 = 0;
+    try {
+        throw new SQLException("deadlock");
+    } catch (e: Error) {
+        if (e.message() == "deadlock") {
+            caught = 1;
+        }
+    }
+
+    return sum + inserted + updated + caught;
+}

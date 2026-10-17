@@ -1,0 +1,12 @@
+package std;
+
+// JDBC shape: a forward cursor over rows and columns, with the JDBC
+// "was the last read NULL?" side channel.
+public interface ResultSet {
+    public function next(): bool;
+    public function getInt(col: int32): int32;
+    public function getString(col: int32): string;
+    public function getStringByLabel(columnName: string): string;
+    public function wasNull(): bool;
+    public function close(): void;
+}

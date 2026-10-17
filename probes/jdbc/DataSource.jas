@@ -1,0 +1,7 @@
+package std;
+
+// JDBC shape: a factory for connections.
+@ProbeApi("jdbc-datasource")
+public interface DataSource {
+    public function getConnection(): Connection;
+}

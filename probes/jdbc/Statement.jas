@@ -1,0 +1,15 @@
+package std;
+
+// JDBC shape: a statement executes SQL.
+//
+// Two friction points are deliberately kept here in their real JDBC shape:
+//   * `const MAX_ROWS` — a JDBC interface constant.
+//   * `args: any...` — the java.sql `executeUpdate(sql, ...args)` variable-arity form.
+//   * `throws SQLException` — JDBC always declares SQLException; Jasper parses it.
+public interface Statement {
+    public const MAX_ROWS: int32 = 100;
+
+    public function executeQuery(sql: string): ResultSet throws SQLException;
+    public function executeUpdate(sql: string, args: any...): int32;
+    public function close(): void;
+}
