@@ -55,6 +55,10 @@
 | 略有不便 | 1 | 1 | 0 | 0 |
 | **合计** | **13** | **2** | **2** | **9** |
 
+> 后续更新：**#13 已修复（本提交）**——显式类型引用不可解析时改为编译期报错
+> （带名字与位置），因此当前仍开放的 `③编译器缺陷` 为 8 条。上表保留本次探针
+> 首次记录时的原始统计。
+
 > 说明：本探针是新增探针，**未修改任何 `.g4`、未改编译器**。下列条目的大部分
 > 与 JDBC/R2DBC 探针的既有发现同源（#6 枚举、#8 静态字段、#9 类继承、#16 dict），
 > 本报告在「JPA 视角」下复核并给出 JPA 形状的具体后果；同源条目标注了引用。
@@ -77,7 +81,8 @@
 10. **关系用「对象数组 + 主键引用」单向表达**，不写对象双向引用、不做实体继承多态。
     原因见 #4（同 R2DBC #9）。
 11. **`Main.jas` 显式 `import std.Error;`**：非 `std` 包内 `Error` 不会自动可见，
-    否则被解析到当前包并在运行期 `NoClassDefFoundError`。原因见 #13。
+    未 import 时现在会**在编译期**报 `Unknown type 'Error' (did you mean to import
+    std.Error?)`（修复前是运行期 `NoClassDefFoundError`）。原因见 #13。
 12. **`Person.jas`/`Address.jas` 所有字段配访问器**（规避 #3 的连带）。
 13. **`missingIdError()` 用常量消息比对**，不依赖 `f"..."` 运行期插值
     （f-string 仅在编译测试中被覆盖，运行期未验证；本探针未采用）。
@@ -265,13 +270,23 @@ public function main(): int32 {
 
 #### 13. 非 `std` 包内 `Error` 不自动可见，且未知类型不报编译错
 - 类别：`③编译器缺陷`
-- 现象：在 `package probes.jpa;` 中写 `catch (e: Error)` 而**未** `import std.Error;`，
-  编译器把 `Error` 解析为 `probes.jpa.Error`（一个根本不存在的类型）——
-  没有报「未知类型」，而是照常生成引用，直到运行期反射 / 加载时才炸：
-  `NoClassDefFoundError: probes/jpa/Error`。
+- 状态：**已修复（本提交）**——`TypeChecker` 现对**用户显式写出的类型引用**做可见性
+  校验：名字必须来自「本程序声明且同包 / 显式 `import` / 语言内建别名 / 保留的 JDK
+  互操作类型 / 限定名」之一，否则在编译期报
+  `Unknown type 'Error' (did you mean to import std.Error?)`（带文件/行/列），
+  并在翻译阶段之前中断，不再产出对不存在类的引用。为支持该判定，`SymbolTable` 新增
+  `typePackages`（简单名 → 包集合）索引，区分「别包同名类型」与「本包可见类型」。
 - 期望：标准库基类可自动导入，或未知名在编译期报错。
-- 实测：如上（本探针正是因为漏 import 而踩到，见第四节第 11 条）。
-- 探针规避：`Main.jas` 显式 `import std.Error;`。
+  - 裁决：采用后者——**显式类型引用未解析即编译报错**；不实现自动导入，保留
+    `import std.Error;` 作为显式、可读的修复路径。
+- 原现象（修复前）：在 `package probes.jpa;` 中写 `catch (e: Error)` 而**未**
+  `import std.Error;`，编译器把 `Error` 解析为 `probes.jpa.Error`（一个根本不存在的
+  类型）——没有报「未知类型」，而是照常生成引用，直到运行期反射 / 加载时才炸：
+  `NoClassDefFoundError: probes/jpa/Error`。
+- 实测（修复后）：同上代码在编译期即失败，且不产出任何 `.class`；显式
+  `import std.Error;` 后正常编译。回归守门见
+  `jasper-compiler/src/test/kotlin/jasper/UnknownTypeTest.kt`。
+- 探针规避：`Main.jas` 显式 `import std.Error;`（现在也是编译通过的**必需**写法）。
 
 ### 略有不便
 
@@ -313,7 +328,8 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 - 最影响「写不出 JPA 形状」的是前 6 条：泛型接口分派（#1）、`return null`（#2）、
   跨文件字段（#3）、实体继承（#4）、运行期注解反射缺失（#5）、缺 `@Id` 无编译期
   校验（#6）。其中 #1/#5/#6 直接决定「注解驱动」能不能成立。
-- 13 个摩擦点里有 9 个是 `③编译器缺陷`，且多为**静默错误字节码**
+- 13 个摩擦点里有 8 个（原 9 个；#13 已随本提交修复）是 `③编译器缺陷`，且多为
+  **静默错误字节码**
   （`VerifyError`/`NoClassFormatError`/`NoSuchMethodError`/`ClassNotFoundException`），
   而不是清晰的编译期报错；这会让用户把编译器 bug 误当成自己代码的问题（与 JDBC/R2DBC
   报告同一结论）。
@@ -335,5 +351,5 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 | #6 缺 @Id 无编译期校验 | 新增 | 本探针首次记录 |
 | #7 `remove` 方法名 | 新增 | 本探针首次记录（与后端名字特判相关，需进一步定位） |
 | #9 注解命名实参/无元注解 | JDBC/R2DBC 注解用法 | 扩展：读取注解实参的适配成本 |
-| #13 未知类型不报编译错 | 新增 | 本探针首次记录 |
+| #13 未知类型不报编译错 | 新增 | 本探针首次记录；**已修复（本提交）** |
 | #14 `label` 关键字 | 新增 | 本探针首次记录 |

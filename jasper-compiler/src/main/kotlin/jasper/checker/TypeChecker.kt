@@ -59,6 +59,25 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     private val interfaceExtends = mutableMapOf<String, List<String>>() // interfaceName -> parentInterfaceNames
 
     /**
+     * 当前被检查文件声明的包名（null 表示无 package 声明）。
+     *
+     * 做什么：判断「某类型简单名是否与本文件同包因而可直接引用」时的基准包。
+     * 什么时候用：每次 [check] 开始时由传入的 sourceFile 设定。
+     * 失败模式：无；仅参与可见性判定。
+     */
+    private var currentPackageName: String? = null
+
+    /**
+     * 当前被检查文件的**文件级 import 表**：`简单名/别名 -> 被导入的全限定名（点分）`。
+     *
+     * 为什么用文件级而不是 SymbolTable.imports：后者是多文件合并后的全局映射，会用
+     *   某个文件的 import 掩盖另一文件缺失 import 的错误；显式类型可见性必须按文件判定。
+     * 什么时候用：每次 [check] 开始时由 sourceFile.imports 构建。
+     * 失败模式：未命中返回 null，不抛异常。
+     */
+    private var fileImports: Map<String, String> = emptyMap()
+
+    /**
      * Function-object protocols recognized as "semantic" (no JVM interface
      * dispatch): the protocol name maps to its single abstract method name.
      * Declared in the Jasper standard library; see `PROTOCOL_METHODS` in the
@@ -90,6 +109,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         errors.clear()
         classImplements.clear()
         interfaceExtends.clear()
+        // 显式类型引用可见性判定所需的本文件上下文：包名 + 本文件 import 表。
+        currentPackageName = sourceFile.packageName
+        fileImports = collectFileImports(sourceFile)
         checkDuplicateTopLevelDeclarations(sourceFile)
         // First pass: collect class hierarchy (interfaces, implements)
         // 第一遍只收集「类->接口」「接口->父接口」的层次信息，供后续子类型判定使用，
@@ -234,11 +256,19 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 val ifaceEnv = env.copy()
                 checkTypeParameters(decl.typeParameters, ifaceEnv, "interface '${decl.name}'")
                 decl.extends.forEach { checkTypeReferences(it, ifaceEnv) }
+                // 接口成员（抽象方法形参/返回、属性、常量）也是显式类型引用，逐一校验。
+                decl.members.forEach { checkMemberTypeReferences(it, ifaceEnv) }
             }
-            is JasEnum -> {}
+            is JasEnum -> {
+                // 枚举体内除常量外的成员同样可能带显式类型引用。
+                decl.members.forEach { checkMemberTypeReferences(it, env) }
+            }
             is JasProperty -> {}
             is JasImport -> {}
             is JasAnnotationType -> {
+                // 注解成员类型也是显式类型引用（如 `string value();` 的 string 走单例，
+                // 但 `Error cause();` 这类具名类型需要可见性校验）。
+                decl.members.forEach { checkMemberTypeReferences(it, env) }
                 // 注解成员若带默认值，则默认值表达式的类型必须能赋给声明的成员类型。
                 for (member in decl.members) {
                     if (member.defaultValue != null) {
@@ -259,6 +289,32 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
     }
 
+    /**
+     * 校验「接口/枚举/注解」成员的显式类型引用。
+     *
+     * 做什么：对属性/注解成员校验其声明类型，对函数校验形参与返回类型（并登记其
+     *   类型参数）；**不做**函数体语句检查——接口方法通常无体，且本函数只服务于
+     *   「显式类型引用可见性」这一个目标，保持最小介入、避免牵连其它检查。
+     * 什么时候用：[checkDeclaration] 处理 JasInterface / JasEnum / JasAnnotationType
+     *   的成员时。
+     * 前置条件：env 已包含外层类型（类/接口）的类型参数。
+     * 失败模式：不抛异常；不可见的类型名会经 checkTypeReferences 追加诊断。
+     * 为什么单独抽出：接口/枚举/注解的成员类型检查逻辑一致，抽到一处避免三份重复。
+     */
+    private fun checkMemberTypeReferences(member: JasDeclaration, env: TypeEnvironment) {
+        when (member) {
+            is JasProperty -> checkTypeReferences(member.type, env)
+            is JasFunction -> {
+                val memberEnv = env.copy()
+                checkTypeParameters(member.typeParameters, memberEnv, "method '${member.name}'")
+                member.parameters.forEach { checkTypeReferences(it.type, memberEnv) }
+                checkTypeReferences(member.returnType, memberEnv)
+            }
+            is JasAnnotationMember -> checkTypeReferences(member.type, env)
+            else -> {}
+        }
+    }
+
     private fun checkTypeParameters(typeParams: List<JasTypeParameter>, env: TypeEnvironment, context: String) {
         // seen 用于检测同一类型参数列表内的重名；bound 若存在则必须是合法类型引用。
         val seen = mutableSetOf<String>()
@@ -273,6 +329,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             env.addTypeParameter(tp)
+            // 上界也是「显式类型引用」，同样需要名字可见性校验（在登记本类型参数之后，
+            // 以便自引用/F-约束（如 T extends Comparable<T>）中的 T 已被识别）。
+            checkTypeReferences(tp.bound, env)
         }
     }
 
@@ -285,6 +344,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             if (!isValidTypeReference(wc.bound)) {
                 error("Where constraint bound '${typeDisplayName(wc.bound)}' is not a valid type in $context", null)
             }
+            // 约束上界同样是显式类型引用，需做名字可见性校验。
+            checkTypeReferences(wc.bound, env)
         }
     }
 
@@ -319,11 +380,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     }
 
     private fun checkTypeReferences(type: JasType?, env: TypeEnvironment) {
-        // 只做「类型引用」层面的检查（个数/嵌套合法性），不解析具体类型含义。
+        // 只做「显式类型引用」层面的检查：名字可见性 + 泛型实参个数 + 嵌套合法性，
+        // 不在此处做类型推断（推断由 inferExpression 负责）。
         if (type == null) return
         when (type) {
             is JasNamedType -> {
-                checkTypeArgumentCount(type.name, type.typeArguments, null)
+                // 关键：用户显式写出的具名类型必须可解析，否则报编译期错误，
+                // 而不是静默兜底成 JasAnyType 并生成对不存在类的引用（FINDINGS #13）。
+                checkNamedTypeVisibility(type, env)
+                checkTypeArgumentCount(type.name, type.typeArguments, type)
                 type.typeArguments.forEach { checkTypeReferences(it, env) }
             }
             is JasArrayType -> checkTypeReferences(type.inner, env)
@@ -335,8 +400,117 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             }
             is JasTupleType -> type.types.forEach { checkTypeReferences(it, env) }
             is JasWildcardType -> type.bound?.let { checkTypeReferences(it, env) }
+            is JasPointerType -> checkTypeReferences(type.inner, env)
+            is JasReferenceType -> checkTypeReferences(type.inner, env)
             else -> {}
         }
+    }
+
+    /**
+     * 校验一个**显式写出的具名类型引用**是否可解析；不可解析则报错（带位置与名字）。
+     *
+     * 做什么：把类型参数、内建/互操作、本程序声明、显式 import、限定名五类来源合起来
+     *   判断；命中任一即可，否则产生一条 `Unknown type '...'` 诊断。
+     * 什么时候用：[checkTypeReferences] 的 JasNamedType 分支；所有显式类型位置
+     *   （变量/字段/形参/返回/catch/泛型实参/cast/new/instanceof 等）都经由它。
+     * 前置条件：env 携带当前函数/类的类型参数；symbolTable 可为 null（结构检查模式）。
+     * 失败模式：不抛异常；仅在日志中追加一条诊断（同一名字多处出现会各报一次）。
+     * 为什么：这是本任务的核心——把「未知类型静默通过」改成编译期硬错误，且**不**产出
+     *   对不存在类的引用（错误发生后编译中断，翻译阶段不会执行）。
+     */
+    private fun checkNamedTypeVisibility(type: JasNamedType, env: TypeEnvironment) {
+        if (isVisibleTypeName(type.name, env)) return
+        error(unknownTypeMessage(type.name), type)
+    }
+
+    /**
+     * 判断一个简单类型名在当前文件能否被直接引用（不做任何报错/副作用）。
+     *
+     * 可见性来源（任一命中即可见，顺序仅影响可读性）：
+     *   1. 当前作用域的类型参数（函数/类/接口泛型形参）；
+     *   2. 语言内建别名或保留的 JDK 互操作类型（见 [KnownTypeNames]）；
+     *   3. 限定名（含 `.`，如 `java.lang.Exception`）：视为显式外部/JDK 引用；
+     *   4. 本文件显式 import（简单名或别名）；
+     *   5. 本程序声明的类型，且**与当前文件同包**（跨文件同包可见；别包必须 import；
+     *      无 package 声明归一为空串，只能引用默认包内声明）。
+     *
+     * 前置条件：无（symbolTable 为 null 时退化为「结构检查」：声明来源无法判定，
+     *   为避免误报，凡不属于前四类者一律放行）。
+     * 失败模式：不抛异常，返回 false 表示不可见（由调用方报错）。
+     * 为什么这样分：把「名字从哪来」拆成互相独立的来源，任一新来源可单独扩展；
+     *   同时明确拒绝「未知就放行」的兜底，未知名字默认 false。
+     */
+    private fun isVisibleTypeName(name: String, env: TypeEnvironment): Boolean {
+        if (env.hasTypeParameter(name)) return true
+        if (KnownTypeNames.isBuiltinOrInterop(name)) return true
+        if (name.contains('.')) return true
+        if (fileImports.containsKey(name)) return true
+        // 无符号表：结构检查模式，无法判定声明，放行以避免误报（symbolTable 可空是既有契约）。
+        val st = symbolTable ?: return true
+        val declared = st.findClass(name) != null ||
+            st.findInterface(name) != null ||
+            st.findEnum(name) != null ||
+            st.findAnnotation(name) != null
+        if (!declared) return false
+        // 声明存在：要求与当前文件同包才可直接引用；无 package 声明归一为空串，
+        // 因而只能引用同样位于「默认包」的声明。别包类型必须显式 import，否则即未知。
+        val packages = st.typePackages[name] ?: return true
+        return (currentPackageName ?: "") in packages
+    }
+
+    /**
+     * 构造「未知类型」诊断消息，并在能找到同名别包类型时给出 import 提示。
+     *
+     * 做什么：例如 `Unknown type 'Error' (did you mean to import std.Error?)`；
+     *   找不到候选时退化为 `Unknown type 'Error'`。
+     * 什么时候用：仅由 [checkNamedTypeVisibility] 在判定不可见后调用。
+     * 失败模式：无；纯字符串构造。
+     * 为什么带 import 提示：用户最常见的成因正是「忘写 import」（FINDINGS #13），
+     *   直接给出可用 import 目标能让错误可立即修复。
+     */
+    private fun unknownTypeMessage(name: String): String {
+        val suggestion = suggestImport(name)
+        return if (suggestion != null) {
+            "Unknown type '$name' (did you mean to import $suggestion?)"
+        } else {
+            "Unknown type '$name'"
+        }
+    }
+
+    /**
+     * 为一个未知简单名寻找可建议的 import 目标（形如 `std.Error`）；找不到返回 null。
+     *
+     * 前置条件：名字不含 `.`（限定名不会被判未知）。
+     * 失败模式：无符号表或无同名声明时返回 null。
+     * 为什么：只有「别包确实声明了同名类型」时才提示 import，避免给出编造的目标。
+     */
+    private fun suggestImport(name: String): String? {
+        if (name.contains('.')) return null
+        val st = symbolTable ?: return null
+        val packages = st.typePackages[name] ?: return null
+        val pkg = packages.firstOrNull { it.isNotEmpty() } ?: return null
+        return "$pkg.$name"
+    }
+
+    /**
+     * 从源文件的 import 声明构建「简单名/别名 -> 全限定名」映射（点分）。
+     *
+     * 什么时候用：[check] 开始时为当前文件构建一次，供显式类型可见性判定使用。
+     * 前置条件：sourceFile.imports 中的元素为 JasImport（其它节点被忽略）。
+     * 失败模式：不抛异常；无 import 时返回空映射。
+     * 为什么按文件构建：显式类型必须按**本文件**的 import 判定，不能被其它文件的
+     *   import 掩盖（SymbolTable.imports 是跨文件合并的全局表）。
+     */
+    private fun collectFileImports(sourceFile: JasSourceFile): Map<String, String> {
+        val out = mutableMapOf<String, String>()
+        for (decl in sourceFile.imports) {
+            if (decl !is JasImport) continue
+            val simpleName = decl.name.split('.').lastOrNull() ?: decl.name
+            out[simpleName] = decl.name
+            // 别名与简单名并存：两种写法都映射到同一个全限定名。
+            decl.alias?.let { out[it] = decl.name }
+        }
+        return out
     }
 
     private fun checkFunction(func: JasFunction, env: TypeEnvironment) {
@@ -429,6 +603,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 if (env.contains(stmt.name)) {
                     error("Duplicate local declaration '${stmt.name}'", stmt)
                 }
+                // 变量声明的显式类型必须先校验可见性（未知类型不得静默通过）。
+                checkTypeReferences(stmt.type, env)
                 if (stmt.initializer != null) {
                     // 声明类型显式给出时，要求初始化表达式可赋给它。
                     val initType = inferExpression(stmt.initializer, env)
@@ -509,6 +685,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 checkStatement(stmt.body, env, returnType)
                 for (catchClause in stmt.catches) {
                     val catchEnv = env.copy()
+                    // catch 形参类型是显式类型引用（FINDINGS #13 的原始触发点）。
+                    checkTypeReferences(catchClause.parameter.type, catchEnv)
                     catchEnv.set(catchClause.parameter.name, catchClause.parameter.type)
                     checkStatement(catchClause.body, catchEnv, returnType)
                 }
@@ -566,6 +744,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 // 因此带显式类型的绑定以自身类型为准，其余绑定沿用整体类型。
                 val initType = inferExpression(stmt.initializer, env)
                 for (binding in stmt.bindings) {
+                    // 解构绑定的显式类型同样是类型引用，先校验可见性。
+                    checkTypeReferences(binding.type, env)
                     env.set(binding.name, binding.type ?: initType)
                 }
             }
@@ -847,18 +1027,20 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasNew -> {
-                // new 的类型即其表达式类型；仅对具名类型校验类型实参个数。
-                if (expr.type is JasNamedType) {
-                    val namedType = expr.type as JasNamedType
-                    checkTypeArgumentCount(namedType.name, namedType.typeArguments, expr)
-                }
+                // new 的类型即其表达式类型；显式类型引用需校验可见性与类型实参个数。
+                checkTypeReferences(expr.type, env)
                 expr.type
             }
-            is JasArrayCreation -> JasArrayType(expr.type)
+            is JasArrayCreation -> {
+                // 数组创建的元素类型是显式类型引用（如 `new Row[n]` 的 Row）。
+                checkTypeReferences(expr.type, env)
+                JasArrayType(expr.type)
+            }
             is JasLambdaExpr -> {
                 // lambda 在子环境中检查：形参注入其中；返回类型由 body 的首个 return 推断。
                 val lambdaEnv = env.copy()
                 for (param in expr.parameters) {
+                    checkTypeReferences(param.type, lambdaEnv)
                     lambdaEnv.set(param.name, param.type)
                 }
                 for (stmt in expr.body.statements) {
@@ -878,13 +1060,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 thenType ?: elseType ?: JasAnyType
             }
             is JasCastExpr -> {
-                // 强制转型的结果类型就是目标类型本身；仅校验具名类型的实参个数。
-                if (expr.type is JasNamedType) {
-                    checkTypeArgumentCount((expr.type as JasNamedType).name, (expr.type as JasNamedType).typeArguments, expr)
-                }
+                // 强制转型的目标类型是显式类型引用；校验可见性与类型实参个数。
+                checkTypeReferences(expr.type, env)
                 expr.type
             }
-            is JasInstanceOfExpr -> JasPrimitiveType("bool")
+            is JasInstanceOfExpr -> {
+                // instanceof 的目标类型也是显式类型引用。
+                checkTypeReferences(expr.type, env)
+                JasPrimitiveType("bool")
+            }
             is JasNullCoalescing -> {
                 // `a ?: b`：左值可空则结果为其非空内层类型；左值非空则维持其类型。
                 val leftType = inferExpression(expr.left, env)

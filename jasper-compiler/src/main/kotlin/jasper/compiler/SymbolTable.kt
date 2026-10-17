@@ -66,6 +66,21 @@ class SymbolTable {
     val importDeclarations: MutableMap<String, JasImport> = mutableMapOf()
 
     /**
+     * 「类型简单名 -> 该名字出现的包名集合」索引，供类型检查阶段判定可见性。
+     *
+     * 做什么：记录每个已声明类型（类/接口/枚举/注解）所在的包；同名类型若出现在
+     *   多个包，则集合里会有多个包名（不丢失任何可见性信息）。
+     * 什么时候用：`TypeChecker` 判断一个**显式写出的简单类型名**能否在当前文件的
+     *   包里直接引用（同包可见），还是必须先 `import`。没有它就无法区分
+     *   `std.Error`（别包）与本包同名类型——这正是「未知类型静默通过」的根因之一。
+     * 前置条件：需要先 [collectDeclarations]；无包声明的文件记为空串。
+     * 失败模式：未命中返回 null（集合不存在），不抛异常。
+     * 为什么用集合而非单值：符号表以简单名为键、last-writer-wins，跨包同名时单值会
+     *   丢掉其中一个包；集合保留全部候选，避免误判「不可见」。
+     */
+    val typePackages: MutableMap<String, MutableSet<String>> = mutableMapOf()
+
+    /**
      * Per-type member signature index: type name -> member name -> declaration.
      *
      * This is the symbol-table view the TypeChecker resolves member accesses
@@ -173,6 +188,7 @@ class SymbolTable {
                     // 后写覆盖：重复声明时保留最后一次出现的类。
                     classes[decl.name] = decl
                     indexMembers(decl.name, decl.members)
+                    recordTypePackage(decl.name, ast.packageName)
                 }
                 is JasInterface -> {
                     val prev = seenTypes.put(decl.name, "interface")
@@ -184,6 +200,7 @@ class SymbolTable {
                     }
                     interfaces[decl.name] = decl
                     indexMembers(decl.name, decl.members)
+                    recordTypePackage(decl.name, ast.packageName)
                 }
                 is JasEnum -> {
                     val prev = seenTypes.put(decl.name, "enum")
@@ -194,6 +211,7 @@ class SymbolTable {
                         errors.add(SymbolError("Duplicate enum declaration '$decl.name'", "enum", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
                     }
                     enums[decl.name] = decl
+                    recordTypePackage(decl.name, ast.packageName)
                 }
                 is JasAnnotationType -> {
                     val prev = seenTypes.put(decl.name, "annotation")
@@ -204,6 +222,7 @@ class SymbolTable {
                         errors.add(SymbolError("Duplicate annotation declaration '$decl.name'", "annotation", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
                     }
                     annotations[decl.name] = decl
+                    recordTypePackage(decl.name, ast.packageName)
                 }
                 is JasImport -> {
                     // import 以「简单名」（点号最后一段）为键；若显式写了别名，则别名也映射到同一全限定名。
@@ -219,6 +238,19 @@ class SymbolTable {
                 else -> {}
             }
         }
+    }
+
+    /**
+     * 记录一个类型简单名所属的包（供 [typePackages] 可见性判定使用）。
+     *
+     * 什么时候用：[collectDeclarations] 每登记一个类型声明时调用一次。
+     * 前置条件：pkg 为源文件声明包；null（无 package 声明）归一为空串。
+     * 失败模式：无（幂等，重复记录同一 (name, pkg) 不产生副作用）。
+     * 为什么：把「声明在哪个包」这一信息随声明一起保存，类型检查阶段才能判断
+     *   一个简单名是否与当前文件同包、可否直接引用。
+     */
+    private fun recordTypePackage(name: String, pkg: String?) {
+        typePackages.getOrPut(name) { mutableSetOf() }.add(pkg ?: "")
     }
 
     /**
@@ -396,6 +428,10 @@ class SymbolTable {
         importDeclarations.putAll(other.importDeclarations)
         imports.putAll(other.imports)
         packages.putAll(other.packages)
+        // 可见性索引按简单名合并包集合（并集，不覆盖），避免跨包同名类型丢失候选包。
+        for ((name, pkgs) in other.typePackages) {
+            typePackages.getOrPut(name) { mutableSetOf() }.addAll(pkgs)
+        }
         // 已知限制：memberSignatures 按“整个类型索引”做 putAll 覆盖——同名类型的成员
         // 索引会整体替换为 other 的版本，而非逐成员合并。若两文件的同名类型各有不同成员，
         // 合并后 this 侧部分成员索引会丢失（类型本身也已被覆盖，故影响有限）。
