@@ -26,7 +26,7 @@
 
 **验收结果**：`jasper.JdbcProbeTest` 通过——
 `std.main.main()` 返回 `21`，`std.buildMeta.buildMeta()` 返回 2 项 `HashMap`，
-`std.Statement` 的 `declaredFields` 为空。
+`std.Statement` 的 `declaredFields` 为 `[MAX_ROWS]`（接口常量现已发射，见 #11）。
 
 ## 二、严重度与类别
 
@@ -48,7 +48,14 @@
 | 略有不便 | 3 | 1 | 2 | 0 |
 | **合计** | **18** | **4** | **2** | **12** |
 
+> 修复进度（commit `dbe8f17`）：已修复 5 条——`③编译器缺陷` #4/#5/#15、
+> `①语法层` #11、`②标准库缺失` #17；剩余未修复 13 条。修复详情见第五节各条目
+> 的「状态」行。
+
 ## 四、探针为通过验收而采用的规避（共 5 处）
+
+> 说明：下列规避是探针源码**编写时**为绕开缺陷所采用的写法，探针源码保持原样。
+> 其中第 5 条与 #4、#15 相关，二者已在 commit `dbe8f17` 修复，此规避不再必要。
 
 1. **全部探针文件放在 `package std;`**：跨包类型引用会被解析成 `<包名>/Error`
    这类不存在的类（见 #14 / #1），所以用户类型只有物理位于 `std` 才能 `extends Error`。
@@ -60,6 +67,7 @@
    同方法内多元素类型数组赋值会产生非法字节码（见 #3）。
 5. **不写 `this.方法()`，并把含 `defer` 的 `main` 放到文件最后**：
    `this.m()` 的接收者类型错误（见 #4），`defer` 会泄漏到后续函数（见 #15）。
+   ——两者均已在 `dbe8f17` 修复，此规避不再必要。
 
 ---
 
@@ -148,6 +156,8 @@ public function main(): int32 { var t = new T(); return t.v(); }
 
 #### 4. `this.方法()` 不可调用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `dbe8f17`）**——`translateIdentifier` 现按当前类登记
+  `this`/`super` 的接收者类型，`invokevirtual` 宿主类正确。
 - 现象：成员调用（`v:` 分支）从**接收者表达式的类型**推导 `invokevirtual` 的宿主类。
   `this` 这个标识符没有登记类型，回退为 `unit`，于是宿主类变成 `std/void`。
 - 触发代码：
@@ -169,6 +179,8 @@ public function main(): int32 { var t = new T(); return t.run(); }
 
 #### 5. 返回 `void` 的自由函数不能作语句调用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `dbe8f17`）**——静态调用分支在 `)V` 之后补
+  `ACONST_NULL`，语句位置不再发生操作数栈下溢。
 - 现象：语句位置的自由函数调用在 `invokestatic ...)V` 之后多出一条 `POP`
   （成员调用会补一个 `aconst_null`，静态调用没有）。
 - 触发代码：
@@ -281,6 +293,10 @@ public function main(): int32 {
 
 #### 11. 接口常量被静默丢弃
 - 类别：`①语法层`
+- 状态：**已修复（commit `dbe8f17`）**——接口常量现构建为 `JasProperty` 并发射
+  `public static final` 字段（字面量走 `ConstantValue`，否则 `<clinit>`），
+  读取降级为 `GETSTATIC`。`jasper.JdbcProbeTest` 现观测到
+  `std.Statement.declaredFields=[MAX_ROWS]`，本条目「实测」中的空数组证据已过期。
 - 现象：接口中的 `public const MAX_ROWS: int32 = 100;` 被解析但未生成任何字段。
 - 触发代码：
 ```jasper
@@ -359,6 +375,8 @@ public function main(): int32 {
 
 #### 15. `defer` 泄漏到后续函数
 - 类别：`③编译器缺陷`
+- 状态：**已修复（commit `dbe8f17`）**——每个函数/构造器/访问器/lambda 现通过
+  `scopedDefers` 建立独立的 `defer` 作用域，退出时恢复外层作用域。
 - 现象：`defer` 体被加入翻译上下文的 `deferredBodies` 列表，但**从不按函数清空**，
   于是一个函数的 `defer` 会被前置到其后每个函数的 `return` 里。
 - 触发代码：
@@ -406,6 +424,10 @@ public function main(): int32 {
 
 #### 17. `string` 缺少 `equals` 等标准方法
 - 类别：`②标准库缺失`
+- 状态：**已修复（commit `dbe8f17`）**——编译器预声明 `equals(kotlin.Any): bool`，
+  `s.equals(o)` 现降级为 `(Object)Z` 调用，而非此前的 `(String)V`。
+  注：这是把 `equals` 作为语言级值相等原语登记，并非补齐整套标准库——
+  `compareTo` 等仍未提供。
 - 触发代码：
 ```jasper
 package jdbcprobe;
@@ -444,11 +466,11 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 1. **`Row[]` 结果集缓存** —— 用户类对象数组丢包名（#1），只能用并行数组。
 2. **`Map<String,Integer>` 列名 → 列号表** —— 泛型 map 类型缺失（#16），
    `getStringByLabel` 固定列号。
-3. **`ResultSet` 内部私有辅助方法 `cellIndex(col)`** —— `this.方法()` 不可调用（#4），
-   改成内联算术。
-4. **`void` 形态的私有 setter 辅助函数** —— void 自由函数不可语句调用（#5），
-   改为返回数组。
-5. **接口常量 `Statement.MAX_ROWS`** —— 被静默丢弃（#11）。
+3. **`ResultSet` 内部私有辅助方法 `cellIndex(col)`** —— `this.方法()` 曾不可用
+   （#4，已修复 `dbe8f17`），探针仍保留内联算术写法。
+4. **`void` 形态的私有 setter 辅助函数** —— void 自由函数曾不可语句调用
+   （#5，已修复 `dbe8f17`），探针仍保留返回数组写法。
+5. **接口常量 `Statement.MAX_ROWS`** —— 曾被静默丢弃（#11，已修复 `dbe8f17`）。
 6. **`if (rs.getType() == Types.Integer)` 列类型分发** —— 枚举比较崩溃（#6），
    用 `int32` 常量代替。
 7. **`throws SQLException` 声明** —— 被忽略（#18），用 `Error` 层次代替。
@@ -458,11 +480,14 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 
 ## 七、结论
 
+- **修复更新（commit `dbe8f17`）**：本文 #4、#5、#11、#15、#17 五个缺陷已修复，
+  并新增 `jasper.ProbeDefectRegressionTest`（5 个测试，每缺陷 1 个）逐一回归；
+  `jasper.JdbcProbeTest` 仍通过。剩余 13 条仍未修复。
 - 探针可编译并运行，说明 Jasper 已具备「接口契约 + 类实现 + 内存状态 + 异常 + 资源
   清理 + 字面量集合」的表达能力，足以拼出一个可运行的 JDBC 假实现。
 - 但 18 个摩擦点里有 12 个是 `③编译器缺陷`，且多为**静默错误字节码**
   （`VerifyError`/`ClassFormatError`/`NoSuchMethodError`/`NPE`），而不是清晰的编译期报错；
   这会让用户把编译器 bug 误当成自己代码的问题。
 - 最影响「写不出 JDBC 形状」的是前 8 条：用户类对象数组（#1）、数组读类型（#2）、
-  多类型数组赋值（#3）、`this.方法()`（#4）、void 自由函数（#5）、枚举（#6）、
-  跨文件接口赋值（#7）、静态字段（#8）。
+  多类型数组赋值（#3）、`this.方法()`（#4，已修复）、void 自由函数（#5，已修复）、
+  枚举（#6）、跨文件接口赋值（#7）、静态字段（#8）。
