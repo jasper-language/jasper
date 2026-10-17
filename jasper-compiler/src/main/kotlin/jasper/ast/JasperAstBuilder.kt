@@ -1296,9 +1296,19 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      */
     override fun visitUnaryGo(ctx: JasperParser.UnaryGoContext): JasNode? = visit(ctx.goExpression())
     /**
-     * goExpression 规则：转发到 goTarget。
+     * goExpression 规则：把 `go <target>` 包成一个运算符为 "go" 的 [JasUnaryOp]。
+     *
+     * 做什么：显式区分「分离调度」与「直接执行」。历史实现直接转发到 goTarget，等于把 `go`
+     *   丢弃、退化成普通语句，语义不可观测（FINDINGS #2）。这里保留一层显式节点，让翻译器
+     *   能把「启动任务」的语义编码为后端可识别的调用名，后续引入真正调度器时只需改这一层。
+     * 什么时候用：解析 `go task();` / `go lambda () { ... };` 时。
+     * 前置条件：goTarget 必须能构出表达式（primary / lambda / block / 括号表达式）。
+     * 失败模式：goTarget 构树失败时抛类型转换异常，由解析层的兜底路径回报语法错误。
      */
-    override fun visitGoExpression(ctx: JasperParser.GoExpressionContext): JasNode? = visit(ctx.goTarget())
+    override fun visitGoExpression(ctx: JasperParser.GoExpressionContext): JasNode? {
+        val target = visit(ctx.goTarget()) as? JasExpression ?: return null
+        return JasUnaryOp("go", target).at(ctx)
+    }
     /**
      * goTarget 的 Primary 标签：转发到 primary。
      */

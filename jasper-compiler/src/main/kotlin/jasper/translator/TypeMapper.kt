@@ -495,6 +495,42 @@ class TypeMapper {
     }
 
     /**
+     * 做什么：由一个**数组类型的 IR 类型**反推出它元素类型的 IR 类型。
+     *
+     * 什么时候用：翻译数组读 `a[i]`、for-in 遍历数组等需要给「元素」一个精确 IR 类型的场景。
+     *   后端据此选 xALOAD 指令，翻译器据此确定 `var x = a[i]` 的推断类型。
+     * 前置条件：入参应当是数组 IR 类型（其 descriptor 以 '[' 开头）；否则按 [type]("kotlin.Any") 兜底。
+     * 失败模式：入参不是数组、或元素描述符无法识别时返回 `kotlin.Any`（**不会**返回 Unit/V）。
+     * 为什么放在 TypeMapper：这是「类型 ↔ 描述符」映射的一部分，所有后端/翻译器共用同一份规则；
+     *   若在翻译器里各写一份，基本类型数组与对象数组很容易漏掉引用元素（#11 的根因之一）。
+     * 关键边界：
+     *   - 一维基本类型数组（`[I`/`[J`/`[F`/`[D`/`[Z`/`[B`/`[S`/`[C`）逐一对到 Jar 基本类型；
+     *   - 引用元素 `Lfoo/Bar;` 去掉 `L`/`;` 后交给 [type]（它按内部名生成引用描述符）；
+     *   - 多维数组的元素仍是数组描述符（如 `[[I` 的元素是 `[I`），原样交给 [type]。
+     */
+    fun irArrayElementType(arrayType: IrType): IrType {
+        val desc = jvmDescriptorFromIrType(arrayType)
+        if (!desc.startsWith("[")) return type("kotlin.Any")
+        val elemDesc = desc.substring(1)
+        return when (elemDesc) {
+            "I" -> intType()
+            "J" -> longType()
+            "F" -> floatType()
+            "D" -> doubleType()
+            "Z" -> boolType()
+            "B" -> type("kotlin.Byte")
+            "S" -> type("kotlin.Short")
+            "C" -> charType()
+            // 元素本身还是数组（多维）或其它描述符形态：原样交给 type()（它只对 'L...;' 需要剥壳）。
+            else -> if (elemDesc.startsWith("L") && elemDesc.endsWith(";")) {
+                type(elemDesc.substring(1, elemDesc.length - 1))
+            } else {
+                type(elemDesc)
+            }
+        }
+    }
+
+    /**
      * 做什么：由类型名得到 JVM 字段/参数描述符。
      *
      * 什么时候用：已知名字（JVM 内部名或 Kotlin FQN）要转描述符时。

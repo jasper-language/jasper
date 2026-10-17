@@ -1580,17 +1580,9 @@ class JasperToIrTranslator {
     }
 
     private fun arrayElementType(arrayType: IrType): IrType {
-        return when (typeMapper.jvmDescriptorFromIrType(arrayType)) {
-            "[I" -> typeMapper.intType()
-            "[J" -> typeMapper.longType()
-            "[F" -> typeMapper.floatType()
-            "[D" -> typeMapper.doubleType()
-            "[Z" -> typeMapper.boolType()
-            "[B" -> typeMapper.mapTypeName("byte")
-            "[S" -> typeMapper.mapTypeName("short")
-            "[C" -> typeMapper.mapTypeName("char")
-            else -> typeMapper.type("kotlin.Any")
-        }
+        // 统一委托 TypeMapper：元素类型解析是「类型 ↔ 描述符」映射的一部分，
+        // 放在类型中枢可同时服务数组读、for-in 与后端指令选择，避免各处重写。
+        return typeMapper.irArrayElementType(arrayType)
     }
 
     private fun translateSwitch(stmt: JasSwitch, ctx: TranslationContext): IrWhen {
@@ -2038,6 +2030,28 @@ class JasperToIrTranslator {
     }
 
     private fun translateUnaryOp(expr: JasUnaryOp, ctx: TranslationContext): IrExpression {
+        // await / go 是异步地基原语，语义特殊，先于通用一元运算分派。（FINDINGS #1/#2）
+        when (expr.op) {
+            // await：当前没有真实的挂起运行时，等待语义按「操作数同步求值完成」实现——
+            // 直接返回操作数的求值结果，其 IR 类型即操作数类型。
+            // 旧实现把 await 当成未知一元运算，降级为对名为 "unknown" 的调用，
+            // 生成的描述符/宿主都不对（运行期 NoSuchMethodError: ...unknown(...)）。
+            // 变化点被隔离在此：将来引入真正的 async/Task 运行时，只需在这里改成
+            // 「按目标类型调用阻塞式取值」，不影响其它一元运算。
+            "await" -> return translateExpression(expr.operand, ctx)
+            // go：分离调度原语。没有调度器时，「启动任务」等价于同步触发任务体的副作用，
+            // 结果丢弃为 Unit。这里只把语义编码进 callNames，具体指令序列交给后端 "go" 分支，
+            // 保持「翻译层定语义、后端定指令」的单向契约。
+            "go" -> {
+                val task = translateExpression(expr.operand, ctx)
+                val goSymbol = ctx.functionSymbols["go"] ?: IrSimpleFunctionSymbolImpl()
+                ctx.callNames[goSymbol] = "go"
+                return IrNodeFactory.createCall(
+                    0, 0, typeMapper.unitType(), null,
+                    arrayOf(task), emptyArray(), goSymbol, null
+                )
+            }
+        }
         val operand = translateExpression(expr.operand, ctx)
         val funcName = when (expr.op) {
             "-" -> "negate"
@@ -2294,8 +2308,12 @@ class JasperToIrTranslator {
         val index = translateExpression(expr.index, ctx)
         val getSymbol = ctx.functionSymbols["get"] ?: IrSimpleFunctionSymbolImpl()
         ctx.callNames[getSymbol] = "get"
+        // 元素读的 IR 结果类型必须是**元素类型**，而不是 Unit：旧实现硬编码 unitType()，
+        // 于是 `var x = a[i]` 推断出 void 描述符，任何后续使用都会生成 V 指令
+        // （VerifyError / ClassFormatError，FINDINGS #11）。元素类型从数组目标类型反推。
+        val elementType = arrayElementType(target.type)
         return IrNodeFactory.createCall(
-            0, 0, typeMapper.unitType(), null,
+            0, 0, elementType, null,
             arrayOf(target, index), emptyArray(), getSymbol, null
         )
     }

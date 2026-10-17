@@ -36,7 +36,14 @@ import probes.r2dbc.TransientR2dbcException;
 //     多态一律走接口。
 //   * 订阅者不保存可空的 Subscription 字段（可空引用字段描述符错误，FINDINGS #10），
 //     取消所需的句柄通过参数即取即用。
-//   * `finally` 在本后端不可靠（FINDINGS #4），资源释放统一用 `defer`。
+//
+// 本轮已移除的规避（异步地基四缺陷修复：FINDINGS #1/#2/#4/#11）：
+//   * #1 `await`、#2 `go`：不再用「同步占位 Task + join()」回避，`taskValue()` 直接用
+//     `go task.complete(...)` 启动任务、`await task.join()` 取值（见下「任务/挂起」节）。
+//   * #4 `finally`：资源释放不再统一改道 `defer`，`main()` 改用标准 try/finally 兜底
+//     释放语句与连接；`MemoryResultSet` 也用 try/finally 复位 wasNull。
+//   * #11 数组读：`MemoryResultSet.getInt/getString` 直接对数组元素做成员访问，
+//     不再先赋给显式类型的局部变量。
 //
 // 文件结构说明：多顶层类型文件须 `package` 开头（见 FINDINGS 第 12 条）。
 // =============================================================================
@@ -371,11 +378,11 @@ public class FailingPublisher implements Publisher {
 }
 
 // ---------------------------------------------------------------------------
-// 「任务 / 挂起」形状（同步占位）
+// 「任务 / 挂起」形状
 // ---------------------------------------------------------------------------
-// 想要写的是：`var row: Row = await task;` 或 `go load(task);`。
-// 当前 `await` 会生成对 `unknown` 的调用、`go` 被静默丢弃（FINDINGS #1/#2），
-// 因此这里给出同步占位 Task：调用方用 join() 取结果。它只用于表达形状与对照。
+// FINDINGS #1/#2 已修：`go` 现在真的触发任务体的副作用（结果丢弃为 Unit），
+// `await e` 返回 `e` 的值。故 taskValue() 直接用 `go` 启动任务、用 `await` 取值；
+// Task 仍保留为「任务句柄」形状（complete/isDone/join）。
 public class Task {
     private var done: bool;
     private var row: Row;
@@ -399,12 +406,13 @@ public class Task {
     }
 }
 
-// 同步任务的小闭环；返回值由 R2dbcProbeTest 断言。
+// 任务小闭环；返回值由 R2dbcProbeTest 断言。
+// `go` 启动任务（同步触发副作用）、`await` 等待并取回结果（FINDINGS #1/#2 已修）。
 public function taskValue(): int32 {
     var task: Task = new Task();
-    task.complete(new Row(7, "task"));
+    go task.complete(new Row(7, "task"));
     if (task.isDone()) {
-        var row: Row = task.join();
+        var row: Row = await task.join();
         return row.id();
     }
     return 0;
@@ -436,8 +444,8 @@ public function buildNested(): List<List<Row> > {
 // ---------------------------------------------------------------------------
 // 驱动器：走完整条 R2DBC 形状链路，返回可断言的整数聚合结果。
 //
-// 放在文件最后：`defer` 在本后端曾泄漏到后续函数（FINDINGS #15 已修），
-// 这里保持原始写法作为对照。
+// FINDINGS #4 已修：资源释放改用标准 try/finally（不再是 `defer` 规避）。
+// 函数仍放在文件最后，保持原始排布以便人工对照。
 // ---------------------------------------------------------------------------
 public function main(): int32 {
     var rows: Row[] = new Row[3];
@@ -448,7 +456,10 @@ public function main(): int32 {
     // 具体类型保留一份，用于读取内存实现特有的计数；接口类型用于走协议。
     var memoryConn: MemoryConnection = new MemoryConnection(rows);
     var conn: Connection = memoryConn;
-    defer { conn.close(); }
+    var statement: Statement = conn.createStatement("select id, name from people");
+    // finally 兜底释放（FINDINGS #4 已修）：无论正常返回还是抛异常，语句与连接都关闭。
+    // 旧写法用 `defer` 规避「finally 不可靠」（原 FINDINGS 第四节第 7 条），现改为标准 try/finally。
+    try {
 
     // (1) 事务开始：begin() 返回 Mono，用 Publisher 多态订阅。
     var beginMono: Mono = conn.begin();
@@ -458,9 +469,6 @@ public function main(): int32 {
     beginPublisher.subscribe(beginSubscriber);
 
     // (2) 查询：executeQuery() 返回 Flux，逐行推送。
-    var statement: Statement = conn.createStatement("select id, name from people");
-    defer { statement.close(); }
-
     var flux: Flux = statement.executeQuery("select id, name from people");
     var queryPublisher: Publisher = flux;
     var collector: CollectingSubscriber = new CollectingSubscriber();
@@ -521,4 +529,8 @@ public function main(): int32 {
     total = total + taskValue();                   // 7
 
     return total;
+    } finally {
+        statement.close();
+        conn.close();
+    }
 }

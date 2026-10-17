@@ -30,18 +30,24 @@ public class MemoryResultSet implements ResultSet {
         return this.cursor < this.rows.length;
     }
 
+    // 取消规避（FINDINGS #11 已修）：数组读表达式的类型现在就是元素类型 `Row`，
+    // 可以直接对 `this.rows[this.cursor]` 做成员访问，不必再先赋给显式类型的局部变量。
+    // 取消规避（FINDINGS #4 已修）：`finally` 在正常/异常/提前 return 路径都会执行，
+    // 这里用 try/finally 复位 `wasNull` 侧信道，覆盖「return 路径也跑 finally」。
     public function getInt(col: int32): int32 {
-        // 先把数组元素读进显式类型的局部变量，再访问字段：直接对数组读做成员
-        // 访问会踩到数组读表达式的类型推断问题（见 FINDINGS #11）。
-        var row: Row = this.rows[this.cursor];
-        this.lastNull = false;
-        return row.id();
+        try {
+            return this.rows[this.cursor].id();
+        } finally {
+            this.lastNull = false;
+        }
     }
 
     public function getString(col: int32): string {
-        var row: Row = this.rows[this.cursor];
-        this.lastNull = false;
-        return row.name();
+        try {
+            return this.rows[this.cursor].name();
+        } finally {
+            this.lastNull = false;
+        }
     }
 
     public function wasNull(): bool {

@@ -187,10 +187,23 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         val isStatic: Boolean,
         // 循环标签栈，元素为 (continue 目标, break 目标)；IrBreak/IrContinue 取栈顶。
         val loopStack: MutableList<Pair<Label, Label>> = mutableListOf(),
+        // finally 上下文栈：进入 try/finally 的函数体时压栈、离开时弹栈。
+        // 生成 IrReturn 时据此在返回前按「内层到外层」顺序执行所有尚未执行的 finally，
+        // 这样「提前 return 也执行 finally」才能成立，且每个 finally 只执行一次（FINDINGS #4）。
+        val finallyStack: MutableList<FinallyContext> = mutableListOf(),
         // 延迟生成的语句块（预留给 translator 的延迟体机制；当前后端未消费）。
         val deferredBodies: MutableList<IrBlock> = mutableListOf()
     )
 
+    /**
+     * 一个 try/finally 的 finally 体（IR 表达式）在生成期的上下文。
+     * 什么时候用：生成 try 体 / catch 体时压入 [MethodContext.finallyStack]；
+     *   生成该 try 的正常收尾与异常处理器时弹出，保证 finally 自身里的 return 不会递归执行自己。
+     * 为什么需要：JVM 没有结构化 finally 指令，异常/正常/return 三条路径都要各自补上
+     *   「执行 finally」的代码；用一个显式上下文栈把「哪些 finally 还没跑」记录下来，
+     *   才能让 return 走对路径且只跑一次。
+     */
+    data class FinallyContext(val block: IrExpression)
     // 当前正在生成的包名（以 '/' 分隔的内部名形式），决定 class 内部名与字段 owner 兜底。
     private var currentPkg: String = ""
     // —— 以下 5 张表在 generate() 第一遍里按符号填入，第二遍生成时只读 ——
@@ -762,18 +775,39 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
             is IrReturn -> {
                 val value = stmt.value
+                val retType = ctx.returnType
+                val returnDesc = if (retType != null) typeMapper.jvmReturnDescriptorFromIrType(retType) else "V"
+                val hasValue = !isIrVoidExpr(value)
                 // translator 用 IrConst(Null) 表示「无返回值」，此时不能再压栈，直接 return。
-                if (!isIrVoidExpr(value)) {
+                if (hasValue) {
                     generateIrExpression(mv, value, ctx, owner)
                     val valueDesc = typeMapper.jvmDescriptorFromIrType(value.type)
-                    val retType = ctx.returnType
                     if (retType != null) {
                         // 返回值同样要拓宽/装箱到方法声明的返回类型，否则类型不匹配
                         // （例如返回 Object 却压了个 int，ARETURN 会校验失败）。
-                        val returnDesc = typeMapper.jvmReturnDescriptorFromIrType(retType)
                         widenIfNeeded(mv, valueDesc, returnDesc)
                         emitBoxingIfNeeded(mv, valueDesc, returnDesc)
                     }
+                }
+                // ③ 提前 return 路径（FINDINGS #4）：若当前处于 try/finally 体内，必须在真正返回前
+                // 执行所有外层 finally。做法：先把已拓宽/装箱好的返回值存进临时槽，按「内层到外层」
+                // 顺序执行 finally，再取回值返回。
+                // 生成 finally 期间临时清空 finallyStack，避免 finally 自身里的 return 递归执行自身
+                // （Java 语义：finally 里的 return 覆盖外层 return）。
+                if (ctx.finallyStack.isNotEmpty()) {
+                    var savedSlot = -1
+                    if (hasValue) {
+                        savedSlot = ctx.nextSlot
+                        ctx.nextSlot += if (returnDesc == "J" || returnDesc == "D") 2 else 1
+                        storeLocal(mv, returnDesc, savedSlot)
+                    }
+                    val pending = ctx.finallyStack.toMutableList()
+                    ctx.finallyStack.clear()
+                    for (f in pending.asReversed()) {
+                        generateFinallyBody(mv, f.block, ctx, owner)
+                    }
+                    ctx.finallyStack.addAll(pending)
+                    if (hasValue) loadLocal(mv, returnDesc, savedSlot)
                 }
                 generateIrReturn(mv, ctx.returnType)
             }
@@ -830,83 +864,115 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 ctx.loopStack.removeLast()
             }
             is IrTry -> {
-                // 无 catch 的 try（只有 try/finally）：不需要异常表，直接把 try 体与
-                // finally 体顺序内联。这不满足「异常路径也执行 finally」的语义，是已知
-                // 简化；正常路径语义与源码一致。
-                if (stmt.catches.isEmpty()) {
-                    val tryBody = stmt.tryResult
-                    if (tryBody is IrBlock) {
-                        for (s in tryBody.statements) {
-                            generateIrStatement(mv, s, ctx, owner)
-                        }
-                    }
-                    val finallyExpr = stmt.finallyExpression
-                    if (finallyExpr is IrBlock) {
-                        for (s in finallyExpr.statements) {
-                            generateIrStatement(mv, s, ctx, owner)
-                        }
-                    } else if (finallyExpr != null) {
-                        generateIrExpression(mv, finallyExpr, ctx, owner)
-                        // finally 值只作副作用时留在栈上的值必须弹掉，保持栈平衡。
-                        if (typeMapper.jvmDescriptorFromIrType(finallyExpr.type) != "V") {
-                            mv.visitInsn(Opcodes.POP)
-                        }
-                    }
-                    return
-                }
-                // 有 catch：构造异常表 tryStart..tryEnd → catchStart，异常类型取第一个
-                // catch 参数的类型（多 catch 时后续类型只做 CHECKCAST，见下）。
+                // try/catch/finally 的统一生成。JVM 没有结构化 finally 指令，必须让三条路径都补上
+                // 「执行 finally」的代码，且同一条路径只执行一次：
+                //   ① 正常结束：try 体之后顺序执行 finally，再跳到 endLabel；
+                //   ② 异常路径（try 体或 catch 体抛出）：异常表兜底到 finallyHandler，
+                //      执行 finally 后 ATHROW 重新抛出；
+                //   ③ 提前 return：见下方 IrReturn 分支，借 finallyStack 在返回前按逆序执行 finally。
+                // 旧实现只支持 ①（且异常/return 路径完全不执行 finally），是 FINDINGS #4 的根因。
+                val finallyExpr = stmt.finallyExpression
+                val hasFinally = finallyExpr != null
+                val hasCatches = stmt.catches.isNotEmpty()
+                val fctx = if (hasFinally) FinallyContext(finallyExpr!!) else null
+
                 val tryStart = Label()
                 val tryEnd = Label()
                 val catchStart = Label()
+                val catchEnd = Label()
+                val finallyHandler = Label()
                 val endLabel = Label()
-                val catchTypeInternal = if (stmt.catches.isNotEmpty()) {
-                    val param = stmt.catches.first().catchParameter
-                    typeMapper.jvmInternalNameFromIrType(param.type)
-                } else "java/lang/Throwable"
-                mv.visitTryCatchBlock(tryStart, tryEnd, catchStart, catchTypeInternal)
+
+                // 异常表顺序即匹配优先级：具体 catch 类型在前，finally 兜底（type=null）在后。
+                val catchTypeInternal = if (hasCatches) {
+                    typeMapper.jvmInternalNameFromIrType(stmt.catches.first().catchParameter.type)
+                } else null
+                // 注意：本 try 的异常表项**延迟到生成完 try 体之后**才登记（见下）。
+                // JVM 按登记顺序匹配异常表项，嵌套 try 的内层处理器必须先于外层登记，
+                // 否则外层 catch 会「抢先」吞掉本该由内层 finally 处理的异常。
+                // （ASM 允许 visitTryCatchBlock 晚于对应 label 调用，输出顺序即调用顺序。）
+
+                // ---- ① try 体 ----
+                // 生成 try 体期间把 finally 上下文压栈，使体内任何 return 都能在返回前执行 finally。
+                if (fctx != null) ctx.finallyStack.add(fctx)
                 mv.visitLabel(tryStart)
                 val tryBody = stmt.tryResult
                 if (tryBody is IrBlock) {
-                    for (s in tryBody.statements) {
-                        generateIrStatement(mv, s, ctx, owner)
-                    }
+                    for (s in tryBody.statements) generateIrStatement(mv, s, ctx, owner)
+                } else {
+                    generateIrStatement(mv, tryBody as IrStatement, ctx, owner)
                 }
                 mv.visitLabel(tryEnd)
-                // try 正常结束要跳过所有 catch 体，直达 endLabel。
-                mv.visitJumpInsn(Opcodes.GOTO, endLabel)
-                mv.visitLabel(catchStart)
-                // 进入 catch 时操作数栈顶是抛出的异常对象；每个 catch 参数都必须从它
-                // 取值。下面为每个 catch 子句分配一个槽并 ASTORE（先按 Throwable 存，
-                // 具体类型不足时再 CHECKCAST 回写），最后按 catch 顺序生成体。
-                for (catchClause in stmt.catches) {
-                    val param = catchClause.catchParameter
-                    val pName = param.name.toString()
-                    val paramDesc = typeMapper.jvmDescriptorFromIrType(param.type)
-                    val paramInternal = typeMapper.jvmInternalNameFromIrType(param.type)
-                    val catchSlot = ctx.nextSlot
-                    // 异常对象是引用，占 1 个槽（即便类型是 long/double 也不会出现在这里）。
-                    ctx.nextSlot += 1
-                    storeLocal(mv, "Ljava/lang/Throwable;", catchSlot)
-                    // 声明的异常类型比 Throwable 更具体时，需 checkcast 后按真实类型
-                    // 重存，后续 loadLocal 才能用正确的描述符取值。
-                    if (paramInternal != "java/lang/Throwable" && paramInternal != "throwable") {
-                        loadLocal(mv, "Ljava/lang/Throwable;", catchSlot)
-                        mv.visitTypeInsn(Opcodes.CHECKCAST, paramInternal)
-                        storeLocal(mv, paramDesc, catchSlot)
-                    }
-                    ctx.variables[pName] = catchSlot
-                    ctx.locals.add(LocalInfo(pName, param.type, catchSlot))
-                    ctx.symbolToName[param.symbol] = pName
-                    val catchBody = catchClause.result
-                    if (catchBody is IrBlock) {
-                        for (s in catchBody.statements) {
-                            generateIrStatement(mv, s, ctx, owner)
-                        }
-                    } else {
-                        generateIrStatement(mv, catchBody as IrStatement, ctx, owner)
-                    }
+                if (fctx != null) ctx.finallyStack.removeLast()
+                // 生成完 try 体后登记本 try 范围的处理器：内层（体里嵌套 try）已先登记。
+                if (hasCatches) {
+                    mv.visitTryCatchBlock(tryStart, tryEnd, catchStart, catchTypeInternal)
                 }
+                if (hasFinally) {
+                    // try 体内未被 catch 命中的异常 → finallyHandler（兜底，type=null）。
+                    mv.visitTryCatchBlock(tryStart, tryEnd, finallyHandler, null)
+                }
+                // 正常结束：执行 finally 后跳过 catch / finally 处理器。
+                if (hasFinally) generateFinallyBody(mv, finallyExpr!!, ctx, owner)
+                mv.visitJumpInsn(Opcodes.GOTO, endLabel)
+
+                // ---- ② catch 分支 ----
+                if (hasCatches) {
+                    mv.visitLabel(catchStart)
+                    if (fctx != null) ctx.finallyStack.add(fctx)
+                    // 进入 catch 时操作数栈顶是抛出的异常对象；每个 catch 参数都必须从它取值。
+                    // 下面为每个 catch 子句分配一个槽并 ASTORE（先按 Throwable 存，
+                    // 具体类型不足时再 CHECKCAST 回写），最后按 catch 顺序生成体。
+                    for (catchClause in stmt.catches) {
+                        val param = catchClause.catchParameter
+                        val pName = param.name.toString()
+                        val paramDesc = typeMapper.jvmDescriptorFromIrType(param.type)
+                        val paramInternal = typeMapper.jvmInternalNameFromIrType(param.type)
+                        val catchSlot = ctx.nextSlot
+                        // 异常对象是引用，占 1 个槽（即便类型是 long/double 也不会出现在这里）。
+                        ctx.nextSlot += 1
+                        storeLocal(mv, "Ljava/lang/Throwable;", catchSlot)
+                        // 声明的异常类型比 Throwable 更具体时，需 checkcast 后按真实类型
+                        // 重存，后续 loadLocal 才能用正确的描述符取值。
+                        if (paramInternal != "java/lang/Throwable" && paramInternal != "throwable") {
+                            loadLocal(mv, "Ljava/lang/Throwable;", catchSlot)
+                            mv.visitTypeInsn(Opcodes.CHECKCAST, paramInternal)
+                            storeLocal(mv, paramDesc, catchSlot)
+                        }
+                        ctx.variables[pName] = catchSlot
+                        ctx.locals.add(LocalInfo(pName, param.type, catchSlot))
+                        ctx.symbolToName[param.symbol] = pName
+                        val catchBody = catchClause.result
+                        if (catchBody is IrBlock) {
+                            for (s in catchBody.statements) generateIrStatement(mv, s, ctx, owner)
+                        } else {
+                            generateIrStatement(mv, catchBody as IrStatement, ctx, owner)
+                        }
+                    }
+                    mv.visitLabel(catchEnd)
+                    if (fctx != null) ctx.finallyStack.removeLast()
+                    // catch 体自身抛出的异常同样要跑 finally；登记时机同样晚于 catch 体内层处理器。
+                    if (hasFinally) {
+                        mv.visitTryCatchBlock(catchStart, catchEnd, finallyHandler, null)
+                    }
+                    // catch 正常结束同样要执行 finally。
+                    if (hasFinally) generateFinallyBody(mv, finallyExpr!!, ctx, owner)
+                    mv.visitJumpInsn(Opcodes.GOTO, endLabel)
+                }
+
+                // ---- ③ finally 兜底处理器：任何未捕获异常都在执行 finally 后重抛 ----
+                // 先把异常存入临时槽，跑完 finally 再取回 ATHROW；finally 里若抛出则新异常向外传播
+                // （原异常被丢弃），与 Java 语义一致。
+                if (hasFinally) {
+                    mv.visitLabel(finallyHandler)
+                    val pendingSlot = ctx.nextSlot
+                    ctx.nextSlot += 1
+                    storeLocal(mv, "Ljava/lang/Throwable;", pendingSlot)
+                    generateFinallyBody(mv, finallyExpr!!, ctx, owner)
+                    loadLocal(mv, "Ljava/lang/Throwable;", pendingSlot)
+                    mv.visitInsn(Opcodes.ATHROW)
+                }
+
                 mv.visitLabel(endLabel)
             }
             is IrThrow -> {
@@ -1066,6 +1132,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // 也最容易受影响的契约（新增语义名要在此处补分支，否则落到 else 的静态调用）。
                 val irName = callNames[expr.symbol] ?: functionSymbolToName[expr.symbol] ?: "invoke"
                 when (irName) {
+                    "go" -> {
+                        // 分离调度原语（FINDINGS #2）：没有真实调度运行时时，「启动任务」= 同步触发
+                        // 任务体的副作用。任务体表达式无论返回什么（含 void 调用留下的 null 占位），
+                        // 在这里都统一 POP 丢弃，再补一个 null 占位，满足「表达式恰好留一个值」的约定。
+                        val task = expr.getValueArgument(0)
+                        if (task != null) {
+                            generateIrExpression(mv, task, ctx, owner)
+                            mv.visitInsn(Opcodes.POP)
+                        }
+                        mv.visitInsn(Opcodes.ACONST_NULL)
+                    }
                     "invoke_lambda" -> {
                         // 闭包调用：translator 把 lambda 编译成一个带 invoke 方法的匿名类，
                         // 这里退化为对接收者的 INVOKEVIRTUAL invoke(...)。接收者类型的
@@ -1658,6 +1735,37 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 只检查顶层（不递归进 if/loop）——嵌套分支的 return 由各分支自己发射。
     private fun hasIrReturn(body: IrBlockBody): Boolean {
         return body.statements.any { it is IrReturn }
+    }
+
+    /**
+     * 生成一个 finally 体的字节码，并保证生成结束后操作数栈上「不残留值」。
+     *
+     * 做什么：finally 体在 Jasper 里是一个块（[IrBlock]）；本函数把它的语句逐条生成。
+     *   空 finally（translator 用 `IrConst(Null)` 占位，如 `lock` 的占位）视为 no-op，
+     *   不生成任何指令——因为该 null 常量语义上是「无值」，若照常压栈会让调用点的
+     *   栈平衡被破坏（例如 IrReturn 之后多出一个 null）。
+     * 什么时候用：try 正常收尾、catch 正常收尾、异常兜底处理器、以及 return 前补跑 finally。
+     * 前置条件：调用方需自行决定 finallyStack 的压栈/弹栈时机（见各调用点）。
+     * 失败模式：块内的语句若自身破坏「表达式恰留一个值」的约定，错误会传递到验证器；本函数不兜底。
+     * 为什么这样设计：finally 会在多条路径上重复生成，集中到一个函数可保证四条路径的
+     *   生成规则完全一致，避免某条路径漏 POP 或漏处理空 finally。
+     */
+    private fun generateFinallyBody(mv: MethodVisitor, expr: IrExpression, ctx: MethodContext, owner: String) {
+        when {
+            expr is IrBlock -> {
+                for (s in expr.statements) generateIrStatement(mv, s, ctx, owner)
+            }
+            isIrVoidExpr(expr) -> {
+                // 空 finally（Unit/null 占位）：没有副作用，也没有值需要压栈或弹掉。
+            }
+            else -> {
+                generateIrExpression(mv, expr, ctx, owner)
+                // finally 表达式只作副作用时，留在栈上的值必须弹掉，保持栈平衡。
+                if (typeMapper.jvmDescriptorFromIrType(expr.type) != "V") {
+                    mv.visitInsn(Opcodes.POP)
+                }
+            }
+        }
     }
 
     // 按返回类型选 return 指令：void→RETURN、int-like→IRETURN、long→LRETURN、
