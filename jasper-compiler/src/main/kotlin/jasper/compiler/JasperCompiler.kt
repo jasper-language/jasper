@@ -595,8 +595,17 @@ class JasperCompiler {
      * 前置条件：仅用于解析兼容，最终由 [unwrapLegacyTopLevelMembers] 还原。
      */
     private fun wrapLegacyTopLevelMembers(source: String): String {
-        // (?s) 让 `.` 跨行；group1=package 行，group2=import/from 行，group3=其余 body。
-        val match = Regex("""(?s)^(\s*package\b[^;]*;\s*)?((?:\s*(?:import|from)\b[^;]*;\s*)*)(.*)$""")
+        // (?s) 让 `.` 跨行；group1=前导注释/空白 + 可选 package 行，group2=import/from 行，group3=其余 body。
+        //
+        // ⚠️ 2026-10-17 修复（R2DBC 探针 #12）：原正则只允许 `\s*` 出现在 `package` 之前，
+        //    于是「文件头注释 + package + 多顶层类型」这种极常见写法会解析失败
+        //    （报 `mismatched input 'package' expecting ...`，错误信息完全看不出真实原因）。
+        //    这里把「空白 / 行注释 / 块注释」都纳入前导部分，并且**保留在 header 里**，
+        //    使注释仍然贴在文件顶部，而不是被吞掉。
+        val match = Regex(
+            """(?s)^((?:(?:[ \t\r\n]+)|(?://[^\n]*\n?)|(?:/\*.*?\*/))*(?:package\b[^;]*;\s*)?)""" +
+            """((?:\s*(?:import|from)\b[^;]*;\s*)*)(.*)$"""
+        )
             .matchEntire(source)
             ?: return source
         val header = (match.groupValues[1] + match.groupValues[2])
