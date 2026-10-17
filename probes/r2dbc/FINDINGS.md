@@ -501,9 +501,10 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 #### 15. `defer` 泄漏到后续函数
 - 类别：`③编译器缺陷`
 - 状态：**已修复**。
-- `main()` 使用 `defer { conn.close(); }` / `defer { statement.close(); }`，且 `main` 之后无
-  其它函数；若 `defer` 仍跨函数泄漏，运行期会 NPE。探针运行成功即证明作用域已正确隔离。
-- 探针处置：保持 `main` 位于文件最后的原始写法作为对照。
+- 探针处置（本批更新）：原 `main()` 曾用 `defer { conn.close(); }` / `defer { statement.close(); }`
+  作为对照；为移除 #4 规避，`main()` 已改用标准 `try/finally`，R2DBC 探针**不再使用 `defer`**。
+  该缺陷的回归守门改由 `jasper.ProbeDefectRegressionTest.defer does not leak into later functions`
+  承担（`defer` 作用域仍被单测覆盖），故此处不再保留探针对照。
 
 ## 六、探针「想写但写不出」的 R2DBC 形状清单
 
