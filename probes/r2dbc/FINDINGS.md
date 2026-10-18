@@ -93,6 +93,8 @@ Flux.declaredFields=[FETCH_SIZE]
 > 修复详情见第五节各条目的「状态」行；回归守门见
 > `jasper.R2dbcDefectRegressionTest`（#1/#2/#4/#11）与
 > `jasper.GenericDispatchTest`（#3，及 #8 的成员调用部分）。
+> **本提交（Q21 / C3+C7）** 另修复 `③编译器缺陷` #6（继承方法描述符退化 `void`）与
+> #9（类继承不参与赋值子类型）；回归守门见 `jasper.InheritanceTest`。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -292,6 +294,12 @@ public class Pt { public var x: int32; public constructor(v: int32) { this.x = v
 
 #### 6. 继承来的方法：返回描述符退化为 `void`
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——`JasperToIrTranslator` 预登记阶段新增继承成员索引传播
+  （`collectSuperTypeNames` + `propagateInheritedMemberIndexes`）：祖先类型的成员返回类型与
+  声明擦除签名沿父类/接口链补进子类型索引，故「子类接收者调用继承方法」不再回退全局
+  last-writer-wins，描述符也不再退化为 `void`。回归守门见 `InheritanceTest` 的
+  `cross file inherited method keeps correct return descriptor`（跨文件、使用方排前）与
+  `method descriptors are correct and never degenerate to void`。
 - 现象：在**子类**类型接收者上调用从基类继承的方法时，若该方法不在子类自己的成员索引里，
   返回类型会回退到全局表；若声明该方法的文件还没被翻译，则退化为 `void`。
 - 触发代码（`Main.jas` 排在 `Base.jas` 之前）：
@@ -358,6 +366,11 @@ public class H2 { private var slot: I; public constructor(c: C) { this.slot = c;
 
 #### 9. 类继承不参与赋值子类型
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——`TypeChecker` 新增 `classExtends` 层次表并让 `isSubtype` 沿
+  类继承链走传递闭包（`A <- B <- C` 时 C 亦是 A 的子类型），同时补了类/接口循环继承诊断与
+  override 返回类型协变校验。子类实例现可赋给基类变量、作形参/返回值，并经基类类型虚分派
+  到 override、经继承解析调到未 override 的方法与继承字段。回归守门见 `InheritanceTest`
+  （13 个用例：虚分派/继承方法/形参返回值/继承字段/三层继承/接口+继承组合/描述符/负向/跨文件）。
 - 现象：`class D extends B` 之后，`var b: B = d;` 被类型检查拒绝（同文件与跨文件都拒绝）。
   接口实现（`implements`）的多态赋值正常工作，唯独类继承的赋值无法识别。
 - 触发代码：

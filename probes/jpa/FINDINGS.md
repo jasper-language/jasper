@@ -187,6 +187,11 @@ public function main(): int32 {
 
 #### 4. 类继承不参与赋值子类型（实体继承形状不可用）
 - 类别：`③编译器缺陷`（同 R2DBC #9 复核）
+- 状态：**已修复（本提交）**——与 R2DBC #9 同源：`TypeChecker.classExtends` + `isSubtype`
+  传递闭包让类继承进入子类型关系；子类实例可赋给基类变量并虚分派。回归守门见
+  `InheritanceTest`（虚分派 / 三层继承 / 接口+继承组合 / 继承字段 / 描述符 / 跨文件）。
+  实体继承（`@Inheritance`、`@MappedSuperclass`）的**元数据**部分（#5/#6 的运行期注解读取、
+  缺 `@Id` 校验）仍未覆盖，属另两条独立缺陷，不在本次范围内。
 - 触发代码：
 ```jasper
 package p;
@@ -337,7 +342,9 @@ public class Node { public function label(): string { return "n"; } }   // 语�
    接口类型变量直接分派（原来只能声明、运行期走窄接口或具体类型）。
 2. **`EntityManager.persist(Object)` 依赖运行期反射注解** —— 不可用（#5）：
    实体必须实现 `Identifiable`/`Lifecycled` 接口，元数据手写。
-3. **实体继承 / `@MappedSuperclass`** —— 不可用（#4）：类继承不参与赋值子类型。
+3. ~~**实体继承 / `@MappedSuperclass`** —— 不可用（#4）~~：**本提交已修复**类继承赋值子类型
+   （子类实例可赋给基类变量并虚分派）；但实体继承的**元数据驱动**依赖运行期注解读取，仍
+   受 #5/#6 阻塞（见下）。
 4. **`Map<主键, 实体>` 一级缓存** —— 不可用（#8）：`dict<K,V>` 不能作类型。
 5. **`@GeneratedValue` 全局序列（静态计数器）** —— 不可用（#10）：静态字段坏。
 6. ~~**`GenerationType` 枚举** —— 不可用（#11）~~：**本提交已修复**，枚举已可比较、
@@ -368,7 +375,7 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 | 本报告 | 同源既有条目 | 关系 |
 | --- | --- | --- |
 | #3 跨文件字段 | R2DBC #5 | 复核；本探针观测到与文件顺序无关 |
-| #4 类继承不参与子类型 | R2DBC #9 | 复核，JPA 视角（实体继承） |
+| #4 类继承不参与子类型 | R2DBC #9 | 复核，JPA 视角（实体继承）；**已修复（本提交）** |
 | #8 dict 不能作类型 | JDBC #16 / R2DBC #16 | 复核，JPA 视角（注册表/一级缓存） |
 | #10 静态字段坏 | JDBC #8 | 复核，JPA 视角（全局序列） |
 | #11 枚举不可比较 | JDBC #6 | 复核，JPA 视角（GenerationType）；**已修复（本提交）** |

@@ -57,6 +57,12 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     private val errors = mutableListOf<TypeError>()
     private val classImplements = mutableMapOf<String, List<String>>() // className -> interfaceNames
     private val interfaceExtends = mutableMapOf<String, List<String>>() // interfaceName -> parentInterfaceNames
+    // className -> direct superclassName（简单名）。null 表示无显式父类（等价 Object）。
+    // 这是「类继承参与子类型判定」的唯一事实来源：isSubtype 沿它向上走传递闭包。
+    // 为什么单列一张表：classImplements 只记接口方向，类继承方向此前完全缺失，
+    //   正是「子类不能赋给基类变量」的根因（R2DBC #9 / JPA #4）。接口与类关系保持独立，
+    //   避免把两种继承语义混在一张表里（隔离的变化点：继承关系来源）。
+    private val classExtends = mutableMapOf<String, String?>()
 
     /**
      * 当前被检查文件声明的包名（null 表示无 package 声明）。
@@ -109,6 +115,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         errors.clear()
         classImplements.clear()
         interfaceExtends.clear()
+        classExtends.clear()
         // 显式类型引用可见性判定所需的本文件上下文：包名 + 本文件 import 表。
         currentPackageName = sourceFile.packageName
         fileImports = collectFileImports(sourceFile)
@@ -122,6 +129,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         // 会误报 Type mismatch（#7）。这里用「不覆盖」语义，保证当前文件的声明优先。
         symbolTable?.classes?.values?.forEach { collectClassHierarchy(it) }
         symbolTable?.interfaces?.values?.forEach { collectInterfaceHierarchy(it) }
+        // 层次图完备后再做一次成环检测：语法允许 `class A extends B; class B extends A`，
+        // 若不诊断，用户只会看到后续莫名的错误，甚至无错误。诊断独立成函数，避免污染收集逻辑。
+        reportHierarchyCycles()
         // 第二遍：每个顶层声明在全新的空环境中检查（局部作用域由各检查函数自行派生）。
         for (decl in sourceFile.declarations) {
             checkDeclaration(decl, TypeEnvironment())
@@ -148,7 +158,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
     }
 
-    /** 记录一个类的 implements 列表；已存在的条目不被覆盖（当前文件优先）。 */
+    /** 记录一个类的 implements 列表与直接父类；已存在的条目不被覆盖（当前文件优先）。 */
     private fun collectClassHierarchy(cls: JasClass) {
         if (classImplements.containsKey(cls.name)) return
         // 只认 JasNamedType 形式的接口名；其它类型（如泛型实参）这里不展开。
@@ -156,6 +166,63 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             if (iface is JasNamedType) iface.name else null
         }
         classImplements[cls.name] = ifaces
+        // 父类同样只认 JasNamedType；无显式父类时记 null（等价 java.lang.Object）。
+        classExtends[cls.name] = (cls.superclass as? JasNamedType)?.name
+    }
+
+    /**
+     * 做什么：检测类继承链与接口继承图中是否存在环，并各报一条诊断；无环时不产生任何输出。
+     *
+     * 什么时候用：[check] 第一遍收集完 classExtends/interfaceExtends 之后、第二遍声明检查之前。
+     * 前置条件：classExtends 与 interfaceExtends 已填充（当前文件 + 符号表）。
+     * 失败模式：不抛异常；只在发现环时向 errors 追加 TypeError。
+     * 为什么这样设计：循环继承本身是非法层次图，若不诊断，`isSubtype` 的 visited 保护虽能
+     *   避免无限递归，但会静默给出错误答案；把「层次图是否有环」这一独立关注点收进单独函数，
+     *   与子类型遍历解耦（隔离的变化点：图合法性 vs 图遍历）。
+     * 已知限制：只沿用户已声明类型判定；跨到外部类型（如 java.lang.Object）的链在表外自然终止。
+     */
+    private fun reportHierarchyCycles() {
+        // 类：每个类至多一个直接父类，沿单链走即可发现环。
+        val reportedClasses = mutableSetOf<String>()
+        for (start in classExtends.keys) {
+            if (start in reportedClasses) continue
+            val path = mutableListOf<String>()
+            val onPath = mutableSetOf<String>()
+            var current: String? = start
+            while (current != null && current !in reportedClasses) {
+                if (!onPath.add(current)) {
+                    val cycle = path.subList(path.indexOf(current), path.size)
+                    reportedClasses.addAll(cycle)
+                    error("Cyclic class inheritance detected: ${(cycle + current).joinToString(" -> ")}")
+                    break
+                }
+                path.add(current)
+                current = classExtends[current]
+            }
+        }
+        // 接口：一个接口可有多个父接口，用「从起点沿父边能否回到起点」的可达性检查判环。
+        // 每个成环接口各报一条（同一环的多个成员会各报一次，属明确、可定位的诊断）。
+        // 用显式队列而非递归：既不引入被风格护栏误判的局部函数，也避免深层次导致栈溢出。
+        val reportedInterfaces = mutableSetOf<String>()
+        for (start in interfaceExtends.keys) {
+            if (start in reportedInterfaces) continue
+            val visited = mutableSetOf<String>()
+            val queue = ArrayDeque(interfaceExtends[start] ?: emptyList())
+            var cyclic = false
+            while (queue.isNotEmpty()) {
+                val node = queue.removeFirst()
+                if (node == start) {
+                    cyclic = true
+                    break
+                }
+                if (!visited.add(node)) continue
+                interfaceExtends[node]?.forEach { queue.add(it) }
+            }
+            if (cyclic) {
+                reportedInterfaces.add(start)
+                error("Cyclic interface inheritance detected involving '$start'")
+            }
+        }
     }
 
     /** 记录一个接口的 extends 列表；已存在的条目不被覆盖（当前文件优先）。 */
@@ -591,6 +658,75 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                     checkStatement(stmt, ctorEnv, JasUnitType)
                 }
             }
+        }
+        checkOverrideReturnTypes(cls)
+    }
+
+    /**
+     * 做什么：校验类方法对祖先（父类/接口）同签名方法的返回类型覆盖是否协变兼容。
+     *
+     * 什么时候用：[checkClass] 成员与构造器都检查完之后。
+     * 前置条件：层次图（classExtends/classImplements/interfaceExtends）已由 [check] 第一遍建立；
+     *   cls 的返回类型若非 null，会被视为显式声明。
+     * 失败模式：不抛异常；仅在不兼容时追加一条明确诊断。
+     * 为什么需要：子类 override 返回类型不兼容（如父类 `string`、子类 `int32`）在 JVM 上会让
+     *   经父类型分派的调用点拿到错误类型的栈值（VerifyError 或静默的语义错误）。这类问题
+     *   在编译期完全可判定，必须给出「哪两个类型不兼容」的明确错误，而不是留到运行期。
+     * 为什么只查返回类型、要求协变（child 可赋给 parent）而不查形参：v1 语言对成员重载支持
+     *   有限，形参逆变/不变性检查超出本任务边界；返回类型协变是 `var b: Base = new Child();
+     *   b.greet()` 语义正确性的最低保证。
+     * 已知限制：同 arity 同名即视为「同一方法」，不做逐参类型匹配；返回类型为 null（省略）时跳过。
+     */
+    private fun checkOverrideReturnTypes(cls: JasClass) {
+        for (member in cls.members) {
+            if (member !is JasFunction) continue
+            val childReturn = member.returnType ?: continue
+            for (ancestor in ancestorTypeNames(cls.name)) {
+                val ancestorType = directMemberType(ancestor, member.name) as? JasFunctionType ?: continue
+                if (ancestorType.paramTypes.size != member.parameters.size) continue
+                // 祖先返回类型若含该祖先自己的类型形参（如 `Repo<T>.get(): T` 或
+                // `Repo<T>.find(): List<T>`），其实际类型由子类 implements 的接口实参决定，
+                // 静态不宜直接比较，跳过（泛型继承链协变属本任务非目标）。
+                val ancestorTypeParams = (symbolTable?.findClass(ancestor)?.typeParameters?.map { it.name }
+                    ?: symbolTable?.findInterface(ancestor)?.typeParameters?.map { it.name }
+                    ?: emptyList()).toSet()
+                if (typeContainsTypeParameter(ancestorType.returnType, ancestorTypeParams)) continue
+                if (!typesCompatible(childReturn, ancestorType.returnType)) {
+                    error(
+                        "Incompatible override: method '${member.name}' in class '${cls.name}' returns " +
+                            "${typeDisplayName(childReturn)}, which is not compatible with " +
+                            "${typeDisplayName(ancestorType.returnType)} from '${ancestor}'",
+                        member
+                    )
+                    break
+                }
+            }
+        }
+    }
+
+    /**
+     * 做什么：递归判断一个类型里是否引用到给定集合中的任一类型形参名。
+     *
+     * 什么时候用：[checkOverrideReturnTypes] 判定祖先方法返回类型是否含未定类型变量。
+     * 前置条件：names 是祖先类型声明的类型形参名集合（可为空）。
+     * 失败模式：不抛异常；type 为 null 或 names 为空时返回 false。
+     * 为什么需要：含类型形参的祖先返回类型（`T`、`List<T>`）其真实类型由子类的接口实参决定，
+     *   静态不可直接比较，必须先排除，否则会对合法的泛型实现产生误报。
+     */
+    private fun typeContainsTypeParameter(type: JasType?, names: Set<String>): Boolean {
+        if (type == null || names.isEmpty()) return false
+        return when (type) {
+            is JasNamedType ->
+                type.name in names || type.typeArguments.any { typeContainsTypeParameter(it, names) }
+            is JasArrayType -> typeContainsTypeParameter(type.inner, names)
+            is JasNullableType -> typeContainsTypeParameter(type.inner, names)
+            is JasNonNullType -> typeContainsTypeParameter(type.inner, names)
+            is JasWildcardType -> typeContainsTypeParameter(type.bound, names)
+            is JasTupleType -> type.types.any { typeContainsTypeParameter(it, names) }
+            is JasFunctionType ->
+                type.paramTypes.any { typeContainsTypeParameter(it, names) } ||
+                    typeContainsTypeParameter(type.returnType, names)
+            else -> false
         }
     }
 
@@ -1401,6 +1537,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 ?.filterIsInstance<JasNamedType>()
                 ?.forEach { enqueue(it.name) }
             // 当前文件收集到的层次信息（用于跨文件/当前文件声明优先的场景）。
+            // classExtends 补上类继承方向：即使 symbolTable 缺失，成员查找也能沿父类链。
+            classExtends[name]?.let { enqueue(it) }
             classImplements[name]?.forEach { enqueue(it) }
             interfaceExtends[name]?.forEach { enqueue(it) }
         }
@@ -1610,9 +1748,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     }
 
     private fun isSubtype(subName: String, superName: String, visited: MutableSet<String> = mutableSetOf()): Boolean {
-        // visited 防止接口层次成环（或重复访问）导致无限递归。
+        // visited 防止继承层次成环（或重复访问）导致无限递归。
         if (subName == superName) return true
         if (!visited.add(subName)) return false
+        // Check direct class inherits superclass
+        // 类继承方向：Child extends Base => Child 是 Base 的子类型；
+        // 沿直接父类递归即得传递闭包（A <- B <- C 时 C 亦是 A 的子类型）。
+        val superclass = classExtends[subName]
+        if (superclass != null) {
+            if (superclass == superName) return true
+            if (isSubtype(superclass, superName, visited)) return true
+        }
         // Check direct class implements interfaces
         val ifaces = classImplements[subName]
         if (ifaces != null) {

@@ -171,6 +171,12 @@ data class TranslationContext(
     // 每个用户类型声明的类型形参名（JVM 风格名 -> [T, ID, ...]）。用于把接收者的类型实参
     // 绑定到声明返回类型上，使调用点的 IR 类型是「源码视角的具体类型」（如 Repo<Person>.get -> Person）。
     val typeParameterNamesByType: MutableMap<String, List<String>> = mutableMapOf(),
+    // 直接父类型索引：JVM 风格类型名 -> 直接父类型 JVM 风格名列表（父类在前，实现的接口/父接口在后）。
+    // 为什么需要：成员/字段解析要沿继承链向上走（子类接收者调用继承来的方法、读继承来的字段），
+    //   而「谁是谁的父」这一信息此前只在翻译类的第二遍才写入 classSuperclassNames，预登记阶段拿不到。
+    //   把继承关系来源收敛到这一张预登记表，成员/字段解析不必各自重新解析 AST（隔离的变化点）。
+    // 已知限制：不含外部类型（java/lang/Object 等）——它们在表外自然终止。
+    val superTypeNamesByType: MutableMap<String, MutableList<String>> = mutableMapOf(),
     // 类名 -> 类符号。
     val classSymbols: MutableMap<String, IrClassSymbol> = mutableMapOf(),
     // 本次翻译中声明的全部类型简单名（翻译前预登记，跨文件可见）。
@@ -278,9 +284,12 @@ class JasperToIrTranslator {
         collectHashableClassNames(listOf(ast), ctx)
         collectMemberReturnTypes(ast, ctx)
         collectMemberSignatures(ast, ctx)
+        collectSuperTypeNames(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
         predeclareStaticMemberFunctions(ast, ctx)
         predeclareEnumConstants(listOf(ast), ctx)
+        // 预登记全部完成后，把祖先成员签名/返回类型补进子类型索引（继承成员可见性）。
+        propagateInheritedMemberIndexes(ctx)
         val fileEntry = NaiveSourceBasedFileEntryImpl("<main>", intArrayOf(), 0)
         val fileSymbol = IrFileSymbolImpl()
         val file = IrFileImpl(fileEntry, fileSymbol, FqName(ctx.currentPkg))
@@ -322,10 +331,14 @@ class JasperToIrTranslator {
             collectHashableClassNames(listOf(ast), ctx)
             collectMemberReturnTypes(ast, ctx)
             collectMemberSignatures(ast, ctx)
+            collectSuperTypeNames(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
             predeclareStaticMemberFunctions(ast, ctx)
             predeclareEnumConstants(listOf(ast), ctx)
         }
+        // 全部文件预登记完成后，再统一传播继承成员索引：跨文件的父类可能排在子类之后，
+        // 必须等所有类型自身的成员都登记完，父->子的补全才完整。
+        propagateInheritedMemberIndexes(ctx)
 
         val files = mutableListOf<IrFile>()
         // 第二遍：逐文件逐声明翻译；每个文件单独一个 IrFile，currentFile 指向当前文件。
@@ -628,6 +641,78 @@ class JasperToIrTranslator {
                 is JasInterface -> record(decl.name, decl.typeParameters, decl.members)
                 else -> {}
             }
+        }
+    }
+
+    /**
+     * 做什么：预登记每个用户类型的**直接父类型**内部名（父类 + 实现的接口 / 父接口）。
+     * 什么时候用：translate / translateAll 的第一遍，紧跟 [collectMemberSignatures] 之后调用。
+     * 前置条件：已安装当前文件的包/import 上下文（否则 resolveNamedTypeName 得到错误键）。
+     * 失败模式：不抛异常；非 JasNamedType 的父引用被忽略（静态不可判定）。
+     * 为什么这样设计：成员/字段解析必须沿继承链向上，而父关系此前只在翻译类第二遍才可得；
+     *   提前收敛到一张表，使 [propagateInheritedMemberIndexes] 与字段解析都能复用。
+     */
+    private fun collectSuperTypeNames(ast: JasSourceFile, ctx: TranslationContext) {
+        for (decl in ast.declarations) {
+            when (decl) {
+                is JasClass -> {
+                    val self = typeMapper.resolveNamedTypeName(decl.name)
+                    val parents = mutableListOf<String>()
+                    // 父类在前：成员解析时近亲优先（子类自己的条目已存在，这里只补缺失）。
+                    (decl.superclass as? JasNamedType)?.let { parents.add(typeMapper.resolveNamedTypeName(it.name)) }
+                    decl.interfaces.filterIsInstance<JasNamedType>().forEach {
+                        parents.add(typeMapper.resolveNamedTypeName(it.name))
+                    }
+                    ctx.superTypeNamesByType[self] = parents
+                }
+                is JasInterface -> {
+                    val self = typeMapper.resolveNamedTypeName(decl.name)
+                    ctx.superTypeNamesByType[self] = decl.extends
+                        .filterIsInstance<JasNamedType>()
+                        .map { typeMapper.resolveNamedTypeName(it.name) }
+                        .toMutableList()
+                }
+                else -> {}
+            }
+        }
+    }
+
+    /**
+     * 做什么：把祖先类型的成员返回类型 / 声明擦除签名沿继承链补进子类型的索引（子类型自己的条目优先）。
+     * 什么时候用：所有文件的预登记完成后（translate / translateAll 第一遍末尾）。
+     * 前置条件：[collectSuperTypeNames] 与 [collectMemberReturnTypes]/[collectMemberSignatures] 已对全部文件执行。
+     * 失败模式：不抛异常；环状继承由「轮数上界 = 类型数」保证在有限轮内停止，不会无限循环。
+     * 为什么这样设计：经**子类类型接收者**调用继承方法时，调用点与后端都按「接收者类型」查索引；
+     *   若索引里没有继承来的成员，返回类型会退化成全局 last-writer-wins（跨文件时甚至退化为 void），
+     *   最终写出错误的调用描述符（R2DBC #6：`invokevirtual std/D.s:()V`）。把「继承成员可见性」
+     *   收敛到一次预登记传播，调用点与后端都无需理解继承链（隔离的变化点）。
+     * 注意：这里复制的是**签名索引条目（查找表）**，不是方法体；子类 IR 仍不包含父类方法。
+     */
+    private fun propagateInheritedMemberIndexes(ctx: TranslationContext) {
+        // 迭代到不动点：父类型的继承成员可能在同一轮里才补进父索引，需再跑一轮才能传给子类型。
+        // 轮数上界为继承深度（不超过类型数），无环图下收敛；环状继承也能在有限轮内停止。
+        val types = ctx.superTypeNamesByType.keys.toList()
+        var round = 0
+        var changed = true
+        while (changed && round <= types.size) {
+            changed = false
+            for (type in types) {
+                for (parent in ctx.superTypeNamesByType[type] ?: emptyList()) {
+                    val parentReturns = ctx.memberReturnTypesByType[parent] ?: continue
+                    val childReturns = ctx.memberReturnTypesByType.getOrPut(type) { mutableMapOf() }
+                    for ((member, ret) in parentReturns) {
+                        if (childReturns.putIfAbsent(member, ret) == null) changed = true
+                    }
+                    val parentSigs = ctx.memberSignaturesByType[parent]
+                    if (parentSigs != null) {
+                        val childSigs = ctx.memberSignaturesByType.getOrPut(type) { mutableMapOf() }
+                        for ((member, sig) in parentSigs) {
+                            if (childSigs.putIfAbsent(member, sig) == null) changed = true
+                        }
+                    }
+                }
+            }
+            round++
         }
     }
 
@@ -2839,7 +2924,7 @@ class JasperToIrTranslator {
     ): IrFieldSymbol {
         val key = receiverClassKey(target, irReceiver, ctx)
         if (key != null) {
-            ctx.fieldSymbolsByClass[key]?.get(property)?.let { return it }
+            lookupFieldAlongHierarchy(key, property, ctx.fieldSymbolsByClass, ctx)?.let { return it }
         }
         return ctx.fieldSymbols[property] ?: IrFieldSymbolImpl()
     }
@@ -2853,9 +2938,35 @@ class JasperToIrTranslator {
         if (property == "length" && isArrayIrType(irReceiver.type)) return typeMapper.intType()
         val key = receiverClassKey(target, irReceiver, ctx)
         if (key != null) {
-            ctx.fieldTypesByClass[key]?.get(property)?.let { return it }
+            lookupFieldAlongHierarchy(key, property, ctx.fieldTypesByClass, ctx)?.let { return it }
         }
         return ctx.fieldTypes[property]
+    }
+
+    /**
+     * 做什么：在「类型名 -> 字段名 -> 值」的索引里，从 [startKey] 出发沿继承链 BFS 查找字段。
+     * 什么时候用：属性读写经子类类型接收者访问继承字段时（[resolveFieldSymbol]/[resolveFieldType]）。
+     * 前置条件：[TranslationContext.superTypeNamesByType] 已由预登记建立。
+     * 失败模式：未命中返回 null，不抛异常；环状继承由 visited 去重保护。
+     * 为什么这样设计：继承字段与继承方法一样，必须沿父链可见；把「沿链查找」收敛到一个泛型函数，
+     *   符号表与类型表两处复用，避免两份几乎相同的遍历逻辑漂移（隔离的变化点：字段解析范围）。
+     */
+    private fun <T> lookupFieldAlongHierarchy(
+        startKey: String,
+        property: String,
+        index: Map<String, Map<String, T>>,
+        ctx: TranslationContext
+    ): T? {
+        val visited = mutableSetOf<String>()
+        val queue = ArrayDeque<String>()
+        queue.add(startKey)
+        while (queue.isNotEmpty()) {
+            val key = queue.removeFirst()
+            if (!visited.add(key)) continue
+            index[key]?.get(property)?.let { return it }
+            ctx.superTypeNamesByType[key]?.forEach { queue.add(it) }
+        }
+        return null
     }
 
     private fun isArrayIrType(type: IrType): Boolean =
