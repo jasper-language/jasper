@@ -31,6 +31,7 @@ import org.jetbrains.kotlin.ir.util.NaiveSourceBasedFileEntryImpl
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.descriptors.DescriptorVisibilities
+import org.jetbrains.kotlin.descriptors.DescriptorVisibility
 import org.jetbrains.kotlin.descriptors.Modality
 import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.descriptors.SourceElement
@@ -46,6 +47,17 @@ import org.jetbrains.kotlin.types.Variance
  * 函数对象协议的方法名集合：对闭包变量调用这些名字时，路由到其生成的 invoke，而非协议接口分派。
  */
 private val PROTOCOL_METHODS = setOf("apply", "test", "reduce", "compare", "accept")
+
+/**
+ * 一次静态字段访问的解析结果。
+ *
+ * 做什么：把「字段符号」与「字段声明类型」成对带出，避免调用方在两个并行索引里重复查找。
+ * 什么时候用：translator 判定 `类名.字段`（或通过实例访问静态字段）时。
+ * 前置条件：符号必须已登记进 [TranslationContext.staticFieldSymbols]。
+ * 失败模式：解析失败时调用方拿到 null，应回退到实例字段路径。
+ * 为什么用数据类：两个值同生同灭，绑定后不会出现「拿到符号却拿错类型」的半成品状态。
+ */
+private data class StaticFieldRef(val symbol: IrFieldSymbol, val type: IrType)
 
 /**
  * 做什么：一次翻译的完整产出——IR 文件列表 + 后端渲染所需的各种「符号 -> 名字/类型」登记表。
@@ -116,6 +128,11 @@ data class TranslationContext(
     val memberReturnTypesByType: MutableMap<String, MutableMap<String, IrType>> = mutableMapOf(),
     // 类名 -> 类符号。
     val classSymbols: MutableMap<String, IrClassSymbol> = mutableMapOf(),
+    // 本次翻译中声明的全部类型简单名（翻译前预登记，跨文件可见）。
+    // 用途：识别 `Type.field` 里的 `Type` 是「类名」而不是「值为 null 的变量」，
+    // 从而走静态字段路径；不能用 classSymbols 代替，因为后者要等对应声明被翻译后才写入，
+    // 跨文件「先用后声明」时会漏判。
+    val declaredTypeNames: MutableSet<String> = mutableSetOf(),
     // 字段名 -> 字段符号（全局按名索引，作为按类索引失败时的回退）。
     val fieldSymbols: MutableMap<String, IrFieldSymbol> = mutableMapOf(),
     // 字段名 -> 字段类型（全局回退）。
@@ -183,7 +200,7 @@ class JasperToIrTranslator {
      */
     fun translate(ast: JasSourceFile, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
-        registerDeclaredTypeNames(listOf(ast))
+        registerDeclaredTypeNames(listOf(ast), ctx)
         installFileContext(ast, ctx)
         // 第一遍（预登记）：不翻译任何声明体，先把「翻译体时会用到的信息」就位：
         //   - 内建函数 hashCode/equals 的签名（合成体要按正确描述符调用）
@@ -224,7 +241,7 @@ class JasperToIrTranslator {
      */
     fun translateAll(asts: List<JasSourceFile>, symbolTable: SymbolTable? = null): TranslationResult {
         val ctx = TranslationContext(typeMapper = typeMapper)
-        registerDeclaredTypeNames(asts)
+        registerDeclaredTypeNames(asts, ctx)
         predeclareRuntimeBuiltins(ctx)
         // 第一遍：对全部文件做预登记（保证跨文件的先声明后使用）。
         for (ast in asts) {
@@ -271,18 +288,32 @@ class JasperToIrTranslator {
      * 为什么这样设计：`isLikelyTypeParam` 的单字母启发式无法自行分辨用户类型与形参，
      *   在翻译前把「有哪些真实类型」一次性告诉 TypeMapper，是最小改动且依赖单向的做法。
      */
-    private fun registerDeclaredTypeNames(asts: List<JasSourceFile>) {
+    private fun registerDeclaredTypeNames(asts: List<JasSourceFile>, ctx: TranslationContext) {
         for (ast in asts) {
             for (decl in ast.declarations) {
                 when (decl) {
-                    is JasClass -> typeMapper.registerKnownType(decl.name)
-                    is JasInterface -> typeMapper.registerKnownType(decl.name)
-                    is JasEnum -> typeMapper.registerKnownType(decl.name)
-                    is JasAnnotationType -> typeMapper.registerKnownType(decl.name)
+                    is JasClass -> registerDeclaredTypeName(decl.name, ctx)
+                    is JasInterface -> registerDeclaredTypeName(decl.name, ctx)
+                    is JasEnum -> registerDeclaredTypeName(decl.name, ctx)
+                    is JasAnnotationType -> registerDeclaredTypeName(decl.name, ctx)
                     else -> {}
                 }
             }
         }
+    }
+
+    /**
+     * 做什么：把一个已声明类型的简单名同时登记进 [TypeMapper]（泛型形参判定用）和
+     *   翻译上下文的 [TranslationContext.declaredTypeNames]（静态访问判定用）。
+     * 什么时候用：translate / translateAll 预登记阶段。
+     * 前置条件：name 是顶层类型的简单名。
+     * 失败模式：无；重复登记是幂等的。
+     * 为什么这样设计：两处都需要「本次编译有哪些类型」，但用途不同，集中在同一处登记可
+     *   避免只更新一处导致静态字段识别与泛型解析结论不一致。
+     */
+    private fun registerDeclaredTypeName(name: String, ctx: TranslationContext) {
+        typeMapper.registerKnownType(name)
+        ctx.declaredTypeNames.add(name)
     }
 
     /**
@@ -925,6 +956,11 @@ class JasperToIrTranslator {
         ctx.classSymbols[iface.name] = symbol
         // 登记「这是接口」：后端据此决定接口标志、默认方法/抽象方法处理，以及类型引用用接口描述符。
         ctx.interfaceDeclNames.add(iface.name)
+        // 接口常量也按类名建索引（`fieldSymbolsByClass[接口内部名]`），
+        // 这样 `Limits.MAX_ROWS` 的静态访问可以通过类名直接解析到字段符号，
+        // 而不必退化成「全局按名查找」这一可能与其他类同名常量冲突的兜底路径。
+        val previousClassName = ctx.currentClassName
+        ctx.currentClassName = typeMapper.resolveNamedTypeName(iface.name)
         // Record extended interfaces
         // 记录继承的父接口（补全为 JVM 风格内部名），导出给后端生成接口表。
         // 父接口名走中央解析（import/点分包名），避免非法内部名。
@@ -953,6 +989,8 @@ class JasperToIrTranslator {
                 irCls.declarations.add(irMember)
             }
         }
+        // 恢复外层上下文，避免接口常量/默认方法体里的字段归属泄漏到后续声明。
+        ctx.currentClassName = previousClassName
         return irCls
     }
 
@@ -1068,9 +1106,40 @@ class JasperToIrTranslator {
 
     // ── property ──
 
+    /**
+     * 做什么：判断修饰符列表（`List<Any>`：字符串关键字 + 注解节点）里是否含某个关键字。
+     * 什么时候用：翻译 `static` / `final` / `private` 等声明修饰符时。
+     * 前置条件：modifiers 来自 AST builder 的 doExtractMods，普通关键字均为小写 String。
+     * 失败模式：无；非字符串元素（注解）一律不匹配。
+     * 为什么这样设计：AST 用 `List<Any>` 混存注解与关键字，集中成一个判据能避免各调用点
+     *   对元素类型做不一致的假设。
+     */
+    private fun hasModifier(modifiers: List<Any>, keyword: String): Boolean =
+        modifiers.any { it is String && it == keyword }
+
+    /**
+     * 做什么：把 Jasper 字段声明的访问修饰符映射为 IR 可见性。
+     * 什么时候用：创建 [IrField] 时。
+     * 前置条件：modifiers 已由 AST builder 归一为小写关键字。
+     * 失败模式：无显式 private/protected 时返回 PUBLIC——这是本语言既有的默认可见性，
+     *   保持它可避免把历史代码从「字段实际 public」改成包私有。
+     * 为什么这样设计：只收敛到一个函数，后端无需理解 Jasper 修饰符文本。
+     */
+    private fun declaredFieldVisibility(modifiers: List<Any>): DescriptorVisibility = when {
+        hasModifier(modifiers, "private") -> DescriptorVisibilities.PRIVATE
+        hasModifier(modifiers, "protected") -> DescriptorVisibilities.PROTECTED
+        else -> DescriptorVisibilities.PUBLIC
+    }
+
     private fun translateProperty(prop: JasProperty, classSymbol: IrClassSymbol, ctx: TranslationContext): IrProperty? {
         val propSymbol = IrPropertySymbolImpl()
         val propType = typeMapper.mapType(prop.type)
+        // 静态性只由声明修饰符决定（接口常量走独立入口）。它同时影响三处：
+        // 字段的 ACC_STATIC、字段符号是否进入 staticFieldSymbols（决定 GETSTATIC/PUTSTATIC），
+        // 以及声明初值是进 <clinit> 还是按实例字段忽略。
+        val isStatic = hasModifier(prop.modifiers, "static")
+        val isFinal = prop.isConst || hasModifier(prop.modifiers, "final")
+        val fieldVisibility = declaredFieldVisibility(prop.modifiers)
         val irProp = factory.createProperty(
             0, 0,
             IrDeclarationOrigin.DEFINED,
@@ -1086,14 +1155,26 @@ class JasperToIrTranslator {
             0, 0,
             IrDeclarationOrigin.DEFINED,
             Name.identifier(prop.name),
-            DescriptorVisibilities.PRIVATE,
+            fieldVisibility,
             fieldSymbol,
             propType,
-            false,
-            true,
+            isFinal,
+            isStatic,
             false
         )
         irProp.backingField = irField
+        if (isStatic) {
+            // 静态字段的符号必须进入该集合：后端据此发 GETSTATIC/PUTSTATIC、加 ACC_STATIC，
+            // 并把声明初值放进 <clinit>。漏登记正是 Q17 三个探针 NPE 的根因。
+            ctx.staticFieldSymbols.add(fieldSymbol)
+            // 声明初值只对静态字段生效；实例字段仍按既有语义在构造器里赋值。
+            // 后端会对 final 字面量写 ConstantValue，对非 final / 非字面量写 <clinit>。
+            if (prop.initializer != null) {
+                irField.initializer = factory.createExpressionBody(
+                    0, 0, translateExpression(prop.initializer!!, ctx)
+                )
+            }
+        }
         // 属性字段同时登记到「全局按名」和「按类」两张表：按类表用于从接收者类型定位字段宿主，
         // 避免两个类共用属性名时在后端撞成同一个字段（全局表仅作回退）。
         ctx.fieldSymbols[prop.name] = fieldSymbol
@@ -2248,15 +2329,85 @@ class JasperToIrTranslator {
         }
     }
 
+    /**
+     * 做什么：把 `target.property` 翻译成字段读取；静态字段与实例字段走两条形态。
+     * 什么时候用：表达式位置的属性读取（`Counter.total`、`a.total`、`this.x`）。
+     * 前置条件：静态字段的接收者必须是已声明类型名（或已知类型的值，见 [resolveStaticFieldRef]）。
+     * 失败模式：字段符号/类型查不到时回退到实例路径（全局按名索引与 Unit 类型兜底）；
+     *   真正的「类名访问实例字段」错误已由 TypeChecker 在更早阶段拦截。
+     * 为什么这样设计：静态字段在 JVM 指令里**没有接收者**。若仍把类名当值翻译，
+     *   就会生成「对一个值为 null 的变量做 GETFIELD」——正是 Q17 探针 NPE 的来源。
+     */
     private fun translatePropertyAccess(expr: JasPropertyAccess, ctx: TranslationContext): IrExpression {
+        val staticRef = resolveStaticFieldRef(expr.property, expr.target, ctx)
+        if (staticRef != null) {
+            // 静态读取：不设置 receiver，后端据符号集合发 GETSTATIC。
+            return IrNodeFactory.createGetField(
+                0, 0, staticRef.type, staticRef.symbol, null, IrStatementOrigin.GET_PROPERTY
+            )
+        }
         val target = translateExpression(expr.target, ctx)
         val fieldSymbol = resolveFieldSymbol(expr.property, expr.target, target, ctx)
         val fieldType = resolveFieldType(expr.property, expr.target, target, ctx) ?: typeMapper.unitType()
         val irGetField = IrNodeFactory.createGetField(
             0, 0, fieldType, fieldSymbol, null, IrStatementOrigin.GET_PROPERTY
         )
-        irGetField.receiver = target
+        // 通过实例访问静态字段（`a.total`）时同样不能生成接收者：JVM 的 GETSTATIC
+        // 不消费对象引用。其余情况保持实例字段语义。
+        if (fieldSymbol !in ctx.staticFieldSymbols) {
+            irGetField.receiver = target
+        }
         return irGetField
+    }
+
+    /**
+     * 做什么：解析一次静态字段访问，返回字段符号与声明类型；不是静态字段时返回 null。
+     * 什么时候用：属性读取、赋值、自增自减都要在「是否生成接收者」上做同一判断。
+     * 前置条件：target 要么是已声明类型名（`Counter.total`），要么是已知类型的简单值
+     *   （`a.total`，且 `total` 是静态字段）。
+     * 失败模式：类型名未登记、字段不存在、字段不是 static 时返回 null（调用方回退实例路径）。
+     * 为什么这样设计：把「类名识别 + 按类字段索引 + 静态性判定」收敛到唯一函数，
+     *   避免三处访问路径各写一套判据而再次出现 GETFIELD/PUTSTATIC 不一致。
+     */
+    private fun resolveStaticFieldRef(
+        property: String,
+        target: JasExpression,
+        ctx: TranslationContext
+    ): StaticFieldRef? {
+        val classKey = declaredClassName(target, ctx) ?: valueReceiverClassName(target, ctx) ?: return null
+        val symbol = ctx.fieldSymbolsByClass[classKey]?.get(property) ?: return null
+        if (symbol !in ctx.staticFieldSymbols) return null
+        val type = ctx.fieldTypesByClass[classKey]?.get(property) ?: typeMapper.unitType()
+        return StaticFieldRef(symbol, type)
+    }
+
+    /**
+     * 做什么：若 target 是「未被局部值遮蔽的已声明类型简单名」，返回其 JVM 风格类名。
+     * 什么时候用：识别 `Counter.total` 中的 `Counter`。
+     * 前置条件：ctx.declaredTypeNames 已在翻译前预登记（跨文件可见）。
+     * 失败模式：不是标识符、名字被局部变量/参数遮蔽、或不是本程序声明的类型时返回 null。
+     * 为什么这样设计：局部变量优先于类型名是语言的名字解析规则；不先查 ctx.symbols 会把
+     *   `var Counter = ...; Counter.total` 误判成静态访问。
+     */
+    private fun declaredClassName(target: JasExpression, ctx: TranslationContext): String? {
+        if (target !is JasIdentifier) return null
+        if (ctx.symbols.containsKey(target.name)) return null
+        if (target.name !in ctx.declaredTypeNames) return null
+        return typeMapper.resolveNamedTypeName(target.name)
+    }
+
+    /**
+     * 做什么：若 target 是已知类型的简单值（局部变量/形参），返回其类名，供静态字段判定。
+     * 什么时候用：`a.total` 且 `total` 是静态字段时，提前判定以免求值接收者。
+     * 前置条件：ctx.varTypes 已登记该名字的 IR 类型。
+     * 失败模式：名字不是简单标识符、类型无法还原成类名时返回 null（回退正常实例路径）。
+     * 为什么这样设计：静态字段访问不应求值接收者；提前按变量声明类型定位字段，
+     *   可避免为 `a.total` 生成一个随后被后端丢弃的接收者求值。
+     */
+    private fun valueReceiverClassName(target: JasExpression, ctx: TranslationContext): String? {
+        if (target !is JasIdentifier) return null
+        val receiverType = ctx.varTypes[target.name] ?: return null
+        return typeMapper.irTypeClassName(receiverType)
     }
 
     /**
@@ -2753,26 +2904,55 @@ class JasperToIrTranslator {
             }
         } else if (expr.target is JasPropertyAccess) {
             val pa = expr.target as JasPropertyAccess
+            // 静态字段：不生成接收者，读写分别是 GETSTATIC/PUTSTATIC。
+            // 若先按实例路径翻译 `Counter`，等于把一个类名当变量求值，运行期 NPE。
+            val staticRef = resolveStaticFieldRef(pa.property, pa.target, ctx)
+            if (staticRef != null) {
+                if (expr.op != "=") {
+                    val getField = IrNodeFactory.createGetField(
+                        0, 0, staticRef.type, staticRef.symbol, null, IrStatementOrigin.GET_PROPERTY
+                    )
+                    val stubSymbol = IrSimpleFunctionSymbolImpl()
+                    ctx.callNames[stubSymbol] = expr.op.removeSuffix("=")
+                    val binOp = IrNodeFactory.createCall(
+                        0, 0, staticRef.type, IrStatementOrigin.PLUS,
+                        arrayOf(getField, value), emptyArray(), stubSymbol, null
+                    )
+                    val setField = IrNodeFactory.createSetField(
+                        0, 0, staticRef.type, staticRef.symbol, null, IrStatementOrigin.EQ
+                    )
+                    setField.value = binOp
+                    return setField
+                }
+                val setField = IrNodeFactory.createSetField(
+                    0, 0, staticRef.type, staticRef.symbol, null, IrStatementOrigin.EQ
+                )
+                setField.value = value
+                return setField
+            }
             val targetExpr = translateExpression(pa.target, ctx)
             val fieldSymbol = resolveFieldSymbol(pa.property, pa.target, targetExpr, ctx)
+            // 实例接收者也可能解析到静态字段（`a.total`）；后端按符号发 GETSTATIC/PUTSTATIC，
+            // 因此这里同样不能挂接收者，否则会多压一个不会被消费的对象引用。
+            val isStatic = fieldSymbol in ctx.staticFieldSymbols
             if (expr.op != "=") {
                 val op = expr.op.removeSuffix("=")
                 val getField = IrNodeFactory.createGetField(0, 0, value.type, fieldSymbol, null, IrStatementOrigin.GET_PROPERTY)
-                getField.receiver = targetExpr
+                if (!isStatic) getField.receiver = targetExpr
                 val stubSymbol = IrSimpleFunctionSymbolImpl()
                 ctx.callNames[stubSymbol] = op
                 val binOp = IrNodeFactory.createCall(
                     0, 0, value.type, IrStatementOrigin.PLUS,
                     arrayOf(getField, value), emptyArray(), stubSymbol, null
                 )
-                val targetExpr2 = translateExpression(pa.target, ctx)
+                val targetExpr2 = if (isStatic) null else translateExpression(pa.target, ctx)
                 val setField = IrNodeFactory.createSetField(0, 0, value.type, fieldSymbol, null, IrStatementOrigin.EQ)
-                setField.receiver = targetExpr2
+                if (targetExpr2 != null) setField.receiver = targetExpr2
                 setField.value = binOp
                 return setField
             }
             val setField = IrNodeFactory.createSetField(0, 0, value.type, fieldSymbol, null, IrStatementOrigin.EQ)
-            setField.receiver = targetExpr
+            if (!isStatic) setField.receiver = targetExpr
             setField.value = value
             return setField
         } else if (expr.target is JasArrayAccess) {
@@ -2894,19 +3074,23 @@ class JasperToIrTranslator {
             }
         } else if (target is JasPropertyAccess) {
             val pa = target
-            val targetExpr = translateExpression(pa.target, ctx)
-            val fieldSymbol = resolveFieldSymbol(pa.property, pa.target, targetExpr, ctx)
+            // 与赋值路径共用同一判据：静态字段既不求值接收者，也不挂 receiver。
+            val staticRef = resolveStaticFieldRef(pa.property, pa.target, ctx)
+            val targetExpr = if (staticRef != null) null else translateExpression(pa.target, ctx)
+            val fieldSymbol = staticRef?.symbol
+                ?: resolveFieldSymbol(pa.property, pa.target, targetExpr!!, ctx)
+            val isStatic = staticRef != null || fieldSymbol in ctx.staticFieldSymbols
             val getField = IrNodeFactory.createGetField(0, 0, typeMapper.intType(), fieldSymbol, null, IrStatementOrigin.GET_PROPERTY)
-            getField.receiver = targetExpr
+            if (!isStatic && targetExpr != null) getField.receiver = targetExpr
             val stubSymbol = IrSimpleFunctionSymbolImpl()
             ctx.callNames[stubSymbol] = if (op == "++") "+" else "-"
             val binOp = IrNodeFactory.createCall(
                 0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
                 arrayOf(getField, one), emptyArray(), stubSymbol, null
             )
-            val targetExpr2 = translateExpression(pa.target, ctx)
+            val targetExpr2 = if (isStatic) null else translateExpression(pa.target, ctx)
             val setField = IrNodeFactory.createSetField(0, 0, typeMapper.unitType(), fieldSymbol, null, IrStatementOrigin.EQ)
-            setField.receiver = targetExpr2
+            if (targetExpr2 != null) setField.receiver = targetExpr2
             setField.value = binOp
             if (needsResult) {
                 val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)

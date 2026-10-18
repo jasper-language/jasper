@@ -984,9 +984,25 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasPropertyAccess -> {
-                // 成员解析顺序：具名类型查成员索引 -> 数组 length 特例 -> 其余告警并兜底 any。
+                // 成员解析顺序：类名静态成员 -> 具名类型查成员索引 -> 数组 length 特例 -> 其余告警并兜底 any。
                 val targetType = inferExpression(expr.target, env)
-                when {
+                // 「类名.字段」与「值.字段」是两种不同语义：前者只能访问静态字段。
+                // 先单独处理，否则会把类名当成一个值为 null 的变量，导致实例字段被静默放行，
+                // 直到运行期才以 NPE 的形式暴露（JDBC #8 / R2DBC #18 / JPA #10）。
+                if (isTypeNameReference(expr.target, env)) {
+                    val typeName = (expr.target as JasIdentifier).name
+                    val property = findPropertyDeclaration(typeName, expr.property)
+                    if (property != null && !isStaticProperty(typeName, property)) {
+                        error("Cannot access instance field '${expr.property}' through class name '$typeName'", expr)
+                        property.type ?: JasAnyType
+                    } else {
+                        val typeArguments = (targetType as? JasNamedType)?.typeArguments ?: emptyList()
+                        findMemberType(typeName, expr.property, typeArguments) ?: run {
+                            warn("Cannot resolve member '${expr.property}' on type '$typeName'", expr)
+                            JasAnyType
+                        }
+                    }
+                } else when {
                     targetType is JasNamedType -> {
                         findMemberType(targetType.name, expr.property, targetType.typeArguments) ?: run {
                             warn("Cannot resolve member '${expr.property}' on type '${targetType.name}'", expr)
@@ -1116,6 +1132,60 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         // 位置对应：第 i 个类型参数映射到第 i 个类型实参（不校验长度一致性）。
         val mapping = typeParams.map { it.name }.zip(typeArguments).toMap()
         return substitute(raw, mapping)
+    }
+
+    /**
+     * 判断一个属性访问的接收者是否是「类型名」而不是「值」。
+     *
+     * 做什么：当接收者是标识符、未被局部变量/形参/类型参数遮蔽，且符号表中确有同名
+     *   类/接口/枚举/注解声明时返回 true。
+     * 什么时候用：[inferExpression] 的 `JasPropertyAccess` 分支区分静态访问与实例访问。
+     * 前置条件：symbolTable 已执行 collectDeclarations；env 是当前作用域。
+     * 失败模式：不抛异常；符号表为 null 或名字未声明时返回 false（按普通值处理）。
+     * 为什么这样设计：名字解析优先级必须与 [inferExpression] 的 `JasIdentifier` 分支一致
+     *   （局部值优先于类型名），否则局部变量恰好与类同名时会误判成静态访问。
+     */
+    private fun isTypeNameReference(target: JasExpression, env: TypeEnvironment): Boolean {
+        if (target !is JasIdentifier) return false
+        if (env.contains(target.name) || env.hasTypeParameter(target.name)) return false
+        return symbolTable?.resolveType(target.name) != null
+    }
+
+    /**
+     * 在类型 [typeName] 的成员中查找名为 [memberName] 的属性声明。
+     *
+     * 做什么：优先查符号表的成员索引（含注解合成成员），未命中再线性遍历类/接口成员。
+     * 什么时候用：需要判断 `类名.成员` 是静态字段还是实例字段时。
+     * 前置条件：typeName 是已声明类型的简单名。
+     * 失败模式：未命中或该名字是函数等非属性成员时返回 null。
+     * 为什么这样设计：与 [rawMemberType] 的查找顺序保持一致，避免「类型能解析、静态性
+     *   却解析失败」造成误报；索引缺失时的线性兜底覆盖旧符号表未建索引的场景。
+     */
+    private fun findPropertyDeclaration(typeName: String, memberName: String): JasProperty? {
+        (symbolTable?.findMemberSignature(typeName, memberName) as? JasProperty)?.let { return it }
+        symbolTable?.findClass(typeName)?.members?.forEach { member ->
+            if (member is JasProperty && member.name == memberName) return member
+        }
+        symbolTable?.findInterface(typeName)?.members?.forEach { member ->
+            if (member is JasProperty && member.name == memberName) return member
+        }
+        return null
+    }
+
+    /**
+     * 判断属性 [prop] 在类型 [typeName] 上是否按 JVM 静态字段处理。
+     *
+     * 做什么：`static` 修饰符直接判真；接口里的 `const` 字段按 JVM 规则恒为 static final，
+     *   也判真（当前语言只允许接口声明 const 字段）。
+     * 什么时候用：`类名.字段` 访问的静态性校验。
+     * 前置条件：prop 已确认属于 typeName。
+     * 失败模式：无（纯判定，不抛异常）。
+     * 为什么这样设计：接口常量在 AST 上没有显式 `static` 修饰符，若只看修饰符会把它误判成
+     *   实例字段并报错，从而破坏既有的 `Limits.MAX_ROWS` 访问。
+     */
+    private fun isStaticProperty(typeName: String, prop: JasProperty): Boolean {
+        if (prop.modifiers.any { it is String && it == "static" }) return true
+        return prop.isConst && symbolTable?.findInterface(typeName) != null
     }
 
     private fun rawMemberType(typeName: String, memberName: String): JasType? {

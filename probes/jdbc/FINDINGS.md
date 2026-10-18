@@ -256,6 +256,11 @@ public function main(): int32 { var s: S = new MyS(); return 1; }
 
 #### 8. 静态字段不可用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——`translateProperty` 现按 `static` 修饰符创建静态 `IrField` 并
+  登记进 `staticFieldSymbols`；`类名.字段` 的读写不再生成接收者，分别发射
+  `GETSTATIC`/`PUTSTATIC`；非 final 静态字段的声明初值由 `<clinit>` 执行；类名访问实例字段
+  改为明确的编译错误。回归见 `jasper.StaticFieldTest`（含 `javap` 指令/字段标志断言）。
+  以下「实测」为修复前证据，保留作历史记录。
 - 触发代码：
 ```jasper
 package jdbcprobe;

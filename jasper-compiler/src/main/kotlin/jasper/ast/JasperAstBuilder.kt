@@ -200,13 +200,17 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         val mods = doExtractMods(ctx.modifier())
         val props = ctx.tail.variableBinding().map { vb ->
             val b = vb.core
+            // 声明处初始化器：实例字段目前仍由构造器赋值，静态字段则依赖它生成 <clinit>。
+            // 这里只负责如实把语法树搬进 AST，具体消费方式由 translator 按 static/final 决定。
+            val initializer = if (vb.`init` != null) visit(vb.`init`) as? JasExpression else null
             JasProperty(
                 b.name.text,
                 if (b.typeRef != null) visit(b.typeRef) as? JasType else null,
                 mods,
                 null,
                 null,
-                ctx.kind.text == "const"
+                ctx.kind.text == "const",
+                initializer
             ).at(ctx)
         }
         return if (props.size == 1) props[0] else null

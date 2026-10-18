@@ -431,6 +431,10 @@ public function main(): int32 { var p: P = new P(); return p.q() + p.q("x"); }
 
 #### 18. 静态字段不可用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——用户声明的 `static` 字段现按 JVM 静态字段发射：字段带
+  `ACC_STATIC`，读写使用 `GETSTATIC`/`PUTSTATIC`，非 final 静态初值在 `<clinit>` 中执行，
+  实例访问与类名访问共享同一份静态值；`类名.实例字段` 给出明确编译错误。
+  回归见 `jasper.StaticFieldTest`。以下「实测」为修复前证据，保留作历史记录。
 - 触发代码：
 ```jasper
 package std;

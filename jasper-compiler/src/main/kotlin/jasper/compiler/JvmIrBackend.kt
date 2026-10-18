@@ -28,6 +28,8 @@ package jasper.compiler
 
 import jasper.translator.*
 import org.jetbrains.kotlin.descriptors.ClassKind
+import org.jetbrains.kotlin.descriptors.DescriptorVisibility
+import org.jetbrains.kotlin.descriptors.DescriptorVisibilities
 import org.jetbrains.kotlin.ir.*
 import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.expressions.*
@@ -427,17 +429,23 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
                 is IrField -> {
                     if (decl.symbol in staticFieldSymbols) {
-                        // Interface constant: `public static final`, with a
-                        // ConstantValue attribute when the initializer is a
-                        // compile-time literal (otherwise `<clinit>` assigns it).
-                        // 中文：接口常量写成 public static final；初始化器是编译期字面量时
-                        // 直接落成 ConstantValue 属性（无需 <clinit>），否则留给 <clinit> 赋值。
+                        // Static field (interface constant or user `static var` / `static final`):
+                        // visibility follows the declaration, mutable fields must NOT be final.
+                        // ConstantValue is only emitted for `final` fields; a non-final static
+                        // initializer is executed in `<clinit>` instead (see needsRuntimeStaticInit).
+                        // 中文：静态字段（接口常量或用户 `static var`/`static final`）：
+                        // 访问标志按声明决定；可变静态字段绝不能加 ACC_FINAL（否则跨类 PUTSTATIC
+                        // 会抛 IllegalAccessError）。只有 final 字段才用 ConstantValue，非 final
+                        // 的初值统一由 <clinit> 执行。
+                        val fieldFlags = fieldVisibilityFlags(decl.visibility) or
+                            Opcodes.ACC_STATIC or
+                            (if (decl.isFinal) Opcodes.ACC_FINAL else 0)
                         cw.visitField(
-                            Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL,
+                            fieldFlags,
                             decl.name.toString(),
                             typeMapper.jvmDescriptorFromIrType(decl.type),
                             null,
-                            staticFieldConstantValue(decl)
+                            if (decl.isFinal) staticFieldConstantValue(decl) else null
                         )
                     } else {
                         // 枚举常量字段必须是 public static final ENUM；普通实例字段 public。
@@ -468,13 +476,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 else -> {}
             }
         }
-        if (isEnum) {
-            generateEnumInfrastructure(cw, cls, internalName)
-        }
-        // 只有当存在「非常量初始化器的静态字段」时才生成 <clinit>，避免发出空的、
+        // 只有当存在「需要运行期初始化的静态字段」时才生成 <clinit>，避免发出空的、
         // 但合法的 <clinit> 属性（多余代码、也有害于 class 体积与工具分析）。
         val staticFields = cls.declarations.filterIsInstance<IrField>().filter { it.symbol in staticFieldSymbols }
-        if (staticFields.any { staticFieldConstantValue(it) == null && it.initializer != null }) {
+        if (isEnum) {
+            // 枚举基础设施自己也要写 <clinit>；把静态字段交给它合并，避免一个类出现两个
+            // <clinit>（JVM 规范不允许，ASM 也不会替你合并）。
+            generateEnumInfrastructure(cw, cls, internalName, staticFields)
+        } else if (staticFields.any { needsRuntimeStaticInit(it) }) {
             generateStaticFieldInitializer(cw, staticFields, internalName)
         }
         cw.visitEnd()
@@ -505,11 +514,39 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     }
 
     /**
-     * Emits a `<clinit>` that initializes static fields whose initializer is not
-     * a compile-time literal (literals are emitted as ConstantValue attributes
-     * directly on the field).
-     * 中文：为一个类发射 <clinit>，按声明顺序把「初始化器不是编译期字面量」的静态
-     * 字段逐个求值并 PUTSTATIC（字面量已作为 ConstantValue 直接写在字段上，绝不重复）。
+     * 做什么：判断某个静态字段的声明初值是否必须由 `<clinit>` 在运行期执行。
+     * 什么时候用：决定是否生成 `<clinit>`，以及 `<clinit>` 内是否跳过该字段。
+     * 前置条件：field 已在 staticFieldSymbols 中。
+     * 失败模式：无；字段无初始化器时返回 false（保持 JVM 默认值）。
+     * 为什么这样设计：`static var` 是可变字段，即使初值是字面量也不能写成 ConstantValue——
+     *   需求要求可变静态字段的初值在 `<clinit>` 中执行；只有 `static final` 常量才走
+     *   ConstantValue 快路径。
+     */
+    private fun needsRuntimeStaticInit(field: IrField): Boolean {
+        if (field.initializer == null) return false
+        return !field.isFinal || staticFieldConstantValue(field) == null
+    }
+
+    /**
+     * 做什么：把 IR 字段可见性映射为 JVM 字段访问标志（ACC_PUBLIC/PRIVATE/PROTECTED）。
+     * 什么时候用：发射静态字段时。
+     * 前置条件：visibility 来自 translator（已按声明归一）。
+     * 失败模式：未知可见性返回 0（包私有），不会抛异常。
+     * 为什么这样设计：ACC_* 是字节码层的唯一真相；集中映射可避免字段/方法各写一遍。
+     */
+    private fun fieldVisibilityFlags(visibility: DescriptorVisibility): Int = when (visibility) {
+        DescriptorVisibilities.PUBLIC -> Opcodes.ACC_PUBLIC
+        DescriptorVisibilities.PRIVATE -> Opcodes.ACC_PRIVATE
+        DescriptorVisibilities.PROTECTED -> Opcodes.ACC_PROTECTED
+        else -> 0
+    }
+
+    /**
+     * Emits a `<clinit>` that initializes static fields requiring runtime evaluation.
+     * Final fields with a compile-time literal use a ConstantValue attribute instead.
+     * 中文：为一个类发射 <clinit>，按声明顺序把「需要运行期初始化」的静态字段逐个
+     * 求值并 PUTSTATIC。需要运行期初始化的判定见 [needsRuntimeStaticInit]：非 final
+     * 字段即使初值是字面量也走这里；final 字面量则已作为 ConstantValue 直接写在字段上。
      *
      * 边界/前置条件：<clinit> 必须无参、返回 void、ACC_STATIC；调用方保证至少有一个
      * 需要运行期初始化的字段（否则不该生成它）。失败模式：字段初始化表达式求值出错
@@ -520,18 +557,35 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitCode()
         // <clinit> 是静态的，所以参数槽从 0 开始；返回值类型为 void（null）也不需要接收者。
         val ctx = MethodContext(mv, mutableListOf(), mutableMapOf(), mutableMapOf(), 0, null, true)
+        emitStaticFieldInitializers(mv, fields, owner, ctx)
+        mv.visitInsn(Opcodes.RETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
+    /**
+     * 做什么：把需要运行期初始化的静态字段逐个求值并 PUTSTATIC 到 [owner]。
+     * 什么时候用：普通类的 `<clinit>`，以及枚举类 `<clinit>` 的尾部（避免生成两个 `<clinit>`）。
+     * 前置条件：mv 已 visitCode；ctx 对应同一个静态方法（参数槽从 0 开始）。
+     * 失败模式：初始化表达式生成失败时异常向上抛，整个类生成失败。
+     * 为什么单独抽出：枚举基础设施也要写 `<clinit>`；共用同一段赋值逻辑可保证
+     *   「枚举常量先初始化、用户静态字段后初始化」的顺序只有一处定义。
+     */
+    private fun emitStaticFieldInitializers(
+        mv: MethodVisitor,
+        fields: List<IrField>,
+        owner: String,
+        ctx: MethodContext
+    ) {
         for (field in fields) {
             val body = field.initializer ?: continue
-            if (staticFieldConstantValue(field) != null) continue
+            if (!needsRuntimeStaticInit(field)) continue
             generateIrExpression(mv, body.expression, ctx, owner)
             mv.visitFieldInsn(
                 Opcodes.PUTSTATIC, owner, field.name.toString(),
                 typeMapper.jvmDescriptorFromIrType(field.type)
             )
         }
-        mv.visitInsn(Opcodes.RETURN)
-        mv.visitMaxs(0, 0)
-        mv.visitEnd()
     }
 
     // 为一个枚举类补齐 JVM 层面的枚举基础设施：<clinit> 里实例化各常量并填
@@ -540,14 +594,25 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 要求的方法，用户代码可能调用，必须由后端合成。
     // 已知限制：靠「字段名首字母大写」来识别枚举常量（启发式）；没有覆盖任何常量的
     // 枚举直接返回不生成；常量名以非大写字母开头时会被漏掉。
-    private fun generateEnumInfrastructure(cw: ClassWriter, cls: IrClass, internalName: String) {
+    private fun generateEnumInfrastructure(
+        cw: ClassWriter,
+        cls: IrClass,
+        internalName: String,
+        staticFields: List<IrField> = emptyList()
+    ) {
         val enumConstNames = mutableListOf<String>()
         for (decl in cls.declarations) {
             if (decl is IrField && decl.name.toString().let { it[0].isUpperCase() }) {
                 enumConstNames.add(decl.name.toString())
             }
         }
-        if (enumConstNames.isEmpty()) return
+        if (enumConstNames.isEmpty()) {
+            // 没有枚举常量时不创建枚举基础设施；但用户静态字段仍需初始化。
+            if (staticFields.any { needsRuntimeStaticInit(it) }) {
+                generateStaticFieldInitializer(cw, staticFields, internalName)
+            }
+            return
+        }
         val n = enumConstNames.size
         // values() 返回的数组元素类型：枚举类自身的引用数组描述符。
         val valuesDesc = "[L$internalName;"
@@ -577,6 +642,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             clMv.visitInsn(Opcodes.AASTORE)
         }
         clMv.visitFieldInsn(Opcodes.PUTSTATIC, internalName, "__jasper_values", valuesDesc)
+        // 用户静态字段排在枚举常量/缓存数组之后初始化：此时常量已可用，且同类只有一个 <clinit>。
+        if (staticFields.any { needsRuntimeStaticInit(it) }) {
+            val ctx = MethodContext(clMv, mutableListOf(), mutableMapOf(), mutableMapOf(), 0, null, true)
+            emitStaticFieldInitializers(clMv, staticFields, internalName, ctx)
+        }
         clMv.visitInsn(Opcodes.RETURN)
         clMv.visitMaxs(0, 0)
         clMv.visitEnd()

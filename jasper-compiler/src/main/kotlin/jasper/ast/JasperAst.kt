@@ -180,15 +180,17 @@ data class JasProperty(
     val getter: JasPropertyAccessor?, val setter: JasPropertyAccessor?,
     val isConst: Boolean = false,
     /**
-     * Initializer expression for a declaration-site constant, e.g. an
-     * interface constant `const MAX_ROWS: int32 = 100;`. Class property
-     * declarations currently leave this null (instance fields are assigned in
-     * constructors); interface constants carry it so a `public static final`
-     * field can be emitted with the constant value.
+     * Initializer expression written at the declaration site, e.g. an
+     * interface constant `const MAX_ROWS: int32 = 100;` or a class static
+     * field `public static var total: int32 = 0;`. Instance-field initializers
+     * are still assigned in constructors (the translator ignores them for the
+     * instance path); class static fields and interface constants consume it
+     * to emit a `ConstantValue` attribute or a `<clinit>` assignment.
      *
-     * 声明处常量的初始化表达式，例如接口常量 `const MAX_ROWS: int32 = 100;`。
-     * 类的属性声明目前留空（实例字段在构造器里赋值）；接口常量会带上它，
-     * 以便后端能按 `public static final` 字段连同常量值一起产出。
+     * 声明处初始化的表达式，例如接口常量 `const MAX_ROWS: int32 = 100;` 或
+     * 类静态字段 `public static var total: int32 = 0;`。实例字段仍在构造器里赋值
+     * （translator 在实例路径上忽略它）；类静态字段与接口常量会消费它，
+     * 用于生成 `ConstantValue` 属性或 `<clinit>` 赋值。
      */
     val initializer: JasExpression? = null
 ) : JasDeclaration()

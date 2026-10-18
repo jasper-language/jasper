@@ -255,6 +255,10 @@ public function main(): int32 {
 
 #### 10. 静态字段不可用 → 全局自增/注册中心只能实例化
 - 类别：`③编译器缺陷`（同 JDBC #8 复核）
+- 状态：**已修复（本提交）**——类静态字段现生成 `GETSTATIC`/`PUTSTATIC`，字段带
+  `ACC_STATIC`；`static var` 的声明初值在 `<clinit>` 中执行，多个实例与类名访问共享同一份值。
+  JPA 的全局自增序列/注册中心可直接用 `static var` 表达。回归见 `jasper.StaticFieldTest`。
+  以下「现象」为修复前证据，保留作历史记录。
 - 现象：`@GeneratedValue` 的全局自增序列、`MappingRegistry` 的全局注册表，在 JPA
   实现里天然是静态单例；当前静态字段读写生成 `GETFIELD` 而非 `GETSTATIC`，
   运行期 NPE。
