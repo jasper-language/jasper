@@ -20,6 +20,7 @@ package jasper.ast
 import jasper.parser.JasperParser
 import jasper.parser.JasperParserBaseVisitor
 import org.antlr.v4.runtime.ParserRuleContext
+import org.antlr.v4.runtime.tree.ParseTree
 
 /**
  * 解析树 → AST 的 Visitor 实现：把 JasperParser 的每条规则翻译成对应的 Jas* 节点。
@@ -1176,74 +1177,88 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitBinaryUnary(ctx: JasperParser.BinaryUnaryContext): JasNode? = visit(ctx.unaryExpression())
 
     /**
+     * 二元运算标签的统一构造入口（内部工具，非 ANTLR 回调）。
+     *
+     * 做什么：把一条 `binaryExpression op binaryExpression` 的 ANTLR 上下文收敛成
+     *         `JasBinaryOp(左, 运算符, 右)`。
+     * 何时用：仅在下方 10 个二元标签访问器里调用；`#BinaryUnary` 不走这里。
+     * 前置条件：`left` / `right` 必须是同一条二元分支上下文的左、右操作数
+     *           （即调用方用 `ctx.binaryExpression(0)` / `ctx.binaryExpression(1)` 取出）。
+     * 失败模式：`visit` 结果若不是 `JasExpression` 会抛类型转换异常——由文法保证左/右
+     *           操作数都是表达式，正常不会发生。
+     * 为什么这样设计：新文法把每个二元分支右侧由 `unaryExpression` 改为递归的
+     *           `binaryExpression`，从而用直接左递归恢复真实优先级（`1 + 2 * 3` 解析为
+     *           `+(1, *(2,3))`）。注意 ANTLR 只为「带标签的子上下文」生成
+     *           `binaryExpression(int)`，基类 `BinaryExpressionContext` 上没有该访问器，
+     *           所以这里接收已取出的左右子树，而不是整个 ctx。把这段重复逻辑抽到一个
+     *           私有函数（变化点隔离在运算符文本上），避免 10 处重复且口径不一致。
+     */
+    private fun binaryOp(left: ParseTree, op: String, right: ParseTree): JasBinaryOp {
+        return JasBinaryOp(visit(left) as JasExpression, op, visit(right) as JasExpression)
+    }
+
+    /**
      * binaryExpression 的乘法类标签（* / %）：产出 JasBinaryOp，运算符取 op 原文。
      */
-    override fun visitBinaryMultiplication(ctx: JasperParser.BinaryMultiplicationContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, ctx.op.text, visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryMultiplication(ctx: JasperParser.BinaryMultiplicationContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), ctx.op.text, ctx.binaryExpression(1)).at(ctx)
 
     /**
-     * binaryExpression 的加法类标签（+ / -）：产出 JasBinaryOp。
+     * binaryExpression 的加法类标签（+ / -）：产出 JasBinaryOp，运算符取 op 原文。
      */
-    override fun visitBinaryAddition(ctx: JasperParser.BinaryAdditionContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, ctx.op.text, visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryAddition(ctx: JasperParser.BinaryAdditionContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), ctx.op.text, ctx.binaryExpression(1)).at(ctx)
 
     /**
-     * binaryExpression 的移位标签（<< >> >>>）：产出 JasBinaryOp。
+     * binaryExpression 的移位标签（<< >> >>>）：产出 JasBinaryOp，运算符取 op 原文。
      */
-    override fun visitBinaryShift(ctx: JasperParser.BinaryShiftContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, ctx.op.text, visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryShift(ctx: JasperParser.BinaryShiftContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), ctx.op.text, ctx.binaryExpression(1)).at(ctx)
 
     /**
-     * binaryExpression 的关系标签（< > <= >=）：产出 JasBinaryOp。
+     * binaryExpression 的关系标签（< > <= >=）：产出 JasBinaryOp，运算符取 op 原文。
      */
-    override fun visitBinaryRelational(ctx: JasperParser.BinaryRelationalContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, ctx.op.text, visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryRelational(ctx: JasperParser.BinaryRelationalContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), ctx.op.text, ctx.binaryExpression(1)).at(ctx)
 
     /**
-     * binaryExpression 的相等标签（== !=）：产出 JasBinaryOp。
+     * binaryExpression 的相等标签（== !=）：产出 JasBinaryOp，运算符取 op 原文。
      */
-    override fun visitBinaryEquality(ctx: JasperParser.BinaryEqualityContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, ctx.op.text, visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryEquality(ctx: JasperParser.BinaryEqualityContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), ctx.op.text, ctx.binaryExpression(1)).at(ctx)
 
     /**
      * binaryExpression 的逻辑与标签（&&）：产出运算符固定为 "&&" 的 JasBinaryOp。
+     * 说明：文法该分支的 op 是 `(And | AND_AND)`，词法器不同拼写都归一为 "&&"。
      */
-    override fun visitBinaryAnd(ctx: JasperParser.BinaryAndContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, "&&", visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryAnd(ctx: JasperParser.BinaryAndContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), "&&", ctx.binaryExpression(1)).at(ctx)
 
     /**
      * binaryExpression 的逻辑或标签（||）：产出运算符固定为 "||" 的 JasBinaryOp。
+     * 说明：文法该分支的 op 是 `(Or | OR_OR)`，词法器不同拼写都归一为 "||"。
      */
-    override fun visitBinaryOr(ctx: JasperParser.BinaryOrContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, "||", visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryOr(ctx: JasperParser.BinaryOrContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), "||", ctx.binaryExpression(1)).at(ctx)
 
     /**
      * binaryExpression 的按位与标签（&）：产出运算符为 "&" 的 JasBinaryOp。
      */
-    override fun visitBinaryBitAnd(ctx: JasperParser.BinaryBitAndContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, "&", visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryBitAnd(ctx: JasperParser.BinaryBitAndContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), "&", ctx.binaryExpression(1)).at(ctx)
 
     /**
      * binaryExpression 的按位或标签（|）：产出运算符为 "|" 的 JasBinaryOp。
+     * 说明：文法允许全角 `｜`（FULLWIDTH_PIPE），此处统一归一为半角 "|"。
      */
-    override fun visitBinaryBitOr(ctx: JasperParser.BinaryBitOrContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, "|", visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryBitOr(ctx: JasperParser.BinaryBitOrContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), "|", ctx.binaryExpression(1)).at(ctx)
 
     /**
      * binaryExpression 的按位异或标签（^）：产出运算符为 "^" 的 JasBinaryOp。
      */
-    override fun visitBinaryBitExclusiveOr(ctx: JasperParser.BinaryBitExclusiveOrContext): JasNode? {
-        return JasBinaryOp(visit(ctx.binaryExpression()) as JasExpression, "^", visit(ctx.unaryExpression()) as JasExpression).at(ctx)
-    }
+    override fun visitBinaryBitExclusiveOr(ctx: JasperParser.BinaryBitExclusiveOrContext): JasNode? =
+        binaryOp(ctx.binaryExpression(0), "^", ctx.binaryExpression(1)).at(ctx)
 
     /**
      * unaryExpression 的一元加标签：产出 JasUnaryOp("+")。
