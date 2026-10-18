@@ -288,6 +288,13 @@ public function main(): int32 { Counter.total = 5; return Counter.total; }
 
 #### 9. 嵌套泛型 `>>` 不能连写
 - 类别：`①语法层`
+- 状态：**已修复（本提交）**——编译器在 Kotlin 侧的 token 流/解析装配上做拆分：在类型实参语境
+  把 `>>`(RSHIFT) 拆成两个 `>`(GT)、`>>>`(URSHIFT) 拆成三个 GT，非类型语境保持移位语义
+  （`a >> b`、`a >>> b` 不变），`> >` 空格写法继续可用；不改任何 `.g4`。
+  实现见 `jasper-compiler/src/main/kotlin/jasper/compiler/NestedGenericTokenSupport.kt`
+  （先全拆、再以「解析错误数」为判据裁剪，最后取错误最少且拆分最少的配置）。
+  回归见 `jasper.NestedGenericsTest`（局部变量/字段/形参/返回值/三层/`new` 实例化/空格写法/
+  移位不受影响/比较不受影响/缺 `>` 仍报错）。以下「实测」证据已过期。
 - 现象：词法器把 `>>` 当作移位运算符，`List<List<int32>>` 解析失败。
 - 触发代码：
 ```jasper

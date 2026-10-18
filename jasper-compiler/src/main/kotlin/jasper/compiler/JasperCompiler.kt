@@ -46,13 +46,11 @@ import jasper.annotations.AnnotationIndex
 import jasper.annotations.AnnotationProcessor
 import jasper.ast.JasperAstBuilder
 import jasper.checker.TypeChecker
-import jasper.parser.JasperLexer
 import jasper.parser.JasperParser
 import jasper.stdlib.StdLib
 import jasper.translator.JasperToIrTranslator
 import jasper.translator.TranslationResult
 import jasper.translator.TypeMapper
-import org.antlr.v4.runtime.CharStreams
 import org.jetbrains.kotlin.ir.declarations.IrFile
 import org.jetbrains.kotlin.ir.symbols.IrConstructorSymbol
 import org.jetbrains.kotlin.ir.symbols.IrFieldSymbol
@@ -62,7 +60,6 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import jasper.compiler.JasperErrorListener
-import jasper.compiler.JasperErrorStrategy
 
 /**
  * Preprocesses source text for syntactic sugar that the parser cannot handle natively.
@@ -658,21 +655,13 @@ class JasperCompiler {
      * 并把默认错误监听器换成 [JasperErrorListener]、错误策略设为 [JasperErrorStrategy]。
      * 为什么 removeErrorListeners：默认监听器会把错误直接打到 stderr，必须先移除，
      * 改由我们自己的监听器静默收集，保证输出可控。
+     * 嵌套泛型支持：委托 [createNestedGenericAwareParser]——它在类型实参语境把 `>>`/`>>>`
+     * 拆成 GT（`List<List<int32>>` 可连写），非类型语境保持移位语义（`a >> b` 不变）。
+     * 详见 NestedGenericTokenSupport.kt。
      * 返回 (parser, listener)；调用方从 listener 取错误列表。
      */
-    private fun createParser(source: String): Pair<JasperParser, JasperErrorListener> {
-        val input = CharStreams.fromString(source)
-        val lexer = JasperLexer(input)
-        val tokens = org.antlr.v4.runtime.CommonTokenStream(lexer)
-        val parser = JasperParser(tokens)
-        val errorListener = JasperErrorListener()
-        // 换掉默认监听器（会污染 stderr），改用自定义监听器收集。
-        parser.removeErrorListeners()
-        parser.addErrorListener(errorListener)
-        // 用自定义恢复策略：出错后同步到分号/右花括号，尽量继续解析以汇集更多错误。
-        parser.errorHandler = JasperErrorStrategy()
-        return Pair(parser, errorListener)
-    }
+    private fun createParser(source: String): Pair<JasperParser, JasperErrorListener> =
+        createNestedGenericAwareParser(source)
 
     /**
      * 对外统一的编译结果：密封成「成功」与「失败」两支，调用方可用 when 穷尽处理。
