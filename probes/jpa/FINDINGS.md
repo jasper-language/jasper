@@ -261,7 +261,16 @@ public function main(): int32 {
 
 #### 9. 注解语法细节：命名实参被解析为「位置参数里包着赋值」，且无元注解
 - 类别：`①语法层`
-- 现象：
+- 状态：**解析部分已修复**——AST 构建层（`JasperAstBuilder.parseAnnotationArgs`）现把
+  「位置参数里包着 `name = value`」归一化为 `JasAnnotationNamedArg`，覆盖纯位置、
+  位置+命名混合、纯命名三种形态；嵌套注解（`@Outer(inner = @Inner(value = 1))`）经
+  `parseAnnotationArgValue` 递归返回 `JasAnnotationLiteral`，其内部实参同样归一化。
+  `AnnotationProcessor.annotationStringArgs` 的主路径现在只处理 `JasAnnotationNamedArg`，
+  位置-赋值分支**仅作防御**（兼容以其它方式构造的 AST）。回归守门：
+  `jasper-compiler/src/test/kotlin/jasper/AnnotationArgumentsTest.kt`。
+  **仍未做**：`@interface` 的 `@Target`/`@Retention` 元注解，以及「注解元素类型必须是常量」
+  的强制校验（Q23 / C18 的另一半）。
+- 现象（修复前，保留作历史记录）：
   - `@Table(name = "person")` 未走语法专有的 `annotationNamedArgument` 规则，
     而是被 ANTLR 判为位置参数分支，到 AST 里变成 `JasAnnotationPositionalArg(赋值)`。
     （编译器已有一个适配器 `annotationStringArgs` 吸收它，见

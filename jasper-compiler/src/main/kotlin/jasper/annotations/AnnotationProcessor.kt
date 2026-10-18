@@ -587,19 +587,21 @@ class AnnotationProcessor {
     /**
      * Extracts the `name = "value"` string arguments of an annotation.
      *
-     * Note on the grammar: `@Mapping(source = "a", target = "b")` does **not**
-     * parse through the grammar's dedicated `annotationNamedArgument` rule — ANTLR
-     * resolves the ambiguity in favour of the positional branch, so `source = "a"`
-     * arrives as a `JasAnnotationPositionalArg` wrapping a `JasAssignment`. Both
-     * spellings are accepted here so the annotation reads the same either way.
-     * (`.g4` files are locked; this adapter is the correct place to absorb it.)
+     * Main path: `@Mapping(source = "a", target = "b")` is normalised by the AST
+     * builder ([jasper.ast.JasperAstBuilder]) into [JasAnnotationNamedArg] — the
+     * grammar's `name = value` ambiguity (positional branch) is folded away at
+     * AST-construction time, so consumers no longer have to adapt per call site.
+     * The positional-assignment branch below is kept **defensive only**: it covers
+     * ASTs assembled by other means (e.g. tests or future front-ends) and is not
+     * expected to fire for source parsed by the normal pipeline.
      *
      * 做什么：抽取注解的 `name = "value"` 字符串实参，返回 名字->值 映射。
      * 什么时候用：解析 @Mapping 的 source/target 实参。
-     * 前置条件：只取值为字符串字面量的实参；其余实参忽略。
-     * 为什么这样写（边界）：`.g4` 文件被锁定，`@Mapping(source=..., target=...)` 被 ANTLR 判为位置参数分支，
-     *   因此要同时接受 JasAnnotationNamedArg 和「位置参数里包着 JasAssignment」两种形态；
-     *   此适配器正是吸收语法歧义的正确位置，避免把语法细节泄漏给调用方。
+     * 前置条件：只取值为字符串字面量的实参；其余实参（含嵌套注解）忽略。
+     * 为什么这样写（边界）：主路径只处理 [JasAnnotationNamedArg]——AST 构建层
+     *   （JasperAstBuilder.parseAnnotationArgs）已把「位置参数里包着 JasAssignment」的
+     *   形态归一化为命名实参。下面的位置分支**仅为防御**，兼容以其它方式构造的 AST，
+     *   正常流水线解析出的源码不会再走到它；这样注解消费者无需各自复制适配逻辑。
      */
     private fun annotationStringArgs(annotation: JasAnnotationUse): Map<String, String> {
         val result = linkedMapOf<String, String>()
@@ -610,6 +612,7 @@ class AnnotationProcessor {
                     result[argument.name] = value.text
                 }
                 is JasAnnotationPositionalArg -> {
+                    // 防御分支：仅当归一化未生效（AST 由其它途径构造）时才可能命中。
                     val value = argument.value
                     if (value is JasAssignment && value.op == "=" &&
                         value.target is JasIdentifier && value.value is JasStringLiteral

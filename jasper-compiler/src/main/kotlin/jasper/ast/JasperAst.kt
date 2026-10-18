@@ -623,6 +623,23 @@ data class JasAnnotationNamedArg(val name: String, val value: JasExpression) : J
  */
 data class JasAnnotationPositionalArg(val value: JasExpression) : JasAnnotationArgument()
 
+/**
+ * 嵌套注解字面量：把内层 [JasAnnotationUse] 包装成表达式，使「注解实参值」这一层
+ * （字段类型固定为 [JasExpression]）也能承载嵌套注解，例如
+ * `@Outer(inner = @Inner(value = 1))`。
+ *
+ * 做什么：表示「作为注解实参值出现的注解实例」，是 [JasAnnotationUse] 的表达式包装。
+ * 什么时候用：JasperAstBuilder 解析 annotationArgumentValue 的 `@` 分支时构建；
+ *   下游若只关心字符串/字面量实参（如 AnnotationProcessor.annotationStringArgs）可忽略它。
+ * 前置条件：annotation 已完成实参命名归一化（即其 arguments 中命名实参已是
+ *   [JasAnnotationNamedArg]，不会再有「位置参数里包着赋值」的形态）。
+ * 失败模式：本节点为纯数据包装，不抛异常；不识别它的消费者应忽略而非崩溃。
+ * 为什么这样设计：注解实参值字段与数组元素都要求 [JasExpression]，而注解使用本身是
+ *   [JasNode]；用一层薄包装把嵌套注解纳入表达式层次，避免把值字段放宽为 [JasNode]
+ *   从而波及所有表达式消费者（依赖单向、变化点最小）。
+ */
+data class JasAnnotationLiteral(val annotation: JasAnnotationUse) : JasExpression()
+
 // --- Types ---
 
 /**

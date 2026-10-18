@@ -2093,30 +2093,56 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     /**
      * 私有辅助：解析注解实参列表，统一产出 JasAnnotationArgument 列表。
      *
-     * 边界：纯命名参数走 NamedNode；混合形态先收位置参数再收命名参数；无参数返回空列表。
+     * 做什么：把语法层的三种实参形态（纯命名 / 位置+命名混合 / 单靠位置）统一收集，
+     *   并做一次「命名归一化」后返回。
+     * 什么时候用：visitAnnotationUseNode 解析 `@X(...)` 的括号内容时。
+     * 前置条件：ctx 为 AnnotationArgumentsNodeContext。
+     * 失败模式：无参数返回空列表；单个实参解析失败（值非法/展开等）则该条被跳过。
+     * 为什么这样设计：文法里虽有专有的 annotationNamedArgument 规则，但
+     *   `name = value` 因歧义常被判入位置分支（parser 优先匹配 annotationPositionalArgument）。
+     *   集中在这里调用 [normalizeAnnotationArgument] 折叠，可让所有消费者只面对
+     *   JasAnnotationNamedArg，无需各自复制适配逻辑（隔离「文法歧义」这一变化点）。
+     * 边界：纯命名路径与混合路径最终都经同一归一化，语义一致；位置参数顺序先于命名参数。
      */
     private fun parseAnnotationArgs(ctx: JasperParser.AnnotationArgumentsNodeContext): List<JasAnnotationArgument> {
         if (ctx.annotationArgumentList() == null) return emptyList()
         val listCtx = ctx.annotationArgumentList()
-        // 注解实参形态：纯命名、或位置+命名混合；统一收集为 JasAnnotationArgument。
-        return when (listCtx) {
+        // 先按文法原样收集（位置在前、命名在后），再统一做命名归一化。
+        val collected = mutableListOf<JasAnnotationArgument>()
+        when (listCtx) {
             is JasperParser.AnnotationArgumentsNamedNodeContext -> {
-                listCtx.annotationNamedArgument().mapNotNull { parseAnnotationNamedArg(it) }
+                listCtx.annotationNamedArgument().mapNotNullTo(collected) { parseAnnotationNamedArg(it) }
             }
             is JasperParser.AnnotationArgumentsMixedNodeContext -> {
-                val result = mutableListOf<JasAnnotationArgument>()
-                for (pa in listCtx.annotationPositionalArgument()) {
-                    val arg = parseAnnotationPositionalArg(pa)
-                    if (arg != null) result.add(arg)
-                }
-                for (na in listCtx.annotationNamedArgument()) {
-                    val arg = parseAnnotationNamedArg(na)
-                    if (arg != null) result.add(arg)
-                }
-                result
+                listCtx.annotationPositionalArgument().mapNotNullTo(collected) { parseAnnotationPositionalArg(it) }
+                listCtx.annotationNamedArgument().mapNotNullTo(collected) { parseAnnotationNamedArg(it) }
             }
-            else -> emptyList()
+            else -> {}
         }
+        return collected.map { normalizeAnnotationArgument(it) }
+    }
+
+    /**
+     * 私有辅助：把「位置参数里包着 `name = value`」归一化为命名实参 [JasAnnotationNamedArg]。
+     *
+     * 做什么：输入一个已解析的注解实参；若它是位置实参且其值恰为 `标识符 = 值` 的赋值，
+     *   则改判为命名实参；否则原样返回。
+     * 什么时候用：parseAnnotationArgs 收集完所有实参后逐条调用。
+     * 前置条件：入参是 parseAnnotationPositionalArg / parseAnnotationNamedArg 的产物。
+     * 失败模式：无（纯结构改写，不抛异常）。
+     * 为什么这样设计：ANTLR 的歧义消解把 `@Table(name = "person")` 判成位置分支，
+     *   于是 AST 里出现 JasAnnotationPositionalArg(JasAssignment(...))。在 AST 构建层
+     *   一次性折叠成命名实参，可让注解消费者免于复制适配（隔离「文法歧义」变化点）。
+     * 边界：仅当 op 恰为 "=" 且 target 是 JasIdentifier 时才折叠——`==`、`!=`、复合赋值
+     *   （`+=` 等）、或 target 非标识符（如属性访问）都保持位置实参原样，避免误伤。
+     */
+    private fun normalizeAnnotationArgument(arg: JasAnnotationArgument): JasAnnotationArgument {
+        if (arg !is JasAnnotationPositionalArg) return arg
+        val value = arg.value
+        if (value is JasAssignment && value.op == "=" && value.target is JasIdentifier) {
+            return JasAnnotationNamedArg((value.target as JasIdentifier).name, value.value)
+        }
+        return arg
     }
 
     /**
@@ -2144,12 +2170,25 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     /**
      * 私有辅助：解析单个注解实参值。
      *
-     * 边界：表达式节点转发求值；数组节点递归收集为 JasArrayInitValues；其余（如注解值）返回 null。
+     * 做什么：把 annotationArgumentValue 的三种形态转成表达式节点——表达式、嵌套注解、数组。
+     * 什么时候用：解析命名/位置实参的值时（[parseAnnotationNamedArg]、[parseAnnotationPositionalArg]）。
+     * 前置条件：ctx 非空。
+     * 失败模式：上下文类型不符或内层注解节点非法时返回 null（该条实参被上层跳过）。
+     * 为什么这样设计：嵌套注解需递归回到 visitAnnotationUseNode，其内部实参会再次经过
+     *   [parseAnnotationArgs] 的命名归一化，从而天然递归生效；用 [JasAnnotationLiteral]
+     *   把注解实例包装成表达式以适配 JasExpression 值字段。
+     * 边界：数组分支把元素递归解析；展开（`...`）不属于实参值形态，不在此处理。
      */
     private fun parseAnnotationArgValue(ctx: JasperParser.AnnotationArgumentValueContext): JasExpression? {
         return when (ctx) {
             is JasperParser.AnnotationArgumentValueExpressionNodeContext -> {
                 visit(ctx.expression()) as? JasExpression
+            }
+            is JasperParser.AnnotationArgumentValueAtNodeContext -> {
+                // 嵌套注解：递归构建 JasAnnotationUse（其内部实参自动走命名归一化），再包成表达式。
+                val annCtx = ctx.annotation() as? JasperParser.AnnotationUseNodeContext ?: return null
+                val use = visitAnnotationUseNode(annCtx) as? JasAnnotationUse ?: return null
+                JasAnnotationLiteral(use).at(ctx) as JasExpression
             }
             is JasperParser.AnnotationArgumentValueArrayNodeContext -> {
                 val values = ctx.annotationArgumentValue().mapNotNull { parseAnnotationArgValue(it) }
