@@ -285,6 +285,7 @@ class JasperToIrTranslator {
         collectMemberReturnTypes(ast, ctx)
         collectMemberSignatures(ast, ctx)
         collectSuperTypeNames(ast, ctx)
+        predeclareFields(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
         predeclareStaticMemberFunctions(ast, ctx)
         predeclareEnumConstants(listOf(ast), ctx)
@@ -332,6 +333,7 @@ class JasperToIrTranslator {
             collectMemberReturnTypes(ast, ctx)
             collectMemberSignatures(ast, ctx)
             collectSuperTypeNames(ast, ctx)
+            predeclareFields(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
             predeclareStaticMemberFunctions(ast, ctx)
             predeclareEnumConstants(listOf(ast), ctx)
@@ -748,6 +750,61 @@ class JasperToIrTranslator {
                     val symbol = byName.getOrPut(member.name) { IrSimpleFunctionSymbolImpl() }
                     ctx.staticFunctionSymbols.add(symbol)
                 }
+            }
+        }
+    }
+
+    /**
+     * 做什么：在翻译任何声明体之前，把每个 class/interface/enum 的字段（实例字段、静态字段、
+     *   接口常量）的符号与类型统一登记进按类索引 [TranslationContext.fieldSymbolsByClass] /
+     *   [TranslationContext.fieldTypesByClass]；静态字段（含接口常量）的符号同时进
+     *   [TranslationContext.staticFieldSymbols]。
+     * 什么时候用：translate / translateAll 的第一遍，紧跟 [collectSuperTypeNames] 之后、
+     *   第二遍翻译之前；每个文件调用一次，调用前须先 [installFileContext]。
+     * 前置条件：AST 已过注解阶段；当前文件上下文已安装——需要 currentPkg/currentImports 才能把
+     *   类型名解析成与运行时一致的 JVM 风格内部名（否则键与访问点对不上，等于没登记）。
+     * 失败模式：不抛异常；字段类型缺失时 [TypeMapper.mapType] 退化为 Unit（与既有 translateProperty
+     *   行为一致）。重复登记用 getOrPut/putIfAbsent，保留首登记者（先声明优先）。
+     * 为什么需要：字段符号此前只在「声明所在文件被翻译时」才登记（translateProperty /
+     *   translateInterfaceConstant），于是访问点若排在声明文件之前，[resolveFieldSymbol] 只能拿到
+     *   一个临时/空符号；该符号从未作为 IrField 出现在任何类体里，后端第一遍建立「符号 → 名字/owner」
+     *   索引时自然查不到它，最终抛 `INTERNAL: unresolved field symbol (no name registered)`
+     *   （R2DBC #5 / JPA #3 的根因）。把「有哪些字段、属于哪个类」提前收敛到一次预登记，
+     *   使字段解析与文件顺序彻底无关（隔离的变化点：字段身份的建立时机）。
+     * 为什么用内部名作键：同一简单名可能出现在不同包，JVM 内部名（如 `p/A`）才是字段宿主的唯一
+     *   标识；该口径与 [resolveFieldSymbol] 的查表口径一致。
+     * 为什么把接口常量也纳入：接口常量就是 `public static final` 字段，预登记后
+     *   `Statement.MAX_ROWS` 的读取点在声明文件之前也能正确落到 GETSTATIC。
+     */
+    private fun predeclareFields(ast: JasSourceFile, ctx: TranslationContext) {
+        /**
+         * 做什么：为一个类型的全部属性成员登记字段符号/类型/静态性。
+         * 什么时候用：本函数遍历到 JasClass/JasInterface/JasEnum 时各调用一次。
+         * 前置条件：已安装当前文件的包/import 上下文。
+         * 失败模式：无；重复登记保留先登记者。
+         */
+        fun record(typeName: String, members: List<JasDeclaration>, isInterface: Boolean) {
+            val owner = typeMapper.resolveNamedTypeName(typeName)
+            val symbols = ctx.fieldSymbolsByClass.getOrPut(owner) { mutableMapOf() }
+            val types = ctx.fieldTypesByClass.getOrPut(owner) { mutableMapOf() }
+            for (member in members) {
+                if (member !is JasProperty) continue
+                val symbol = symbols.getOrPut(member.name) { IrFieldSymbolImpl() }
+                types.putIfAbsent(member.name, typeMapper.mapType(member.type))
+                // 静态性判定必须与声明处（translateProperty / translateInterfaceConstant）完全一致，
+                // 否则访问点会发错指令：
+                //   - 接口 `const` 走 translateInterfaceConstant，恒为 static；
+                //   - 其余（含类里的 `const`）走 translateProperty，静态性只看 `static` 修饰符。
+                val isStatic = (isInterface && member.isConst) || hasModifier(member.modifiers, "static")
+                if (isStatic) ctx.staticFieldSymbols.add(symbol)
+            }
+        }
+        for (decl in ast.declarations) {
+            when (decl) {
+                is JasClass -> record(decl.name, decl.members, isInterface = false)
+                is JasInterface -> record(decl.name, decl.members, isInterface = true)
+                is JasEnum -> record(decl.name, decl.members, isInterface = false)
+                else -> {}
             }
         }
     }
@@ -1315,8 +1372,11 @@ class JasperToIrTranslator {
      *   才会发 GETSTATIC 而非 GETFIELD；初值留在 IrField 上供后端发 ConstantValue 或 clinit 赋值。
      */
     private fun translateInterfaceConstant(prop: JasProperty, ctx: TranslationContext): IrField {
-        val propType = typeMapper.mapType(prop.type)
-        val fieldSymbol = IrFieldSymbolImpl()
+        // 复用预登记符号/类型：接口常量的读取点（Statement.MAX_ROWS）可能在声明文件之前翻译，
+        // 必须与声明处共享同一 IrFieldSymbol 身份，否则后端按符号反查不到字段名。
+        val predeclaredSymbol = ctx.fieldSymbolsByClass[ctx.currentClassName]?.get(prop.name)
+        val propType = ctx.fieldTypesByClass[ctx.currentClassName]?.get(prop.name) ?: typeMapper.mapType(prop.type)
+        val fieldSymbol = predeclaredSymbol ?: IrFieldSymbolImpl()
         val irField = factory.createField(
             0, 0,
             IrDeclarationOrigin.DEFINED,
@@ -1474,7 +1534,13 @@ class JasperToIrTranslator {
 
     private fun translateProperty(prop: JasProperty, classSymbol: IrClassSymbol, ctx: TranslationContext): IrProperty? {
         val propSymbol = IrPropertySymbolImpl()
-        val propType = typeMapper.mapType(prop.type)
+        // 复用预登记阶段登记的类型与字段符号（若存在）。这是「调用点与声明点共享同一符号身份」
+        // 的关键：访问点（resolveFieldSymbol）在声明文件之前翻译时拿到的就是这个预登记符号，
+        // 后端第一遍按 IrField 建立「符号 → 名字/owner」索引时登记的也是它；若此处另建一个新符号，
+        // 访问点的符号就永远查不到名字（INTERNAL: unresolved field symbol）。
+        // 没有预登记值时才新建（防御：兼容直接调用 translateProperty、未走预登记的内部路径）。
+        val predeclaredSymbol = ctx.fieldSymbolsByClass[ctx.currentClassName]?.get(prop.name)
+        val propType = ctx.fieldTypesByClass[ctx.currentClassName]?.get(prop.name) ?: typeMapper.mapType(prop.type)
         // 静态性只由声明修饰符决定（接口常量走独立入口）。它同时影响三处：
         // 字段的 ACC_STATIC、字段符号是否进入 staticFieldSymbols（决定 GETSTATIC/PUTSTATIC），
         // 以及声明初值是进 <clinit> 还是按实例字段忽略。
@@ -1491,7 +1557,7 @@ class JasperToIrTranslator {
             true, false, false, false, false,
             null, false, false
         )
-        val fieldSymbol = IrFieldSymbolImpl()
+        val fieldSymbol = predeclaredSymbol ?: IrFieldSymbolImpl()
         val irField = factory.createField(
             0, 0,
             IrDeclarationOrigin.DEFINED,
