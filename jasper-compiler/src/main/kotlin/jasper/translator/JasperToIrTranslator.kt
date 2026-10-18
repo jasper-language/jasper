@@ -60,6 +60,24 @@ private val PROTOCOL_METHODS = setOf("apply", "test", "reduce", "compare", "acce
 private data class StaticFieldRef(val symbol: IrFieldSymbol, val type: IrType)
 
 /**
+ * 做什么：一个用户类型「成员方法的声明擦除签名」——擦除后的形参描述符列表 + 返回描述符。
+ * 什么时候用：后端在经接口/泛型接收者发 `INVOKEINTERFACE`/`INVOKEVIRTUAL` 时，据此得到
+ *   被调方法在 JVM 里的真实描述符（类型变量按擦除规则落到 `Object`）。
+ * 前置条件：由 translator 预登记阶段从 AST 声明计算；不做类型变量上界解析（v1 无界→Object）。
+ * 失败模式：仅承载数据；更复杂的泛型形状（通配符/F-bounded/基本类型实参装箱）不在此表达，
+ *   由后端在选择描述符时按「参数个数不匹配则回退」处理。
+ * 已知限制：索引按「类型名 + 方法名」聚合（见 [JasperToIrTranslator.collectMemberSignatures]
+ *   的 first-writer-wins），同名**同元数**但形参类型不同的重载不会被区分；v1 语言本身
+ *   对成员重载支持有限（不同元数重载已不可用），现有程序不触发该冲突。
+ * 为什么这样设计：后端不在翻译期持有 AST，且成员调用点的 IR 符号不与声明符号同身份，
+ *   因此把「声明签名」这一变化点收敛到 translator 预登记，后端只按名查询，不重新推断。
+ */
+data class MemberMethodSignature(
+    val paramDescriptors: List<String>,
+    val returnDescriptor: String
+)
+
+/**
  * 做什么：一次翻译的完整产出——IR 文件列表 + 后端渲染所需的各种「符号 -> 名字/类型」登记表。
  * 什么时候用：translate / translateAll 返回；由后端（JVM/LLVM）消费以决定调用/字段的最终形态。
  * 前置条件：调用方应对同一批 AST 只取用一次结果。
@@ -94,7 +112,11 @@ data class TranslationResult(
     // is derived by the backend from the argument types and the call's IR type.
     // 合成静态调用（枚举 values()/valueOf(String)）：符号 -> JVM 内部宿主名。
     // 方法名取自 callNames；描述符由后端据实参类型与调用 IR 类型推导。
-    val syntheticStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap()
+    val syntheticStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap(),
+    // 每个用户类型的成员方法「声明擦除签名」：JVM 风格类型名 -> 方法名 -> (形参描述符列表, 返回描述符)。
+    // 后端据此在经接口/泛型接收者调用时写出被调方法的真实（擦除后）描述符。
+    // 中文：成员方法声明擦除签名索引；键/值规则见 MemberMethodSignature 文档。
+    val memberSignaturesByType: Map<String, Map<String, MemberMethodSignature>> = emptyMap()
 )
 
 /**
@@ -137,6 +159,18 @@ data class TranslationContext(
     // 成员返回类型索引：JVM 风格类/接口名 -> 成员名 -> 返回类型。
     // 供迭代协议 lowering 依据具体可迭代类型的 next() 推断循环变量类型（避免全局映射被覆盖）。
     val memberReturnTypesByType: MutableMap<String, MutableMap<String, IrType>> = mutableMapOf(),
+    // Member declared (erased) signatures: JVM-style type name -> member name -> signature.
+    // Populated in the predeclare pass; exported to the backend so an interface-typed
+    // call site can emit the *declared* (erased) descriptor instead of guessing from args.
+    // 成员「声明擦除签名」索引：JVM 风格类型名 -> 成员名 -> 擦除签名。预登记阶段填充，
+    // 导出给后端，使接口类型接收者的调用点能发出「声明的、擦除后的」描述符，而非按实参猜。
+    val memberSignaturesByType: MutableMap<String, MutableMap<String, MemberMethodSignature>> = mutableMapOf(),
+    // Declared type-parameter names per user type (JVM-style name -> [T, ID, ...]).
+    // Used to bind a receiver's type arguments onto the declared return type so the call
+    // site's IR type is the *source* type (e.g. Repo<Person>.get -> Person).
+    // 每个用户类型声明的类型形参名（JVM 风格名 -> [T, ID, ...]）。用于把接收者的类型实参
+    // 绑定到声明返回类型上，使调用点的 IR 类型是「源码视角的具体类型」（如 Repo<Person>.get -> Person）。
+    val typeParameterNamesByType: MutableMap<String, List<String>> = mutableMapOf(),
     // 类名 -> 类符号。
     val classSymbols: MutableMap<String, IrClassSymbol> = mutableMapOf(),
     // 本次翻译中声明的全部类型简单名（翻译前预登记，跨文件可见）。
@@ -243,6 +277,7 @@ class JasperToIrTranslator {
         predeclareRuntimeBuiltins(ctx)
         collectHashableClassNames(listOf(ast), ctx)
         collectMemberReturnTypes(ast, ctx)
+        collectMemberSignatures(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
         predeclareStaticMemberFunctions(ast, ctx)
         predeclareEnumConstants(listOf(ast), ctx)
@@ -265,7 +300,8 @@ class JasperToIrTranslator {
             interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
             staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
             staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
-            syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap())
+            syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap(),
+            memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap())
     }
 
     /**
@@ -285,6 +321,7 @@ class JasperToIrTranslator {
             installFileContext(ast, ctx)
             collectHashableClassNames(listOf(ast), ctx)
             collectMemberReturnTypes(ast, ctx)
+            collectMemberSignatures(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
             predeclareStaticMemberFunctions(ast, ctx)
             predeclareEnumConstants(listOf(ast), ctx)
@@ -314,32 +351,55 @@ class JasperToIrTranslator {
             interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
             staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
             staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
-            syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap())
+            syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap(),
+            memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap())
     }
 
     /**
      * 做什么：扫描一组源文件的顶层类型声明，把它们的**简单名**登记进 [TypeMapper]，
-     *   供名字解析区分「真实单字母类型」与「泛型形参」。
+     *   供名字解析区分「真实单字母类型」与「泛型形参」；同时登记各类型的**泛型形参名**。
      *
      * 什么时候用：translate / translateAll 开始翻译前调用一次（必须早于任何 mapType，
      *   否则解析已经用错判据）。
      * 前置条件：asts 已完成解析。
      * 失败模式：不抛异常；只登记 class/interface/enum/annotation 四类顶层声明，
-     *   嵌套类型暂不登记（当前语言与探针均不依赖）。
+     *   嵌套类型与方法级形参暂不登记（当前语言与探针均不依赖；单字母形参仍由启发式兜底）。
      * 为什么这样设计：`isLikelyTypeParam` 的单字母启发式无法自行分辨用户类型与形参，
-     *   在翻译前把「有哪些真实类型」一次性告诉 TypeMapper，是最小改动且依赖单向的做法。
+     *   也无法识别 `ID`/`KEY` 等多字母形参（`Repository<T, ID>` 是 JPA 探针的标准形状）。
+     *   在翻译前把「有哪些真实类型」与「有哪些形参名」一次性告诉 TypeMapper，
+     *   是最小改动且依赖单向的做法。
      */
     private fun registerDeclaredTypeNames(asts: List<JasSourceFile>, ctx: TranslationContext) {
         for (ast in asts) {
             for (decl in ast.declarations) {
                 when (decl) {
-                    is JasClass -> registerDeclaredTypeName(decl.name, ctx)
-                    is JasInterface -> registerDeclaredTypeName(decl.name, ctx)
+                    is JasClass -> {
+                        registerDeclaredTypeName(decl.name, ctx)
+                        registerTypeParams(decl.typeParameters)
+                    }
+                    is JasInterface -> {
+                        registerDeclaredTypeName(decl.name, ctx)
+                        registerTypeParams(decl.typeParameters)
+                    }
                     is JasEnum -> registerDeclaredTypeName(decl.name, ctx)
                     is JasAnnotationType -> registerDeclaredTypeName(decl.name, ctx)
                     else -> {}
                 }
             }
+        }
+    }
+
+    /**
+     * 做什么：把一组泛型形参名登记进 [TypeMapper]，使其按泛型擦除规则落到 `Object`。
+     * 什么时候用：[registerDeclaredTypeNames] 遍历到带 `typeParameters` 的类型声明时。
+     * 前置条件：形参来自 JasClass/JasInterface 的 `typeParameters`；名字是简单名。
+     * 失败模式：无（幂等登记）。
+     * 为什么这样设计：擦除判定属于 TypeMapper 的职责，translator 只负责把「语言层的声明事实」
+     *   （哪些名字是形参）喂给它，保证「类型名 → 描述符」的规则仍集中在唯一入口。
+     */
+    private fun registerTypeParams(typeParameters: List<JasTypeParameter>) {
+        for (tp in typeParameters) {
+            typeMapper.registerTypeParam(tp.name)
         }
     }
 
@@ -523,6 +583,49 @@ class JasperToIrTranslator {
             when (decl) {
                 is JasClass -> record(decl.name, decl.members)
                 is JasInterface -> record(decl.name, decl.members)
+                else -> {}
+            }
+        }
+    }
+
+    /**
+     * 做什么：预登记每个用户类型成员方法的「声明擦除签名」与类型形参名，供后端确定调用描述符。
+     * 什么时候用：translate / translateAll 的第一遍，紧跟 [collectMemberReturnTypes] 之后。
+     * 前置条件：调用前已通过 installFileContext 安装当前文件的包/import 上下文，否则
+     *   [TypeMapper.resolveNamedTypeName] 得到的键与运行时内部名对不上。
+     * 失败模式：不抛异常；形参类型缺失的成员整条跳过（宁可回退旧行为，也不登记半成品签名）。
+     *   同名成员用 putIfAbsent 保留先登记者（first-writer-wins，与 collectMemberReturnTypes 一致）。
+     * 为什么这样设计：JVM 泛型擦除后，接口方法（如 `save(T)`）的描述符是 `(Object)V`，而调用点
+     *   的实参类型可能是具体类型（`Person`）。成员调用的 IR 符号不与声明同身份，后端无法自行推断，
+     *   故把「声明签名」这一变化点收敛到此处预登记；描述符擦除规则复用 TypeMapper 的唯一入口。
+     */
+    private fun collectMemberSignatures(ast: JasSourceFile, ctx: TranslationContext) {
+        /**
+         * 做什么：把一个类型的成员签名与类型形参名写入按类型的索引。
+         * 什么时候用：本函数遍历到 JasClass/JasInterface/JasEnum 时各调用一次。
+         * 前置条件：已安装当前文件的包/import 上下文。
+         * 失败模式：无；同名成员 first-writer-wins。
+         */
+        fun record(typeName: String, typeParams: List<JasTypeParameter>, members: List<JasDeclaration>) {
+            val qualified = typeMapper.resolveNamedTypeName(typeName)
+            // 类型形参名按声明顺序登记：调用点据此把接收者实参绑定到声明返回类型。
+            if (typeParams.isNotEmpty()) {
+                ctx.typeParameterNamesByType.putIfAbsent(qualified, typeParams.map { it.name })
+            }
+            val index = ctx.memberSignaturesByType.getOrPut(qualified) { mutableMapOf() }
+            for (member in members) {
+                if (member !is JasFunction) continue
+                // 形参类型必须全部已知，否则无法得到可靠描述符——整条跳过。
+                if (member.parameters.any { it.type == null }) continue
+                val paramDescs = member.parameters.map { typeMapper.jvmDescriptorFromType(it.type) }
+                val retDesc = typeMapper.jvmReturnDescriptor(member.returnType)
+                index.putIfAbsent(member.name, MemberMethodSignature(paramDescs, retDesc))
+            }
+        }
+        for (decl in ast.declarations) {
+            when (decl) {
+                is JasClass -> record(decl.name, decl.typeParameters, decl.members)
+                is JasInterface -> record(decl.name, decl.typeParameters, decl.members)
                 else -> {}
             }
         }
@@ -2410,23 +2513,70 @@ class JasperToIrTranslator {
         // producing a wrong call descriptor and a VerifyError.
         // 中文：优先用「接收者声明类型」索引取返回类型，避免全局同名 last-writer-wins
         // 把无关签名（如 Iterator.next）串到 ResultSet.next 上；接收者类型未知时才回退全局表。
-        val memberReturnType = if (expr.target is JasPropertyAccess) {
-            args.firstOrNull()?.type?.let { receiverType ->
-                typeMapper.irTypeClassName(receiverType)?.let { owner ->
-                    ctx.memberReturnTypesByType[owner]?.get(name)
-                }
-            }
-        } else null
+        val receiverType = if (expr.target is JasPropertyAccess) args.firstOrNull()?.type else null
+        val receiverOwner = receiverType?.let { typeMapper.irTypeClassName(it) }
+        val memberReturnType = receiverOwner?.let { ctx.memberReturnTypesByType[it]?.get(name) }
         val baseReturnType = memberReturnType ?: ctx.functionReturnTypes[name] ?: typeMapper.unitType()
-        val returnType = if (expr.inferredTypeArgs != null && expr.inferredTypeArgs!!.isNotEmpty()) {
+        var returnType = if (expr.inferredTypeArgs != null && expr.inferredTypeArgs!!.isNotEmpty()) {
             substituteIrType(baseReturnType, expr.inferredTypeArgs!!)
         } else {
             baseReturnType
         }
+        // 泛型接收者（如 `Repo<Person>`）的返回类型里仍可能是接口声明的类型变量 T；
+        // 用接收者实参把它替换成源码视角的具体类型，调用点才能据此补 CHECKCAST。
+        returnType = substituteByReceiverTypeArgs(returnType, receiverOwner, receiverType, ctx)
         return IrNodeFactory.createCall(
             0, 0, returnType, IrStatementOrigin.INVOKE,
             irArgs, emptyArray<IrType>(), symbol, null
         )
+    }
+
+    /**
+     * 做什么：用接收者的泛型实参替换声明返回类型里的类型变量（如 `Repo<Person>.get` 的
+     *   `T` → `Person`）。
+     * 什么时候用：[translateCall] 计算成员调用表达式的静态类型时（经接口/泛型接收者调用）。
+     * 前置条件：owner 是接收者的静态类型名；receiverType 的实参顺序与类型声明形参顺序一致
+     *   （[TranslationContext.typeParameterNamesByType] 已按声明顺序登记）。
+     * 失败模式：owner 未登记类型形参、receiverType 不是简单类型、或实参缺失/为星投影时，
+     *   原样返回（退回擦除后的类型），不抛异常。
+     * 为什么这样设计：JVM 调用点走「擦除后的接口描述符 + 结果 CHECKCAST」，因此 IR 调用类型
+     *   必须是源码视角的具体类型；把「接收者实参绑定到类型变量」收敛到唯一函数，后端不必理解泛型。
+     */
+    private fun substituteByReceiverTypeArgs(
+        type: IrType,
+        owner: String?,
+        receiverType: IrType?,
+        ctx: TranslationContext
+    ): IrType {
+        if (owner == null || receiverType !is IrSimpleType) return type
+        val names = ctx.typeParameterNamesByType[owner] ?: return type
+        if (names.isEmpty()) return type
+        val bindings = mutableMapOf<String, IrType>()
+        for ((i, arg) in receiverType.arguments.withIndex()) {
+            if (i >= names.size) break
+            val argType = (arg as? IrTypeProjection)?.type
+            if (argType != null) bindings[names[i]] = argType
+        }
+        if (bindings.isEmpty()) return type
+        return substituteTypeVariableNames(type, bindings)
+    }
+
+    /**
+     * 做什么：把一个 IR 类型里「按名字识别出的类型变量」替换为绑定类型（浅替换，只处理顶层）。
+     * 什么时候用：[substituteByReceiverTypeArgs] 内部。
+     * 前置条件：bindings 的键是类型变量名（如 "T"），值是具体 IR 类型。
+     * 失败模式：非类型变量、或未命中的名字原样返回；不做深层（嵌套泛型实参）替换，属 v1 边界。
+     * 为什么单独成函数：方法级类型变量（真 IrTypeParameterSymbol）已由 [substituteIrType] 处理，
+     *   这里补的是「按名字识别的类级类型变量」这一既存近似表示。
+     */
+    private fun substituteTypeVariableNames(type: IrType, bindings: Map<String, IrType>): IrType {
+        if (type is IrSimpleType) {
+            val className = typeMapper.irTypeClassName(type)
+            if (className != null) {
+                bindings[className]?.let { return it }
+            }
+        }
+        return type
     }
 
     /**

@@ -87,9 +87,12 @@ Flux.declaredFields=[FETCH_SIZE]
 > #4（`finally`）、#11（数组元素读类型）；并修复 `①语法层` #2 的**执行语义**
 > （`go` 任务体真的执行、副作用可观察）。#2 的另一半「`go` 可作普通标识符/方法名」
 > 受 `JasperLexer.g4` 硬关键字阻塞，**仍未修复**（需把 `Go` 改为软关键字，见第五节 #2）。
-> **本提交** 另修复 `③编译器缺陷` #14（枚举比较 / `switch` / `match`），回归守门见
-> `jasper.EnumTest`。修复详情见第五节各条目的「状态」行；回归守门见
-> `jasper.R2dbcDefectRegressionTest`。
+> **本提交** 另修复 `③编译器缺陷` #14（枚举比较 / `switch` / `match`），**#3**
+> （泛型类型变量擦除为 `Object` + 实现类补桥 + 接口分派），并**部分修复 #8**
+> （「成员方法调用实参宽化」已修——调用点改用声明的擦除签名；「字段赋值宽化」仍开放）。
+> 修复详情见第五节各条目的「状态」行；回归守门见
+> `jasper.R2dbcDefectRegressionTest`（#1/#2/#4/#11）与
+> `jasper.GenericDispatchTest`（#3，及 #8 的成员调用部分）。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -101,9 +104,13 @@ Flux.declaredFields=[FETCH_SIZE]
 1. **元素类型固定为具体 `Row`，而不是泛型 `T`**（#3）。泛型形状保留在
    `ReactiveStreams.jas`（`Rx*` 前缀）中只作声明；运行路径全部走 `std` 包的
    `Publisher`/`Subscriber`/`Mono`/`Flux`（元素类型 `Row`）。
+   （**#3 已修复（本提交）**：该规避现已不再必要，泛型接口可经接口变量分派；探针源保留
+   原写法以保留历史证据，未在本轮改写。）
 2. **具体表达式先赋给接口类型局部变量，再传给接口形参/存入接口字段**（#8）。
    例：`var seedSub: Subscription = new MemorySubscription(new Resource()); this.seed = seedSub;`
    以及 `var gateSubscriber: Subscriber = gate; this.source.subscribe(gateSubscriber);`。
+   （**#8 部分修复（本提交）**：「传给接口形参」已可直接传具体类型；「存入接口字段」仍需
+   接口类型局部变量兜底。）
 3. **字段读取改用取值方法**（#5）：`Row` 的字段私有，暴露 `id()`/`name()`；
    这样跨文件读取不再依赖「声明字段的文件先被翻译」的排序。
 4. **继承来的方法用声明该方法的类型作接收者**（#6）：
@@ -175,6 +182,13 @@ public class T { public function go(): int32 { return 1; } }   // 仍语法错�
 
 #### 3. 泛型类型变量作形参/返回值 → 描述符为字面量 `LT;`
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——JVM 泛型擦除与桥接方法修复：类型变量（含 `ID` 这类多字母
+  形参）现按声明登记并擦除为 `java/lang/Object`（不再产出 `LT;`），编译期为泛型接口实现类
+  自动补 `ACC_PUBLIC|ACC_BRIDGE|ACC_SYNTHETIC` 桥接（含 `S<int32>` 的装箱/拆箱），调用点
+  改用接口声明的擦除后描述符。触发代码现可正常运行。回归守门：
+  `jasper-compiler/src/test/kotlin/jasper/GenericDispatchTest.kt`（真编译 + `URLClassLoader`
+  加载执行 + `javap` 形状断言）。以下「实测」为修复前证据，保留作历史记录。v1 边界同 JPA #1
+  （有界形参仍擦除为 `Object`；通配符 / F-bounded / 多级泛型继承未覆盖）。
 - 现象：`T` 直接出现在方法形参/返回值时，JVM 描述符被写成字面量 `LT;`，而不是擦除后的
   `Ljava/lang/Object;`。接口声明的方法与实现类的方法因此对不上，调用点分派失败。
 - 触发代码：
@@ -303,6 +317,13 @@ public class B { public function s(): string { return "x"; } }
 
 #### 8. 具体类型的实参/右值未宽化到声明的接口类型
 - 类别：`③编译器缺陷`
+- 状态：**部分修复（本提交）**——「**成员方法调用**」那一半已修复：调用点对已登记成员
+  改用「声明的擦除签名」发描述符，故 `this.consume(new C())` / `consume(c2)` /
+  `consume(this.c)` 现生成 `consume(Lstd/I;)I` 而非 `consume(Lstd/C;)I`
+  （实测三处均通过，返回 `3`；见 `GenericDispatchTest` 的仓库/接口分派用例同源机制）。
+  **仍未修复**：字段赋值位 `this.slot = c`（字段声明 `I`、右值 `C`）仍按右值类型写
+  `PUTFIELD slot:Lstd/C;`，运行期 `NoSuchFieldError`——本轮任务（Q20 泛型擦除/桥接）
+  未覆盖字段赋值的宽化，保留待后续。
 - 现象：
   - **成员方法调用**的形参描述符取自**实参的静态类型**，而不是被调方法的声明形参类型；
   - **字段赋值**的描述符取自**右值类型**，而不是字段声明类型。
@@ -522,8 +543,9 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 
 以下 R2DBC 惯用写法在当前语言下无法直接表达，探针只能降级或改用同步占位：
 
-1. **`Publisher<T>` / `Mono<T>` / `Flux<T>` 泛型响应式协议** —— 类型变量描述符缺陷（#3），
-   改用 `Row` 具体元素类型；泛型形状仅作声明（`ReactiveStreams.jas`）。
+1. ~~**`Publisher<T>` / `Mono<T>` / `Flux<T>` 泛型响应式协议** —— 类型变量描述符缺陷（#3）~~：
+   **本提交已修复**，泛型接口可经接口类型变量分派；探针运行路径仍用 `Row` 具体元素类型，
+   泛型形状保留在 `ReactiveStreams.jas`（只声明）。
 2. ~~**`await publisher` / 挂起取值**~~ —— `await` 已修复（#1，`7e66eca`）：
    `await e` 返回 `e` 的值，可参与算术/拼接；探针 `taskValue()` 已使用 `await`。
    注意：当前仍**没有真正的挂起运行时**，`await` 只是「同步求值完成」。
@@ -531,7 +553,8 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
    触发、副作用可观察；但**没有真正的调度器/线程切换**，且 `go` 作方法名仍被
    硬关键字阻塞（未修）。
 4. **背压窗口 `request(n)`** —— 见第七节「未做」；当前用「订阅即尽力投递 + `cancel`」。
-5. **`Flux<T>.collect(): T[]` 物化结果集** —— 泛型返回（#3），改为 `collect(): Row[]`。
+5. **`Flux<T>.collect(): T[]` 物化结果集** —— 泛型返回（#3，**本提交已修复**）：类型变量
+   返回不再写出 `LT;`/`[LT;`；探针为保留历史改用 `collect(): Row[]`。
 6. **`Row.get(0, Int::class)` 之类的按列名/类型取值** —— 泛型 map 缺失（#16），
    改为强类型字段 + `id()`/`name()` 方法。
 7. ~~**`finally { connection.close(); }` 资源兜底**~~ —— `finally` 已修复（#4，`7e66eca`），
@@ -562,12 +585,14 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 - 探针可**真编译、真加载、真运行**，说明 Jasper 已具备「接口契约 + 类实现 + 跨文件实现 +
   内存状态 + 错误层次 + 资源释放 + 接口常量 + 对象数组」的表达能力，足以拼出一个可运行的
   R2DBC 假实现，并压出订阅/取消/错误传播/资源释放的可观察行为（`main-result=35`）。
-- 但 18 个摩擦点里有 14 个是 `③编译器缺陷`，且大多是**静默的错误字节码**
+- 但 18 个摩擦点里有 13 个是 `③编译器缺陷`，且大多是**静默的错误字节码**
   （`VerifyError`/`ClassFormatError`/`NoSuchMethodError`），而不是清晰的编译期报错；
   这会诱导用户把编译器 bug 误当成自己代码的问题。本批已修复其中 3 条
   （#1/#4/#11，commit `7e66eca`）并修复 #2 的执行语义；**本提交**又修复 #14
-  （枚举比较 / `switch` / `match`）。
+  （枚举比较 / `switch` / `match`）与 #3（泛型擦除 / 桥接 / 接口分派），并部分修复 #8
+  （成员调用实参宽化）。
 - 与「异步 / 挂起」最相关的 `await`（#1）、`go`（#2）现已可用其**语言语义**
   （`await` 取值、`go` 触发副作用）；但**仍不具备真正的异步运行时**（无挂起、
-  无线程切换），泛型响应式协议（#3）仍属 `[表达不了]`——探针目前只能以
-  「同步语义 + 回调协议」逼近真实的异步响应形状。
+  无线程切换）。泛型响应式协议（#3）的**分派障碍已修复（本提交）**——泛型接口可经接口
+  变量分派；本探针运行路径仍以 `Row` 具体元素类型 + 「同步语义 + 回调协议」逼近真实
+  异步响应形状。

@@ -30,6 +30,7 @@ import jasper.translator.*
 import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.descriptors.DescriptorVisibility
 import org.jetbrains.kotlin.descriptors.DescriptorVisibilities
+import org.jetbrains.kotlin.descriptors.Modality
 import org.jetbrains.kotlin.ir.*
 import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.expressions.*
@@ -239,6 +240,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private var callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap()
     // 构造器符号 → 构造器类型标记（如 "array:<elemDesc>" 表示数组新建而非对象新建）。
     private var constructorTypes: Map<IrConstructorSymbol, String> = emptyMap()
+    // 用户类型的成员方法「声明擦除签名」：JVM 风格类型名 → 方法名 → 擦除签名。
+    // 经接口/泛型接收者的调用点据此写出被调方法的真实（擦除后）描述符。
+    private var memberSignaturesByType: Map<String, Map<String, MemberMethodSignature>> = emptyMap()
+    // 接口 JVM 内部名 → 其声明的方法（不含 <init>/合成访问器）。生成桥接方法时用来
+    // 找到「本类实现的接口要求哪些擦除后签名」。
+    private var interfaceMethods: Map<String, List<IrSimpleFunction>> = emptyMap()
 
     // 由字段符号反查 owner 内部名；查不到时退化为当前包，避免写出空 owner 导致
     // ClassWriter 抛异常（宁可生成一个可能 NoSuchFieldError 的引用，也不崩在生成期）。
@@ -339,9 +346,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         staticFieldSymbols = translationResult.staticFieldSymbols
         staticFunctionSymbols = translationResult.staticFunctionSymbols
         syntheticStaticCallOwners = translationResult.syntheticStaticCallOwners
+        memberSignaturesByType = translationResult.memberSignaturesByType
         checkGraalvmHostilePatterns(translationResult)
         // 第 1 遍：建立符号 → 名字 / owner 索引。owner 用「包名内部名/类名」的 JVM 约定，
         // 顶层函数则以其自身为 owner（等价于文件名即类名，makeClass 时补建 main 桥）。
+        val interfaceMethodIndex = mutableMapOf<String, MutableList<IrSimpleFunction>>()
         for (file in translationResult.irFiles) {
             for (decl in file.declarations) {
                 when (decl) {
@@ -352,6 +361,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     }
                     is IrClass -> {
                         val internalName = "${file.packageFqName?.toString()?.replace('.', '/') ?: ""}/${decl.name.toString()}"
+                        // 接口方法索引：供桥接方法生成查「本类实现的接口要求哪些擦除后签名」。
+                        if (decl.kind == ClassKind.INTERFACE) {
+                            val methods = interfaceMethodIndex.getOrPut(internalName) { mutableListOf() }
+                            for (classDecl in decl.declarations) {
+                                if (classDecl is IrSimpleFunction && !classDecl.name.toString().startsWith("<")) {
+                                    methods.add(classDecl)
+                                }
+                            }
+                        }
                         for (classDecl in decl.declarations) {
                             when (classDecl) {
                                 is IrSimpleFunction -> {
@@ -377,6 +395,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             }
         }
+        // 第一遍结束：固化接口方法索引（第二遍生成桥接方法时只读）。
+        interfaceMethods = interfaceMethodIndex
         // 第 2 遍：真正生成。每个 IR 文件按包名建目录，逐顶层声明写出 <Name>.class。
         for (file in translationResult.irFiles) {
             currentPkg = file.packageFqName?.toString()?.replace('.', '/') ?: ""
@@ -543,6 +563,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
                 else -> {}
             }
+        }
+        // 桥接方法：泛型接口方法擦除后与实现类方法描述符不同，须由编译器补桥
+        // （ACC_BRIDGE|ACC_SYNTHETIC）。只对「非接口、非抽象」的普通类生成。
+        if (!isInterface && !isEnum && !isAnnotation && cls.modality != Modality.ABSTRACT) {
+            generateBridgeMethods(cw, cls, internalName)
         }
         // 只有当存在「需要运行期初始化的静态字段」时才生成 <clinit>，避免发出空的、
         // 但合法的 <clinit> 属性（多余代码、也有害于 class 体积与工具分析）。
@@ -832,6 +857,165 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             // 保持方法结构完整，避免 visitMaxs/visitEnd 之间没有指令。
             generateIrReturn(mv, func.returnType)
         }
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
+    /**
+     * 做什么：为一个实现了泛型接口的普通类生成桥接方法（`ACC_PUBLIC|ACC_BRIDGE|ACC_SYNTHETIC`）。
+     *
+     * 什么时候用：[generateIrClass] 发射完本类成员后，且本类是非抽象、非接口、非枚举的普通类。
+     * 前置条件：[interfaceMethods] 已由 [generate] 第一遍建好；[classInterfaceNames] 给出本类
+     *   直接实现的接口内部名列表。
+     * 失败模式：无法桥接的形状（见 [canBridge]）会**跳过**该方法且不抛异常——运行期若真被调用
+     *   会得到 `AbstractMethodError`，属明确的 v1 边界（例如接口基本类型形参 ↔ 实现引用形参）；
+     *   「无界类型变量 ↔ 基本类型实参」（如 `Box<int32>`）通过装箱/拆箱已支持。
+     * 为什么这样设计：JVM 上泛型接口方法擦除后（如 `save(T)` → `(Object)V`）与实现类方法
+     *   （`save(Person)V`）描述符不同，必须由编译器补桥才能经接口变量分派。把「哪些
+     *   (接口方法, 实现方法) 需要桥」收敛到本函数，主生成路径无须理解泛型（隔离的变化点）。
+     */
+    private fun generateBridgeMethods(cw: ClassWriter, cls: IrClass, internalName: String) {
+        val ifaceNames = classInterfaceNames[cls.name.toString()] ?: return
+        val ownMethods = cls.declarations.filterIsInstance<IrSimpleFunction>()
+        if (ownMethods.isEmpty() || ifaceNames.isEmpty()) return
+        val ownByName = ownMethods.groupBy { it.name.toString() }
+        // 已存在的 (名字, 描述符) 集合：实现类若已用擦除后签名声明，就无需桥。
+        val existing = ownMethods.map { it.name.toString() to irMethodDescriptor(it) }.toMutableSet()
+        for (ifaceInternal in ifaceNames) {
+            val methods = interfaceMethods[ifaceInternal] ?: continue
+            for (ifaceFunc in methods) {
+                val mName = ifaceFunc.name.toString()
+                val ifaceDesc = irMethodDescriptor(ifaceFunc)
+                if ((mName to ifaceDesc) in existing) continue
+                val candidates = ownByName[mName] ?: continue
+                val target = candidates.firstOrNull { canBridge(ifaceFunc, it) } ?: continue
+                emitBridgeMethod(cw, internalName, mName, ifaceFunc, target)
+                existing.add(mName to ifaceDesc)
+            }
+        }
+    }
+
+    /**
+     * 做什么：判断实现类方法 [target] 能否作为接口方法 [ifaceFunc] 擦除后签名的桥接目标。
+     * 什么时候用：[generateBridgeMethods] 选取目标方法时。
+     * 前置条件：二者同名（调用方已保证）；参数/返回类型描述符可解析。
+     * 失败模式：形状不支持时返回 false（调用方跳过，不生成非法桥）。
+     * 为什么这样设计：v1 只支持「参数/返回都是引用类型（含数组）」的桥——此时 Object 与具体
+     *   引用之间可用 CHECKCAST/ARETURN 安全转换；一旦涉及基本类型与 Object 的互转（需要
+     *   装箱/拆箱）就拒绝，避免生成错误字节码（宁可留 AbstractMethodError 也不留 VerifyError）。
+     */
+    private fun canBridge(ifaceFunc: IrSimpleFunction, target: IrSimpleFunction): Boolean {
+        if (ifaceFunc.valueParameters.size != target.valueParameters.size) return false
+        val ifaceRet = typeMapper.jvmReturnDescriptorFromIrType(ifaceFunc.returnType)
+        val targetRet = typeMapper.jvmReturnDescriptorFromIrType(target.returnType)
+        if (!isBridgeableReturn(ifaceRet, targetRet)) return false
+        for (i in ifaceFunc.valueParameters.indices) {
+            val ifaceDesc = typeMapper.jvmDescriptorFromIrType(ifaceFunc.valueParameters[i].type)
+            val targetDesc = typeMapper.jvmDescriptorFromIrType(target.valueParameters[i].type)
+            if (!isBridgeableParam(ifaceDesc, targetDesc)) return false
+        }
+        return true
+    }
+
+    /**
+     * 做什么：单个形参位能否桥接（接口擦除描述符 [ifaceDesc] → 实现描述符 [targetDesc]）。
+     * 什么时候用：[canBridge] 校验形参时。
+     * 前置条件：无。
+     * 失败模式：无（纯判定）。
+     * 为什么这样设计：三种可桥情形——① 描述符相同；② 两侧都是引用（CHECKCAST 收窄）；
+     *   ③ 接口擦除为引用（Object）、实现为基本类型（拆箱，如 `Box<int32>` 的 `put`）。
+     *   其余（基本类型↔引用方向不明）拒绝，避免生成错误字节码。
+     */
+    private fun isBridgeableParam(ifaceDesc: String, targetDesc: String): Boolean {
+        if (ifaceDesc == targetDesc) return true
+        val ifaceIsRef = referenceInternalName(ifaceDesc) != null
+        val targetIsRef = referenceInternalName(targetDesc) != null
+        if (ifaceIsRef && targetIsRef) return true
+        // 引用（擦除后的 Object）→ 基本类型：桥内拆箱。
+        return ifaceIsRef && targetDesc != "V"
+    }
+
+    /**
+     * 做什么：返回位能否桥接（接口擦除返回描述符 [ifaceDesc] → 实现返回描述符 [targetDesc]）。
+     * 什么时候用：[canBridge] 校验返回位时。
+     * 前置条件：无。
+     * 失败模式：无（纯判定）。
+     * 为什么这样设计：① 相同；② 两侧都是引用（ARETURN 向上转型）；③ 实现为基本类型、
+     *   接口擦除为引用（装箱，如 `Box<int32>` 的 `get`）——但 [emitBoxingIfNeeded] 目前
+     *   只覆盖 I/J/F/D/Z，故基本类型限这几类（B/S/C 拒绝，避免写出错误字节码）。
+     */
+    private fun isBridgeableReturn(ifaceDesc: String, targetDesc: String): Boolean {
+        if (ifaceDesc == targetDesc) return true
+        val ifaceIsRef = referenceInternalName(ifaceDesc) != null
+        val targetIsRef = referenceInternalName(targetDesc) != null
+        if (ifaceIsRef && targetIsRef) return true
+        return ifaceIsRef && targetDesc in setOf("I", "J", "F", "D", "Z")
+    }
+
+    /**
+     * 做什么：把引用/数组描述符还原为 `CHECKCAST` 可用的「类内部名 / 数组描述符」。
+     * 什么时候用：桥接方法的 CHECKCAST 目标、以及桥接可行性判定。
+     * 前置条件：desc 是合法描述符。
+     * 失败模式：基本类型（单字符）返回 null；调用方须据此判定「不可桥」。
+     * 为什么这样设计：JVM 的 CHECKCAST 对引用类传内部名（`p/Q`）、对数组传数组描述符（`[I`），
+     *   两者形态不同，集中到一个函数避免调用点各写一套转换。
+     */
+    private fun referenceInternalName(desc: String): String? = when {
+        desc.startsWith("L") && desc.endsWith(";") -> desc.substring(1, desc.length - 1)
+        desc.startsWith("[") -> desc
+        else -> null
+    }
+
+    /**
+     * 做什么：发射一个桥接方法：按接口擦除描述符收参数 → 逐参 CHECKCAST 到实现类型 →
+     *   `INVOKEVIRTUAL` 转发到实现方法 → 按返回类型返回。
+     * 什么时候用：[generateBridgeMethods] 选定 (接口方法, 实现方法) 后。
+     * 前置条件：[canBridge] 已判定可桥（引用↔引用用 CHECKCAST；Object↔基本类型用装箱/拆箱）。
+     * 失败模式：不抛异常；若中途发现无法转换会写出不完整方法——因此调用前必须经 canBridge 校验。
+     * 为什么这样设计：桥接体的唯一变化点是「参数收窄/拆箱 → 转发 → 返回装箱」三步，集中在一处
+     *   可读性最好；返回指令统一按接口擦除返回类型选，保证适配后栈类型与声明一致。
+     */
+    private fun emitBridgeMethod(
+        cw: ClassWriter,
+        internalName: String,
+        name: String,
+        ifaceFunc: IrSimpleFunction,
+        target: IrSimpleFunction
+    ) {
+        val ifaceDesc = irMethodDescriptor(ifaceFunc)
+        val mv = cw.visitMethod(
+            Opcodes.ACC_PUBLIC or Opcodes.ACC_BRIDGE or Opcodes.ACC_SYNTHETIC,
+            name, ifaceDesc, null, null
+        )
+        mv.visitCode()
+        // 桥是实例方法：槽 0 是 this，参数从 1 起（与普通实例方法一致）。
+        mv.visitVarInsn(Opcodes.ALOAD, 0)
+        var slot = 1
+        for (i in ifaceFunc.valueParameters.indices) {
+            val ifaceParam = typeMapper.jvmDescriptorFromIrType(ifaceFunc.valueParameters[i].type)
+            loadLocal(mv, ifaceParam, slot)
+            val targetParam = typeMapper.jvmDescriptorFromIrType(target.valueParameters[i].type)
+            if (ifaceParam != targetParam) {
+                if (referenceInternalName(targetParam) != null) {
+                    // 引用 → 引用：CHECKCAST 收窄到实现形参类型。
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, referenceInternalName(targetParam)!!)
+                } else {
+                    // 引用（擦除后的 Object）→ 基本类型：拆箱。
+                    emitUnboxingFromRef(mv, targetParam)
+                }
+            }
+            // 槽位按「接口擦除后的参数」宽度推进（宽类型 J/D 占两槽）。
+            slot += irTypeSlots(ifaceFunc.valueParameters[i].type)
+        }
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, internalName, name, irMethodDescriptor(target), false)
+        // 返回适配：实现是基本类型、接口擦除为引用时补装箱（如 int → Object）。
+        val ifaceRet = typeMapper.jvmReturnDescriptorFromIrType(ifaceFunc.returnType)
+        val targetRet = typeMapper.jvmReturnDescriptorFromIrType(target.returnType)
+        if (ifaceRet != targetRet && referenceInternalName(ifaceRet) != null && referenceInternalName(targetRet) == null) {
+            emitBoxingIfNeeded(mv, targetRet, ifaceRet)
+        }
+        // 返回指令以「接口擦除后的返回」为准：适配后栈上值的类型与它一致。
+        generateIrReturn(mv, ifaceFunc.returnType)
         mv.visitMaxs(0, 0)
         mv.visitEnd()
     }
@@ -1566,6 +1750,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // 判定用「原始内部名」与其简单名两种写法，兼容 translator 的命名差异。
                             val isInterfaceTarget = interfaceDeclNames.contains(rawReceiverInternal) ||
                                 interfaceDeclNames.contains(rawReceiverInternal.substringAfterLast('/'))
+                            // 声明擦除签名：泛型接口方法（如 Repo.save(T)）在 JVM 里是
+                            // (Ljava/lang/Object;)V，不能按实参类型（Person）拼描述符。
+                            // 参数个数对不上（重载/varargs 等）时退回旧行为。
+                            val declared = memberSignaturesByType[rawReceiverInternal]?.get(realName)
+                            val useDeclared = declared != null &&
+                                declared.paramDescriptors.size == expr.valueArgumentsCount - 1
                             // Generate receiver
                             generateIrExpression(mv, receiver, ctx, owner)
                             // Generate remaining args and build descriptor
@@ -1573,18 +1763,45 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             for (i in 1 until expr.valueArgumentsCount) {
                                 val arg = expr.getValueArgument(i) ?: continue
                                 generateIrExpression(mv, arg, ctx, owner)
-                                paramSb.append(typeMapper.jvmDescriptorFromIrType(arg.type))
+                                if (useDeclared) {
+                                    val targetDesc = declared!!.paramDescriptors[i - 1]
+                                    // 实参类型与声明形参不一致时补装箱（如 int → Object）。
+                                    emitBoxingIfNeeded(mv, typeMapper.jvmDescriptorFromIrType(arg.type), targetDesc)
+                                    paramSb.append(targetDesc)
+                                } else {
+                                    paramSb.append(typeMapper.jvmDescriptorFromIrType(arg.type))
+                                }
                             }
-                            // 返回描述符有特例：StringBuilder.append/set/get/remove 等
-                            // 链式 API 返回接收者类型本身，而不是 IR 记录的静态类型；
-                            // toString 固定返回 String；其余按 IR 调用类型擦除。
-                            val returnDesc = if (realName == "toString") "Ljava/lang/String;"
-                                else if (realName.startsWith("append") || realName == "set" || realName == "get" || realName == "remove") receiverDesc
-                                else typeMapper.jvmReturnDescriptorFromIrType(expr.type)
+                            // 返回描述符：优先用声明的擦除签名；否则用旧的特例
+                            // （StringBuilder.append/set/get/remove 返回接收者、toString 返回 String、
+                            // 其余按 IR 调用类型擦除）。
+                            val returnDesc = when {
+                                useDeclared -> declared!!.returnDescriptor
+                                realName == "toString" -> "Ljava/lang/String;"
+                                realName.startsWith("append") || realName == "set" ||
+                                    realName == "get" || realName == "remove" -> receiverDesc
+                                else -> typeMapper.jvmReturnDescriptorFromIrType(expr.type)
+                            }
                             if (isInterfaceTarget) {
                                 mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, receiverInternal, realName, "($paramSb)$returnDesc", true)
                             } else {
                                 mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, receiverInternal, realName, "($paramSb)$returnDesc", false)
+                            }
+                            // 声明的擦除返回（如 Object）与调用点静态类型（如 Person）不一致时，
+                            // 在调用点补 CHECKCAST / 拆箱-装箱，使栈上值的类型与 IR 视角一致。
+                            if (useDeclared) {
+                                val callReturnDesc = typeMapper.jvmDescriptorFromIrType(expr.type)
+                                if (returnDesc != "V" && callReturnDesc != returnDesc) {
+                                    if (callReturnDesc.startsWith("L") && returnDesc.startsWith("L")) {
+                                        mv.visitTypeInsn(
+                                            Opcodes.CHECKCAST,
+                                            callReturnDesc.substring(1, callReturnDesc.length - 1)
+                                        )
+                                    } else {
+                                        emitUnboxingIfNeeded(mv, returnDesc, callReturnDesc)
+                                        emitBoxingIfNeeded(mv, returnDesc, callReturnDesc)
+                                    }
+                                }
                             }
                             // Void member calls (e.g. generated setters) leave no value on
                             // the stack, but the statement emitter always expects one to POP.

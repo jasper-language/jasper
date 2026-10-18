@@ -21,7 +21,9 @@
 //   新增 JasType 子类时，必须在 mapType / jvmDescriptorFromType / jvmInternalNameFromType
 //   三处 when 里补齐分支，否则会落到各自兜底分支、静默丢失类型信息。
 // 已知限制：
-//   - 泛型参数（T 等）仅按名字启发式识别（isLikelyTypeParam 只认单个大写字母），不查作用域；
+//   - 泛型形参识别：优先用 translator 登记的「已声明形参名」（knownTypeParamNames，支持 ID/KEY
+//     等多字母形参），未登记时退回「单个大写字母且非已声明类型」的启发式（isLikelyTypeParam）；
+//     仍不查作用域，同名类与形参冲突时形参优先，属已知近似；
 //   - 函数类型 / 元组类型 / 引用类型当前统一退化为 java/lang/Object 或占位类名；
 //   - IR 侧只识别 IrSimpleType，其它 IrType 子类一律兜底，不区分真实类型。
 // ============================================================================
@@ -110,6 +112,32 @@ class TypeMapper {
         knownTypeNames.add(name)
     }
 
+    /**
+     * 本次编译中**已声明的泛型形参简单名**集合（如 `T`、`E`、`K`、`V`、`ID`、`KEY`）。
+     *
+     * 做什么：给 [isTypeParamLike] 一个「来自声明」的权威判据，使其不再依赖
+     *   「单大写字母」这一只能覆盖 `T/E/K/V` 的启发式——JPA 形状 `Repository<T, ID>`
+     *   的 `ID` 是两个字母，旧启发式识别不到，会被当成真实类并写出 `L<包>/ID;`
+     *   （FINDINGS #1 的根因之一），进而接口描述符与调用点实参不匹配、链接期 VerifyError。
+     * 什么时候用：翻译开始前由 translator 扫描全部顶层类型声明时登记；之后所有名字解析都查它。
+     * 前置条件：登记的是**形参简单名**（不含包信息）。
+     * 失败模式：未登记时退回单字母启发式；不抛异常。
+     * 为什么这样设计：把「哪些名字是泛型形参」从「猜」变成「登记」，与 [knownTypeNames]
+     *   一正一反地收紧判定；依赖单向，translator 只写、本类只读。
+     * 已知边界：登记是全编译单元作用域的（不区分声明作用域）；若同名类 `ID` 与形参 `ID`
+     *   既存，形参判定优先，属 v1 已知近似（详见 [isTypeParamLike]）。
+     */
+    val knownTypeParamNames: MutableSet<String> = mutableSetOf()
+
+    /**
+     * 登记一个已声明的泛型形参名，供 [isTypeParamLike] 判定使用。
+     * 什么时候用：翻译开始前由 translator 扫描 JasClass/JasInterface 的 `typeParameters` 时调用。
+     * 失败模式：无（重复登记是幂等的）。
+     */
+    fun registerTypeParam(name: String) {
+        knownTypeParamNames.add(name)
+    }
+
     // 名字 → IR 类符号 的缓存：同一名字复用同一符号，保证 IR 中同名类型「身份相等」，
     // 后端才能凭 classifier 从 symbolToName 反查回名字。
     private val symbols = mutableMapOf<String, IrClassSymbol>()
@@ -131,12 +159,56 @@ class TypeMapper {
         return null
     }
 
-    // 把「名字」落到 JVM 描述符：数组名（以 '[' 开头）本身就是描述符，直接返回；
-    // 否则先经 builtinTypes 归一化（识别 int32/string 等 Jas 别名），再转描述符。
+    // 把「名字」落到 JVM 描述符：数组名（以 '[' 开头）本身就是描述符，先做元素擦除；
+    // 类型变量名（如 T）擦除为 Object（JVM 泛型擦除）；否则先经 builtinTypes 归一化
+    // （识别 int32/string 等 Jas 别名），再转描述符。
     private fun classNameToJvmDescriptor(name: String): String {
-        if (name.startsWith("[")) return name
+        if (name.startsWith("[")) return eraseArrayDescriptor(name)
+        if (isTypeVariableLike(name)) return "Ljava/lang/Object;"
         val mapped = builtinTypes[name.lowercase()] ?: name
         return jvmDescriptor(mapped)
+    }
+
+    /**
+     * 做什么：判断一个「名字」是否应按 JVM 泛型擦除规则落到 `java/lang/Object`。
+     * 判据：直接委托 [isTypeParamLike]——已登记的形参名（含多字母 `ID`/`KEY`）优先，
+     *   否则「单个大写字母且未被登记为已声明类型」的启发式（避免用户定义的单字母类
+     *   `class S` 被误擦除）。
+     * 什么时候用：所有「名字 → 描述符/内部名」的落点（[classNameToJvmDescriptor] /
+     *   [jvmInternalNameFromIrType] / [jvmDescriptorFromType] / [jvmInternalNameFromType]）。
+     * 前置条件：若希望「真实单字母类型」不被误擦，调用方须先通过
+     *   [registerKnownType] 登记过它；若希望多字母形参被擦除，须先经 [registerTypeParam]
+     *   登记（translator 预登记阶段两者都会做）。
+     * 失败模式：不抛异常；只做名字判定，不查作用域/上界。
+     * 为什么这样设计：JVM 泛型擦除要求无界类型变量最终落到 Object。把该判定集中到唯一
+     *   函数，避免后端/翻译器各处各自拼 `LT;`（FINDINGS #1 的根因）。
+     * 已知限制：v1 只支持无界类型变量；有界（`<T extends Foo>`）仍落到 Object，属任务书边界。
+     */
+    private fun isTypeVariableLike(name: String): Boolean {
+        return isTypeParamLike(name)
+    }
+
+    /**
+     * 做什么：把一个数组描述符中的「类型变量元素」擦除为 Object，例如 `[LT;` →
+     *   `[Ljava/lang/Object;`、`[[LT;` → `[[Ljava/lang/Object;`。
+     * 什么时候用：[classNameToJvmDescriptor] 与 [jvmInternalNameFromIrType] 遇到以 '[' 开头
+     *   的名字时；因为 `T[]` 在构造数组类型时就已把元素拼成了 `LT;`。
+     * 前置条件：desc 是以一个或多个 '[' 开头的合法数组描述符。
+     * 失败模式：不抛异常；非数组/无法识别的元素原样保留。
+     * 为什么需要：数组元素是类型变量时，数组整体描述符也必须擦除，否则接口方法
+     *   （如 `findAll(): T[]`）会写出 `[LT;` 这种非法签名。
+     */
+    private fun eraseArrayDescriptor(desc: String): String {
+        var dims = 0
+        while (dims < desc.length && desc[dims] == '[') dims++
+        val element = desc.substring(dims)
+        val erasedElement = if (element.startsWith("L") && element.endsWith(";")) {
+            val internal = element.substring(1, element.length - 1)
+            if (isTypeVariableLike(internal)) "Ljava/lang/Object;" else element
+        } else {
+            element
+        }
+        return "[".repeat(dims) + erasedElement
     }
 
     /**
@@ -176,7 +248,9 @@ class TypeMapper {
     fun jvmInternalNameFromIrType(type: IrType): String {
         val name = irTypeClassName(type)
         if (name != null) {
-            return if (name.startsWith("[")) name else jvmInternalName(builtinTypes[name.lowercase()] ?: name)
+            if (isTypeVariableLike(name)) return "java/lang/Object"
+            return if (name.startsWith("[")) eraseArrayDescriptor(name)
+            else jvmInternalName(builtinTypes[name.lowercase()] ?: name)
         }
         return "java/lang/Object"
     }
@@ -388,12 +462,18 @@ class TypeMapper {
     }
 
     /**
-     * 做什么：判断名字应当被当作「泛型形参」（不加包前缀）还是「真实类型」（加包前缀）。
-     * 判据：形如单大写字母**且未被登记为用户类型**才视为泛型形参。
-     * 为什么需要：单纯看名字长度会把用户定义的单字母类（如 `class S`）误判为类型参数，
-     *   使其名字失去包限定（#7）。登记真实声明后再判断即可两者兼顾。
+     * 做什么：判断名字应当被当作「泛型形参」（不加包前缀 / 擦除为 Object）还是「真实类型」。
+     * 判据（顺序即语义，勿随意调整）：
+     *   1. 已通过 [registerTypeParam] 登记为形参名 → 形参（覆盖 `ID/KEY/NAME` 等多字母形参）；
+     *   2. 否则退回「单大写字母且未被登记为用户类型」的启发式（覆盖未登记的 `T/E/K/V`，
+     *      同时避免把用户定义的单字母类 `class S` 误判，即 #7 的修法）。
+     * 为什么需要：单看名字长度会把用户定义的单字母类误判为形参（#7）；只靠启发式又认不出
+     *   多字母形参（#1）。先信「声明过的形参名」，再退回启发式，才能两者兼顾。
+     * 已知边界：形参名集合是全编译单元作用域的；若同一编译里既声明了类 `ID`、又把它用作形参，
+     *   形参判定优先——这是名字驱动近似的固有取舍，v1 接受并不阻塞常见写法。
      */
     private fun isTypeParamLike(name: String): Boolean {
+        if (name in knownTypeParamNames) return true
         return isLikelyTypeParam(name) && name !in knownTypeNames
     }
 
@@ -423,27 +503,8 @@ class TypeMapper {
         }
     }
 
-    // 造一个星投影（`*`）。当前实现仍以匿名 IrTypeProjection 冒充，
-    // equals 判定为 IrStarProjection，以配合后端对星投影的识别分支。
-    private fun makeStarProjection(): IrTypeArgument {
-        return object : IrTypeProjection {
-            override val variance: Variance get() = Variance.INVARIANT
-            override val type: IrType get() = type("kotlin.Any")
-            /**
-             * 做什么：星投影被视为与 IrStarProjection 相等，供后端按星投影分支处理。
-             * 注意：这与下面的 hashCode（身份散列）并不完全对称，属已有实现的已知近似，
-             *   改动前需评估对 IR 比较的影响。
-             */
-            override fun equals(other: Any?): Boolean = other is IrStarProjection
-            /**
-             * 做什么：用对象身份散列；与 equals 的宽松语义不完全对称，属已知近似。
-             */
-            override fun hashCode(): Int = java.lang.System.identityHashCode(this)
-        }
-    }
-
     // 把 Jas 泛型实参列表转成 IR 类型实参：通配符按 extends 决定 out/in 变型，
-    // 具名类型用不变型，其它一律退化为星投影（保证实参个数不丢）。
+    // 其余具体类型（具名类型 / 基本类型 / string / 数组 / 函数 / 元组）一律不变型投影。
     private fun mapTypeArguments(args: List<JasType>): List<IrTypeArgument> {
         return args.map { arg ->
             when (arg) {
@@ -454,13 +515,12 @@ class TypeMapper {
                         if (arg.extends) Variance.OUT_VARIANCE else Variance.IN_VARIANCE
                     )
                 }
-                is JasNamedType -> {
-                    makeTypeProjection(
-                        mapType(arg),
-                        Variance.INVARIANT
-                    )
-                }
-                else -> makeStarProjection()
+                // 为什么不再对未知/基本类型退化为星投影：接收者的泛型实参要参与
+                // 「调用点返回类型替换」（如 `Box<int32>.get()` 的 T → int32）。
+                // 星投影会丢掉基本类型，使调用点不知道该拆箱，从而在 `r = box.get()`
+                // 处生成非法字节码（VerifyError）。具体类型全部按不变型投影即可保留信息；
+                // 需要引用的签名位（`<...>`）由 irTypeArgumentSignature 负责装箱。
+                else -> makeTypeProjection(mapType(arg), Variance.INVARIANT)
             }
         }
     }
@@ -474,11 +534,12 @@ class TypeMapper {
      * 失败模式：元素类型无法还原名字时按对象数组 `[Ljava/lang/Object;` 兜底。
      */
     fun arrayType(inner: IrType): IrType {
-        val innerName = irTypeClassName(inner)
-        val jvmDesc = if (innerName != null) jvmDescriptor(innerName) else "Ljava/lang/Object;"
+        // 元素描述符经 jvmDescriptorFromIrType 得到，类型变量元素会擦除为 Object
+        // （如 `T[]` → `[Ljava/lang/Object;`），避免写出 `[LT;` 这种非法签名。
+        val innerDesc = jvmDescriptorFromIrType(inner)
         // 已知边界：两个分支目前表达式相同（统一为 `[` + 描述符），
         // 分开写是为将来区分基本类型数组与对象数组留出落点。
-        val arrayJvmName = if (jvmDesc.length == 1) "[$jvmDesc" else "[$jvmDesc"
+        val arrayJvmName = if (innerDesc.length == 1) "[$innerDesc" else "[$innerDesc"
         return type(arrayJvmName)
     }
 
@@ -556,6 +617,7 @@ class TypeMapper {
         if (type == null) return "V"
         return when (type) {
             is JasNamedType -> {
+                if (isTypeVariableLike(type.name)) return "Ljava/lang/Object;"
                 val mapped = builtinTypes[type.name.lowercase()] ?: resolveNamedTypeName(type.name)
                 jvmDescriptor(mapped)
             }
@@ -603,6 +665,7 @@ class TypeMapper {
         if (type == null) return "void"
         return when (type) {
             is JasNamedType -> {
+                if (isTypeVariableLike(type.name)) return "java/lang/Object"
                 val mapped = builtinTypes[type.name.lowercase()] ?: resolveNamedTypeName(type.name)
                 jvmInternalName(mapped)
             }
@@ -714,6 +777,9 @@ class TypeMapper {
             }
             val name = symbolToName[classifier]
             if (name != null) {
+                // 类型变量在泛型签名里写作 `T<名字>;`（如 T → TT;），而不是引用描述符；
+                // 否则 `List<T>` 会被拼成非法的 `Ljava/util/List<LT;>;`。
+                if (isTypeVariableLike(name)) return "T$name;"
                 val mapped = builtinTypes[name.lowercase()] ?: name
                 // 数组名已是描述符，泛型签名里数组不参与实参展开。
                 if (mapped.startsWith("[")) return mapped
@@ -738,6 +804,9 @@ class TypeMapper {
      * 做什么：IR 类型实参 → JVM 签名片段，带变型前缀（`+` out / `-` in / 空）。
      *
      * 什么时候用：[irTypeSignature] 展开泛型实参时。
+     * 关键边界：泛型签名里的类型实参**必须是引用类型**，因此基本类型描述符
+     *   （I/J/F/D/Z/B/S/C）会先装箱为对应包装类（如 `I` → `Ljava/lang/Integer;`），
+     *   否则会写出非法的 `<I>` 签名（`Box<int32>` 的实参即此情形）。
      * 失败模式：星投影 → `*`；其它未知 IrTypeArgument → `*`。
      */
     fun irTypeArgumentSignature(arg: IrTypeArgument): String {
@@ -749,11 +818,28 @@ class TypeMapper {
                     Variance.IN_VARIANCE -> "-"
                     else -> ""
                 }
-                "$prefix${irTypeSignature(arg.type)}"
+                val raw = irTypeSignature(arg.type)
+                // 基本类型实参在签名位必须装箱为引用类型，否则签名非法。
+                val sig = primitiveBoxedInternalNames[raw]?.let { "L$it;" } ?: raw
+                "$prefix$sig"
             }
             else -> "*"
         }
     }
+
+    // 基本类型描述符 → 对应 JVM 包装类内部名。仅用于泛型签名位（`<...>`)：
+    // 那里必须是引用类型，故把基本类型装箱后再写。与后端 emitBoxingIfNeeded 的
+    // 映射语义一致，但这里是**签名文本**层面的映射，不产生字节码。
+    private val primitiveBoxedInternalNames = mapOf(
+        "I" to "java/lang/Integer",
+        "J" to "java/lang/Long",
+        "F" to "java/lang/Float",
+        "D" to "java/lang/Double",
+        "Z" to "java/lang/Boolean",
+        "B" to "java/lang/Byte",
+        "S" to "java/lang/Short",
+        "C" to "java/lang/Character"
+    )
 
     /**
      * 做什么：IR 类型参数 → JVM 签名里的「类型参数声明」片段（`名字:上界签名`）。
