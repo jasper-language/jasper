@@ -252,6 +252,10 @@ class JasperCompiler {
             val backend = JvmIrBackend(mapper)
             backend.generate(pipeline.ir, outputDir)
 
+            // class 写盘成功后，导出编译器 manifest（throws 元信息）。
+            // 失败由本方法的 catch(Exception) 兜底为 CompileError.Internal，不静默。
+            JasperManifest.writeForFile(pipeline.ast, outputDir)
+
             CompileResult.Success("Compilation succeeded: ${pipeline.ast.declarations.size} declarations, classes written to $outputDir")
         } catch (e: CompileException) {
             CompileResult.Error(e.errors)
@@ -308,6 +312,11 @@ class JasperCompiler {
 
             val backend = JvmIrBackend(typeMapper)
             backend.generate(mergedResult, outputDir)
+
+            // 多文件：按输入顺序归并各文件 AST 的 throws 元信息写入同一 manifest。
+            // 失败由本方法的 catch(Exception) 兜底为 CompileError.Internal，不静默。
+            JasperManifest.writeForFiles(results.values.map { it.ast }, outputDir)
+
             CompileResult.Success("Compilation succeeded: ${results.size} files, classes written to $outputDir")
         } catch (e: CompileException) {
             CompileResult.Error(e.errors)

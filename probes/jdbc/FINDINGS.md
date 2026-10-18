@@ -53,7 +53,9 @@
 > #4/#5/#15、`①语法层` #11、`②标准库缺失` #17；
 > **第二批（commit `e544e5a`）** 已修复 4 条「跨包/链接」缺陷——`③编译器缺陷`
 > #14/#12/#1/#7；**本提交** 已修复 `③编译器缺陷` #6（枚举常量比较 / `switch` / `match`）。
-> 剩余未修复 8 条。修复详情见第五节各条目的「状态」行。
+> **Q24 / C19** 另**部分修复** `①语法层` #18（`throws` 解析进 AST 并写入编译器 manifest；
+> 按裁决不做 checked exception）。剩余未修复 8 条（#18 已部分修复）。
+> 修复详情见第五节各条目的「状态」行。
 
 ## 四、探针为通过验收而采用的规避（原 5 处；第 1、2 条已随本批修复移除）
 
@@ -497,6 +499,13 @@ public function main(): int32 {
 
 #### 18. `throws` 被解析但被忽略，无检查
 - 类别：`①语法层`
+- 状态：**部分修复（编译器 manifest，Q24 / C19）**。`throws` 子句不再被丢弃：method /
+  constructor / interface method 三条路径都解析进 AST（`JasFunction.throwsTypes` /
+  `JasConstructor.throwsTypes`），并在 class 写盘后写入
+  `<outputDir>/jasper-manifest.json`（schema `jasper-manifest/0`），供 IDE / 文档 /
+  静态分析 / AI / 模块消费者读取。按用户裁决（G2/A），**不**做 Java 式 checked exception：
+  调用点不强制 `try/catch`，class 文件也不承载 throws；Managed `.jaso` 二进制映射待
+  ABI 冻结后再定。回归守门：`jasper.ThrowsManifestTest`。
 - 触发代码：
 ```jasper
 package jdbcprobe;

@@ -45,6 +45,8 @@ sealed class JasDeclaration : JasNode()
  * whereConstraints where 子句中的类型约束。
  * 三个 synthetic* 字段是注解处理的「延迟生成」标记：只合成签名，函数体留到 lowering
  * 阶段在类型信息齐备时生成，隔离了「签名先于实现可用」这一变化点。
+ * throwsTypes 是 `throws A, B` 子句解析出的异常类型列表（默认空表示未声明），
+ * 仅作签名元信息，不做 checked exception 强制。
  */
 data class JasFunction(
     val name: String, val parameters: List<JasParameter>, val returnType: JasType?,
@@ -52,7 +54,19 @@ data class JasFunction(
     val whereConstraints: List<JasTypeConstraint> = emptyList(),
     val syntheticAccessor: JasSyntheticAccessor? = null,
     val syntheticEquality: JasSyntheticEquality? = null,
-    val syntheticMapper: JasSyntheticMapper? = null
+    val syntheticMapper: JasSyntheticMapper? = null,
+    /**
+     * `throws` 子句声明的异常类型（源码书写顺序，无声明时为空列表）。
+     *
+     * 做什么：承载方法/接口方法签名上的 `throws A, B` 元信息，供编译器 manifest
+     * （`jasper-manifest.json`）与将来的 IDE/静态分析消费。
+     * 什么时候用：需要读取「该方法可能抛哪些异常」的声明性信息时。
+     * 前置条件：由 [JasperAstBuilder] 在解析 `throws_` 规则时填充；合成函数的本字段为默认空。
+     * 失败模式：无（纯数据）；非法/无法解析的类型在构建阶段已被丢弃。
+     * 为什么这样设计：Jasper 不做 Java 式 checked exception（用户裁决 G2/A），
+     * `throws` 只是签名元信息，因此放在 AST 上而不进入类型检查强制或字节码。
+     */
+    val throwsTypes: List<JasType> = emptyList()
 ) : JasDeclaration()
 
 /**
@@ -155,11 +169,23 @@ data class JasEnumConstant(val name: String, val args: List<JasExpression>) : Ja
  * 构造器声明：modifiers 修饰符；parameters 形参；
  * delegateCall 对 this(...)/super(...) 的显式构造器调用（null 表示无）；
  * body 构造器体（null 表示无体）。
+ * throwsTypes 是 `throws A, B` 子句解析出的异常类型列表（默认空表示未声明），
+ * 与 [JasFunction.throwsTypes] 同为「仅元信息、不做 checked exception 强制」。
  */
 data class JasConstructor(
     val modifiers: List<Any>, val parameters: List<JasParameter>,
     val delegateCall: JasExplicitConstructorInvocation?,
-    val body: JasBlock?
+    val body: JasBlock?,
+    /**
+     * 构造器 `throws` 子句声明的异常类型（源码书写顺序，无声明时为空列表）。
+     *
+     * 做什么：承载构造器签名上的 `throws A, B` 元信息，供编译器 manifest 消费。
+     * 什么时候用：需要读取「该构造器可能抛哪些异常」的声明性信息时。
+     * 前置条件：由 [JasperAstBuilder] 在解析 constructorHeader 的 `throws_` 时填充。
+     * 失败模式：无（纯数据）。
+     * 为什么这样设计：同 [JasFunction.throwsTypes]——`throws` 仅为签名元信息，不进字节码。
+     */
+    val throwsTypes: List<JasType> = emptyList()
 ) : JasDeclaration()
 
 /**

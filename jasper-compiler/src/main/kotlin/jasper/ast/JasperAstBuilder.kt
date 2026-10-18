@@ -274,7 +274,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             is JasperParser.MethodBodyBlockContext -> visit(b.block()) as? JasBlock
             else -> null
         }
-        return JasFunction(ctx.name.text, params, returnType, body, mods, typeParams, whereConstraints).at(ctx)
+        return JasFunction(ctx.name.text, params, returnType, body, mods, typeParams, whereConstraints, throwsTypes = doVisitThrows(ctx.thr)).at(ctx)
     }
 
     // 鈹€鈹€ Parameters 鈹€鈹€
@@ -286,6 +286,23 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      */
     private fun doVisitFuncParams(ctx: JasperParser.FunctionParameterListContext): List<JasParameter> {
         return ctx.functionParameter().mapNotNull { visit(it) as? JasParameter }
+    }
+
+    /**
+     * 私有辅助：把 `throws_` 规则解析成异常类型列表。
+     *
+     * 做什么：遍历 `Throws (exceptionType (',' exceptionType)* ','?)`，对每个
+     * exceptionType 复用其内部 typeExpr 的解析结果，得到 `List<JasType>`。
+     * 什么时候用：method / constructor / interface method 三条声明路径解析 `thr` 子句时。
+     * 前置条件：ctx 可空；为 null（未写 throws）时返回空列表。
+     * 失败模式：单个 exceptionType 的 typeExpr 若解析不出 JasType（理论上不会，因为
+     *   exceptionType 规则只是 typeExpr 的包装）会被 mapNotNull 静默丢弃，其余照常保留。
+     * 为什么这样设计：不重复造类型解析——直接复用 visit(typeExpr) 的既有能力；
+     *   仅把「列表收集」这一重复逻辑收束到单一辅助，避免三处声明路径各写一遍。
+     */
+    private fun doVisitThrows(ctx: JasperParser.Throws_Context?): List<JasType> {
+        if (ctx == null) return emptyList()
+        return ctx.exceptionType().mapNotNull { visit(it.typeExpr()) as? JasType }
     }
 
     /**
@@ -324,7 +341,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             val s = visit(bs)
             if (s is JasStatement) stmts.add(s)
         }
-        return JasConstructor(mods, params, delegate, if (stmts.isEmpty()) JasBlock(emptyList()) else JasBlock(stmts)).at(ctx)
+        return JasConstructor(mods, params, delegate, if (stmts.isEmpty()) JasBlock(emptyList()) else JasBlock(stmts), throwsTypes = doVisitThrows(header.thr)).at(ctx)
     }
 
     /**
@@ -462,7 +479,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         val params = if (ctx.plist != null) doVisitFuncParams(ctx.plist) else emptyList()
         val returnType = if (ctx.ret != null) visit(ctx.ret) as? JasType else null
         val whereConstraints = if (ctx.where != null) doVisitWhere(ctx.where) else emptyList()
-        return JasFunction(ctx.name.text, params, returnType, null, mods, typeParams, whereConstraints).at(ctx)
+        return JasFunction(ctx.name.text, params, returnType, null, mods, typeParams, whereConstraints, throwsTypes = doVisitThrows(ctx.thr)).at(ctx)
     }
 
     // 鈹€鈹€ Annotation type 鈹€鈹€

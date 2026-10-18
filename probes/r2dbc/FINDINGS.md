@@ -95,6 +95,8 @@ Flux.declaredFields=[FETCH_SIZE]
 > `jasper.GenericDispatchTest`（#3，及 #8 的成员调用部分）。
 > **本提交（Q21 / C3+C7）** 另修复 `③编译器缺陷` #6（继承方法描述符退化 `void`）与
 > #9（类继承不参与赋值子类型）；回归守门见 `jasper.InheritanceTest`。
+> **Q24 / C19** 另**部分修复** `①语法层` #20（`throws` 解析进 AST 并写入编译器 manifest；
+> 按裁决不做 checked exception）；回归守门见 `jasper.ThrowsManifestTest`。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -521,6 +523,13 @@ public class B { }
 
 #### 20. `throws` 被解析但被忽略
 - 类别：`①语法层`
+- 状态：**部分修复（编译器 manifest，Q24 / C19）**。`throws` 子句不再被丢弃：method /
+  constructor / interface method 三条路径都解析进 AST（`JasFunction.throwsTypes` /
+  `JasConstructor.throwsTypes`），并在 class 写盘后写入
+  `<outputDir>/jasper-manifest.json`（schema `jasper-manifest/0`），供工具链 / AI /
+  模块消费者读取。按用户裁决（G2/A），**不**做 Java 式 checked exception：调用点不强制
+  `try/catch`，class 文件也不承载 throws；Managed `.jaso` 二进制映射待 ABI 冻结后再定。
+  回归守门：`jasper.ThrowsManifestTest`。
 - 触发代码：
 ```jasper
 package std;
