@@ -991,6 +991,14 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 // 直到运行期才以 NPE 的形式暴露（JDBC #8 / R2DBC #18 / JPA #10）。
                 if (isTypeNameReference(expr.target, env)) {
                     val typeName = (expr.target as JasIdentifier).name
+                    // 枚举常量（`Color.Red`）的静态类型就是枚举类型本身。必须先于字段/成员
+                    // 索引识别：常量不是 JasProperty，SymbolTable 不会为它建成员索引，否则
+                    // 会被误报为「Cannot resolve member」并降级成 any（比较/赋值仍能过，
+                    // 但失去了正确的类型信息）。
+                    val enumDecl = symbolTable?.findEnum(typeName)
+                    if (enumDecl != null && enumDecl.constants.any { it.name == expr.property }) {
+                        return JasNamedType(typeName)
+                    }
                     val property = findPropertyDeclaration(typeName, expr.property)
                     if (property != null && !isStaticProperty(typeName, property)) {
                         error("Cannot access instance field '${expr.property}' through class name '$typeName'", expr)

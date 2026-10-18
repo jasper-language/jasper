@@ -52,7 +52,8 @@
 > 修复进度：**第一批（commit `dbe8f17`）** 已修复 5 条局部缺陷——`③编译器缺陷`
 > #4/#5/#15、`①语法层` #11、`②标准库缺失` #17；
 > **第二批（commit `e544e5a`）** 已修复 4 条「跨包/链接」缺陷——`③编译器缺陷`
-> #14/#12/#1/#7。剩余未修复 9 条。修复详情见第五节各条目的「状态」行。
+> #14/#12/#1/#7；**本提交** 已修复 `③编译器缺陷` #6（枚举常量比较 / `switch` / `match`）。
+> 剩余未修复 8 条。修复详情见第五节各条目的「状态」行。
 
 ## 四、探针为通过验收而采用的规避（原 5 处；第 1、2 条已随本批修复移除）
 
@@ -209,6 +210,17 @@ public function main(): int32 { sink(1); return 0; }
 
 #### 6. 枚举的比较 / `switch` / `match` 全部触发编译器内部错误
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——根因是「`EnumType.Constant` 被当成实例字段读取」：
+  translator 把 `Types.Integer` 翻译成「对类名求值后 `GETFIELD`」，ASM 计算栈帧时报
+  `INTERNAL: Index -1 out of bounds for length 0`。现改为：translator 预登记枚举常量符号
+  （键为 JVM 内部类名，声明处与使用处共享同一身份），常量声明保持 `IrEnumEntry`，读取
+  表达式走新增的 `IrGetEnumValue`；后端据 `IrEnumEntry` 发射
+  `public static final ACC_ENUM` 字段、在 `<clinit>` 用 `PUTSTATIC` 按声明顺序初始化，
+  `IrGetEnumValue` 发 `GETSTATIC`（不再用「字段名首字母大写」启发式）。另修正
+  `values()` 中把字段描述符当类名用的 `CHECKCAST`（原写法会 `ClassFormatError`）。
+  回归守门：`jasper-compiler/src/test/kotlin/jasper/EnumTest.kt`（同常量/异常量比较、
+  `if` 分支、`switch` 三分支 + default、`match`、枚举形参/返回值、`values()`/`valueOf`、
+  javap 字段标志与 `<clinit>` 证据，共 7 个用例）。
 - 现象：枚举**声明**本身可用，但任何比较或在 `switch`/`match` 中使用枚举常量都会
   让编译器崩溃。
 - 触发代码：
@@ -505,8 +517,8 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 4. **`void` 形态的私有 setter 辅助函数** —— void 自由函数曾不可语句调用
    （#5，已修复 `dbe8f17`），探针仍保留返回数组写法。
 5. **接口常量 `Statement.MAX_ROWS`** —— 曾被静默丢弃（#11，已修复 `dbe8f17`）。
-6. **`if (rs.getType() == Types.Integer)` 列类型分发** —— 枚举比较崩溃（#6），
-   用 `int32` 常量代替。
+6. ~~**`if (rs.getType() == Types.Integer)` 列类型分发**~~ —— 枚举比较曾崩溃（#6），
+   **本提交已修复**，可直接使用枚举；探针保留 `int32` 常量写法仅为未回归改写。
 7. **`throws SQLException` 声明** —— 被忽略（#18），用 `Error` 层次代替。
 8. **`executeUpdate(sql, a, b, c)` 展开调用、`args.length`** —— varargs 不可用（#10），
    只传单个数组并忽略 `args`。
@@ -522,7 +534,11 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
     （统一「类型名 → JVM 内部名」解析 + 跨文件层次汇总），并新增
     `jasper.CrossPackageLinkageTest`（4 个测试，每缺陷 1 个）回归；
     探针据此**去掉两处规避**（`SQLException` 独立成包 + `import`、`MemoryResultSet`
-    拆到独立文件）。`jasper.JdbcProbeTest` 始终通过。剩余 9 条仍未修复。
+    拆到独立文件）。
+  - **本提交**：`③编译器缺陷` #6 已修复——枚举常量改为 `IrEnumEntry` 表示、读取走
+    `IrGetEnumValue`，后端据 `IrEnumEntry` 发射静态 `ACC_ENUM` 字段并在 `<clinit>` 中
+    初始化；新增 `jasper.EnumTest`（7 个测试）回归。`jasper.JdbcProbeTest` 始终通过。
+    剩余 8 条仍未修复。
 - 探针可编译并运行，说明 Jasper 已具备「接口契约 + 类实现 + 内存状态 + 异常 + 资源
   清理 + 字面量集合」的表达能力，足以拼出一个可运行的 JDBC 假实现。
 - 但 18 个摩擦点里有 12 个是 `③编译器缺陷`，且多为**静默错误字节码**
@@ -530,4 +546,4 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
   这会让用户把编译器 bug 误当成自己代码的问题。
 - 最影响「写不出 JDBC 形状」的是前 8 条：用户类对象数组（#1，已修复）、数组读类型（#2）、
   多类型数组赋值（#3）、`this.方法()`（#4，已修复）、void 自由函数（#5，已修复）、
-  枚举（#6）、跨文件接口赋值（#7，已修复）、静态字段（#8）。
+  枚举（#6，本提交已修复）、跨文件接口赋值（#7，已修复）、静态字段（#8）。

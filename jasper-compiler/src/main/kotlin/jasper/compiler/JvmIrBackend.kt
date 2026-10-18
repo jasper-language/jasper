@@ -217,6 +217,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private val fieldSymbolToName = mutableMapOf<IrFieldSymbol, String>()
     // 字段符号 → owner 内部名（声明该字段的类）。
     private val fieldOwnerMap = mutableMapOf<IrFieldSymbol, String>()
+    // 枚举项符号 → 常量字段名 / owner 内部名。枚举常量不是 IrField，不能复用上面的
+    // 字段表；IrGetEnumValue 只携带枚举项符号，必须在这里查回 JVM 字段坐标。
+    private val enumEntrySymbolToName = mutableMapOf<IrEnumEntrySymbol, String>()
+    private val enumEntrySymbolToOwner = mutableMapOf<IrEnumEntrySymbol, String>()
     // 类名（简单名）→ 超类内部名；来自 translator，未登记时默认 java/lang/Object。
     private var classSuperclassNames: Map<String, String> = emptyMap()
     // 类名（简单名）→ 直接实现的接口内部名列表；注解类强制实现 Annotation。
@@ -285,6 +289,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         functionSymbolToOwner.clear()
         fieldSymbolToName.clear()
         fieldOwnerMap.clear()
+        enumEntrySymbolToName.clear()
+        enumEntrySymbolToOwner.clear()
         graalvmWarnings.clear()
         // 装载 translator 侧提供的映射；这些是只读输入，后端不回写。
         callNames = translationResult.callNames
@@ -316,6 +322,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 is IrField -> {
                                     fieldSymbolToName[classDecl.symbol] = classDecl.name.toString()
                                     fieldOwnerMap[classDecl.symbol] = internalName
+                                }
+                                // 枚举项同样需要「符号 → 字段坐标」索引：读取点
+                                // （IrGetEnumValue）引用的是枚举项符号，不是字段符号。
+                                is IrEnumEntry -> {
+                                    enumEntrySymbolToName[classDecl.symbol] = classDecl.name.toString()
+                                    enumEntrySymbolToOwner[classDecl.symbol] = internalName
                                 }
                                 else -> {}
                             }
@@ -448,14 +460,27 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             if (decl.isFinal) staticFieldConstantValue(decl) else null
                         )
                     } else {
-                        // 枚举常量字段必须是 public static final ENUM；普通实例字段 public。
+                        // 能走到这里的 IrField 是「非 static 字段」：枚举常量现在统一由
+                        // IrEnumEntry 分支发射（不再是带大写名字的 IrField），因此枚举体里的
+                        // 普通实例字段必须按实例字段发射，不能误加 ACC_STATIC/ACC_ENUM。
                         // 泛型信息（如 List<T>）作为字段 Signature 单独写出，描述符仍走擦除。
-                        val fieldFlags = if (isEnum) Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL or Opcodes.ACC_ENUM
-                            else Opcodes.ACC_PUBLIC
+                        val fieldFlags = Opcodes.ACC_PUBLIC
                         val fieldDesc = typeMapper.jvmDescriptorFromIrType(decl.type)
                         val fieldSig = typeMapper.buildFieldSignature(decl)
                         cw.visitField(fieldFlags, decl.name.toString(), fieldDesc, fieldSig, null)
                     }
+                }
+                is IrEnumEntry -> {
+                    // 枚举常量字段：JVM 枚举协议要求 public static final 且带 ACC_ENUM，
+                    // 描述符就是枚举类自身；初值由 <clinit> 通过 PUTSTATIC 写入（见
+                    // generateEnumInfrastructure），因此这里不写 ConstantValue。
+                    cw.visitField(
+                        Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL or Opcodes.ACC_ENUM,
+                        decl.name.toString(),
+                        "L$internalName;",
+                        null,
+                        null
+                    )
                 }
                 is IrProperty -> {
                     // Property access is handled directly via IrGetField/IrSetField at the IR level.
@@ -592,20 +617,19 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // `__jasper_values` 缓存数组，再生成合成的 `values()` 与 `valueOf(String)`。
     // 为什么需要：语言层只声明了常量与构造器；values()/valueOf() 是 Java 枚举协议
     // 要求的方法，用户代码可能调用，必须由后端合成。
-    // 已知限制：靠「字段名首字母大写」来识别枚举常量（启发式）；没有覆盖任何常量的
-    // 枚举直接返回不生成；常量名以非大写字母开头时会被漏掉。
+    // 常量识别：直接收集 cls.declarations 里的 IrEnumEntry（Kotlin IR 对枚举常量的原生
+    // 表示），声明顺序即 ordinal 顺序。不再使用「字段名首字母大写」启发式——它会把
+    // 普通静态字段误当常量，也会漏掉小写开头的常量，且与 translator 的 IrEnumEntry
+    // 表示对不上（Q18 崩溃的根因之一）。
+    // 已知限制：当前只支持无用户参数的枚举常量的 <clinit> 实例化；带实参的常量
+    // （`A(1)`）仍按 (name, ordinal) 调用构造器，属任务书明确的非目标。
     private fun generateEnumInfrastructure(
         cw: ClassWriter,
         cls: IrClass,
         internalName: String,
         staticFields: List<IrField> = emptyList()
     ) {
-        val enumConstNames = mutableListOf<String>()
-        for (decl in cls.declarations) {
-            if (decl is IrField && decl.name.toString().let { it[0].isUpperCase() }) {
-                enumConstNames.add(decl.name.toString())
-            }
-        }
+        val enumConstNames = cls.declarations.filterIsInstance<IrEnumEntry>().map { it.name.toString() }
         if (enumConstNames.isEmpty()) {
             // 没有枚举常量时不创建枚举基础设施；但用户静态字段仍需初始化。
             if (staticFields.any { needsRuntimeStaticInit(it) }) {
@@ -655,7 +679,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         vMv.visitCode()
         vMv.visitFieldInsn(Opcodes.GETSTATIC, internalName, "__jasper_values", valuesDesc)
         vMv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "[L$internalName;", "clone", "()Ljava/lang/Object;", false)
-        vMv.visitTypeInsn(Opcodes.CHECKCAST, valuesDesc.removePrefix("["))
+        // CHECKCAST 的目标必须是「类型名或数组描述符」：这里 clone() 返回 Object，
+        // 需要转回数组类型，因此应传数组描述符 `[Lpkg/Enum;`（去掉前导 '[' 会得到
+        // `Lpkg/Enum;`，那是字段描述符，不是合法类名，加载期直接 ClassFormatError）。
+        vMv.visitTypeInsn(Opcodes.CHECKCAST, valuesDesc)
         vMv.visitInsn(Opcodes.ARETURN)
         vMv.visitMaxs(0, 0)
         vMv.visitEnd()
@@ -1606,6 +1633,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     }
                     mv.visitMethodInsn(Opcodes.INVOKESPECIAL, internalName, "<init>", desc, false)
                 }
+            }
+            is IrGetEnumValue -> {
+                // 枚举常量读取：JVM 上就是读取枚举类的静态字段（GETSTATIC）。
+                // 符号 -> owner/名字 由第一遍扫描 IrEnumEntry 时建立；缺索引时退回当前包，
+                // 保持与字段读取一致的「宁可生成可疑引用也不在生成期崩溃」契约。
+                val entryName = enumEntrySymbolToName[expr.symbol] ?: "value"
+                val entryOwner = enumEntrySymbolToOwner[expr.symbol] ?: currentPkg
+                mv.visitFieldInsn(Opcodes.GETSTATIC, entryOwner, entryName, "L$entryOwner;")
             }
             is IrGetField -> {
                 // 字段读取：先看是否为接口常量（static final），走 GETSTATIC；

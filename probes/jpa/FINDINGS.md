@@ -55,9 +55,10 @@
 | 略有不便 | 1 | 1 | 0 | 0 |
 | **合计** | **13** | **2** | **2** | **9** |
 
-> 后续更新：**#13 已修复（本提交）**——显式类型引用不可解析时改为编译期报错
-> （带名字与位置），因此当前仍开放的 `③编译器缺陷` 为 8 条。上表保留本次探针
-> 首次记录时的原始统计。
+> 后续更新：**#13 与 #11 已修复（本提交）**——#13：显式类型引用不可解析时改为编译期
+> 报错（带名字与位置）；#11：枚举常量的比较 / `switch` / `match` 不再触发内部错误
+> （枚举常量改为 `IrEnumEntry` + `<clinit>` 初始化）。因此当前仍开放的 `③编译器缺陷`
+> 为 7 条。上表保留本次探针首次记录时的原始统计。
 
 > 说明：本探针是新增探针，**未修改任何 `.g4`、未改编译器**。下列条目的大部分
 > 与 JDBC/R2DBC 探针的既有发现同源（#6 枚举、#8 静态字段、#9 类继承、#16 dict），
@@ -77,7 +78,8 @@
 6. **缺 @Id 的校验下移到运行期** `MappingRegistry.register()`（手写元数据）。原因见 #6。
 7. **元数据/表用显式类 + 对象数组**，不用 `dict<string, …>`。原因见 #8（同 JDBC #16）。
 8. **自增计数器用实例字段**（`nextId`），不用静态字段。原因见 #10（同 JDBC #8）。
-9. **`@GeneratedValue.strategy` 用 `string`** 而非枚举。原因见 #11（同 JDBC #6）。
+9. ~~**`@GeneratedValue.strategy` 用 `string`** 而非枚举~~ —— **本提交已修复**（#11，
+   同 JDBC #6），可直接使用枚举；探针保留字符串写法仅为未回归改写。
 10. **关系用「对象数组 + 主键引用」单向表达**，不写对象双向引用、不做实体继承多态。
     原因见 #4（同 R2DBC #9）。
 11. **`Main.jas` 显式 `import std.Error;`**：非 `std` 包内 `Error` 不会自动可见，
@@ -266,6 +268,13 @@ public function main(): int32 {
 
 #### 11. 枚举不可比较 → `@GeneratedValue` 策略只能用 `string`
 - 类别：`③编译器缺陷`（同 JDBC #6 复核）
+- 状态：**已修复（本提交）**——根因与 JDBC #6 同源：枚举常量被当成实例字段读取，
+  编译期崩于 `INTERNAL: Index -1 out of bounds for length 0`。现改为 translator 预登记
+  枚举常量符号并保持 `IrEnumEntry` 表示、读取走新增 `IrGetEnumValue`（后端发 `GETSTATIC`），
+  后端据 `IrEnumEntry` 发射 `public static final ACC_ENUM` 字段并在 `<clinit>` 中
+  `PUTSTATIC` 初始化；`switch`/`match`/比较/形参/返回值均恢复可用，`@GeneratedValue`
+  现在可以改用真正的枚举 `GenerationType`。回归守门：
+  `jasper-compiler/src/test/kotlin/jasper/EnumTest.kt`。
 - 现象：JPA 用 `GenerationType { IDENTITY, SEQUENCE, TABLE, AUTO }`；本语言枚举一旦
   参与比较或在 `switch`/`match` 中使用即触发编译器内部错误。
 - 探针规避：见第四节第 9 条（`@GeneratedValue(strategy = "identity")` 用字符串）。
@@ -318,7 +327,8 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 3. **实体继承 / `@MappedSuperclass`** —— 不可用（#4）：类继承不参与赋值子类型。
 4. **`Map<主键, 实体>` 一级缓存** —— 不可用（#8）：`dict<K,V>` 不能作类型。
 5. **`@GeneratedValue` 全局序列（静态计数器）** —— 不可用（#10）：静态字段坏。
-6. **`GenerationType` 枚举** —— 不可用（#11）：枚举不可比较。
+6. ~~**`GenerationType` 枚举** —— 不可用（#11）~~：**本提交已修复**，枚举已可比较、
+   可在 `switch`/`match` 使用。
 7. **实体公有字段的跨文件读取** —— 不可用（#3）：必须走访问器。
 8. **查询不到时返回 `null`** —— 不可用（#2）：`return null`（any）生成非法字节码。
 9. **`remove` 作为方法名** —— 不可用（#7）：改名 `removeById`。
@@ -332,7 +342,7 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 - 最影响「写不出 JPA 形状」的是前 6 条：泛型接口分派（#1）、`return null`（#2）、
   跨文件字段（#3）、实体继承（#4）、运行期注解反射缺失（#5）、缺 `@Id` 无编译期
   校验（#6）。其中 #1/#5/#6 直接决定「注解驱动」能不能成立。
-- 13 个摩擦点里有 8 个（原 9 个；#13 已随本提交修复）是 `③编译器缺陷`，且多为
+- 13 个摩擦点里有 7 个（原 9 个；#13 与 #11 已随本提交修复）是 `③编译器缺陷`，且多为
   **静默错误字节码**
   （`VerifyError`/`NoClassFormatError`/`NoSuchMethodError`/`ClassNotFoundException`），
   而不是清晰的编译期报错；这会让用户把编译器 bug 误当成自己代码的问题（与 JDBC/R2DBC
@@ -348,7 +358,7 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 | #4 类继承不参与子类型 | R2DBC #9 | 复核，JPA 视角（实体继承） |
 | #8 dict 不能作类型 | JDBC #16 / R2DBC #16 | 复核，JPA 视角（注册表/一级缓存） |
 | #10 静态字段坏 | JDBC #8 | 复核，JPA 视角（全局序列） |
-| #11 枚举不可比较 | JDBC #6 | 复核，JPA 视角（GenerationType） |
+| #11 枚举不可比较 | JDBC #6 | 复核，JPA 视角（GenerationType）；**已修复（本提交）** |
 | #1 泛型接口分派 | R2DBC #3（`LT;` 描述符） | 扩展：本条进一步区分「可声明/可实现/不可接口分派」 |
 | #2 `return null` | 新增 | 本探针首次记录 |
 | #5 运行期注解反射缺失 | 新增 | 本探针首次记录 |

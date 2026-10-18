@@ -87,7 +87,9 @@ Flux.declaredFields=[FETCH_SIZE]
 > #4（`finally`）、#11（数组元素读类型）；并修复 `①语法层` #2 的**执行语义**
 > （`go` 任务体真的执行、副作用可观察）。#2 的另一半「`go` 可作普通标识符/方法名」
 > 受 `JasperLexer.g4` 硬关键字阻塞，**仍未修复**（需把 `Go` 改为软关键字，见第五节 #2）。
-> 修复详情见第五节各条目的「状态」行；回归守门见 `jasper.R2dbcDefectRegressionTest`。
+> **本提交** 另修复 `③编译器缺陷` #14（枚举比较 / `switch` / `match`），回归守门见
+> `jasper.EnumTest`。修复详情见第五节各条目的「状态」行；回归守门见
+> `jasper.R2dbcDefectRegressionTest`。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -215,6 +217,12 @@ public function main(): int32 { var r: int32 = f(); return r + flag; }
 
 #### 14. 枚举比较触发编译器内部错误
 - 类别：`③编译器缺陷`
+- 状态：**已修复（本提交）**——根因与 JDBC #6 同源：`Color.Red` 被翻译成「对类名求值的
+  `GETFIELD`」。现改为 translator 预登记枚举常量符号并保持 `IrEnumEntry` 表示，读取走
+  新增 `IrGetEnumValue`（后端发 `GETSTATIC`），后端据 `IrEnumEntry` 发射
+  `public static final ACC_ENUM` 字段并在 `<clinit>` 中 `PUTSTATIC` 初始化；此前会
+  `ClassFormatError` 的 `values()` `CHECKCAST` 也一并修正。回归守门：
+  `jasper-compiler/src/test/kotlin/jasper/EnumTest.kt`。
 - 触发代码：
 ```jasper
 package std;
@@ -557,7 +565,8 @@ public function main(): int32 { return f(); }      // 未 try/catch，仍可编�
 - 但 18 个摩擦点里有 14 个是 `③编译器缺陷`，且大多是**静默的错误字节码**
   （`VerifyError`/`ClassFormatError`/`NoSuchMethodError`），而不是清晰的编译期报错；
   这会诱导用户把编译器 bug 误当成自己代码的问题。本批已修复其中 3 条
-  （#1/#4/#11，commit `7e66eca`）并修复 #2 的执行语义。
+  （#1/#4/#11，commit `7e66eca`）并修复 #2 的执行语义；**本提交**又修复 #14
+  （枚举比较 / `switch` / `match`）。
 - 与「异步 / 挂起」最相关的 `await`（#1）、`go`（#2）现已可用其**语言语义**
   （`await` 取值、`go` 触发副作用）；但**仍不具备真正的异步运行时**（无挂起、
   无线程切换），泛型响应式协议（#3）仍属 `[表达不了]`——探针目前只能以

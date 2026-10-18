@@ -68,6 +68,20 @@ public class IrNodeFactory {
         return new IrGetFieldImpl(IND, start, end, type, symbol, superQualifier, origin);
     }
 
+    /**
+     * 做什么：构造一次「读取枚举常量」的 IR 表达式（IrGetEnumValue）。
+     * 什么时候用：translator 解析 `EnumType.CONSTANT` 时；后端据此发 GETSTATIC。
+     * 前置条件：symbol 必须指向同一枚举类里已声明的 IrEnumEntry；type 是该枚举的 IR 类型。
+     * 失败模式：不校验 symbol 与 type 是否一致；IR 构造期约束由调用方负责。
+     * 为什么这样设计：枚举常量是 IR 的独立声明种类（IrEnumEntry），不能伪装成普通字段
+     *   读取；用专用表达式把「读哪个枚举项」显式表达出来（本方法只是 Kotlin 2.1 构造器
+     *   需要 IrElementConstructorIndicator 的薄封装，集中在一处避免散落反射式构造）。
+     */
+    public static IrGetEnumValue createGetEnumValue(
+            int start, int end, IrType type, IrEnumEntrySymbol symbol) {
+        return new IrGetEnumValueImpl(IND, start, end, type, symbol);
+    }
+
     public static IrSetField createSetField(
             int start, int end, IrType type, IrFieldSymbol symbol,
             IrClassSymbol superQualifier, IrStatementOrigin origin) {

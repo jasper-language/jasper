@@ -175,7 +175,13 @@ data class TranslationContext(
     val hashableClassNames: MutableSet<String> = mutableSetOf(),
     // Field symbols for interface constants (`public static final` fields).
     // 接口常量（public static final 字段）的字段符号集合，导出给后端发静态指令。
-    val staticFieldSymbols: MutableSet<IrFieldSymbol> = mutableSetOf()
+    val staticFieldSymbols: MutableSet<IrFieldSymbol> = mutableSetOf(),
+    // Enum constants: JVM internal class name -> constant name -> IR enum-entry symbol.
+    // 枚举常量索引：JVM 内部类名 -> 常量名 -> IR 枚举项符号。
+    // 为什么必须预登记：`Color.Red` 可能出现在枚举声明之前（同文件靠后声明或跨文件），
+    //   表达式翻译必须拿到与声明处**同一个**符号，后端才能把 IR 读取映射回同名字段。
+    // 键用内部名而非简单名：同一简单名可能出现在不同包，内部名是字段宿主的唯一标识。
+    val enumConstantSymbolsByType: MutableMap<String, MutableMap<String, IrEnumEntrySymbol>> = mutableMapOf()
 )
 
 /**
@@ -211,6 +217,7 @@ class JasperToIrTranslator {
         collectHashableClassNames(listOf(ast), ctx)
         collectMemberReturnTypes(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
+        predeclareEnumConstants(listOf(ast), ctx)
         val fileEntry = NaiveSourceBasedFileEntryImpl("<main>", intArrayOf(), 0)
         val fileSymbol = IrFileSymbolImpl()
         val file = IrFileImpl(fileEntry, fileSymbol, FqName(ctx.currentPkg))
@@ -249,6 +256,7 @@ class JasperToIrTranslator {
             collectHashableClassNames(listOf(ast), ctx)
             collectMemberReturnTypes(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
+            predeclareEnumConstants(listOf(ast), ctx)
         }
 
         val files = mutableListOf<IrFile>()
@@ -354,6 +362,30 @@ class JasperToIrTranslator {
         }
         typeMapper.currentImports = exact
         typeMapper.currentWildcardPackages = wildcard
+    }
+
+    /**
+     * 做什么：在翻译任何声明体之前，为全部枚举常量预先建立 IR 枚举项符号。
+     * 什么时候用：translate / translateAll 的第一遍（与顶层函数预登记同一阶段）。
+     * 前置条件：调用前已 [installFileContext]（需要 currentPkg/currentImports 才能把
+     *   枚举简单名解析成唯一内部名）。
+     * 失败模式：不抛异常；重复调用用 putIfAbsent 去重，先登记者优先。
+     * 为什么需要：`Color.Red` 可能早于枚举声明被翻译（同文件后置声明、跨文件引用）。
+     *   枚举项符号必须只有一份身份：声明处与使用处若各建一个符号，后端就无法把读取点
+     *   映射回同一个字段（症状正是本任务修复的 GETFIELD 帧错误）。
+     * 为什么用内部名作键：字段宿主在 JVM 层按内部名唯一确定；简单名可能跨包重名。
+     */
+    private fun predeclareEnumConstants(asts: List<JasSourceFile>, ctx: TranslationContext) {
+        for (ast in asts) {
+            for (decl in ast.declarations) {
+                if (decl !is JasEnum) continue
+                val owner = typeMapper.resolveNamedTypeName(decl.name)
+                val byName = ctx.enumConstantSymbolsByType.getOrPut(owner) { mutableMapOf() }
+                for (constant in decl.constants) {
+                    byName.putIfAbsent(constant.name, IrEnumEntrySymbolImpl())
+                }
+            }
+        }
     }
 
     // 预登记顶层函数的符号与签名：先建符号、登记调用名/返回/形参类型。
@@ -847,19 +879,8 @@ class JasperToIrTranslator {
         ctx.currentSuperclassName = qualifiedSuper
         ctx.classSuperclassNames[cls.name] = qualifiedSuper
         if (cls.constructors.isEmpty()) {
-            // Generate a default no-arg constructor
             // 无显式构造器时补一个默认无参 <init>；否则类无法被 new（后端要求至少一个可调用构造器）。
-            val defaultCtorSymbol = IrConstructorSymbolImpl()
-            val defaultCtor = factory.createConstructor(
-                0, 0, IrDeclarationOrigin.DEFINED,
-                Name.special("<init>"),
-                DescriptorVisibilities.PUBLIC,
-                false, false, typeMapper.unitType(),
-                defaultCtorSymbol, true, false, null
-            )
-            val defaultCtorBody = factory.createBlockBody(0, 0)
-            defaultCtor.body = defaultCtorBody
-            irCls.declarations.add(defaultCtor)
+            addDefaultConstructor(irCls)
         } else {
             for (ctor in cls.constructors) {
                 val irCtor = translateConstructor(ctor, symbol, ctx)
@@ -870,6 +891,28 @@ class JasperToIrTranslator {
         ctx.currentSuperclassName = ""
         ctx.currentClassName = previousClassName
         return irCls
+    }
+
+    /**
+     * 做什么：为没有显式构造器的类/枚举补一个 public 无参构造器。
+     * 什么时候用：translateClass / translateEnum 在成员翻译完成后调用。
+     * 前置条件：irCls 已创建并已挂到当前 IR 文件；默认体为空，不引用任何成员。
+     * 失败模式：不抛异常；调用方负责判断「确实没有显式构造器」。
+     * 为什么集中：普通类与枚举的默认构造器语义一致（空体；枚举的 (name,ordinal)
+     *   前导参数由后端 `generateEnumConstructor` 统一补齐），两份实现会逐渐漂移。
+     */
+    private fun addDefaultConstructor(irCls: IrClass) {
+        val defaultCtorSymbol = IrConstructorSymbolImpl()
+        val defaultCtor = factory.createConstructor(
+            0, 0, IrDeclarationOrigin.DEFINED,
+            Name.special("<init>"),
+            DescriptorVisibilities.PUBLIC,
+            false, false, typeMapper.unitType(),
+            defaultCtorSymbol, true, false, null
+        )
+        val defaultCtorBody = factory.createBlockBody(0, 0)
+        defaultCtor.body = defaultCtorBody
+        irCls.declarations.add(defaultCtor)
     }
 
     private fun translateConstructor(ctor: JasConstructor, classSymbol: IrClassSymbol, ctx: TranslationContext): IrConstructor {
@@ -1038,6 +1081,19 @@ class JasperToIrTranslator {
 
     // ── enum ──
 
+    /**
+     * 做什么：把一个 `JasEnum` 翻译成 IR 枚举类（ENUM_CLASS）：枚举项 + 成员 + 默认构造器。
+     * 什么时候用：translateTopLevelDeclaration 遇到顶层枚举声明时。
+     * 前置条件：枚举常量符号已由 [predeclareEnumConstants] 预登记；ctx 处于该枚举所在文件/包。
+     * 失败模式：不抛异常；成员翻译失败时按通用翻译规则静默跳过/降级。
+     * 为什么这样设计：
+     *   - 枚举项保持为 IrEnumEntry（Kotlin IR 对枚举常量的原生表示），后端据此发出
+     *     `public static final ACC_ENUM` 字段并在 `<clinit>` 里实例化；不再用「字段名首字母
+     *     大写」的启发式猜测常量，语义与表示一致（隔离的变化点：常量识别规则只存在于后端
+     *     对 IrEnumEntry 的处理）。
+     *   - 枚举成员与普通类共用 [translateClassMember]，避免两套成员翻译逻辑。
+     *   - 设置 currentClassName：枚举体内的属性/静态字段与 `this` 访问都依赖它定位宿主。
+     */
     private fun translateEnum(enum: JasEnum, ctx: TranslationContext): IrClass {
         val symbol = IrClassSymbolImpl()
         val irCls = factory.createClass(
@@ -1052,27 +1108,50 @@ class JasperToIrTranslator {
             SourceElement.NO_SOURCE
         )
         ctx.classSymbols[enum.name] = symbol
+        // 枚举和普通类一样需要「当前类」上下文；否则枚举体里的成员字段会落到错误宿主，
+        // 后端访问时拿不到 owner。
+        val qualifiedClassName = typeMapper.resolveNamedTypeName(enum.name)
+        val previousClassName = ctx.currentClassName
+        ctx.currentClassName = qualifiedClassName
+        // 常量符号必须复用预登记的那一份（同一声明/使用共享身份）；缺失时补建，兼容直接
+        // 调用 translateEnum 而没走预登记的内部路径。
+        val constantSymbols = ctx.enumConstantSymbolsByType.getOrPut(qualifiedClassName) { mutableMapOf() }
         for (const in enum.constants) {
-            val irConst = translateEnumConstant(const, ctx)
-            irCls.declarations.add(irConst)
+            irCls.declarations.add(translateEnumConstant(const, constantSymbols))
         }
         for (member in enum.members) {
             val irMember = translateClassMember(member, ctx, symbol)
             if (irMember != null) {
                 irCls.declarations.add(irMember)
+                // 属性背后的字段要作为独立 IrField 出现在类体里（IR 约定），与 translateClass 一致。
+                if (irMember is IrProperty && irMember.backingField != null) {
+                    irCls.declarations.add(irMember.backingField!!)
+                }
             }
         }
+        // 枚举的 JVM 构造器必须存在：后端会在 <clinit> 中用 (String,int[,用户参数]) 调用它。
+        // 没有显式构造器时补默认无参构造器（后端自动补 (name,ordinal) 前导参数）。
+        if (enum.members.none { it is JasConstructor }) {
+            addDefaultConstructor(irCls)
+        }
+        ctx.currentClassName = previousClassName
         return irCls
     }
 
-    private fun translateEnumConstant(const: JasEnumConstant, ctx: TranslationContext): IrEnumEntry {
-        val entrySymbol = IrEnumEntrySymbolImpl()
+    /**
+     * 做什么：把一个枚举常量翻译成 IR 枚举项（IrEnumEntry）。
+     * 什么时候用：[translateEnum] 遍历 constants 时。
+     * 前置条件：constantSymbols 是当前枚举「常量名 -> 符号」的索引（由预登记阶段建立）。
+     * 失败模式：无；符号缺失时补建并写回索引，保证声明处与使用处仍共享同一身份。
+     * 为什么复用符号：后端 pass 1 按 IrEnumEntry.symbol 建立「符号 -> owner/名字」索引，
+     *   使用处（IrGetEnumValue）引用同一符号才能解析到同一字段。
+     */
+    private fun translateEnumConstant(
+        const: JasEnumConstant,
+        constantSymbols: MutableMap<String, IrEnumEntrySymbol>
+    ): IrEnumEntry {
+        val entrySymbol = constantSymbols.getOrPut(const.name) { IrEnumEntrySymbolImpl() }
         return factory.createEnumEntry(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(const.name), entrySymbol)
-    }
-
-    private fun translateEnumEntry(decl: JasEnumConstant, ctx: TranslationContext): IrDeclaration {
-        val entrySymbol = IrEnumEntrySymbolImpl()
-        return factory.createEnumEntry(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(decl.name), entrySymbol)
     }
 
     // ── annotation type ──
@@ -2330,6 +2409,25 @@ class JasperToIrTranslator {
     }
 
     /**
+     * 做什么：识别并翻译「枚举类型名.常量名」（如 `Color.Red`），返回读取枚举项的 IR 表达式。
+     * 什么时候用：[translatePropertyAccess] 的第一道分流。
+     * 前置条件：target 是未被局部值遮蔽的已声明类型名；枚举常量已在预登记阶段建立符号。
+     * 失败模式：target 不是类型名、类型不是枚举、或属性不是该枚举的常量时返回 null，
+     *   调用方继续按普通静态/实例字段路径处理。
+     * 为什么这样设计：枚举常量在 IR 里是 IrEnumEntry 而非 IrField，读取语义也不同
+     *   （JVM 上都是 GETSTATIC，但符号身份必须指向枚举项，后端才能发出正确的字段
+     *   描述符与 `<clinit>` 初始化顺序）。把「是不是枚举常量」收敛到本函数，属性路径
+     *   无需理解枚举表示（隔离的变化点）。
+     */
+    private fun translateEnumConstantAccess(expr: JasPropertyAccess, ctx: TranslationContext): IrExpression? {
+        val classKey = declaredClassName(expr.target, ctx) ?: return null
+        val entrySymbol = ctx.enumConstantSymbolsByType[classKey]?.get(expr.property) ?: return null
+        // 枚举值的静态类型就是枚举类自身（读取点的 IR 类型决定后续比较/赋值/参数描述符）。
+        val enumType = typeMapper.type(classKey)
+        return IrNodeFactory.createGetEnumValue(0, 0, enumType, entrySymbol)
+    }
+
+    /**
      * 做什么：把 `target.property` 翻译成字段读取；静态字段与实例字段走两条形态。
      * 什么时候用：表达式位置的属性读取（`Counter.total`、`a.total`、`this.x`）。
      * 前置条件：静态字段的接收者必须是已声明类型名（或已知类型的值，见 [resolveStaticFieldRef]）。
@@ -2339,6 +2437,10 @@ class JasperToIrTranslator {
      *   就会生成「对一个值为 null 的变量做 GETFIELD」——正是 Q17 探针 NPE 的来源。
      */
     private fun translatePropertyAccess(expr: JasPropertyAccess, ctx: TranslationContext): IrExpression {
+        // 枚举常量优先识别：`Color.Red` 的形态与「类名.静态字段」完全相同，但 IR 表示不同
+        // （IrGetEnumValue 对应 IrEnumEntry）。若不先分流，会落入字段路径并生成对类名
+        // 求值的 GETFIELD——正是 `INTERNAL: Index -1 out of bounds` 的来源。
+        translateEnumConstantAccess(expr, ctx)?.let { return it }
         val staticRef = resolveStaticFieldRef(expr.property, expr.target, ctx)
         if (staticRef != null) {
             // 静态读取：不设置 receiver，后端据符号集合发 GETSTATIC。
