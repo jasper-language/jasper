@@ -212,11 +212,20 @@ class EnumTest {
     }
 
     /**
-     * 5. 枚举值作为形参传入、作为返回值传出，且传递后仍是同一常量。
-     *    注意：这里刻意用两个独立 `if` 表达「两个条件同时成立」，而不用 `&&`。
-     *    原因：当前 grammar 把 `==` 与 `&&` 放在同一优先级层（见 JasperParser.g4 的
-     *    binaryExpression），`a == X && b == Y` 会被解析成 `((a == X) && b) == Y`，
-     *    与枚举无关。因此换成两个独立判断，避免踩到该已知语法限制。
+     * 5. 枚举值作为形参传入、作为返回值传出，且传递后仍是同一常量；两个条件用 `&&` 连接。
+     *
+     * 重要（已知语法限制，Q19 复核）：`JasperParser.g4` 的 `binaryExpression` 每个运算符
+     * 备选的右侧是 `unaryExpression` 而非递归回 `binaryExpression`，因此 ANTLR 虽为各备选
+     * 生成了 `precpred`，却无法逐级下探——**所有二元运算符实际按同一优先级、左结合解析**：
+     *   `a != Types.Varchar && b != Types.Null`  →  `((a != Varchar) && b) != Null`
+     * 于是 `&&` 的左操作数变回枚举引用、右操作数变回枚举引用，后端按引用比较发射会得到
+     * 非法字节码（`VerifyError: Bad type on operand stack`）。这是**语法层**问题（权威仓库
+     * `jasper-language/jasper-grammar`，本实现只以 submodule 消费，禁止就地改 .g4），
+     * 修复须在上游完成。
+     *
+     * 因此在当前 grammar 下必须显式加括号强制分组：`(a == X) && (b == Y)`。本用例改用该
+     * 写法（而非旧版的两个独立 `if`）以真正覆盖 `&&`；用例 8 继续锁定该分组语义。一旦上游
+     * grammar 支持优先级，可去掉括号，本注释与用例 8 需同步更新。
      */
     @Test
     fun `enum values pass through parameters and return positions`() {
@@ -228,9 +237,8 @@ class EnumTest {
             public function main(): int32 {
                 var a: Types = echo(Types.Varchar);
                 var b: Types = echo(pick());
-                if (a != Types.Varchar) { return 0; }
-                if (b != Types.Null) { return 0; }
-                return 1;
+                if ((a == Types.Varchar) && (b == Types.Null)) { return 1; }
+                return 0;
             }
         """.trimIndent()
         val out = compile(source, "params-return")
@@ -240,19 +248,29 @@ class EnumTest {
 
     /**
      * 6. 后端合成的 `values()` / `valueOf(String)` 必须可用。
-     *    注意：Jasper 源码层还没有「类名.静态方法」调用语法（`Types.values()` 会被当作
-     *    实例成员调用），因此这里直接通过反射调用 JVM 上真实存在的合成方法——这仍然
-     *    是端到端证据：类必须能加载、常量必须已初始化、数组与名字表必须正确。
+     *
+     * Q19 起源码层已支持「类名.静态方法」调用语法（`Types.values()` / `Types.valueOf("x")`），
+     * 因此这里直接走源码调用而非反射：类必须能加载、常量必须已初始化、数组与名字表必须
+     * 正确，且调用指令必须是 INVOKESTATIC（指令级断言见 MemberAccessTest）。
      */
     @Test
     fun `synthesized values and valueOf are usable`() {
         val source = """
             package test;
             public enum Types { Integer, Varchar, Null }
-            public function main(): int32 { return 0; }
+            public function main(): int32 {
+                var n: int32 = Types.values().length;
+                var t: Types = Types.valueOf("Varchar");
+                if (t == Types.Varchar) { return n; }
+                return 0;
+            }
         """.trimIndent()
         val out = compile(source, "values-valueof")
 
+        // values().length 为 3，且 valueOf("Varchar") 命中 Varchar 分支，故返回 3。
+        assertEquals(3, invokeStatic(out, "test.main", "main"))
+
+        // 反射再确认 JVM 上的枚举协议确实存在。
         URLClassLoader(arrayOf(out.toUri().toURL())).use { loader ->
             val types = loader.loadClass("test.Types")
             assertTrue(types.isEnum, "test.Types must be a JVM enum class")
@@ -315,6 +333,33 @@ class EnumTest {
             assertTrue(Modifier.isFinal(field.modifiers), "Integer must be final")
             assertEquals(types, field.type, "Integer must be typed as its enum class")
         }
+    }
+
+    /**
+     * 8. 分组回归：枚举比较参与 `&&` 时必须显式加括号（原因见用例 5 的语法说明）。
+     *
+     * 本用例断言 `&&` 两侧的枚举比较都被正确求值：
+     *   第一支 `(a == Integer) && (b == Null)` 应为假 → 跳过；
+     *   第二支 `(a == Integer) && (b == Varchar)` 应为真 → 返回 2。
+     * 若有人把括号去掉，该表达式会因 grammar 的扁平优先级被解析成
+     * `((a == Integer) && b) == Varchar`，并以后端 `VerifyError` 崩溃——本用例即以此为守门。
+     */
+    @Test
+    fun `enum comparison conjunction requires explicit grouping`() {
+        val source = """
+            package test;
+            public enum Types { Integer, Varchar, Null }
+            public function main(): int32 {
+                var a: Types = Types.Integer;
+                var b: Types = Types.Varchar;
+                if ((a == Types.Integer) && (b == Types.Null)) { return 1; }
+                if ((a == Types.Integer) && (b == Types.Varchar)) { return 2; }
+                return 0;
+            }
+        """.trimIndent()
+        val out = compile(source, "precedence")
+
+        assertEquals(2, invokeStatic(out, "test.main", "main"))
     }
 
 }

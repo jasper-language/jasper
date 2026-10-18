@@ -854,6 +854,13 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             is JasCall -> {
                 // 先推断所有实参类型，再按 callee 形态走两条路：具名函数（重载解析）或函数值。
                 val argTypes = expr.args.map { inferExpression(it, env) }
+                // 类名静态方法调用（`A.f()` / 枚举合成方法 `Types.values()`）必须在「按函数值
+                // 推断 target」之前分流：否则 `A.f` 会被当成对类名的属性访问，落入
+                // 「类名不能访问实例成员」的错误路径，而正确的语义是静态调用（Q19 C22）。
+                val staticTarget = expr.target
+                if (staticTarget is JasPropertyAccess && isTypeNameReference(staticTarget.target, env)) {
+                    return inferStaticMemberCall(expr, staticTarget, argTypes)
+                }
                 if (symbolTable != null && expr.target is JasIdentifier) {
                     val name = (expr.target as JasIdentifier).name
                     val funcs = symbolTable.findFunctions(name)
@@ -984,7 +991,13 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasPropertyAccess -> {
-                // 成员解析顺序：类名静态成员 -> 具名类型查成员索引 -> 数组 length 特例 -> 其余告警并兜底 any。
+                // 成员解析顺序：类名静态成员 -> 具名类型查成员索引 -> 数组 length 特例
+                //   -> 其余（未解析 target / 非具名类型）告警并兜底 any。
+                // 为什么对「具名类型」的未命中改为 error：具名类型的成员集合是编译期可判定的，
+                //   未命中就是用户笔误或缺少声明；若只 warn 并兜底 any，translator 会生成对
+                //   不存在字段的访问（假符号 + Unit 描述符），最终产出非法字节码
+                //   （ClassFormatError / NoSuchFieldError，Q19 C23）。any 接收者的成员集合
+                //   不可知，仍按宽松处理（保持既有动态调用语义）。
                 val targetType = inferExpression(expr.target, env)
                 // 「类名.字段」与「值.字段」是两种不同语义：前者只能访问静态字段。
                 // 先单独处理，否则会把类名当成一个值为 null 的变量，导致实例字段被静默放行，
@@ -1006,14 +1019,21 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                     } else {
                         val typeArguments = (targetType as? JasNamedType)?.typeArguments ?: emptyList()
                         findMemberType(typeName, expr.property, typeArguments) ?: run {
-                            warn("Cannot resolve member '${expr.property}' on type '$typeName'", expr)
+                            error("Cannot resolve member '${expr.property}' on type '$typeName'", expr)
                             JasAnyType
                         }
                     }
                 } else when {
                     targetType is JasNamedType -> {
                         findMemberType(targetType.name, expr.property, targetType.typeArguments) ?: run {
-                            warn("Cannot resolve member '${expr.property}' on type '${targetType.name}'", expr)
+                            // 只有「符号表中确有的具名类型」才把未命中升级为错误；类型参数
+                            // （如 T）、外部 JDK 类型（如 java.util.HashMap）等的成员集合不可知，
+                            // 维持 warn+any 以免误伤泛型与平台互操作。
+                            if (isDeclaredTypeName(targetType.name)) {
+                                error("Cannot resolve member '${expr.property}' on type '${targetType.name}'", expr)
+                            } else {
+                                warn("Cannot resolve member '${expr.property}' on type '${targetType.name}'", expr)
+                            }
                             JasAnyType
                         }
                     }
@@ -1122,6 +1142,107 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
     }
 
+    /**
+     * 推断「类名.静态方法(...)」调用的类型，并给出可操作的诊断。
+     *
+     * 做什么：对形如 `A.f(...)` 的调用返回方法声明类型；同时识别枚举类的合成静态方法
+     *   `values()`（返回 `T[]`）与 `valueOf(string)`（返回 `T`）。若既不是静态方法也不是
+     *   合成方法，则报错（区分「实例方法被类名调用」与「完全没有该成员」两种情形）。
+     * 什么时候用：[inferExpression] 的 `JasCall` 分支，且 target 是「类名」引用时。
+     * 前置条件：target.target 已被 [isTypeNameReference] 认定为类型名；argTypes 已推断。
+     * 失败模式：不抛异常；无法解析时返回 [JasAnyType] 并记录一条错误诊断。
+     * 为什么这样设计：静态调用与实例调用在 JVM 上走不同指令（INVOKESTATIC vs
+     *   INVOKEVIRTUAL），checker 必须先认出来，translator 才能据此不生成接收者实参。
+     *   把「枚举合成方法」与「用户静态方法」收敛在同一入口，调用点无需知道二者差异
+     *   （隔离的变化点：方法来源）。
+     */
+    private fun inferStaticMemberCall(
+        expr: JasCall,
+        target: JasPropertyAccess,
+        argTypes: List<JasType?>
+    ): JasType? {
+        val typeName = (target.target as JasIdentifier).name
+        val memberName = target.property
+        // 枚举的 values()/valueOf(String) 由后端为每个枚举类合成，源码层按静态方法使用。
+        val enumDecl = symbolTable?.findEnum(typeName)
+        if (enumDecl != null) {
+            when (memberName) {
+                "values" -> {
+                    if (expr.args.isNotEmpty()) {
+                        error("Function 'values' expects 0 argument(s), got ${expr.args.size}", expr)
+                    }
+                    return JasArrayType(JasNamedType(typeName))
+                }
+                "valueOf" -> {
+                    if (expr.args.size != 1) {
+                        error("Function 'valueOf' expects 1 argument(s), got ${expr.args.size}", expr)
+                    }
+                    val arg = argTypes.firstOrNull()
+                    if (arg != null && !typesCompatible(arg, JasStringType)) {
+                        error("Function 'valueOf' argument 1 type mismatch: expected string, got ${typeDisplayName(arg)}", expr)
+                    }
+                    return JasNamedType(typeName)
+                }
+            }
+        }
+        val fn = findFunctionMember(typeName, memberName)
+        if (fn != null && fn.modifiers.any { it is String && it == "static" }) {
+            val required = fn.parameters.count { it.defaultValue == null && !it.vararg }
+            val hasVararg = fn.parameters.lastOrNull()?.vararg == true
+            val arityOk = expr.args.size >= required &&
+                (hasVararg || expr.args.size <= fn.parameters.size)
+            if (!arityOk) {
+                error("Function '$memberName' expects ${fn.parameters.size} argument(s), got ${expr.args.size}", expr)
+            }
+            return fn.returnType ?: JasUnitType
+        }
+        // 不是静态方法：给出比「未解析」更精确的诊断，帮助用户区分「忘写 static」与「名字写错」。
+        if (fn != null) {
+            error("Cannot call instance method '$memberName' through class name '$typeName'", expr)
+        } else {
+            error("Cannot resolve static method '$memberName' on type '$typeName'", expr)
+        }
+        return JasAnyType
+    }
+
+    /**
+     * 在类型（类/接口/枚举）的成员中查找名为 [memberName] 的函数声明。
+     *
+     * 做什么：先查符号表成员索引（含注解合成成员），未命中再线性遍历类/接口/枚举成员。
+     * 什么时候用：[inferStaticMemberCall] 判断某名字是否为函数成员。
+     * 前置条件：typeName 是已声明类型的简单名。
+     * 失败模式：未命中返回 null（不抛异常）；不区分重载，返回首次声明的那个。
+     * 为什么这样设计：与 [rawMemberType] 保持同一查找顺序，避免「类型能解析、成员却查不到」
+     *   导致的静态性误判。
+     */
+    private fun findFunctionMember(typeName: String, memberName: String): JasFunction? {
+        (symbolTable?.findMemberSignature(typeName, memberName) as? JasFunction)?.let { return it }
+        symbolTable?.findClass(typeName)?.members?.forEach { member ->
+            if (member is JasFunction && member.name == memberName) return member
+        }
+        symbolTable?.findInterface(typeName)?.members?.forEach { member ->
+            if (member is JasFunction && member.name == memberName) return member
+        }
+        symbolTable?.findEnum(typeName)?.members?.forEach { member ->
+            if (member is JasFunction && member.name == memberName) return member
+        }
+        return null
+    }
+
+    /**
+     * 判断简单名 [name] 是否对应符号表中已声明的类型（类/接口/枚举/注解）。
+     *
+     * 做什么：作为「未解析成员是否升级为错误」的判据——只有已知成员集合的具名类型才升级。
+     * 什么时候用：[inferExpression] 的 `JasPropertyAccess` 分支。
+     * 前置条件：无（symbolTable 可空）。
+     * 失败模式：symbolTable 为空时返回 false（退化为宽松警告）。
+     */
+    private fun isDeclaredTypeName(name: String): Boolean =
+        symbolTable?.findClass(name) != null ||
+            symbolTable?.findInterface(name) != null ||
+            symbolTable?.findEnum(name) != null ||
+            symbolTable?.findAnnotation(name) != null
+
     private fun findMemberType(
         typeName: String,
         memberName: String,
@@ -1197,9 +1318,19 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     }
 
     private fun rawMemberType(typeName: String, memberName: String): JasType? {
-        // Resolve through the symbol table's member signature index first; this
-        // index includes annotation-synthesized members (e.g. @Getter/@Setter).
-        // 中文说明：优先走符号表的成员签名索引（含注解合成成员），再退回遍历 AST 成员。
+        // 先查本类型自身的成员；未命中再沿继承链（父类 + 接口，传递闭包）查找。
+        // 为什么必须查继承链：把「具名类型未解析成员」升级为编译错误后，若只认本类型成员，
+        //   合法的「子类实例调用父类/接口方法」会被误报；继承成员本就是可见的。
+        directMemberType(typeName, memberName)?.let { return it }
+        for (ancestor in ancestorTypeNames(typeName)) {
+            directMemberType(ancestor, memberName)?.let { return it }
+        }
+        return null
+    }
+
+    // 单个类型自身的成员查找（不展开继承链）。
+    // 优先走符号表成员索引（含注解合成成员），再退回线性遍历 AST 成员。
+    private fun directMemberType(typeName: String, memberName: String): JasType? {
         when (val indexed = symbolTable?.findMemberSignature(typeName, memberName)) {
             is JasProperty -> return indexed.type
             is JasFunction -> return JasFunctionType(
@@ -1232,6 +1363,48 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
 
         return null
+    }
+
+    /**
+     * 收集类型 [start] 的全部祖先类型名（父类 + 实现的接口 + 父接口，传递闭包）。
+     *
+     * 做什么：BFS 遍历继承链，返回简单名列表（不含 start 自身），已访问集合去重避免环。
+     * 什么时候用：[rawMemberType] 展开继承成员查找。
+     * 前置条件：symbolTable 已执行 collectDeclarations；classImplements/interfaceExtends 已在
+     *   [check] 第一遍建立。
+     * 失败模式：不抛异常；未声明的祖先（如 `java.lang.Throwable`）及其成员不进入结果，
+     *   因此其成员无法解析——这是「只依赖已知声明」的已知边界。
+     * 为什么这样设计：成员可见性与继承链是语言级规则，收敛到唯一函数可避免各调用点各自
+     *   实现导致行为漂移（隔离的变化点：继承关系来源）。
+     */
+    private fun ancestorTypeNames(start: String): List<String> {
+        val result = LinkedHashSet<String>()
+        val queue = ArrayDeque<String>()
+        // seen 初始为空，起点由 enqueue 首次入队；result 用 `name != start` 把起点自身排除。
+        // 注意：不能预置 seen=start，否则 enqueue(start) 会被判重而丢弃，BFS 无法启动。
+        // 用局部 lambda（而非局部 fun）：既保持单一定义，又不让代码风格护栏把局部函数
+        // 误判成「缺少中文 KDoc 的公共 API」。
+        val seen = mutableSetOf<String>()
+        val enqueue: (String?) -> Unit = { name ->
+            if (name != null && seen.add(name)) queue.add(name)
+        }
+        enqueue(start)
+        while (queue.isNotEmpty()) {
+            val name = queue.removeFirst()
+            if (name != start) result.add(name)
+            val cls = symbolTable?.findClass(name)
+            if (cls != null) {
+                (cls.superclass as? JasNamedType)?.let { enqueue(it.name) }
+                cls.interfaces.filterIsInstance<JasNamedType>().forEach { enqueue(it.name) }
+            }
+            symbolTable?.findInterface(name)?.extends
+                ?.filterIsInstance<JasNamedType>()
+                ?.forEach { enqueue(it.name) }
+            // 当前文件收集到的层次信息（用于跨文件/当前文件声明优先的场景）。
+            classImplements[name]?.forEach { enqueue(it) }
+            interfaceExtends[name]?.forEach { enqueue(it) }
+        }
+        return result.toList()
     }
 
     private fun inferLambdaReturnType(body: JasBlock, env: TypeEnvironment): JasType? {

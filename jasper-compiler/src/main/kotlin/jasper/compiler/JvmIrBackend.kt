@@ -229,6 +229,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private var interfaceDeclNames: Set<String> = emptySet()
     // 需按 JVM 静态字段发射/访问的字段符号（接口常量 public static final）。
     private var staticFieldSymbols: Set<IrFieldSymbol> = emptySet()
+    // 声明为 static 的成员函数符号：决定成员方法 access 是否加 ACC_STATIC，以及参数槽起点。
+    private var staticFunctionSymbols: Set<IrSimpleFunctionSymbol> = emptySet()
+    // 合成静态调用的宿主：符号 -> JVM 内部类名（枚举 values/valueOf）。方法名取自 callNames，
+    // 描述符由实参类型 + 调用 IR 类型推导；它们没有 IR 声明，故 owner 不能靠 functionSymbolToOwner。
+    private var syntheticStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap()
     // 函数符号 → translator 赋予的语义调用名（"+"、"v:foo"、"ctor_delegate:" 等）；
     // 这是后端与 translator 之间的核心协议，决定走哪条专用生成路径。
     private var callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap()
@@ -268,6 +273,39 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         typeMapper.jvmDescriptorFromIrType(type).startsWith("[")
 
     /**
+     * 做什么：解析字段符号对应的 JVM 字段名；查不到时**立即抛内部错误**（fail fast）。
+     * 什么时候用：IrGetField / IrSetField 在真正发射 GETFIELD/PUTFIELD/GETSTATIC/PUTSTATIC 之前。
+     * 前置条件：调用点已排除数组 `.length` 特例（它不查字段符号，走 ARRAYLENGTH）。
+     * 失败模式：符号未登记时抛 IllegalStateException，终止本次编译。
+     * 为什么这样设计：字段符号查不到意味着 IR 引用了不存在/未登记的字段。旧实现退化成
+     *   名字 `field`、描述符 `V`，产出的是**非法字节码**（ClassFormatError），把编译期
+     *   错误推迟成晦涩的运行期崩溃（Q19 C23）。此处改为断言，宁可编译期大声失败，也不写出
+     *   非法 class——「禁止静默兜底」是后端对前端的硬契约。
+     */
+    private fun requireFieldName(symbol: IrFieldSymbol): String {
+        return fieldSymbolToName[symbol]
+            ?: throw IllegalStateException(
+                "INTERNAL: unresolved field symbol (no name registered); refusing to emit illegal bytecode"
+            )
+    }
+
+    /**
+     * 做什么：把字段访问的描述符做合法性断言（不得为 `V`/Unit）。
+     * 什么时候用：IrGetField / IrSetField 发射字段指令前。
+     * 前置条件：desc 由 typeMapper 从字段/值的 IR 类型得到。
+     * 失败模式：desc == "V" 时抛 IllegalStateException。
+     * 为什么这样设计：字段不能是 void；`V` 描述符只可能来自「类型解析失败退化成 Unit」，
+     *   正是静默兜底的特征信号。断言可把这类问题在编译期暴露（Q19 C23）。
+     */
+    private fun requireFieldDescriptor(desc: String): String {
+        check(desc != "V") {
+            "INTERNAL: field access with unit descriptor 'V'; refusing to emit illegal bytecode"
+        }
+        return desc
+    }
+
+
+    /**
      * 做什么：后端唯一入口。先扫描 GraalVM 风险点，再用一遍遍历建立「符号→名字/owner」
      *   全局索引，最后按包目录逐声明生成并写出 class 文件。
      *
@@ -299,6 +337,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         classInterfaceNames = translationResult.classInterfaceNames
         interfaceDeclNames = translationResult.interfaceDeclNames
         staticFieldSymbols = translationResult.staticFieldSymbols
+        staticFunctionSymbols = translationResult.staticFunctionSymbols
+        syntheticStaticCallOwners = translationResult.syntheticStaticCallOwners
         checkGraalvmHostilePatterns(translationResult)
         // 第 1 遍：建立符号 → 名字 / owner 索引。owner 用「包名内部名/类名」的 JVM 约定，
         // 顶层函数则以其自身为 owner（等价于文件名即类名，makeClass 时补建 main 桥）。
@@ -426,9 +466,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         for (decl in cls.declarations) {
             when (decl) {
                 is IrSimpleFunction -> {
-                    // 接口方法只能是 public abstract（没有 Code 属性）；普通类方法默认 public。
-                    val methodFlags = if (isInterface) Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT else Opcodes.ACC_PUBLIC
-                    generateIrFunction(cw, decl, internalName, false, methodFlags)
+                    // 接口方法只能是 public abstract（没有 Code 属性）；普通类方法默认 public，
+                    // 由 generateIrFunction 按 isStatic 决定是否补 ACC_STATIC（此处传 -1 表示
+                    // 「不接管 access」）。声明为 static 的成员函数参数槽从 0 起（无 this）。
+                    val isStaticMember = !isInterface && decl.symbol in staticFunctionSymbols
+                    val methodFlags = if (isInterface) Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT else -1
+                    generateIrFunction(cw, decl, internalName, isStaticMember, methodFlags)
                 }
                 is IrConstructor -> {
                     // Handle enum constructors: they need synthetic (String, int) prefix
@@ -1567,8 +1610,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             }
                             // 描述符用被调函数的声明类型（擦除后），拿不到符号时退回实参类型；
                             // owner 同理退回当前文件（顶层函数同文件调用的情况）。
+                            // 合成静态调用（枚举 values/valueOf）没有 IR 声明，owner 取自 translator
+                            // 旁路登记的宿主表。
                             val desc = irCallDescriptor(expr)
-                            val targetOwner = functionSymbolToOwner[expr.symbol] ?: owner
+                            val targetOwner = functionSymbolToOwner[expr.symbol]
+                                ?: syntheticStaticCallOwners[expr.symbol]
+                                ?: owner
                             mv.visitMethodInsn(Opcodes.INVOKESTATIC, targetOwner, irName, desc, false)
                             // Handle return type mismatch between erasure and call-site IR type.
                             // 中文：调用点 IR 类型与被调函数真实返回类型可能不同（泛型擦除：
@@ -1644,11 +1691,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
             is IrGetField -> {
                 // 字段读取：先看是否为接口常量（static final），走 GETSTATIC；
-                // 否则求接收者后 GETFIELD。字段名兜底为 "field"（符号表缺失时不至于崩）。
-                val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
+                // 否则求接收者后 GETFIELD。符号/类型缺失一律 fail fast（禁止静默兜底）。
                 if (expr.symbol in staticFieldSymbols) {
+                    val fieldName = requireFieldName(expr.symbol)
                     val fieldOwner = resolveFieldOwner(expr.symbol)
-                    val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.type)
+                    val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.type))
                     mv.visitFieldInsn(Opcodes.GETSTATIC, fieldOwner, fieldName, fieldDesc)
                     return
                 }
@@ -1657,28 +1704,31 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // Handle array.length: emit ARRAYLENGTH instead of GETFIELD
                 // 中文：`arr.length` 在 JVM 里是 ARRAYLENGTH 指令，不是字段访问——IR 把它
                 // 表达成对数组的字段读取，这里必须改写指令，否则会写出不存在的 length 字段。
+                // 注意：必须在解析字段名之前返回，因为数组没有真实的字段符号（假符号无名字）。
                 if (receiver != null && isArrayType(receiver.type)) {
                     mv.visitInsn(Opcodes.ARRAYLENGTH)
                     return
                 }
-                val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.type)
+                val fieldName = requireFieldName(expr.symbol)
+                val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.type))
                 val fieldOwner = resolveFieldOwner(expr.symbol)
                 mv.visitFieldInsn(Opcodes.GETFIELD, fieldOwner, fieldName, fieldDesc)
             }
             is IrSetField -> {
                 // 字段写：静态走 PUTSTATIC（无接收者）；实例先压接收者再压值，最后 PUTFIELD。
-                // 描述符取被写值的类型（与字段声明类型在 translator 侧已对齐）。
-                val fieldName = fieldSymbolToName[expr.symbol] ?: "field"
+                // 描述符取被写值的类型（与字段声明类型在 translator 侧已对齐）；缺失一律 fail fast。
                 if (expr.symbol in staticFieldSymbols) {
+                    val fieldName = requireFieldName(expr.symbol)
                     generateIrExpression(mv, expr.value, ctx, owner)
                     val fieldOwner = resolveFieldOwner(expr.symbol)
-                    val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.value.type)
+                    val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.value.type))
                     mv.visitFieldInsn(Opcodes.PUTSTATIC, fieldOwner, fieldName, fieldDesc)
                     return
                 }
                 val receiver = expr.receiver
                 if (receiver != null) generateIrExpression(mv, receiver, ctx, owner)
-                val fieldDesc = typeMapper.jvmDescriptorFromIrType(expr.value.type)
+                val fieldName = requireFieldName(expr.symbol)
+                val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.value.type))
                 generateIrExpression(mv, expr.value, ctx, owner)
                 val fieldOwner = resolveFieldOwner(expr.symbol)
                 mv.visitFieldInsn(Opcodes.PUTFIELD, fieldOwner, fieldName, fieldDesc)

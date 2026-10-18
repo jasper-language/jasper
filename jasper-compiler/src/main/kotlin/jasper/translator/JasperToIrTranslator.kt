@@ -83,7 +83,18 @@ data class TranslationResult(
     // constants). Backend uses this for `GETSTATIC`/`PUTSTATIC` and for the
     // `public static final` field flags.
     // 必须以 JVM 静态方式读写/发射的字段符号（接口常量）；后端据此发 GETSTATIC/PUTSTATIC 与 static final 标志。
-    val staticFieldSymbols: Set<IrFieldSymbol> = emptySet()
+    val staticFieldSymbols: Set<IrFieldSymbol> = emptySet(),
+    // Member functions declared `static`: backend emits them with ACC_STATIC and a
+    // receiver-less parameter slot base, so `A.f()` lowers to INVOKESTATIC.
+    // 声明为 `static` 的成员函数符号集合：后端据此给成员方法加 ACC_STATIC 并用
+    // 「无接收者」的参数槽起点，使 `A.f()` 正确降为 INVOKESTATIC。
+    val staticFunctionSymbols: Set<IrSimpleFunctionSymbol> = emptySet(),
+    // Synthetic static calls (enum `values()` / `valueOf(String)`): symbol -> JVM
+    // internal owner name. The method name comes from `callNames`; the descriptor
+    // is derived by the backend from the argument types and the call's IR type.
+    // 合成静态调用（枚举 values()/valueOf(String)）：符号 -> JVM 内部宿主名。
+    // 方法名取自 callNames；描述符由后端据实参类型与调用 IR 类型推导。
+    val syntheticStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap()
 )
 
 /**
@@ -176,6 +187,22 @@ data class TranslationContext(
     // Field symbols for interface constants (`public static final` fields).
     // 接口常量（public static final 字段）的字段符号集合，导出给后端发静态指令。
     val staticFieldSymbols: MutableSet<IrFieldSymbol> = mutableSetOf(),
+    // Static member function index: JVM-style class name -> function name -> symbol.
+    // `A.f()` call sites look up the *declaration's* symbol here so the call and the
+    // method share one identity; the backend then resolves the owner via the symbol.
+    // 静态成员函数索引：JVM 风格类名 -> 函数名 -> 符号。`A.f()` 调用点据此取到与声明
+    // 同一身份的符号，后端便能由符号反查 owner（INVOKESTATIC 的目标类）。
+    val staticMemberFunctionSymbolsByType: MutableMap<String, MutableMap<String, IrSimpleFunctionSymbol>> = mutableMapOf(),
+    // Member function symbols declared `static` (exported to the backend for ACC_STATIC).
+    // 声明为 `static` 的成员函数符号集合（导出后端以加 ACC_STATIC）。
+    val staticFunctionSymbols: MutableSet<IrSimpleFunctionSymbol> = mutableSetOf(),
+    // Enum class keys (JVM-style names): `Types.values()`/`valueOf` are synthesized
+    // static calls, recognized by this set.
+    // 枚举类名（JVM 风格）集合：`Types.values()`/`valueOf` 被识别为合成静态调用。
+    val enumClassKeys: MutableSet<String> = mutableSetOf(),
+    // Synthetic static call owner index: symbol -> owner internal name (enum synth methods).
+    // 合成静态调用的宿主索引：符号 -> 宿主内部名（枚举合成方法）。
+    val syntheticStaticCallOwners: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
     // Enum constants: JVM internal class name -> constant name -> IR enum-entry symbol.
     // 枚举常量索引：JVM 内部类名 -> 常量名 -> IR 枚举项符号。
     // 为什么必须预登记：`Color.Red` 可能出现在枚举声明之前（同文件靠后声明或跨文件），
@@ -217,6 +244,7 @@ class JasperToIrTranslator {
         collectHashableClassNames(listOf(ast), ctx)
         collectMemberReturnTypes(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
+        predeclareStaticMemberFunctions(ast, ctx)
         predeclareEnumConstants(listOf(ast), ctx)
         val fileEntry = NaiveSourceBasedFileEntryImpl("<main>", intArrayOf(), 0)
         val fileSymbol = IrFileSymbolImpl()
@@ -235,7 +263,9 @@ class JasperToIrTranslator {
             classSuperclassNames = ctx.classSuperclassNames.toMap(),
             classInterfaceNames = ctx.interfaceNames.mapValues { it.value.toList() }.toMap(),
             interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
-            staticFieldSymbols = ctx.staticFieldSymbols.toSet())
+            staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
+            staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
+            syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap())
     }
 
     /**
@@ -256,6 +286,7 @@ class JasperToIrTranslator {
             collectHashableClassNames(listOf(ast), ctx)
             collectMemberReturnTypes(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
+            predeclareStaticMemberFunctions(ast, ctx)
             predeclareEnumConstants(listOf(ast), ctx)
         }
 
@@ -281,7 +312,9 @@ class JasperToIrTranslator {
             classSuperclassNames = ctx.classSuperclassNames.toMap(),
             classInterfaceNames = ctx.interfaceNames.mapValues { it.value.toList() }.toMap(),
             interfaceDeclNames = ctx.interfaceDeclNames.toSet(),
-            staticFieldSymbols = ctx.staticFieldSymbols.toSet())
+            staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
+            staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
+            syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap())
     }
 
     /**
@@ -495,6 +528,42 @@ class JasperToIrTranslator {
         }
     }
 
+    /**
+     * 做什么：预登记「声明为 static 的成员函数」的符号，并记录本次编译中出现的枚举类名。
+     * 什么时候用：translate / translateAll 的第一遍（必须在 installFileContext 之后，
+     *   以便 resolveNamedTypeName 得到与运行时一致的 JVM 风格类名）。
+     * 前置条件：asts 已完成解析；当前文件上下文已安装。
+     * 失败模式：不抛异常；非类型声明被跳过。重复预登记用 putIfAbsent 保持首登记者（声明顺序优先）。
+     * 为什么这样设计：`A.f()` 的调用点必须拿到与声明**同一身份**的函数符号，后端才能由符号
+     *   反查 owner（INVOKESTATIC 的目标类）；同时把「哪些函数是 static」旁路给后端以发出
+     *   ACC_STATIC。枚举类名集合则用于识别 `Types.values()`/`valueOf` 这两个合成静态方法。
+     *   （隔离的变化点：静态性来源只在声明侧判定，调用/后端不再各自猜测。）
+     */
+    private fun predeclareStaticMemberFunctions(ast: JasSourceFile, ctx: TranslationContext) {
+        for (decl in ast.declarations) {
+            val owner = when (decl) {
+                is JasClass -> typeMapper.resolveNamedTypeName(decl.name)
+                is JasInterface -> typeMapper.resolveNamedTypeName(decl.name)
+                is JasEnum -> typeMapper.resolveNamedTypeName(decl.name)
+                else -> null
+            } ?: continue
+            if (decl is JasEnum) ctx.enumClassKeys.add(owner)
+            val members = when (decl) {
+                is JasClass -> decl.members
+                is JasInterface -> decl.members
+                is JasEnum -> decl.members
+                else -> emptyList()
+            }
+            for (member in members) {
+                if (member is JasFunction && hasModifier(member.modifiers, "static")) {
+                    val byName = ctx.staticMemberFunctionSymbolsByType.getOrPut(owner) { mutableMapOf() }
+                    val symbol = byName.getOrPut(member.name) { IrSimpleFunctionSymbolImpl() }
+                    ctx.staticFunctionSymbols.add(symbol)
+                }
+            }
+        }
+    }
+
     private fun translateTopLevelDeclaration(decl: JasDeclaration, ctx: TranslationContext): IrDeclaration? {
         return when (decl) {
             is JasFunction -> translateFunction(decl, null, ctx)
@@ -549,6 +618,11 @@ class JasperToIrTranslator {
         val returnType = resolveTypeParam(func.returnType)
         val symbol = if (parentClass == null) {
             ctx.functionSymbols[func.name] ?: IrSimpleFunctionSymbolImpl()
+        } else if (hasModifier(func.modifiers, "static")) {
+            // 静态成员函数：复用预登记符号，保证声明处与 `A.f()` 调用点共享同一符号身份，
+            // 后端才能由符号反查 owner 并发出 ACC_STATIC（否则调用与声明会指向两个符号）。
+            ctx.staticMemberFunctionSymbolsByType[ctx.currentClassName]?.get(func.name)
+                ?: IrSimpleFunctionSymbolImpl()
         } else {
             IrSimpleFunctionSymbolImpl()
         }
@@ -2278,6 +2352,12 @@ class JasperToIrTranslator {
                 return translateLambdaInvocation(lambda, expr.args, ctx)
             }
         }
+        // 类名静态方法调用：`A.f()` 与枚举合成方法 `Types.values()`/`valueOf(...)`。
+        // 必须在实例成员调用路径之前分流：静态调用不生成接收者实参，后端走 INVOKESTATIC。
+        val staticCall = resolveStaticCallTarget(expr, ctx)
+        if (staticCall != null) {
+            return translateStaticCall(expr, staticCall, ctx)
+        }
         val symbol = ctx.functionSymbols[name]
             ?: IrSimpleFunctionSymbolImpl()
         ctx.callNames[symbol] = if (expr.target is JasPropertyAccess) "v:$name" else name
@@ -2346,6 +2426,77 @@ class JasperToIrTranslator {
         return IrNodeFactory.createCall(
             0, 0, returnType, IrStatementOrigin.INVOKE,
             irArgs, emptyArray<IrType>(), symbol, null
+        )
+    }
+
+    /**
+     * 一次静态方法调用的解析结果。
+     *
+     * 做什么：把「函数符号」「宿主类内部名」「返回类型」「是否合成方法」成组带出。
+     * 什么时候用：[resolveStaticCallTarget] 的返回值、[translateStaticCall] 的输入。
+     * 失败模式：仅承载数据，无副作用；字段在解析成功时必定非空。
+     * 为什么用数据类：四个值同生同灭，避免调用方在多张索引表里重复查找或拿到半成品状态。
+     */
+    private data class StaticCallRef(
+        val symbol: IrSimpleFunctionSymbol,
+        val owner: String,
+        val returnType: IrType
+    )
+
+    /**
+     * 做什么：识别 `A.f(...)` 形式的类名静态调用，返回其符号/宿主/返回类型；不是静态调用时返回 null。
+     * 什么时候用：[translateCall] 在实例成员调用路径之前调用。
+     * 前置条件：target 的基名未被局部变量遮蔽，且是本次编译声明的类型名（[declaredClassName]）。
+     * 失败模式：返回 null，调用方继续走实例成员/顶层函数路径（不抛异常）。
+     * 为什么这样设计：把「是不是类名静态调用」收敛到唯一入口，`translateCall` 无需理解
+     *   枚举合成方法（values/valueOf）与用户 static 方法在来源上的差异（隔离的变化点）。
+     *   只有静态符号存在时才认领：否则可能是 `obj.field` 之类的实例访问，交回原路径。
+     */
+    private fun resolveStaticCallTarget(expr: JasCall, ctx: TranslationContext): StaticCallRef? {
+        val target = expr.target as? JasPropertyAccess ?: return null
+        val classKey = declaredClassName(target.target, ctx) ?: return null
+        val memberName = target.property
+        // 枚举的 values()/valueOf(String) 由后端合成：没有 AST 声明，用新符号 + 宿主索引登记。
+        if (classKey in ctx.enumClassKeys) {
+            when (memberName) {
+                "values" -> {
+                    val enumType = typeMapper.type(classKey)
+                    val symbol = IrSimpleFunctionSymbolImpl()
+                    ctx.syntheticStaticCallOwners[symbol] = classKey
+                    ctx.callNames[symbol] = memberName
+                    return StaticCallRef(symbol, classKey, typeMapper.arrayType(enumType))
+                }
+                "valueOf" -> {
+                    val enumType = typeMapper.type(classKey)
+                    val symbol = IrSimpleFunctionSymbolImpl()
+                    ctx.syntheticStaticCallOwners[symbol] = classKey
+                    ctx.callNames[symbol] = memberName
+                    return StaticCallRef(symbol, classKey, enumType)
+                }
+            }
+        }
+        val symbol = ctx.staticMemberFunctionSymbolsByType[classKey]?.get(memberName) ?: return null
+        val returnType = ctx.memberReturnTypesByType[classKey]?.get(memberName)
+            ?: ctx.functionReturnTypes[memberName]
+            ?: typeMapper.unitType()
+        return StaticCallRef(symbol, classKey, returnType)
+    }
+
+    /**
+     * 做什么：把已识别的静态调用翻译成无接收者的 IrCall（后端据此发 INVOKESTATIC）。
+     * 什么时候用：[resolveStaticCallTarget] 命中后由 [translateCall] 调用。
+     * 前置条件：ref 由 [resolveStaticCallTarget] 产出；expr.args 为调用实参（不含接收者）。
+     * 失败模式：不抛异常；未识别为 static 的方法不会走到这里（见 resolveStaticCallTarget 的前置判定）。
+     * 为什么这样设计：静态调用与实例调用的唯一 IR 差异就是「有没有接收者实参」以及调用名
+     *   （静态用普通名字，实例用 "v:" 前缀）。把它独立成函数，调用名协议的变化点只在这里。
+     */
+    private fun translateStaticCall(expr: JasCall, ref: StaticCallRef, ctx: TranslationContext): IrExpression {
+        // 静态调用名必须是普通函数名：后端以 "v:" 前缀区分实例调用，其余一律按 INVOKESTATIC。
+        ctx.callNames[ref.symbol] = (expr.target as JasPropertyAccess).property
+        val irArgs = expr.args.map { translateExpression(it, ctx) }.toTypedArray()
+        return IrNodeFactory.createCall(
+            0, 0, ref.returnType, IrStatementOrigin.INVOKE,
+            irArgs, emptyArray<IrType>(), ref.symbol, null
         )
     }
 
