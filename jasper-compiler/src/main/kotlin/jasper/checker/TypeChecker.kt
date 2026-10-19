@@ -119,6 +119,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         // 显式类型引用可见性判定所需的本文件上下文：包名 + 本文件 import 表。
         currentPackageName = sourceFile.packageName
         fileImports = collectFileImports(sourceFile)
+        // 把本文件的包/import 装进符号表：多文件编译共享同一张表，findXxx 的简单名
+        // 必须按「正在检查的文件」解析，否则 p1/p2 同名类型会串包。
+        symbolTable?.beginFileScope(currentPackageName, fileImports)
         checkDuplicateTopLevelDeclarations(sourceFile)
         // First pass: collect class hierarchy (interfaces, implements)
         // 第一遍只收集「类->接口」「接口->父接口」的层次信息，供后续子类型判定使用，
@@ -158,16 +161,24 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
     }
 
-    /** 记录一个类的 implements 列表与直接父类；已存在的条目不被覆盖（当前文件优先）。 */
+    /**
+     * 记录一个类的 implements 列表与直接父类；已存在的条目不被覆盖（当前文件优先）。
+     *
+     * 键使用「包 + 简单名」的限定名：跨包的 `p1.Impl` / `p2.Impl` 必须各自维护自己的
+     * 父类型关系，否则后遍历的包会覆盖前一个包，生成错误的接口表。
+     * 接口名解析使用声明所在文件自己的 import 上下文（而不是当前检查文件的上下文），
+     * 这样跨文件声明 `class Impl implements ImportedThing` 也能得到正确的限定名。
+     */
     private fun collectClassHierarchy(cls: JasClass) {
-        if (classImplements.containsKey(cls.name)) return
+        val self = qualifiedTypeName(cls)
+        if (classImplements.containsKey(self)) return
         // 只认 JasNamedType 形式的接口名；其它类型（如泛型实参）这里不展开。
         val ifaces = cls.interfaces.mapNotNull { iface ->
-            if (iface is JasNamedType) iface.name else null
+            if (iface is JasNamedType) resolveDeclarationTypeName(cls, iface.name) else null
         }
-        classImplements[cls.name] = ifaces
+        classImplements[self] = ifaces
         // 父类同样只认 JasNamedType；无显式父类时记 null（等价 java.lang.Object）。
-        classExtends[cls.name] = (cls.superclass as? JasNamedType)?.name
+        classExtends[self] = (cls.superclass as? JasNamedType)?.let { resolveDeclarationTypeName(cls, it.name) }
     }
 
     /**
@@ -227,12 +238,52 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
 
     /** 记录一个接口的 extends 列表；已存在的条目不被覆盖（当前文件优先）。 */
     private fun collectInterfaceHierarchy(iface: JasInterface) {
-        if (interfaceExtends.containsKey(iface.name)) return
+        val self = qualifiedTypeName(iface)
+        if (interfaceExtends.containsKey(self)) return
         val parents = iface.extends.mapNotNull { ext ->
-            if (ext is JasNamedType) ext.name else null
+            if (ext is JasNamedType) resolveDeclarationTypeName(iface, ext.name) else null
         }
-        interfaceExtends[iface.name] = parents
+        interfaceExtends[self] = parents
     }
+
+    /**
+     * 把声明 [owner] 的简单名落成限定名（包 + 名）。
+     *
+     * 什么时候用：[collectClassHierarchy]/[collectInterfaceHierarchy] 为继承图建键时。
+     * 前置条件：owner 已经过符号表采集；symbolTable 可为 null（结构检查模式）。
+     * 失败模式：符号表缺失或声明未登记时退回「当前文件包 + 简单名」，保证行为可继续。
+     * 为什么不能用 `cls.name`：跨包同名类型会让 p1/p2 的继承边互相覆盖。
+     */
+    private fun qualifiedTypeName(owner: JasDeclaration): String {
+        val key = symbolTable?.typeKeyOfDeclaration(owner)
+        if (key != null) return key.qualifiedName
+        // 无符号表时仍能处理当前文件的四类顶层声明；其它声明不会进入继承图。
+        val simpleName = when (owner) {
+            is JasClass -> owner.name
+            is JasInterface -> owner.name
+            is JasEnum -> owner.name
+            is JasAnnotationType -> owner.name
+            else -> ""
+        }
+        return jasTypeKey(simpleName).qualifiedName
+    }
+
+    /**
+     * 在声明 [owner] 自己的文件上下文中解析一个类型引用，返回点分限定名。
+     *
+     * 失败模式：无法解析时保留原写法（例如 JDK 外部类型 `java.lang.Throwable`），
+     *   这样可以继续按原名字做宽泛比较，而不是伪造一个本程序的包名。
+     */
+    private fun resolveDeclarationTypeName(owner: JasDeclaration, name: String): String {
+        return symbolTable?.resolveTypeKeyForDeclaration(owner, name)?.qualifiedName ?: name
+    }
+
+    /**
+     * 用当前检查文件的包名构造一个兜底 [TypeKey]；无符号表时所有声明都在当前文件，
+     * 因此这与符号表身份语义一致。
+     */
+    private fun jasTypeKey(simpleName: String): jasper.compiler.TypeKey =
+        jasper.compiler.TypeKey(currentPackageName ?: "", simpleName)
 
     private fun error(message: String, node: JasNode? = null) {
         errors.add(TypeError(message, node))
@@ -569,15 +620,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
      *   import 掩盖（SymbolTable.imports 是跨文件合并的全局表）。
      */
     private fun collectFileImports(sourceFile: JasSourceFile): Map<String, String> {
-        val out = mutableMapOf<String, String>()
-        for (decl in sourceFile.imports) {
-            if (decl !is JasImport) continue
-            val simpleName = decl.name.split('.').lastOrNull() ?: decl.name
-            out[simpleName] = decl.name
-            // 别名与简单名并存：两种写法都映射到同一个全限定名。
-            decl.alias?.let { out[it] = decl.name }
-        }
-        return out
+        // 复用符号表的同一份 import 解析规则（含 from-import、别名与非通配过滤），
+        // 避免类型检查器与符号表对「简单名 -> 全限定名」得出不同结论。
+        return jasper.compiler.buildImportMap(sourceFile.imports)
     }
 
     private fun checkFunction(func: JasFunction, env: TypeEnvironment) {
@@ -1516,28 +1561,24 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     private fun ancestorTypeNames(start: String): List<String> {
         val result = LinkedHashSet<String>()
         val queue = ArrayDeque<String>()
-        // seen 初始为空，起点由 enqueue 首次入队；result 用 `name != start` 把起点自身排除。
+        val startName = canonicalTypeName(start)
+        // seen 初始为空，起点由 enqueue 首次入队；result 用 `name != startName` 把起点自身排除。
         // 注意：不能预置 seen=start，否则 enqueue(start) 会被判重而丢弃，BFS 无法启动。
         // 用局部 lambda（而非局部 fun）：既保持单一定义，又不让代码风格护栏把局部函数
         // 误判成「缺少中文 KDoc 的公共 API」。
         val seen = mutableSetOf<String>()
         val enqueue: (String?) -> Unit = { name ->
-            if (name != null && seen.add(name)) queue.add(name)
+            if (name != null) {
+                val canonical = canonicalTypeName(name)
+                if (seen.add(canonical)) queue.add(canonical)
+            }
         }
-        enqueue(start)
+        enqueue(startName)
         while (queue.isNotEmpty()) {
             val name = queue.removeFirst()
-            if (name != start) result.add(name)
-            val cls = symbolTable?.findClass(name)
-            if (cls != null) {
-                (cls.superclass as? JasNamedType)?.let { enqueue(it.name) }
-                cls.interfaces.filterIsInstance<JasNamedType>().forEach { enqueue(it.name) }
-            }
-            symbolTable?.findInterface(name)?.extends
-                ?.filterIsInstance<JasNamedType>()
-                ?.forEach { enqueue(it.name) }
-            // 当前文件收集到的层次信息（用于跨文件/当前文件声明优先的场景）。
-            // classExtends 补上类继承方向：即使 symbolTable 缺失，成员查找也能沿父类链。
+            if (name != startName) result.add(name)
+            // 继承图已在 [check] 第一遍把当前文件与符号表中的所有类型合并进来，
+            // 因此这里只读图，不再按简单名回查符号表，避免跨包同名时选错声明。
             classExtends[name]?.let { enqueue(it) }
             classImplements[name]?.forEach { enqueue(it) }
             interfaceExtends[name]?.forEach { enqueue(it) }
@@ -1748,35 +1789,50 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     }
 
     private fun isSubtype(subName: String, superName: String, visited: MutableSet<String> = mutableSetOf()): Boolean {
+        // 先把两边都规范化成「包 + 名」的限定名：继承图按限定名建键，
+        // 而调用方传进来的通常是源码里的简单名。
+        val sub = canonicalTypeName(subName)
+        val sup = canonicalTypeName(superName)
         // visited 防止继承层次成环（或重复访问）导致无限递归。
-        if (subName == superName) return true
-        if (!visited.add(subName)) return false
+        if (sub == sup) return true
+        if (!visited.add(sub)) return false
         // Check direct class inherits superclass
         // 类继承方向：Child extends Base => Child 是 Base 的子类型；
         // 沿直接父类递归即得传递闭包（A <- B <- C 时 C 亦是 A 的子类型）。
-        val superclass = classExtends[subName]
+        val superclass = classExtends[sub]
         if (superclass != null) {
-            if (superclass == superName) return true
-            if (isSubtype(superclass, superName, visited)) return true
+            if (superclass == sup) return true
+            if (isSubtype(superclass, sup, visited)) return true
         }
         // Check direct class implements interfaces
-        val ifaces = classImplements[subName]
+        val ifaces = classImplements[sub]
         if (ifaces != null) {
-            if (superName in ifaces) return true
+            if (sup in ifaces) return true
             // Transitively check each implemented interface's parent hierarchy
             // 递归检查每个已实现接口的父接口层次。
             for (iface in ifaces) {
-                if (isSubtype(iface, superName, visited)) return true
+                if (isSubtype(iface, sup, visited)) return true
             }
         }
         // Check interface extends hierarchy
-        val parents = interfaceExtends[subName]
+        val parents = interfaceExtends[sub]
         if (parents != null) {
             for (parent in parents) {
-                if (isSubtype(parent, superName, visited)) return true
+                if (isSubtype(parent, sup, visited)) return true
             }
         }
         return false
+    }
+
+    /**
+     * 把源码类型名规范化为符号表的限定名；无法解析时保留原名字。
+     *
+     * 什么时候用：isSubtype / ancestorTypeNames 等继承图查询。
+     * 前置条件：当前文件作用域已通过 SymbolTable.beginFileScope 设置。
+     * 失败模式：外部/JDK 类型或未声明类型保持原样（仍然可做相等比较），不抛异常。
+     */
+    private fun canonicalTypeName(name: String): String {
+        return symbolTable?.resolveTypeKey(name)?.qualifiedName ?: name
     }
 
     private val numericWidening = mapOf(

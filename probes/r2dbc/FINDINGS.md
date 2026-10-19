@@ -100,6 +100,9 @@ Flux.declaredFields=[FETCH_SIZE]
 > **Q25 / C6+C16** 修复 `③编译器缺陷` #5（跨文件/跨包字段访问依赖文件翻译顺序）：
 > 字段符号/类型改为在第二遍翻译前按类统一预登记，声明处复用同一 `IrFieldSymbol` 身份，
 > 文件顺序不再影响字段解析；回归守门见 `jasper.CrossFileFieldTest`。
+> **Q27 / C16** 修复 `③编译器缺陷` #13（跨包同名类型不可共存）：类型主键改为
+> 「包 + 简单名」，检查器按本包/import 解析简单名，翻译与后端按 JVM 内部名区分
+> 父类/接口/描述符；回归守门见 `jasper.CrossPackageTypeIdentityTest`。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -476,6 +479,14 @@ public class T {
 
 #### 13. 跨包同名类型不可共存
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q27 / C16）**——类型身份改为「包名 + 简单名」（`TypeKey`），
+  符号表的 class/interface/enum/annotation 与成员索引均按该键存储；简单名查询保留为
+  「本包 → 当前文件 import → 全局唯一候选」的兼容层。
+  生成侧同步按 JVM 内部名区分（`p1/Thing`、`p2/Thing`），字段/方法描述符使用
+  `Lp1/Thing;` / `Lp2/Thing;`；`classSuperclassNames` / `classInterfaceNames` /
+  `interfaceDeclNames` 也改用内部名为键，避免跨包同名类互相覆盖接口表。
+  回归守门见 `jasper.CrossPackageTypeIdentityTest`（真编译 + `URLClassLoader` 真执行 +
+  `javap` 描述符断言）；以下「实测」为修复前证据，保留作历史记录。
 - 现象：符号表按**简单名**登记类型，两个不同包里同名类型触发重复声明。
 - 触发代码：
 ```jasper

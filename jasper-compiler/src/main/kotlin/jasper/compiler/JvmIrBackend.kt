@@ -532,15 +532,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         // 超类：枚举一律继承 java/lang/Enum（枚举常量的 name/ordinal 由它提供）；普通类查
         // translator 交来的超类表（值已是内部名）；查不到按 Object。接口的 super 在 classfile
         // 里仍写 java/lang/Object（JVM 规范要求）。
+        // 映射表以 JVM 内部名（含包）为键：p1.Impl / p2.Impl 的父类与接口表不能按简单名
+        // 共享，否则后写者会覆盖前者，生成错误的 class 文件。
         val superName = when {
             isEnum -> "java/lang/Enum"
-            classSuperclassNames.containsKey(cls.name.toString()) -> classSuperclassNames[cls.name.toString()]!!
+            classSuperclassNames.containsKey(internalName) -> classSuperclassNames[internalName]!!
             else -> "java/lang/Object"
         }
         // 直接接口列表：注解类型强制实现 java/lang/annotation/Annotation；其余查映射表。
         val interfaceNames = when {
             isAnnotation -> arrayOf("java/lang/annotation/Annotation")
-            classInterfaceNames.containsKey(cls.name.toString()) -> classInterfaceNames[cls.name.toString()]!!.toTypedArray()
+            classInterfaceNames.containsKey(internalName) -> classInterfaceNames[internalName]!!.toTypedArray()
             else -> emptyArray()
         }
         // 泛型 Signature（类级 <T:...>LSuper;...）：只有类有类型参数时才非 null；
@@ -941,7 +943,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      *   (接口方法, 实现方法) 需要桥」收敛到本函数，主生成路径无须理解泛型（隔离的变化点）。
      */
     private fun generateBridgeMethods(cw: ClassWriter, cls: IrClass, internalName: String) {
-        val ifaceNames = classInterfaceNames[cls.name.toString()] ?: return
+        val ifaceNames = classInterfaceNames[internalName] ?: return
         val ownMethods = cls.declarations.filterIsInstance<IrSimpleFunction>()
         if (ownMethods.isEmpty() || ifaceNames.isEmpty()) return
         val ownByName = ownMethods.groupBy { it.name.toString() }
@@ -1101,11 +1103,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             body.statements[0] is IrCall &&
             callNames[(body.statements[0] as IrCall).symbol]?.startsWith("ctor_delegate:") == true
         if (!hasDelegate) {
-            // 隐式 super()：ALOAD 0 + INVOKESPECIAL Super.<init>()V。超类名用简单名查表
-            // （owner 是内部名，表以简单名为键），查不到回落 Object。
+            // 隐式 super()：ALOAD 0 + INVOKESPECIAL Super.<init>()V。owner 就是类的
+            // JVM 内部名，映射表也以内部名为键，直接查表即可；查不到回落 Object。
             mv.visitVarInsn(Opcodes.ALOAD, 0)
-            val simpleName = owner.substringAfterLast('/')
-            val superName = classSuperclassNames[simpleName] ?: "java/lang/Object"
+            val superName = classSuperclassNames[owner] ?: "java/lang/Object"
             mv.visitMethodInsn(Opcodes.INVOKESPECIAL, superName, "<init>", "()V", false)
         }
         if (body is IrBlockBody) {
@@ -1815,9 +1816,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // Determine if receiver is an interface
                             // 接口方法必须用 INVOKEINTERFACE（且参数 isInterface=true，
                             // 末尾 4 字节要求 count 参数），用错会导致 IncompatibleClassChangeError。
-                            // 判定用「原始内部名」与其简单名两种写法，兼容 translator 的命名差异。
-                            val isInterfaceTarget = interfaceDeclNames.contains(rawReceiverInternal) ||
-                                interfaceDeclNames.contains(rawReceiverInternal.substringAfterLast('/'))
+                            // 只按完整内部名判定：translator 现在把接口声明登记为「包 + 名」。
+                            // 若再回退到简单名，跨包「同名 interface + 同名 class」会把 class
+                            // 误判成接口，发出 INVOKEINTERFACE 并在链接期报 IncompatibleClassChangeError。
+                            val isInterfaceTarget = interfaceDeclNames.contains(rawReceiverInternal)
                             // 声明擦除签名：泛型接口方法（如 Repo.save(T)）在 JVM 里是
                             // (Ljava/lang/Object;)V，不能按实参类型（Person）拼描述符。
                             // 参数个数对不上（重载/varargs 等）时退回旧行为。

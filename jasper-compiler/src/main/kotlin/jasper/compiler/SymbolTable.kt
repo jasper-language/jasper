@@ -33,6 +33,73 @@
 package jasper.compiler
 
 import jasper.ast.*
+import java.util.IdentityHashMap
+
+/**
+ * 顶层类型的全局身份：**包名 + 简单名**。
+ *
+ * 做什么：作为 [SymbolTable] 中 classes/interfaces/enums/annotations 与成员签名索引的
+ *   主键，使 `p1.Thing` 与 `p2.Thing` 成为两个互不冲突的类型。
+ * 什么时候用：采集声明、按限定名查询、把声明类型解析成 JVM 内部名时。
+ * 前置条件：simpleName 必须是最末一段名字（当前语言不支持嵌套类型）；packageName 用
+ *   空串表示无 package 声明的默认包。
+ * 失败模式：本身是纯数据，不抛异常；[fromQualifiedName] 对空串返回 null。
+ * 为什么这样设计：类型身份是「包 + 名」而不是「名」，把这条规则收敛成值对象后，
+ *   所有以类型为键的索引共享同一口径，避免各处各自拼字符串导致身份不一致。
+ */
+data class TypeKey(val packageName: String, val simpleName: String) {
+    /**
+     * 点分全限定名：无包时就是简单名。
+     * 什么时候用：诊断、TypeChecker 的继承图表键、以及需要把类型身份落成人类可读名字时。
+     */
+    val qualifiedName: String
+        get() = if (packageName.isEmpty()) simpleName else "$packageName.$simpleName"
+
+    companion object {
+        /**
+         * 把点分限定名拆成 [TypeKey]；无点号时归入默认包。
+         *
+         * 失败模式：空名字返回 null（调用方应视为「无法解析」而不是默认包类型）。
+         * 为什么不用 lastIndexOf('/')：源码层使用点分名；JVM 内部名在进入符号表前
+         *   应已由 TypeMapper 处理，这里只负责语言层身份。
+         */
+        fun fromQualifiedName(name: String): TypeKey? {
+            if (name.isEmpty()) return null
+            val lastDot = name.lastIndexOf('.')
+            return if (lastDot < 0) {
+                TypeKey("", name)
+            } else {
+                TypeKey(name.substring(0, lastDot), name.substring(lastDot + 1))
+            }
+        }
+    }
+}
+
+/**
+ * 构造一个源文件的精确 import 表：`简单名/别名 -> 点分全限定名`。
+ *
+ * 做什么：同时支持 `import a.b.Thing;`、`import a.b.Thing as T;` 与
+ *   `from a.b import Thing;` 三种精确导入形态；通配导入不在此展开（当前语言不支持
+ *   安全展开，避免把未知名字猜成错误的全限定名）。
+ * 什么时候用：SymbolTable 采集每个文件的解析上下文，以及 TypeChecker 判定显式类型
+ *   可见性时。
+ * 前置条件：imports 中非 [JasImport] 的节点会被忽略。
+ * 失败模式：不抛异常；无法识别的形态跳过，未命中返回空映射。
+ * 为什么集中成顶层函数：import 的「简单名/别名 + fromSource」解析规则被符号表与
+ *   类型检查器共用，放在一处可避免两份实现随语法演进漂移。
+ */
+fun buildImportMap(imports: List<JasDeclaration>): Map<String, String> {
+    val result = linkedMapOf<String, String>()
+    for (decl in imports) {
+        if (decl !is JasImport || decl.isOnDemand) continue
+        val fqn = if (decl.fromSource != null) "${decl.fromSource}.${decl.name}" else decl.name
+        val simple = decl.alias ?: fqn.substringAfterLast('.')
+        result[simple] = fqn
+        // 别名与简单名并存：两种写法都解析到同一全限定名。
+        decl.alias?.let { result[it] = fqn }
+    }
+    return result
+}
 
 /**
  * 符号/声明错误记录：由 SymbolTable 在采集与合并阶段产生。
@@ -57,10 +124,16 @@ data class SymbolError(val message: String, val kind: String, val name: String, 
  */
 class SymbolTable {
     val functions: MutableMap<String, MutableList<JasFunction>> = mutableMapOf()
-    val classes: MutableMap<String, JasClass> = mutableMapOf()
-    val interfaces: MutableMap<String, JasInterface> = mutableMapOf()
-    val enums: MutableMap<String, JasEnum> = mutableMapOf()
-    val annotations: MutableMap<String, JasAnnotationType> = mutableMapOf()
+    /**
+     * 已声明类，键是 [TypeKey]（包名 + 简单名）。
+     *
+     * 为什么不再以简单名为键：跨包同名类型（`p1.Thing` / `p2.Thing`）是不同身份；
+     * 简单名只应作为查询期的解析输入，不能作为存储期的全局主键。
+     */
+    val classes: MutableMap<TypeKey, JasClass> = mutableMapOf()
+    val interfaces: MutableMap<TypeKey, JasInterface> = mutableMapOf()
+    val enums: MutableMap<TypeKey, JasEnum> = mutableMapOf()
+    val annotations: MutableMap<TypeKey, JasAnnotationType> = mutableMapOf()
     val packages: MutableMap<String, MutableList<String>> = mutableMapOf()
     val imports: MutableMap<String, String> = mutableMapOf()
     val importDeclarations: MutableMap<String, JasImport> = mutableMapOf()
@@ -75,8 +148,8 @@ class SymbolTable {
      *   `std.Error`（别包）与本包同名类型——这正是「未知类型静默通过」的根因之一。
      * 前置条件：需要先 [collectDeclarations]；无包声明的文件记为空串。
      * 失败模式：未命中返回 null（集合不存在），不抛异常。
-     * 为什么用集合而非单值：符号表以简单名为键、last-writer-wins，跨包同名时单值会
-     *   丢掉其中一个包；集合保留全部候选，避免误判「不可见」。
+     * 为什么用集合而非单值：一个简单名可能在多个包各自声明；集合保留全部候选，
+     *   既能判断「本包是否声明过」，也能在未知类型诊断里给出 import 提示。
      */
     val typePackages: MutableMap<String, MutableSet<String>> = mutableMapOf()
 
@@ -93,15 +166,65 @@ class SymbolTable {
      *     方法体」的成员视图。手写成员当然在 AST 里，但 `@Getter`/`@Setter` 等注解
      *     合成的访问器在检查阶段还没有方法体，仅靠遍历 AST 会漏掉它们；把它们提前
      *     放进本索引后，合成签名在类型检查时即可见。
-     *   - 索引粒度是「类型名 -> 成员名 -> 单个声明」，采用 first-declaration-wins
-     *     （见 indexMembers 的 putIfAbsent），与旧的线性首次匹配扫描语义一致，
-     *     保证重构前后行为不变。
-     *   - 已知限制：同名重载只保留第一个；不做继承链查找；merge 时按整个类型索引
-     *     覆盖而非逐成员合并（详见 merge）。
+     *   - 索引粒度是「类型身份（[TypeKey]） -> 成员名 -> 单个声明」，采用
+     *     first-declaration-wins（见 indexMembers 的 putIfAbsent），与旧的线性首次匹配
+     *     扫描语义一致，保证重构前后行为不变。
+     *   - 已知限制：同名重载只保留第一个；不做继承链查找。
      */
-    val memberSignatures: MutableMap<String, MutableMap<String, JasDeclaration>> = mutableMapOf()
+    val memberSignatures: MutableMap<TypeKey, MutableMap<String, JasDeclaration>> = mutableMapOf()
     var currentPackage: String? = null
     var errors: MutableList<SymbolError> = mutableListOf()
+
+    /**
+     * 本次编译中**已出现过的类型身份**及类别（class/interface/enum/annotation）。
+     *
+     * 做什么：跨文件、跨类别检测同一 [TypeKey] 的重复声明；与各具体 Map 分开保存，
+     *   才能在 `p1.Thing` 是 class、`p2.Thing` 是 interface 时仍按包区分互不冲突，
+     *   而同一包内同名不同 kind 仍报冲突。
+     * 什么时候用：collectDeclarations 与 merge 写入前查询/更新。
+     * 失败模式：不抛异常，只作为诊断依据。
+     */
+    private val seenTypes: MutableMap<TypeKey, String> = mutableMapOf()
+
+    /**
+     * 每个类型声明所属文件的解析上下文（包名 + 精确 import 表）。
+     *
+     * 为什么需要：类型检查阶段会把符号表里**其它文件**的声明也并入继承图；此时仅凭
+     *   当前文件的包/import 无法正确解析那份声明里的 `implements OtherThing`。
+     *   用 IdentityHashMap 是因为 AST 是对象树，按对象身份记录比结构相等更可靠。
+     */
+    private val declarationScopes = IdentityHashMap<JasDeclaration, DeclarationScope>()
+
+    /** 一个声明所在文件的解析上下文：只在 SymbolTable 内部使用。 */
+    private data class DeclarationScope(
+        val typeKey: TypeKey,
+        val imports: Map<String, String>
+    )
+
+    /**
+     * 当前**查询**使用的解析上下文（包名 + 精确 import 表）。
+     *
+     * 为什么与 [currentPackage] 分开：[currentPackage] 记录最后采集的文件，而多文件
+     *   编译是「先采集全部文件、再逐文件检查」；查询上下文必须由调用方（TypeChecker）
+     *   在检查每个文件前重置，否则会串包。
+     */
+    private var scopedPackage: String = ""
+    private var scopedImports: Map<String, String> = emptyMap()
+
+    /**
+     * 进入某个源文件的解析作用域：后续简单名查询先按该文件的 import 与本包解析。
+     *
+     * 什么时候用：多文件编译中，每个文件做类型检查前调用（TypeChecker.check 入口）。
+     * 前置条件：packageName 为该文件的 package 声明（null 表示默认包）；imports 是
+     *   [buildImportMap] 的结果。
+     * 失败模式：不抛异常；只影响后续 findXxx 的简单名解析，不改变已存声明。
+     * 为什么显式方法而不是构造参数：SymbolTable 被多个阶段共享，文件作用域是「检查期
+     *   临时状态」，显式重设比让每个查询调用方各自传包名/import 更不易漏改。
+     */
+    fun beginFileScope(packageName: String?, imports: Map<String, String> = emptyMap()) {
+        scopedPackage = packageName ?: ""
+        scopedImports = imports
+    }
 
     /**
      * 注册编译器内置函数（println / print / toString），使它们在类型检查时可见。
@@ -160,14 +283,15 @@ class SymbolTable {
      */
     fun collectDeclarations(ast: JasSourceFile) {
         currentPackage = ast.packageName
+        val packageName = ast.packageName ?: ""
         // 记录包名占位，便于后续按包聚合；值本身当前不承载额外信息。
         ast.packageName?.let { pkg ->
             packages.getOrPut(pkg) { mutableListOf() }
         }
-        // seenTypes 用于检测“同一文件内、跨类别”的重名（如 class X 与 interface X 同名）。
-        // 注意它与下面的 classes.containsKey 检查是两条独立路径：前者覆盖跨 kind 冲突，
-        // 后者覆盖同 kind 的重复；两条都可能命中，因此重复声明可能产生两条诊断。
-        val seenTypes = mutableMapOf<String, String>() // name -> kind
+        // 本次文件的精确 import 表：既用于查询期作用域，也随声明一起保存，
+        // 这样检查其它文件声明里的父类型引用时仍能使用那份文件自己的 import。
+        val fileImports = buildImportMap(ast.imports + ast.declarations)
+        beginFileScope(ast.packageName, fileImports)
         // 注意：`ast.imports` 与 `ast.declarations` 是**两个**独立列表（前者由 AST 构建
         // 器单独填充），只遍历 declarations 会整体漏掉 import —— 这正是「import 被忽略」
         // 的根因之一。这里把两者合并遍历，让 import 也进入符号索引。
@@ -178,51 +302,22 @@ class SymbolTable {
                     functions.getOrPut(decl.name) { mutableListOf() }.add(decl)
                 }
                 is JasClass -> {
-                    val prev = seenTypes.put(decl.name, "class")
-                    if (prev != null) {
-                        errors.add(SymbolError("Duplicate class declaration '$decl.name' (previous: $prev)", "class", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    if (classes.containsKey(decl.name)) {
-                        errors.add(SymbolError("Duplicate class declaration '$decl.name'", "class", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    // 后写覆盖：重复声明时保留最后一次出现的类。
-                    classes[decl.name] = decl
-                    indexMembers(decl.name, decl.members)
-                    recordTypePackage(decl.name, ast.packageName)
+                    val key = registerTypeIdentity(decl, packageName, "class", fileImports)
+                    classes[key] = decl
+                    indexMembers(key, decl.members)
                 }
                 is JasInterface -> {
-                    val prev = seenTypes.put(decl.name, "interface")
-                    if (prev != null) {
-                        errors.add(SymbolError("Duplicate interface declaration '$decl.name' (previous: $prev)", "interface", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    if (interfaces.containsKey(decl.name)) {
-                        errors.add(SymbolError("Duplicate interface declaration '$decl.name'", "interface", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    interfaces[decl.name] = decl
-                    indexMembers(decl.name, decl.members)
-                    recordTypePackage(decl.name, ast.packageName)
+                    val key = registerTypeIdentity(decl, packageName, "interface", fileImports)
+                    interfaces[key] = decl
+                    indexMembers(key, decl.members)
                 }
                 is JasEnum -> {
-                    val prev = seenTypes.put(decl.name, "enum")
-                    if (prev != null) {
-                        errors.add(SymbolError("Duplicate enum declaration '$decl.name' (previous: $prev)", "enum", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    if (enums.containsKey(decl.name)) {
-                        errors.add(SymbolError("Duplicate enum declaration '$decl.name'", "enum", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    enums[decl.name] = decl
-                    recordTypePackage(decl.name, ast.packageName)
+                    val key = registerTypeIdentity(decl, packageName, "enum", fileImports)
+                    enums[key] = decl
                 }
                 is JasAnnotationType -> {
-                    val prev = seenTypes.put(decl.name, "annotation")
-                    if (prev != null) {
-                        errors.add(SymbolError("Duplicate annotation declaration '$decl.name' (previous: $prev)", "annotation", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    if (annotations.containsKey(decl.name)) {
-                        errors.add(SymbolError("Duplicate annotation declaration '$decl.name'", "annotation", decl.name, line = decl.sourceLine, column = decl.sourceColumn))
-                    }
-                    annotations[decl.name] = decl
-                    recordTypePackage(decl.name, ast.packageName)
+                    val key = registerTypeIdentity(decl, packageName, "annotation", fileImports)
+                    annotations[key] = decl
                 }
                 is JasImport -> {
                     // import 以「简单名」（点号最后一段）为键；若显式写了别名，则别名也映射到同一全限定名。
@@ -241,42 +336,90 @@ class SymbolTable {
     }
 
     /**
-     * 记录一个类型简单名所属的包（供 [typePackages] 可见性判定使用）。
+     * 登记一个类型声明的身份与重复诊断，返回其 [TypeKey]。
      *
-     * 什么时候用：[collectDeclarations] 每登记一个类型声明时调用一次。
-     * 前置条件：pkg 为源文件声明包；null（无 package 声明）归一为空串。
-     * 失败模式：无（幂等，重复记录同一 (name, pkg) 不产生副作用）。
-     * 为什么：把「声明在哪个包」这一信息随声明一起保存，类型检查阶段才能判断
-     *   一个简单名是否与当前文件同包、可否直接引用。
+     * 做什么：按「包 + 简单名」查重；同 kind 重复与跨 kind 冲突都写一条 SymbolError。
+     * 什么时候用：[collectDeclarations] 每遇到一个类型声明时。
+     * 前置条件：packageName 为声明所在包（默认包用空串）；imports 为该文件精确 import 表。
+     * 失败模式：不抛异常；即使重复也返回 key，调用方继续执行 last-wins 写入，以便
+     *   后续阶段在错误集中报告中仍能看到完整符号视图。
+     * 为什么把作用域一起记录：其它文件的声明在检查时也要解析父类型，不能只靠当前文件上下文。
      */
-    private fun recordTypePackage(name: String, pkg: String?) {
-        typePackages.getOrPut(name) { mutableSetOf() }.add(pkg ?: "")
+    private fun registerTypeIdentity(
+        decl: JasDeclaration,
+        packageName: String,
+        kind: String,
+        imports: Map<String, String>
+    ): TypeKey {
+        val key = TypeKey(packageName, declarationSimpleName(decl))
+        declarationScopes[decl] = DeclarationScope(key, imports)
+        val previous = seenTypes.put(key, kind)
+        if (previous != null) {
+            val qualified = key.qualifiedName
+            val message = if (previous == kind) {
+                "Duplicate $kind declaration '$qualified'"
+            } else {
+                "Duplicate $kind declaration '$qualified' (previous: $previous)"
+            }
+            errors.add(SymbolError(message, kind, qualified, line = decl.sourceLine, column = decl.sourceColumn))
+        }
+        recordTypePackage(key)
+        return key
     }
 
     /**
-     * 按简单名查找已声明的注解类型。
+     * 记录一个类型身份所属的包（供 [typePackages] 可见性判定使用）。
+     *
+     * 什么时候用：[registerTypeIdentity] 每登记一个类型声明时调用一次。
+     * 前置条件：key 是「包 + 简单名」。
+     * 失败模式：无（幂等，重复记录同一 key 不产生副作用）。
+     * 为什么保留简单名索引：显式类型可见性检查按源码里写出的简单名工作，需要知道
+     *   「这个名字在哪些包出现过」；它只是可见性索引，不再是类型身份。
+     */
+    private fun recordTypePackage(key: TypeKey) {
+        typePackages.getOrPut(key.simpleName) { mutableSetOf() }.add(key.packageName)
+    }
+
+    /**
+     * 取一个类型声明的简单名。
+     *
+     * 为什么需要：`JasDeclaration` 是 sealed 基类，没有统一的 `name` 属性；而类型身份
+     *   登记只接受 class/interface/enum/annotation 四类。非类型声明返回空串，调用方
+     *   本就不应传入。
+     */
+    private fun declarationSimpleName(decl: JasDeclaration): String = when (decl) {
+        is JasClass -> decl.name
+        is JasInterface -> decl.name
+        is JasEnum -> decl.name
+        is JasAnnotationType -> decl.name
+        else -> ""
+    }
+
+    /**
+     * 按简单名或限定名查找已声明的注解类型。
      *
      * 什么时候用：注解处理阶段判断某个注解名是否有对应声明。
-     * 前置条件：需先执行 collectDeclarations。
+     * 前置条件：需先执行 collectDeclarations；简单名按当前查询作用域（本包/import）解析。
      * 失败模式：未命中返回 null（不报错）。
      */
     fun findAnnotation(name: String): JasAnnotationType? {
-        return annotations[name]
+        return resolveTypeKey(name)?.let { annotations[it] }
     }
 
     /**
-     * Indexes the members of a type by simple name so the TypeChecker can resolve
-     * member accesses (including annotation-synthesized accessors) uniformly.
+     * Indexes the members of a type so the TypeChecker can resolve member accesses
+     * (including annotation-synthesized accessors) uniformly.
      * First declaration wins, matching the previous linear first-match scan.
      *
      * 中文说明：
+     *   - 键是 [TypeKey]，因此 `p1.Thing.v` 与 `p2.Thing.v` 不会互相覆盖。
      *   - 只索引 JasProperty 与 JasFunction；其它成员（构造器、嵌套类型等）不进索引。
      *   - putIfAbsent 保证 first-declaration-wins：同名成员（含重载）只保留第一次
      *     出现的声明。这是刻意为之——旧的成员解析是线性首次匹配，此处必须保持等价，
      *     重构才不会改变类型检查结果。
      */
-    private fun indexMembers(typeName: String, members: List<JasDeclaration>) {
-        val index = memberSignatures.getOrPut(typeName) { mutableMapOf() }
+    private fun indexMembers(typeKey: TypeKey, members: List<JasDeclaration>) {
+        val index = memberSignatures.getOrPut(typeKey) { mutableMapOf() }
         for (member in members) {
             when (member) {
                 is JasProperty -> index.putIfAbsent(member.name, member)
@@ -295,22 +438,118 @@ class SymbolTable {
      * 为什么：让注解阶段合成的签名在类型检查时可见，无需方法体存在。
      */
     fun findMemberSignature(typeName: String, memberName: String): JasDeclaration? {
-        return memberSignatures[typeName]?.get(memberName)
+        return resolveTypeKey(typeName)?.let { memberSignatures[it]?.get(memberName) }
     }
 
     /**
-     * 把类型简单名解析为 JasNamedType，仅当它确实是本符号表中已声明的类/接口/枚举/注解。
+     * 把类型简单名/限定名解析为 JasNamedType，仅当它确实是本符号表中已声明的类型。
      *
      * 什么时候用：需要判断一个名字是否代表某个已声明类型时。
-     * 前置条件：需先执行 collectDeclarations。
-     * 失败模式：未命中返回 null；不做继承链查找，也不做包路径/import 解析。
+     * 前置条件：需先执行 collectDeclarations；简单名按当前查询作用域（本包/import）解析。
+     * 失败模式：未命中返回 null；不做继承链查找。
+     * 注意：返回的 [JasNamedType.name] 保留调用方写法（简单名或限定名），不在此处重写
+     *   源 AST 名字；需要身份时请用 [resolveTypeKey]。
      */
     fun resolveType(name: String): JasType? {
-        if (classes.containsKey(name)) return JasNamedType(name)
-        if (interfaces.containsKey(name)) return JasNamedType(name)
-        if (enums.containsKey(name)) return JasNamedType(name)
-        if (annotations.containsKey(name)) return JasNamedType(name)
-        return null
+        return if (resolveTypeKey(name) != null) JasNamedType(name) else null
+    }
+
+    /**
+     * 按当前查询作用域把名字解析成唯一的 [TypeKey]；无法唯一解析时返回 null。
+     *
+     * 解析优先级（与语言可见性规则一致）：
+     *   1. 已限定的名字（含点号）：直接按「包 + 简单名」查；
+     *   2. 当前文件的精确 import（含别名）：命中且该类型已声明；
+     *   3. 当前文件所在包：同包简单名优先；
+     *   4. 兼容兜底：若整个符号表里只有一个同名类型，返回它（保持既有宽松行为）。
+     *
+     * 什么时候用：TypeChecker 的所有类型/成员查询、以及需要把名字落成类型身份的调用方。
+     * 前置条件：调用前应通过 [beginFileScope] 设置当前文件上下文。
+     * 失败模式：未命中或有多个同名候选且不在本包/import 中时返回 null，不抛异常。
+     * 为什么 import 优先于本包：任务书明确要求 `import p2.Thing;` 后简单名解析到 p2；
+     *   这样也让「显式导入」成为用户消除同包同名歧义的手段。
+     */
+    fun resolveTypeKey(name: String): TypeKey? {
+        if (name.isEmpty()) return null
+        val normalized = name.replace('/', '.')
+        if (normalized.contains('.')) {
+            val key = TypeKey.fromQualifiedName(normalized) ?: return null
+            return key.takeIf(::hasType)
+        }
+        scopedImports[name]?.let { imported ->
+            val key = TypeKey.fromQualifiedName(imported)
+            if (key != null && hasType(key)) return key
+        }
+        val local = TypeKey(scopedPackage, name)
+        if (hasType(local)) return local
+        // 兼容兜底：全局唯一同名类型。跨包重名时故意返回 null，让可见性检查给出
+        // 「需要 import / 未知类型」诊断，而不是静默选中某一个包。
+        return simpleNameCandidates(name).singleOrNull()
+    }
+
+    /**
+     * 在**指定声明所属文件**的上下文里解析类型名。
+     *
+     * 做什么：用声明记录下来的包名与 import 表做与 [resolveTypeKey] 相同的解析。
+     * 什么时候用：TypeChecker 合并符号表中其它文件的继承关系时，解析 `implements`/`extends`。
+     * 前置条件：owner 必须是经 [collectDeclarations] 登记过的类型声明。
+     * 失败模式：owner 未登记时退回当前查询作用域；仍未命中返回 null。
+     */
+    fun resolveTypeKeyForDeclaration(owner: JasDeclaration, name: String): TypeKey? {
+        val scope = declarationScopes[owner] ?: return resolveTypeKey(name)
+        return resolveTypeKeyInScope(name, scope.typeKey.packageName, scope.imports)
+    }
+
+    /**
+     * 在显式给定的包/import 上下文里解析类型名（不改动当前查询作用域）。
+     *
+     * 什么时候用：需要以「某个声明所在文件」的视角解析名字时（见 [resolveTypeKeyForDeclaration]）。
+     * 前置条件：imports 为 [buildImportMap] 的结果。
+     * 失败模式：同 [resolveTypeKey]。
+     */
+    fun resolveTypeKeyInScope(name: String, packageName: String?, imports: Map<String, String>): TypeKey? {
+        if (name.isEmpty()) return null
+        val normalized = name.replace('/', '.')
+        if (normalized.contains('.')) {
+            return TypeKey.fromQualifiedName(normalized)?.takeIf(::hasType)
+        }
+        imports[name]?.let { imported ->
+            val key = TypeKey.fromQualifiedName(imported)
+            if (key != null && hasType(key)) return key
+        }
+        val local = TypeKey(packageName ?: "", name)
+        if (hasType(local)) return local
+        return simpleNameCandidates(name).singleOrNull()
+    }
+
+    /**
+     * 返回一个声明对应的类型身份；未登记的声明返回 null。
+     *
+     * 什么时候用：TypeChecker 建立继承图时需要稳定的限定键，而不是简单名。
+     * 前置条件：声明已经过 [collectDeclarations]。
+     */
+    fun typeKeyOfDeclaration(decl: JasDeclaration): TypeKey? = declarationScopes[decl]?.typeKey
+
+    /**
+     * 判断某个类型身份是否已在符号表中声明（四类之一）。
+     * 什么时候用：[resolveTypeKey] 内部与按限定名查询时。
+     * 失败模式：无。
+     */
+    private fun hasType(key: TypeKey): Boolean =
+        classes.containsKey(key) || interfaces.containsKey(key) ||
+            enums.containsKey(key) || annotations.containsKey(key)
+
+    /**
+     * 按简单名返回所有已声明候选身份。
+     *
+     * 为什么从 [typePackages] 推导：该索引本就按简单名记录包集合，避免再造一份并行索引；
+     *   过滤 [hasType] 可排除历史遗留/手工写入包集合但并无声明的条目。
+     */
+    private fun simpleNameCandidates(simpleName: String): List<TypeKey> {
+        return typePackages[simpleName]
+            ?.map { TypeKey(it, simpleName) }
+            ?.filter(::hasType)
+            ?: emptyList()
     }
 
     /**
@@ -336,33 +575,60 @@ class SymbolTable {
     }
 
     /**
-     * 按名字返回类声明；未命中返回 null。
+     * 按简单名或限定名返回类声明；未命中返回 null。
      *
-     * 前置条件：需先执行 collectDeclarations。
-     * 失败模式：未命中返回 null。
+     * 什么时候用：大多数调用方只知道源码里的名字，由本兼容层按当前文件包/import 解析。
+     * 前置条件：需先执行 collectDeclarations；简单名需先设置查询作用域。
+     * 失败模式：未命中或同名候选无法唯一确定时返回 null。
      */
     fun findClass(name: String): JasClass? {
-        return classes[name]
+        return resolveTypeKey(name)?.let { classes[it] }
     }
 
     /**
-     * 按名字返回接口声明；未命中返回 null。
+     * 按已确定的类型身份返回类声明；未命中返回 null。
      *
-     * 前置条件：需先执行 collectDeclarations。
+     * 什么时候用：调用方已经持有 [TypeKey]（例如 TypeChecker 的继承图），避免再次按名字解析。
      * 失败模式：未命中返回 null。
+     */
+    fun findClass(key: TypeKey): JasClass? = classes[key]
+
+    /**
+     * 按简单名或限定名返回接口声明；未命中返回 null。
+     *
+     * 前置条件：需先执行 collectDeclarations；简单名需先设置查询作用域。
+     * 失败模式：未命中或无法唯一解析时返回 null。
      */
     fun findInterface(name: String): JasInterface? {
-        return interfaces[name]
+        return resolveTypeKey(name)?.let { interfaces[it] }
     }
 
     /**
-     * 按名字返回枚举声明；未命中返回 null。
+     * 按已确定的类型身份返回接口声明；未命中返回 null。
+     * 什么时候用：已持有 [TypeKey] 的调用方（继承图、成员查询）。
+     */
+    fun findInterface(key: TypeKey): JasInterface? = interfaces[key]
+
+    /**
+     * 按简单名或限定名返回枚举声明；未命中返回 null。
      *
-     * 前置条件：需先执行 collectDeclarations。
-     * 失败模式：未命中返回 null。
+     * 前置条件：需先执行 collectDeclarations；简单名需先设置查询作用域。
+     * 失败模式：未命中或无法唯一解析时返回 null。
      */
     fun findEnum(name: String): JasEnum? {
-        return enums[name]
+        return resolveTypeKey(name)?.let { enums[it] }
+    }
+
+    /**
+     * 按显式包名 + 简单名返回类声明，不经过 import/当前作用域解析。
+     *
+     * 什么时候用：调用方明确知道目标类型的包（例如按 JVM 内部名反查）。
+     * 前置条件：无；未命中返回 null。
+     * 为什么单独提供：把「按身份精确查询」与「按源码名字兼容解析」分开，避免后者
+     *   在未来规则变化时影响需要精确身份的调用点。
+     */
+    fun findClassQualified(packageName: String, name: String): JasClass? {
+        return classes[TypeKey(packageName, name)]
     }
 
     /**
@@ -400,41 +666,59 @@ class SymbolTable {
             // 函数：同名的重载集合直接并集追加（不判冲突）。
             functions.getOrPut(name) { mutableListOf() }.addAll(funcs)
         }
-        for ((name, cls) in other.classes) {
-            if (classes.containsKey(name)) {
-                errors.add(SymbolError("Duplicate class declaration '$name' during merge", "class", name, line = cls.sourceLine, column = cls.sourceColumn))
-            }
-            // 冲突时后合并者覆盖（last-wins）；已在上面记录诊断。
-            classes[name] = cls
+        // 类型冲突按 TypeKey 判定：只有「同包 + 同名」才冲突；跨包同名类型可以共存。
+        // 用 seenTypes 统一检查，因此 class/interface/enum/annotation 之间的跨 kind
+        // 冲突也会被报告，而不只是同一张 Map 内部的重复。
+        for ((key, cls) in other.classes) {
+            recordMergedType(key, "class", cls.sourceLine, cls.sourceColumn)
+            classes[key] = cls
         }
-        for ((name, iface) in other.interfaces) {
-            if (interfaces.containsKey(name)) {
-                errors.add(SymbolError("Duplicate interface declaration '$name' during merge", "interface", name, line = iface.sourceLine, column = iface.sourceColumn))
-            }
-            interfaces[name] = iface
+        for ((key, iface) in other.interfaces) {
+            recordMergedType(key, "interface", iface.sourceLine, iface.sourceColumn)
+            interfaces[key] = iface
         }
-        for ((name, enumDecl) in other.enums) {
-            if (enums.containsKey(name)) {
-                errors.add(SymbolError("Duplicate enum declaration '$name' during merge", "enum", name, line = enumDecl.sourceLine, column = enumDecl.sourceColumn))
-            }
-            enums[name] = enumDecl
+        for ((key, enumDecl) in other.enums) {
+            recordMergedType(key, "enum", enumDecl.sourceLine, enumDecl.sourceColumn)
+            enums[key] = enumDecl
         }
-        for ((name, ann) in other.annotations) {
-            if (annotations.containsKey(name)) {
-                errors.add(SymbolError("Duplicate annotation declaration '$name' during merge", "annotation", name, line = ann.sourceLine, column = ann.sourceColumn))
-            }
-            annotations[name] = ann
+        for ((key, ann) in other.annotations) {
+            recordMergedType(key, "annotation", ann.sourceLine, ann.sourceColumn)
+            annotations[key] = ann
         }
         importDeclarations.putAll(other.importDeclarations)
         imports.putAll(other.imports)
         packages.putAll(other.packages)
+        declarationScopes.putAll(other.declarationScopes)
         // 可见性索引按简单名合并包集合（并集，不覆盖），避免跨包同名类型丢失候选包。
         for ((name, pkgs) in other.typePackages) {
             typePackages.getOrPut(name) { mutableSetOf() }.addAll(pkgs)
         }
-        // 已知限制：memberSignatures 按“整个类型索引”做 putAll 覆盖——同名类型的成员
-        // 索引会整体替换为 other 的版本，而非逐成员合并。若两文件的同名类型各有不同成员，
-        // 合并后 this 侧部分成员索引会丢失（类型本身也已被覆盖，故影响有限）。
-        memberSignatures.putAll(other.memberSignatures)
+        // 成员索引逐成员合并（first-writer-wins）：不同包的同名类型各有独立 TypeKey，
+        // 不会互相覆盖；同一 TypeKey 的重复声明已在上面报错，此处保留已有成员即可。
+        for ((key, index) in other.memberSignatures) {
+            val target = memberSignatures.getOrPut(key) { mutableMapOf() }
+            for ((memberName, declaration) in index) {
+                target.putIfAbsent(memberName, declaration)
+            }
+        }
+    }
+
+    /**
+     * 合并时登记类型身份并诊断「同包同名」冲突。
+     *
+     * 什么时候用：[merge] 处理另一张符号表的四类类型声明时。
+     * 前置条件：key 来自 other 的已登记声明。
+     * 失败模式：不抛异常；冲突时追加 SymbolError，调用方仍按 last-wins 覆盖。
+     */
+    private fun recordMergedType(key: TypeKey, kind: String, line: Int, column: Int) {
+        val previous = seenTypes.put(key, kind)
+        if (previous != null) {
+            val message = if (previous == kind) {
+                "Duplicate $kind declaration '${key.qualifiedName}' during merge"
+            } else {
+                "Duplicate $kind declaration '${key.qualifiedName}' during merge (previous: $previous)"
+            }
+            errors.add(SymbolError(message, kind, key.qualifiedName, line = line, column = column))
+        }
     }
 }

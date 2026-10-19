@@ -555,7 +555,8 @@ class JasperToIrTranslator {
                             prop.modifiers.filterIsInstance<JasAnnotationUse>().any { simpleAnnotationName(it.name) == "EqualsAndHashCode" }
                         }
                 if (hasHashFunction || hasEqualityAnnotation) {
-                    ctx.hashableClassNames.add(decl.name)
+                    // 用内部名登记：跨包同名类可能一个带 hash()、一个不带，简单名会串。
+                    ctx.hashableClassNames.add(typeMapper.resolveNamedTypeName(decl.name))
                 }
             }
         }
@@ -1073,7 +1074,8 @@ class JasperToIrTranslator {
             is JasNamedType -> {
                 // 命名类型：若该类带 hash()（手写或 @EqualsAndHashCode 合成）用 .hash()（值语义），
                 // 否则用 .hashCode()（身份/默认语义）。判定依据是预登记的可哈希类名集合。
-                val hashMethod = if (type.name.substringAfterLast('.') in ctx.hashableClassNames) "hash" else "hashCode"
+                // 与登记口径一致：先把类型名解析成 JVM 内部名，再查「是否提供 hash()」。
+                val hashMethod = if (typeMapper.resolveNamedTypeName(type.name) in ctx.hashableClassNames) "hash" else "hashCode"
                 nullGuardedMemberHash(thisField, hashMethod)
             }
             else -> nullGuardedMemberHash(thisField, "hashCode")
@@ -1175,7 +1177,9 @@ class JasperToIrTranslator {
         val ifaceNames = cls.interfaces.mapNotNull { iface ->
             if (iface is JasNamedType) typeMapper.resolveNamedTypeName(iface.name) else null
         }
-        ctx.interfaceNames[cls.name] = ifaceNames.toMutableList()
+        // 键必须是 JVM 内部名：跨包同名类（p1.Impl / p2.Impl）若按简单名存表会互相覆盖，
+        // 导致后端把其中一个类错误地实现成另一个包的接口。
+        ctx.interfaceNames[qualifiedClassName] = ifaceNames.toMutableList()
         // 泛型形参先建 IR 形参，再翻成员——保证成员签名里能引用它们。
         for (tp in cls.typeParameters) {
             val irTp = translateTypeParameter(tp, ctx)
@@ -1196,7 +1200,8 @@ class JasperToIrTranslator {
         // jvmInternalNameFromType 现已走中央解析（import/点分包名），返回的已是完整内部名。
         val qualifiedSuper = if (cls.superclass != null) typeMapper.jvmInternalNameFromType(cls.superclass) else "java/lang/Object"
         ctx.currentSuperclassName = qualifiedSuper
-        ctx.classSuperclassNames[cls.name] = qualifiedSuper
+        // 同样按 JVM 内部名建键，避免跨包同名类的父类信息互相覆盖。
+        ctx.classSuperclassNames[qualifiedClassName] = qualifiedSuper
         if (cls.constructors.isEmpty()) {
             // 无显式构造器时补一个默认无参 <init>；否则类无法被 new（后端要求至少一个可调用构造器）。
             addDefaultConstructor(irCls)
@@ -1316,20 +1321,22 @@ class JasperToIrTranslator {
             SourceElement.NO_SOURCE
         )
         ctx.classSymbols[iface.name] = symbol
-        // 登记「这是接口」：后端据此决定接口标志、默认方法/抽象方法处理，以及类型引用用接口描述符。
-        ctx.interfaceDeclNames.add(iface.name)
+        // 接口身份同样按 JVM 内部名记录：跨包同名接口（p1.Thing / p2.Thing）必须可区分，
+        // 后端据此决定接口标志、默认方法/抽象方法处理，以及调用点用 INVOKEINTERFACE。
+        val qualifiedInterfaceName = typeMapper.resolveNamedTypeName(iface.name)
+        ctx.interfaceDeclNames.add(qualifiedInterfaceName)
         // 接口常量也按类名建索引（`fieldSymbolsByClass[接口内部名]`），
         // 这样 `Limits.MAX_ROWS` 的静态访问可以通过类名直接解析到字段符号，
         // 而不必退化成「全局按名查找」这一可能与其他类同名常量冲突的兜底路径。
         val previousClassName = ctx.currentClassName
-        ctx.currentClassName = typeMapper.resolveNamedTypeName(iface.name)
+        ctx.currentClassName = qualifiedInterfaceName
         // Record extended interfaces
         // 记录继承的父接口（补全为 JVM 风格内部名），导出给后端生成接口表。
         // 父接口名走中央解析（import/点分包名），避免非法内部名。
         val ifaceNames = iface.extends.mapNotNull { ext ->
             if (ext is JasNamedType) typeMapper.resolveNamedTypeName(ext.name) else null
         }
-        ctx.interfaceNames[iface.name] = ifaceNames.toMutableList()
+        ctx.interfaceNames[qualifiedInterfaceName] = ifaceNames.toMutableList()
         for (tp in iface.typeParameters) {
             val irTp = translateTypeParameter(tp, ctx)
             irCls.typeParameters = irCls.typeParameters + irTp
