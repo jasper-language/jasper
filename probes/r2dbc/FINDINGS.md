@@ -97,6 +97,9 @@ Flux.declaredFields=[FETCH_SIZE]
 > #9（类继承不参与赋值子类型）；回归守门见 `jasper.InheritanceTest`。
 > **Q24 / C19** 另**部分修复** `①语法层` #20（`throws` 解析进 AST 并写入编译器 manifest；
 > 按裁决不做 checked exception）；回归守门见 `jasper.ThrowsManifestTest`。
+> **Q25 / C6+C16** 修复 `③编译器缺陷` #5（跨文件/跨包字段访问依赖文件翻译顺序）：
+> 字段符号/类型改为在第二遍翻译前按类统一预登记，声明处复用同一 `IrFieldSymbol` 身份，
+> 文件顺序不再影响字段解析；回归守门见 `jasper.CrossFileFieldTest`。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -117,6 +120,8 @@ Flux.declaredFields=[FETCH_SIZE]
    接口类型局部变量兜底。）
 3. **字段读取改用取值方法**（#5）：`Row` 的字段私有，暴露 `id()`/`name()`；
    这样跨文件读取不再依赖「声明字段的文件先被翻译」的排序。
+   （**#5 已修复（Q25 / C6+C16）**：该规避现已不再必要；探针源保留原写法以保留历史证据，
+   未在本轮改写。）
 4. **继承来的方法用声明该方法的类型作接收者**（#6）：
    `var error: R2dbcException = new R2dbcException(...); return error.sqlState();`。
 5. **多态一律走接口，不做「子类赋给基类变量」**（#9）：`MemoryConnection` 先赋给
@@ -274,6 +279,18 @@ public function main(): int32 {
 
 #### 5. 跨文件字段读取依赖文件翻译顺序
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q25 / C6+C16）**——根因是字段符号/类型只在「声明所在文件被翻译时」才登记，
+  访问点若排在声明文件之前，`resolveFieldSymbol` 只能拿到与声明处不同身份的临时/空符号，
+  后端按符号反查不到名字，于是退化成伪字段 `field`/`void` 或直接
+  `INTERNAL: unresolved field symbol`。现由 `JasperToIrTranslator.predeclareFields` 在第二遍
+  翻译前，对**全部文件**的 class/interface/enum 字段做统一预登记：实例字段、静态字段、
+  接口常量都登记进按类索引 `fieldSymbolsByClass` / `fieldTypesByClass`，静态字段（含接口常量）
+  同时进入 `staticFieldSymbols`；声明处 `translateProperty` / `translateInterfaceConstant`
+  复用预登记的那一个 `IrFieldSymbol` 对象（而不是另建），因此调用点与声明点共享同一符号身份。
+  文件顺序（含跨包、经 `Holder` 间接访问）不再影响解析结果。回归守门：
+  `jasper.CrossFileFieldTest`（8 个用例：同包两种顺序、跨包、`Holder` 间接、静态字段、
+  接口常量、Q21 继承字段、缺失字段负向；真编译 + `URLClassLoader` 执行 + `javap` 断言
+  `Fieldref` 的 owner/描述符）。以下「现象/实测」为修复前证据，保留作历史记录。
 - 现象：读取**另一个文件**里声明的类的**公有字段**时，字段符号与类型解析都只在
   「声明字段的文件已经被翻译过」时成立。翻译顺序按源文件名排序；一旦读取者排在前面，
   IR 里字段名退化为兜底名 `field`、类型退化为 `void`。
@@ -292,7 +309,8 @@ public class Pt { public var x: int32; public constructor(v: int32) { this.x = v
 - 实测：`ClassFormatError: Field "field" in class std/main has illegal signature "V"`。
 - 绕过：把声明文件改成排序在前的名字，或改用取值方法。
 - 探针规避：`Row` 字段私有、暴露 `id()`/`name()` 方法（成员返回类型在第一遍预登记，
-  与文件顺序无关）。
+  与文件顺序无关）。（**已修复**：该规避现已不再必要；探针源保留原写法以保留历史证据，
+  未在本轮改写。）
 
 #### 6. 继承来的方法：返回描述符退化为 `void`
 - 类别：`③编译器缺陷`
