@@ -407,6 +407,20 @@ public function main(): int32 { var d: D = new D(); var b: B = d; return b.v(); 
 
 #### 10. 可空引用字段描述符错误
 - 类别：`③编译器缺陷`
+- 状态：**已修复（读取路径 Q21/Q25；写入路径 Q26 / C14）**——
+  1) 读取/声明：`C?` 字段经 Q21/Q25 的类型映射后，声明与 `GETFIELD` 描述符已是
+     `Lp/C;`；Q26 的 javap 复核确认 `public p.C slot;`、`getfield slot:Lp/C;` 均正确。
+  2) 写入：Q26 回归时发现 `this.slot = null` 仍生成
+     `putfield slot:Ljava/lang/Object;`，运行期
+     `NoSuchFieldError: ... member field 'java.lang.Object slot'`。根因是后端
+     `IrSetField` 用「被写值的类型」拼描述符，而 `null` 字面量的 IR 类型是
+     `Any?`（`Ljava/lang/Object;`），与字段声明的 `Lp/C;` 不一致。现后端第一遍
+     扫描时登记 `字段符号 → 声明描述符`，读写指令统一复用该声明描述符，并在写前
+     按声明类型做 widen/box/unbox/checkcast（`null` 会得到合法的
+     `aconst_null; checkcast p/C; putfield slot:Lp/C;`）。
+  回归守门：`jasper-compiler/src/test/kotlin/jasper/NullReturnTest.kt`
+  （`nullable reference field keeps reference descriptor and supports access`，
+  真编译 + 真执行 + `javap` 描述符断言）。以下「实测」为修复前证据，保留作历史记录。
 - 触发代码：
 ```jasper
 package std;
@@ -419,9 +433,13 @@ public class H {
 public function main(): int32 { return new H().get(); }
 ```
 - 期望：`C?` 字段按 `LC;` 存引用。
-- 实测：`VerifyError: Bad type on operand stack`（字段被当成 `java.lang.Object`，
-  与读取点的 `C` 不匹配）。
-- 探针规避：订阅者不保存可空的接口字段，取消句柄通过参数即取即用。
+- 修复前实测：`VerifyError: Bad type on operand stack`（字段被当成 `java.lang.Object`，
+  与读取点的 `C` 不匹配）；后续 Q26 复核还发现写入路径为
+  `putfield slot:Ljava/lang/Object;`，运行期 `NoSuchFieldError`。
+- 修复后实测：`javap -p -c` 显示字段声明 `public p.C slot;`，`getfield`/`putfield`
+  均为 `slot:Lp/C;`；构造、`this.slot.v()`、`this.slot = null` 与 `slot == null`
+  全部正常。
+- 探针规避（**已移除**）：订阅者可直接保存可空的接口字段，取消句柄不必再靠参数即取即用。
 
 #### 11. 数组元素读取的类型是 `void`，不能直接使用
 - 类别：`③编译器缺陷`

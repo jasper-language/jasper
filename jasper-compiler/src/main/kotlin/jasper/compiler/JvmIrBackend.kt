@@ -218,6 +218,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private val fieldSymbolToName = mutableMapOf<IrFieldSymbol, String>()
     // 字段符号 → owner 内部名（声明该字段的类）。
     private val fieldOwnerMap = mutableMapOf<IrFieldSymbol, String>()
+    // 字段符号 → 声明处的 JVM 字段描述符。
+    // 为什么必须单独记：JVM 要求字段指令里的描述符与 `visitField` 写出的声明描述符
+    // 逐字符一致。若像旧实现那样取「被写值」的类型，`this.slot = null` 会拿到
+    // `null` 字面量的 `Ljava/lang/Object;`，与声明的 `Lp/C;` 不一致，运行期直接
+    // `NoSuchFieldError: ... member field 'java.lang.Object slot'`（C14 的写路径）。
+    // 该表与 fieldSymbolToName/fieldOwnerMap 一起在第一遍扫描里填充，第二遍只读。
+    private val fieldSymbolToDescriptor = mutableMapOf<IrFieldSymbol, String>()
     // 枚举项符号 → 常量字段名 / owner 内部名。枚举常量不是 IrField，不能复用上面的
     // 字段表；IrGetEnumValue 只携带枚举项符号，必须在这里查回 JVM 字段坐标。
     private val enumEntrySymbolToName = mutableMapOf<IrEnumEntrySymbol, String>()
@@ -311,6 +318,60 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return desc
     }
 
+    /**
+     * 做什么：取字段**声明处**的 JVM 描述符，供 GETFIELD/PUTFIELD/GETSTATIC/PUTSTATIC 使用。
+     *
+     * 什么时候用：所有字段指令发射前。字段读/写都必须用同一个声明描述符，
+     *   否则 class 文件里「声明的字段」与「指令引用的字段」对不上，运行期
+     *   `NoSuchFieldError`。
+     * 前置条件：symbol 来自第一遍扫描过的 IrField 声明。
+     * 失败模式：符号未登记时退回 [fallbackType] 的描述符（保持旧行为，避免对合成/
+     *   外部符号过度收紧），但 `V` 描述符仍 fail fast。
+     * 为什么这样设计：`IrSetField.type` 是 translator 用「被写值的类型」填的，`null`
+     *   字面量会给出 `java/lang/Object`；而字段声明可能是 `Lp/C;`。把「声明描述符」
+     *   收敛到这张索引表，读写两条路径就不会再各自猜测类型（隔离了变化点）。
+     */
+    private fun resolveFieldDescriptor(symbol: IrFieldSymbol, fallbackType: IrType): String {
+        val desc = fieldSymbolToDescriptor[symbol]
+            ?: typeMapper.jvmDescriptorFromIrType(fallbackType)
+        return requireFieldDescriptor(desc)
+    }
+
+    /**
+     * 做什么：把栈顶值从 [fromDesc] 转换成字段声明类型 [toDesc]，供 PUTFIELD/PUTSTATIC 使用。
+     *
+     * 什么时候用：字段写指令发射前、值已经在栈顶时。
+     * 前置条件：栈顶恰好是 [fromDesc] 类型的一个值；接收者（实例写）在它下面。
+     * 失败模式：不支持或类型检查本应拒绝的组合可能留下验证器错误；本函数不兜底，
+     *   也不抛业务异常。
+     * 为什么需要：字段描述符改用声明类型后，值本身仍可能来自更宽/擦除的类型，
+     *   例如 `null`（IR 类型 `Any?` → Object）、`any` 赋给具体引用、`int` 赋给
+     *   `int64`/`any` 字段。这里复用既有 widen/box/unbox 原语，把「值转换」与
+     *   「描述符选择」两个变化点分开，避免在各调用点复制转换逻辑。
+     */
+    private fun emitStoreConversion(mv: MethodVisitor, fromDesc: String, toDesc: String) {
+        if (fromDesc == toDesc) return
+        val fromPrimitive = isPrimitiveDesc(fromDesc)
+        val toPrimitive = isPrimitiveDesc(toDesc)
+        when {
+            // 基本类型之间：只做数值拓宽（收窄不在类型检查允许范围内）。
+            fromPrimitive && toPrimitive -> widenIfNeeded(mv, fromDesc, toDesc)
+            // 基本类型 → 引用：装箱（目前只支持 Object/Serializable 目标）。
+            fromPrimitive -> emitBoxingIfNeeded(mv, fromDesc, toDesc)
+            // 引用 → 基本类型：先 checkcast 到包装类再 unbox。
+            toPrimitive -> emitUnboxingFromRef(mv, toDesc)
+            // 引用 → 引用：目标是 Object/Serializable 时无需指令（任何引用都可赋值）；
+            // 更具体的引用目标（含数组）补 CHECKCAST，满足验证器对精确类型的要求。
+            // `null` 常量走这条分支时 CHECKCAST 也是合法的（结果仍是 null）。
+            toDesc == "Ljava/lang/Object;" || toDesc == "Ljava/io/Serializable;" -> Unit
+            else -> {
+                val targetInternal = if (toDesc.startsWith("[")) toDesc
+                else toDesc.removePrefix("L").removeSuffix(";")
+                mv.visitTypeInsn(Opcodes.CHECKCAST, targetInternal)
+            }
+        }
+    }
+
 
     /**
      * 做什么：后端唯一入口。先扫描 GraalVM 风险点，再用一遍遍历建立「符号→名字/owner」
@@ -334,6 +395,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         functionSymbolToOwner.clear()
         fieldSymbolToName.clear()
         fieldOwnerMap.clear()
+        fieldSymbolToDescriptor.clear()
         enumEntrySymbolToName.clear()
         enumEntrySymbolToOwner.clear()
         graalvmWarnings.clear()
@@ -380,6 +442,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 is IrField -> {
                                     fieldSymbolToName[classDecl.symbol] = classDecl.name.toString()
                                     fieldOwnerMap[classDecl.symbol] = internalName
+                                    // 声明描述符在此固化：字段读/写指令都必须复用它，
+                                    // 不能退回到「值/读取表达式的类型」（见字段声明处注释）。
+                                    fieldSymbolToDescriptor[classDecl.symbol] =
+                                        typeMapper.jvmDescriptorFromIrType(classDecl.type)
                                 }
                                 // 枚举项同样需要「符号 → 字段坐标」索引：读取点
                                 // （IrGetEnumValue）引用的是枚举项符号，不是字段符号。
@@ -1102,7 +1168,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val retType = ctx.returnType
                 val returnDesc = if (retType != null) typeMapper.jvmReturnDescriptorFromIrType(retType) else "V"
                 val hasValue = !isIrVoidExpr(value)
-                // translator 用 IrConst(Null) 表示「无返回值」，此时不能再压栈，直接 return。
+                // translator 用「Unit 类型的 IrConst(Null)」表示无返回值；此时不能再压栈。
+                // 注意：源码的 `null` 字面量同样是 IrConst(Null)，但类型是 Any?，必须压
+                // ACONST_NULL（由 isIrVoidExpr 按返回描述符区分，见其 KDoc）。
                 if (hasValue) {
                     generateIrExpression(mv, value, ctx, owner)
                     val valueDesc = typeMapper.jvmDescriptorFromIrType(value.type)
@@ -1912,7 +1980,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 if (expr.symbol in staticFieldSymbols) {
                     val fieldName = requireFieldName(expr.symbol)
                     val fieldOwner = resolveFieldOwner(expr.symbol)
-                    val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.type))
+                    val fieldDesc = resolveFieldDescriptor(expr.symbol, expr.type)
                     mv.visitFieldInsn(Opcodes.GETSTATIC, fieldOwner, fieldName, fieldDesc)
                     return
                 }
@@ -1927,26 +1995,40 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     return
                 }
                 val fieldName = requireFieldName(expr.symbol)
-                val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.type))
+                // 读也以声明描述符为准：compound assignment 等路径可能把 IrGetField 的
+                // type 填成值类型，若直接使用会与声明不一致。
+                val fieldDesc = resolveFieldDescriptor(expr.symbol, expr.type)
                 val fieldOwner = resolveFieldOwner(expr.symbol)
                 mv.visitFieldInsn(Opcodes.GETFIELD, fieldOwner, fieldName, fieldDesc)
             }
             is IrSetField -> {
                 // 字段写：静态走 PUTSTATIC（无接收者）；实例先压接收者再压值，最后 PUTFIELD。
-                // 描述符取被写值的类型（与字段声明类型在 translator 侧已对齐）；缺失一律 fail fast。
+                // 描述符必须取字段**声明处**的类型：translator 把 IrSetField.type 填成「值」
+                // 的类型，`this.slot = null` 时会得到 Object，与声明 Lp/C; 不一致
+                // （运行期 NoSuchFieldError）。值本身再按声明类型做 widen/box/unbox/checkcast。
                 if (expr.symbol in staticFieldSymbols) {
                     val fieldName = requireFieldName(expr.symbol)
+                    val fieldDesc = resolveFieldDescriptor(expr.symbol, expr.value.type)
                     generateIrExpression(mv, expr.value, ctx, owner)
+                    emitStoreConversion(
+                        mv,
+                        typeMapper.jvmDescriptorFromIrType(expr.value.type),
+                        fieldDesc
+                    )
                     val fieldOwner = resolveFieldOwner(expr.symbol)
-                    val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.value.type))
                     mv.visitFieldInsn(Opcodes.PUTSTATIC, fieldOwner, fieldName, fieldDesc)
                     return
                 }
                 val receiver = expr.receiver
                 if (receiver != null) generateIrExpression(mv, receiver, ctx, owner)
                 val fieldName = requireFieldName(expr.symbol)
-                val fieldDesc = requireFieldDescriptor(typeMapper.jvmDescriptorFromIrType(expr.value.type))
+                val fieldDesc = resolveFieldDescriptor(expr.symbol, expr.value.type)
                 generateIrExpression(mv, expr.value, ctx, owner)
+                emitStoreConversion(
+                    mv,
+                    typeMapper.jvmDescriptorFromIrType(expr.value.type),
+                    fieldDesc
+                )
                 val fieldOwner = resolveFieldOwner(expr.symbol)
                 mv.visitFieldInsn(Opcodes.PUTFIELD, fieldOwner, fieldName, fieldDesc)
             }
@@ -2086,10 +2168,29 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
     }
 
-    // translator 用 IrConst(Null) 占位表示「这个表达式没有值」（如 void return）。
-    // 生成 return 时据此决定要不要压返回值。
+    /**
+     * 做什么：判断一个 IR 表达式是否只是 translator 用来占位的「无值表达式」。
+     *
+     * 什么时候用：[IrReturn] 生成时决定要不要压返回值，以及 [generateFinallyBody]
+     *   跳过空 finally 占位。
+     * 前置条件：expr 已由 translator 构造完成，[TypeMapper] 能还原其类型。
+     * 失败模式：不抛异常；类型无法还原时按「有值」处理（保守地压栈，宁可让验证器
+     *   报错也不静默吞掉一个真实值）。
+     * 为什么这样设计：translator 复用 `IrConst(Null)` 表达两种完全不同的语义——
+     *   1) `typeMapper.unitExpr()`：类型是 `kotlin.Unit`（JVM 描述符 `V`），表示
+     *      「这里没有值」（裸 `return`、空 finally、无返回值的 when 分支）；
+     *   2) `typeMapper.nullConst()`：类型是 `kotlin.Any?`（JVM 描述符
+     *      `Ljava/lang/Object;`），表示源码里的 `null` 字面量，**必须**在栈上压
+     *      `ACONST_NULL`。
+     *   早期实现只看 `kind == Null`，把第 2 种也当成无值，导致 `return null` 只发
+     *   `ARETURN` 而没有压 null，触发 `VerifyError: Operand stack underflow`。
+     *   因此这里以「JVM 返回描述符是否为 V」作为唯一判据：只有 Unit/void 才是无值，
+     *   可空引用（含 `any`）一律有值。判据收敛到本函数，避免各调用点各自判断。
+     */
     private fun isIrVoidExpr(expr: IrExpression): Boolean {
-        return expr is IrConstImpl && expr.kind == IrConstKind.Null
+        return expr is IrConstImpl &&
+            expr.kind == IrConstKind.Null &&
+            typeMapper.jvmReturnDescriptorFromIrType(expr.type) == "V"
     }
 
     // 方法体顶层是否已有 return 语句：没有则由 generateIrFunction 补一条。

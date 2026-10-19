@@ -148,6 +148,15 @@ public function main(): int32 {
 
 #### 2. `return null`（返回 `any` 的函数）生成非法字节码
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q26 / C9）**——根因在后端 `JvmIrBackend.isIrVoidExpr`：translator 把
+  「无返回值占位」（`typeMapper.unitExpr()`，IR 类型 `kotlin.Unit`，JVM 描述符 `V`）和
+  源码的 `null` 字面量（`typeMapper.nullConst()`，IR 类型 `kotlin.Any?`，描述符
+  `Ljava/lang/Object;`）都编码成 `IrConstKind.Null`；旧判据只看 `kind == Null`，于是
+  `return null` 被当成无值，只发裸 `areturn`。现判据改为「JVM 返回描述符是否为 `V`」：
+  只有 Unit/void 占位算无值，可空引用（含 `any`）一律先压 `ACONST_NULL`。修复后
+  `return null` 的 false 分支字节码为 `aconst_null; areturn`。回归守门：
+  `jasper-compiler/src/test/kotlin/jasper/NullReturnTest.kt`（真编译 + `URLClassLoader`
+  执行 + `javap` 形状断言）。以下「实测」为修复前证据，保留作历史记录。
 - 触发代码：
 ```jasper
 package p;
@@ -159,10 +168,12 @@ function maybe(flag: bool): any {
 public function main(): int32 { var x: any = maybe(false); return 0; }
 ```
 - 期望：`return null;` 生成 `aconst_null; areturn`。
-- 实测：`VerifyError: Operand stack underflow`
+- 修复前实测：`VerifyError: Operand stack underflow`
   `at maybe.maybe(Z)Ljava/lang/Object; @16: areturn`（反汇编中该分支只有一个裸
   `areturn`，缺 `aconst_null`）。
-- 探针规避：见第四节第 3 条（返回 `any` 的 `find` 用数组首元素占位，不返回 null）。
+- 修复后实测：`maybe(false)` 正常返回 `null`；`javap -c` 显示该分支
+  `aconst_null` 后紧跟 `areturn`。
+- 探针规避（**已移除**）：返回 `any` 的 `find` 可直接返回 `null`，不再需要数组首元素占位。
 
 #### 3. 跨文件读取公有字段生成非法字段描述符
 - 类别：`③编译器缺陷`（同 R2DBC #5 复核）
