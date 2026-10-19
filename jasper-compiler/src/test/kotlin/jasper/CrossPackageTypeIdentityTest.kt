@@ -79,11 +79,21 @@ class CrossPackageTypeIdentityTest {
     /** 加载类、实例化无参构造器，再调用无参实例方法。 */
     private fun invokeInstance(outputDir: Path, className: String, method: String): Any? {
         URLClassLoader(arrayOf(outputDir.toUri().toURL())).use { loader ->
-            val clazz = loader.loadClass(className)
-            val instance = clazz.getDeclaredConstructor().newInstance()
-            val target = clazz.methods.first { it.name == method && it.parameterCount == 0 }
-            return target.invoke(instance)
+            return invokeInstance(loader, className, method)
         }
+    }
+
+    /**
+     * 在已有类加载器中实例化并调用无参实例方法。
+     *
+     * 什么时候用：需要让多个跨包同名类型**在同一 loader 中同时存在**时；这比每个类各建
+     *   一个 loader 更接近真实应用，也能暴露类加载期的链接冲突。
+     */
+    private fun invokeInstance(loader: ClassLoader, className: String, method: String): Any? {
+        val clazz = loader.loadClass(className)
+        val instance = clazz.getDeclaredConstructor().newInstance()
+        val target = clazz.methods.first { it.name == method && it.parameterCount == 0 }
+        return target.invoke(instance)
     }
 
     /** 对生成的 class 运行 `javap -v -p`，返回反汇编文本并落盘为证据。 */
@@ -156,8 +166,12 @@ class CrossPackageTypeIdentityTest {
             """.trimIndent()
         )
         val out = compileAll(sources, "coexist-implementations")
-        assertEquals(1, invokeInstance(out, "p1.Impl", "v"))
-        assertEquals(2, invokeInstance(out, "p2.Impl", "v"))
+        // 同一个 URLClassLoader 同时加载两个 Impl：验证它们能在同一 JVM 运行期共存，
+        // 而不是各自在不同 loader 中「碰巧」成功。
+        URLClassLoader(arrayOf(out.toUri().toURL())).use { loader ->
+            assertEquals(1, invokeInstance(loader, "p1.Impl", "v"))
+            assertEquals(2, invokeInstance(loader, "p2.Impl", "v"))
+        }
     }
 
     /**
@@ -178,8 +192,10 @@ class CrossPackageTypeIdentityTest {
             """.trimIndent()
         )
         val out = compileAll(sources, "coexist-classes")
-        assertEquals(10, invokeInstance(out, "p1.Widget", "value"))
-        assertEquals(20, invokeInstance(out, "p2.Widget", "value"))
+        URLClassLoader(arrayOf(out.toUri().toURL())).use { loader ->
+            assertEquals(10, invokeInstance(loader, "p1.Widget", "value"))
+            assertEquals(20, invokeInstance(loader, "p2.Widget", "value"))
+        }
     }
 
     /**
