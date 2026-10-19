@@ -9,3 +9,4 @@ rootProject.name = "jasper"
 
 include(":jasper-compiler")
 include(":jasper-llvm")
+include(":jucs")

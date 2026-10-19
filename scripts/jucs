@@ -1,0 +1,15 @@
+#!/bin/bash
+# JUCS 命令行启动器 / JUCS command launcher
+#
+# 前置：先构建分发包 `./gradlew :jucs:installDist`。
+# 为什么单独一个脚本：与仓库里的 `jasperc` 保持一致的调用习惯，
+# 同时把"尚未构建"这种情况用明确的退出码（8，IO 类）表达出来。
+# Requires a prior `./gradlew :jucs:installDist`; missing build output exits 8.
+set -u
+here="$(cd "$(dirname "$0")/.." && pwd)"
+launcher="$here/jucs/build/install/jucs/bin/jucs"
+if [ ! -x "$launcher" ]; then
+  echo "jucs 尚未构建：请先运行 ./gradlew :jucs:installDist" >&2
+  exit 8
+fi
+exec "$launcher" "$@"

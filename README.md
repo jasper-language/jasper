@@ -2,6 +2,22 @@
 
 Jasper is a language compiler project built around a Kotlin IR backend route.
 
+## Unified command line (JUCS)
+
+The `jucs` module is the reference implementation of **JUCS** (Jasper Unified
+Command Standard): one command contract per command, one shared parser,
+validator, permission gate and renderer for human, script and AI callers.
+
+```text
+./gradlew :jucs:installDist
+./scripts/jucs --help
+./scripts/jucs fs file list --path . --output json
+```
+
+Current scope, error codes, exit codes and the explicitly unimplemented parts
+are documented in [docs/jucs.md](docs/jucs.md). This module does not change the
+existing `jasperc` command line.
+
 ## Current Compiler Pipeline
 
 Jasper source must flow through the following primary pipeline:
