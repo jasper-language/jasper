@@ -118,6 +118,7 @@ list get search create update delete start stop restart status install uninstall
 - 签名与发布者信任链；
 - `.jaso` 命令元数据（与既有模块清单衔接）；
 - 把 `jasperc` 迁移为 JUCS 命令及其兼容桥。
+- JAPS 应用封装与多实例（另有独立标准，目前只有前瞻设计，没有任何实现）。
 
 ## 9. 试用
 
