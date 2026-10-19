@@ -169,9 +169,27 @@ class SymbolTable {
      *   - 索引粒度是「类型身份（[TypeKey]） -> 成员名 -> 单个声明」，采用
      *     first-declaration-wins（见 indexMembers 的 putIfAbsent），与旧的线性首次匹配
      *     扫描语义一致，保证重构前后行为不变。
-     *   - 已知限制：同名重载只保留第一个；不做继承链查找。
+     *   - [memberSignatures] 仍是「名字 -> 首个声明」的兼容索引，供属性与旧的单值查询
+     *     路径使用；函数重载的完整候选集另存于 [memberFunctions]。
+     *   - 已知限制：不做继承链查找（继承展开由 TypeChecker 的层次图负责）。
      */
     val memberSignatures: MutableMap<TypeKey, MutableMap<String, JasDeclaration>> = mutableMapOf()
+
+    /**
+     * 「类型身份 -> 成员名 -> 同名函数列表」的重载索引。
+     *
+     * 做什么：保留每个类型中**所有**同名函数声明（按声明顺序），使类型检查器能按
+     *   实参个数/类型做重载决议，而不是只看见第一次出现的那个声明。
+     * 什么时候用：[jasper.checker.TypeChecker] 解析实例成员调用 `obj.f(...)` 时通过
+     *   [findMemberFunctions] 取候选；属性访问仍走 [findMemberSignature] 的单值索引。
+     * 前置条件：需要先执行 [collectDeclarations]；注解阶段合成的成员也会经
+     *   [indexMembers] 进入这里。
+     * 失败模式：未命中返回空列表，不抛异常；不做继承链展开。
+     * 为什么与 [memberSignatures] 并存：属性/字段是「一名一值」，函数是「一名多重载」，
+     *   两者的基数不同。把它们拆成两张索引，既让重载路径拿到完整候选集，又让属性与
+     *   兼容查询保持原有的单值语义（隔离的变化点：成员基数）。
+     */
+    val memberFunctions: MutableMap<TypeKey, MutableMap<String, MutableList<JasFunction>>> = mutableMapOf()
     var currentPackage: String? = null
     var errors: MutableList<SymbolError> = mutableListOf()
 
@@ -409,24 +427,45 @@ class SymbolTable {
     /**
      * Indexes the members of a type so the TypeChecker can resolve member accesses
      * (including annotation-synthesized accessors) uniformly.
-     * First declaration wins, matching the previous linear first-match scan.
      *
      * 中文说明：
      *   - 键是 [TypeKey]，因此 `p1.Thing.v` 与 `p2.Thing.v` 不会互相覆盖。
      *   - 只索引 JasProperty 与 JasFunction；其它成员（构造器、嵌套类型等）不进索引。
-     *   - putIfAbsent 保证 first-declaration-wins：同名成员（含重载）只保留第一次
-     *     出现的声明。这是刻意为之——旧的成员解析是线性首次匹配，此处必须保持等价，
-     *     重构才不会改变类型检查结果。
+     *   - 属性保持 first-declaration-wins：同一类型内同名属性即重复声明，保留首个。
+     *   - 函数**累积**到 [memberFunctions]：同名不同参数个数是合法的重载，不能再用
+     *     putIfAbsent 丢掉后续声明（这正是 Q28 中「只看见第一个 q()」的根因）。
+     *   - [memberSignatures] 同时保留首个函数声明，作为属性/兼容查询的单值视图。
      */
     private fun indexMembers(typeKey: TypeKey, members: List<JasDeclaration>) {
         val index = memberSignatures.getOrPut(typeKey) { mutableMapOf() }
         for (member in members) {
             when (member) {
                 is JasProperty -> index.putIfAbsent(member.name, member)
-                is JasFunction -> index.putIfAbsent(member.name, member)
+                is JasFunction -> {
+                    // 单值视图继续 first-writer-wins，保证属性/旧查询路径行为不变。
+                    index.putIfAbsent(member.name, member)
+                    // 重载视图累积全部同名函数；声明顺序即候选顺序。
+                    memberFunctions
+                        .getOrPut(typeKey) { mutableMapOf() }
+                        .getOrPut(member.name) { mutableListOf() }
+                        .add(member)
+                }
                 else -> {}
             }
         }
+    }
+
+    /**
+     * 按「类型名 + 成员名」查找该类型**直接声明**的全部同名函数（重载候选）。
+     *
+     * 什么时候用：TypeChecker 解析 `obj.method(...)` 时先取候选，再按实参个数/类型过滤；
+     *   调用方负责沿继承链合并祖先候选（见 TypeChecker 的层次遍历）。
+     * 前置条件：对应类型已被 [collectDeclarations] 索引。
+     * 失败模式：未命中返回空列表；不区分 static/instance，也不做继承展开。
+     * 为什么返回列表：重载决议必须看到全部候选；返回单个值会让后续重载永远不可达。
+     */
+    fun findMemberFunctions(typeName: String, memberName: String): List<JasFunction> {
+        return resolveTypeKey(typeName)?.let { memberFunctions[it]?.get(memberName) } ?: emptyList()
     }
 
     /**
@@ -434,8 +473,10 @@ class SymbolTable {
      *
      * 什么时候用：TypeChecker 解析 `obj.field` / `obj.method()` 时优先走这里。
      * 前置条件：对应类型已被 collectDeclarations 索引；注解合成的成员也已写入索引。
-     * 失败模式：未命中返回 null；不区分重载，返回的是第一次声明的成员。
-     * 为什么：让注解阶段合成的签名在类型检查时可见，无需方法体存在。
+     * 失败模式：未命中返回 null；不区分重载，返回的是第一次声明的成员
+     *   （函数重载请用 [findMemberFunctions]）。
+     * 为什么：让注解阶段合成的签名在类型检查时可见，无需方法体存在；并为属性/字段
+     *   这类「一名一值」成员保留稳定的单值查询。
      */
     fun findMemberSignature(typeName: String, memberName: String): JasDeclaration? {
         return resolveTypeKey(typeName)?.let { memberSignatures[it]?.get(memberName) }
@@ -699,6 +740,15 @@ class SymbolTable {
             val target = memberSignatures.getOrPut(key) { mutableMapOf() }
             for ((memberName, declaration) in index) {
                 target.putIfAbsent(memberName, declaration)
+            }
+        }
+        // 重载索引按「类型 + 成员名」做并集：同名不同元数的函数必须全部保留。
+        // 同一 TypeKey 的重复类型声明已在 recordMergedType 报错，这里仍保留候选，
+        // 让后续检查能在错误集中同时看到冲突声明，而不是静默丢一半。
+        for ((key, index) in other.memberFunctions) {
+            val target = memberFunctions.getOrPut(key) { mutableMapOf() }
+            for ((memberName, functions) in index) {
+                target.getOrPut(memberName) { mutableListOf() }.addAll(functions)
             }
         }
     }

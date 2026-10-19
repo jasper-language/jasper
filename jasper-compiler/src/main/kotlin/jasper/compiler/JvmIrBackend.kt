@@ -250,6 +250,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 用户类型的成员方法「声明擦除签名」：JVM 风格类型名 → 方法名 → 擦除签名。
     // 经接口/泛型接收者的调用点据此写出被调方法的真实（擦除后）描述符。
     private var memberSignaturesByType: Map<String, Map<String, MemberMethodSignature>> = emptyMap()
+    // 调用点符号 -> 成员索引键：translator 已按检查器选中的重载算好，backend 直接复用。
+    private var memberCallKeys: Map<IrSimpleFunctionSymbol, String> = emptyMap()
     // 接口 JVM 内部名 → 其声明的方法（不含 <init>/合成访问器）。生成桥接方法时用来
     // 找到「本类实现的接口要求哪些擦除后签名」。
     private var interfaceMethods: Map<String, List<IrSimpleFunction>> = emptyMap()
@@ -409,6 +411,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         staticFunctionSymbols = translationResult.staticFunctionSymbols
         syntheticStaticCallOwners = translationResult.syntheticStaticCallOwners
         memberSignaturesByType = translationResult.memberSignaturesByType
+        memberCallKeys = translationResult.memberCallKeys
         checkGraalvmHostilePatterns(translationResult)
         // 第 1 遍：建立符号 → 名字 / owner 索引。owner 用「包名内部名/类名」的 JVM 约定，
         // 顶层函数则以其自身为 owner（等价于文件名即类名，makeClass 时补建 main 桥）。
@@ -1822,8 +1825,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             val isInterfaceTarget = interfaceDeclNames.contains(rawReceiverInternal)
                             // 声明擦除签名：泛型接口方法（如 Repo.save(T)）在 JVM 里是
                             // (Ljava/lang/Object;)V，不能按实参类型（Person）拼描述符。
-                            // 参数个数对不上（重载/varargs 等）时退回旧行为。
-                            val declared = memberSignaturesByType[rawReceiverInternal]?.get(realName)
+                            // 键必须带元数（实参个数），否则不同参数个数的重载会互相覆盖，
+                            // 调用点可能拿到另一个重载的描述符并触发 NoSuchMethodError。
+                            val declaredKey = memberCallKeys[expr.symbol]
+                                ?: memberArityKey(realName, expr.valueArgumentsCount - 1)
+                            val declared = memberSignaturesByType[rawReceiverInternal]?.get(declaredKey)
                             val useDeclared = declared != null &&
                                 declared.paramDescriptors.size == expr.valueArgumentsCount - 1
                             // Generate receiver

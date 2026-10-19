@@ -66,16 +66,41 @@ private data class StaticFieldRef(val symbol: IrFieldSymbol, val type: IrType)
  * 前置条件：由 translator 预登记阶段从 AST 声明计算；不做类型变量上界解析（v1 无界→Object）。
  * 失败模式：仅承载数据；更复杂的泛型形状（通配符/F-bounded/基本类型实参装箱）不在此表达，
  *   由后端在选择描述符时按「参数个数不匹配则回退」处理。
- * 已知限制：索引按「类型名 + 方法名」聚合（见 [JasperToIrTranslator.collectMemberSignatures]
- *   的 first-writer-wins），同名**同元数**但形参类型不同的重载不会被区分；v1 语言本身
- *   对成员重载支持有限（不同元数重载已不可用），现有程序不触发该冲突。
+ * 已知限制：索引键是「类型名 + 方法名 + 元数」（见 [memberArityKey]）；同名同元数但
+ *   形参类型不同的重载仍无法在此区分（检查器会将其报告为同元数歧义，不会走到后端）。
+ *   不同元数的重载各自独立登记，互不覆盖。
  * 为什么这样设计：后端不在翻译期持有 AST，且成员调用点的 IR 符号不与声明符号同身份，
- *   因此把「声明签名」这一变化点收敛到 translator 预登记，后端只按名查询，不重新推断。
+ *   因此把「声明签名」这一变化点收敛到 translator 预登记，后端只按「名字 + 元数」查询，
+ *   不重新推断。
  */
 data class MemberMethodSignature(
     val paramDescriptors: List<String>,
     val returnDescriptor: String
 )
+
+/**
+ * 做什么：把「成员方法名 + 元数」编码成成员索引的键。
+ * 什么时候用：translator 预登记成员返回类型/声明签名，以及 backend 在调用点反查时，
+ *   必须使用同一个键格式，才能让不同参数个数的重载各自命中自己的签名。
+ * 前置条件：arity 是 JVM 调用点的**实际形参个数**（vararg 已在调用点打包成数组，
+ *   因此等于声明形参个数；默认参数未省略时同样等于声明形参个数）。
+ * 失败模式：纯字符串拼接，不会失败。方法名是语言标识符（不含 `/`），用 `/` 分隔安全。
+ * 为什么这样设计：此前索引是「方法名 -> 单个签名」，不同元数重载会互相覆盖；把元数
+ *   纳入键是最小、无歧义的修复，调用点与 backend 无需共享 AST，只需共享键格式。
+ */
+internal fun memberArityKey(name: String, arity: Int): String = "$name/$arity"
+
+/**
+ * 做什么：vararg 成员方法在索引中的「通配键」。
+ * 什么时候用：vararg 调用在调用点会把尾部实参打包成数组，JVM 描述符上的形参个数
+ *   与源码实参个数无关；因此预登记时为 vararg 方法额外写一份通配键，backend 在
+ *   调用点优先按 [memberArityKey] 精确查找，未命中再回退到本通配键。
+ * 前置条件：与 [memberArityKey] 使用同一套索引。
+ * 失败模式：纯字符串拼接，不会失败。
+ * 为什么需要：`q(x: string)` 与 `q(xs: int32...)` 在 JVM 上都是 1 个形参，但源码
+ *   调用 `q(1,2,3)` 需要命中后者；只按「打包后的实参个数」查会误命中前者。
+ */
+internal fun memberVarargKey(name: String): String = "$name/*"
 
 /**
  * 做什么：一次翻译的完整产出——IR 文件列表 + 后端渲染所需的各种「符号 -> 名字/类型」登记表。
@@ -116,7 +141,11 @@ data class TranslationResult(
     // 每个用户类型的成员方法「声明擦除签名」：JVM 风格类型名 -> 方法名 -> (形参描述符列表, 返回描述符)。
     // 后端据此在经接口/泛型接收者调用时写出被调方法的真实（擦除后）描述符。
     // 中文：成员方法声明擦除签名索引；键/值规则见 MemberMethodSignature 文档。
-    val memberSignaturesByType: Map<String, Map<String, MemberMethodSignature>> = emptyMap()
+    val memberSignaturesByType: Map<String, Map<String, MemberMethodSignature>> = emptyMap(),
+    // 成员调用点符号 -> 本次调用应使用的成员索引键（[memberArityKey] / [memberVarargKey]）。
+    // 由 translator 在调用点依据检查器选中的重载写入，backend 据此取**同一个**签名；
+    // 避免 backend 重新按「打包后实参个数」猜测而在 vararg/定长重载间选错。
+    val memberCallKeys: Map<IrSimpleFunctionSymbol, String> = emptyMap()
 )
 
 /**
@@ -165,6 +194,8 @@ data class TranslationContext(
     // 成员「声明擦除签名」索引：JVM 风格类型名 -> 成员名 -> 擦除签名。预登记阶段填充，
     // 导出给后端，使接口类型接收者的调用点能发出「声明的、擦除后的」描述符，而非按实参猜。
     val memberSignaturesByType: MutableMap<String, MutableMap<String, MemberMethodSignature>> = mutableMapOf(),
+    // 成员调用点符号 -> 成员索引键（元数键或 vararg 通配键），translate 完成时拷出给 backend。
+    val memberCallKeys: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
     // Declared type-parameter names per user type (JVM-style name -> [T, ID, ...]).
     // Used to bind a receiver's type arguments onto the declared return type so the call
     // site's IR type is the *source* type (e.g. Repo<Person>.get -> Person).
@@ -311,7 +342,8 @@ class JasperToIrTranslator {
             staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
             staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
             syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap(),
-            memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap())
+            memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap(),
+            memberCallKeys = ctx.memberCallKeys.toMap())
     }
 
     /**
@@ -367,7 +399,8 @@ class JasperToIrTranslator {
             staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
             staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
             syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap(),
-            memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap())
+            memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap(),
+            memberCallKeys = ctx.memberCallKeys.toMap())
     }
 
     /**
@@ -582,7 +615,7 @@ class JasperToIrTranslator {
          * 什么时候用：本函数遍历到 JasClass/JasInterface 时各调用一次。
          * 前置条件：调用前已通过 installFileContext 安装当前文件的包/import 上下文，
          *   否则 resolveNamedTypeName 无法得到正确的限定名。
-         * 失败模式：无；index 用 putIfAbsent，重复名字保留先登记者（first-writer-wins）。
+         * 失败模式：无；键包含元数，不同元数重载各自登记；同元数保留先登记者。
          */
         fun record(typeName: String, members: List<JasDeclaration>) {
             // 用中央解析得到与运行时一致的内部分名（处理点分包名与 import），
@@ -591,7 +624,15 @@ class JasperToIrTranslator {
             val index = ctx.memberReturnTypesByType.getOrPut(qualified) { mutableMapOf() }
             for (member in members) {
                 if (member is JasFunction) {
-                    index.putIfAbsent(member.name, typeMapper.mapType(member.returnType))
+                    // 返回类型也必须按元数区分：q() 与 q(string) 可以返回不同类型。
+                    index.putIfAbsent(
+                        memberArityKey(member.name, member.parameters.size),
+                        typeMapper.mapType(member.returnType)
+                    )
+                    // vararg 调用的源码实参个数不固定，额外登记通配键供调用点回退。
+                    if (member.parameters.lastOrNull()?.vararg == true) {
+                        index.putIfAbsent(memberVarargKey(member.name), typeMapper.mapType(member.returnType))
+                    }
                 }
             }
         }
@@ -620,7 +661,7 @@ class JasperToIrTranslator {
          * 做什么：把一个类型的成员签名与类型形参名写入按类型的索引。
          * 什么时候用：本函数遍历到 JasClass/JasInterface/JasEnum 时各调用一次。
          * 前置条件：已安装当前文件的包/import 上下文。
-         * 失败模式：无；同名成员 first-writer-wins。
+         * 失败模式：无；键包含元数，不同元数重载各自登记；同元数保留先登记者。
          */
         fun record(typeName: String, typeParams: List<JasTypeParameter>, members: List<JasDeclaration>) {
             val qualified = typeMapper.resolveNamedTypeName(typeName)
@@ -635,7 +676,14 @@ class JasperToIrTranslator {
                 if (member.parameters.any { it.type == null }) continue
                 val paramDescs = member.parameters.map { typeMapper.jvmDescriptorFromType(it.type) }
                 val retDesc = typeMapper.jvmReturnDescriptor(member.returnType)
-                index.putIfAbsent(member.name, MemberMethodSignature(paramDescs, retDesc))
+                // 键含元数：后端在调用点按「实际实参个数」反查，必须命中对应的那个重载。
+                val signature = MemberMethodSignature(paramDescs, retDesc)
+                index.putIfAbsent(memberArityKey(member.name, member.parameters.size), signature)
+                // vararg 的 JVM 形参个数固定为「固定形参 + 1 个数组」，但源码实参个数可变；
+                // 另登记通配键，调用点按源码元数精确键未命中时回退到这里。
+                if (member.parameters.lastOrNull()?.vararg == true) {
+                    index.putIfAbsent(memberVarargKey(member.name), signature)
+                }
             }
         }
         for (decl in ast.declarations) {
@@ -2013,7 +2061,7 @@ class JasperToIrTranslator {
 
         // Type the loop variable from the concrete iterable's `next()` member.
         val iterableClass = typeMapper.irTypeClassName(iterableExpr.type)
-        val elemType = (iterableClass?.let { ctx.memberReturnTypesByType[it]?.get("next") })
+        val elemType = (iterableClass?.let { ctx.memberReturnTypesByType[it]?.get(memberArityKey("next", 0)) })
             ?: ctx.functionReturnTypes["next"]
             ?: typeMapper.type("kotlin.Any")
         val elemSymbol = IrVariableSymbolImpl()
@@ -2622,6 +2670,13 @@ class JasperToIrTranslator {
         val symbol = ctx.functionSymbols[name]
             ?: IrSimpleFunctionSymbolImpl()
         ctx.callNames[symbol] = if (expr.target is JasPropertyAccess) "v:$name" else name
+        // 成员调用：记录本次调用应使用的索引键（源码元数或 vararg 通配）。
+        // backend 只看到打包后的 IR 实参，无法自行区分 `q(string)` 与 `q(int32...)`；
+        // 由 translator 把「检查器选中的那个重载」所需的键带上（隔离的变化点：描述符来源）。
+        val memberIndexKey = if (expr.target is JasPropertyAccess) {
+            if (expr.varargCall != null) memberVarargKey(name) else memberArityKey(name, expr.args.size)
+        } else null
+        if (memberIndexKey != null) ctx.memberCallKeys[symbol] = memberIndexKey
         val args = mutableListOf<IrExpression>()
         if (expr.target is JasPropertyAccess) {
             args.add(translateExpression(expr.target.target, ctx))
@@ -2673,7 +2728,9 @@ class JasperToIrTranslator {
         // 把无关签名（如 Iterator.next）串到 ResultSet.next 上；接收者类型未知时才回退全局表。
         val receiverType = if (expr.target is JasPropertyAccess) args.firstOrNull()?.type else null
         val receiverOwner = receiverType?.let { typeMapper.irTypeClassName(it) }
-        val memberReturnType = receiverOwner?.let { ctx.memberReturnTypesByType[it]?.get(name) }
+        val memberReturnType = receiverOwner?.let { owner ->
+            memberIndexKey?.let { key -> ctx.memberReturnTypesByType[owner]?.get(key) }
+        }
         val baseReturnType = memberReturnType ?: ctx.functionReturnTypes[name] ?: typeMapper.unitType()
         var returnType = if (expr.inferredTypeArgs != null && expr.inferredTypeArgs!!.isNotEmpty()) {
             substituteIrType(baseReturnType, expr.inferredTypeArgs!!)
@@ -2784,7 +2841,7 @@ class JasperToIrTranslator {
             }
         }
         val symbol = ctx.staticMemberFunctionSymbolsByType[classKey]?.get(memberName) ?: return null
-        val returnType = ctx.memberReturnTypesByType[classKey]?.get(memberName)
+        val returnType = ctx.memberReturnTypesByType[classKey]?.get(memberArityKey(memberName, expr.args.size))
             ?: ctx.functionReturnTypes[memberName]
             ?: typeMapper.unitType()
         return StaticCallRef(symbol, classKey, returnType)

@@ -506,6 +506,12 @@ public interface Thing { public function v(): int32; }
 
 #### 17. 成员方法重载（不同元数）不可用
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q28 / C10）**——成员函数索引改为「类型 -> 成员名 -> 同名函数列表」，
+  检查器按 required/default/vararg 计算可接受元数并按元数 + 实参类型选择；translator/backend
+  用「方法名 + 源码元数」索引取同一声明的擦除描述符（vararg 另用通配键），不再只看见
+  第一个 `q()`。回归见 `jasper.MemberOverloadTest`（真编译 + URLClassLoader 真执行 + javap）。
+  已知限制：同名**同元数**但形参类型不同的重载仍不支持，编译期在声明处以
+  `same-arity overloads are not supported yet` 明确拒绝，不会静默选第一个。
 - 触发代码：
 ```jasper
 package std;
@@ -515,10 +521,10 @@ public class P {
 }
 public function main(): int32 { var p: P = new P(); return p.q() + p.q("x"); }
 ```
-- 期望：按元数选择重载。
-- 实测：`Function value expects 0 argument(s), got 1`。
-- 探针规避：`Statement.executeQuery(sql)` 与 `Connection.createStatement(sql)` 等一律给出
-  带参版本，不声明同名不同元数的重载。
+- 期望：按元数选择重载，返回 3。
+- 修复前实测：`Function value expects 0 argument(s), got 1`。
+- 探针规避（历史）：`Statement.executeQuery(sql)` 与 `Connection.createStatement(sql)` 等
+  一律给出带参版本，不声明同名不同元数的重载；修复后不再需要该规避。
 
 #### 18. 静态字段不可用
 - 类别：`③编译器缺陷`

@@ -676,10 +676,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                     clsEnv.set(member.name, member.type)
                 }
                 is JasFunction -> {
-                    // 方法用「名字/参数个数」判重：同名同 arity 才算重复，允许重载。
-                    val signature = "${member.name}/${member.parameters.size}"
+                    // 方法用「名字/形参个数/是否 vararg」判重：同名不同元数、以及
+                    // 定长 1 参 vs vararg 1 参都是合法重载，必须允许共存。
+                    // 同元数不同参数类型暂不支持（本任务非目标），在声明处就明确拒绝，
+                    // 而不是等到调用点静默选第一个。
+                    val signature = "${member.name}/${member.parameters.size}/${member.parameters.lastOrNull()?.vararg == true}"
                     if (!memberNames.add(signature)) {
-                        error("Duplicate method '${member.name}' with ${member.parameters.size} parameter(s) in class '${cls.name}'", member)
+                        error(
+                            "Duplicate method '${member.name}' with ${member.parameters.size} parameter(s) " +
+                                "in class '${cls.name}' (same-arity overloads are not supported yet)",
+                            member
+                        )
                     }
                 }
                 else -> {}
@@ -1062,21 +1069,16 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                             // 第二步：在 arity 匹配的候选中找第一个「实参类型全部兼容」的重载。
                             // 兼容判定额外放行「形参是裸类型参数」的情形（留待 unify 推断），
                             // 以及任一侧类型为 null（推断失败）时的宽松放行。
-                            /** 单个实参是否可传给该形参：兼容、任一侧未知、或形参是待推断的裸类型参数。 */
-                            fun paramAccepts(fn: JasFunction, paramType: JasType?, argType: JasType?): Boolean =
-                                paramType == null || argType == null ||
-                                typesCompatible(argType, paramType) ||
-                                (paramType is JasNamedType && fn.typeParameters.any { tp -> tp.name == paramType.name && paramType.typeArguments.isEmpty() })
                             // 每个候选先决定 varargs 降级方式（无 varargs 时为 null），再逐参校验。
                             val resolved = byArity.asSequence().mapNotNull { fn ->
                                 val vararg = resolveVarargCall(fn.parameters.map { it.type ?: JasAnyType }, fn.parameters.lastOrNull()?.vararg == true, argTypes)
                                 val ok = if (vararg == null) {
                                     fn.parameters.size == argTypes.size &&
-                                        fn.parameters.zip(argTypes).all { (param, argType) -> paramAccepts(fn, param.type, argType) }
+                                        fn.parameters.zip(argTypes).all { (param, argType) -> parameterAccepts(fn, param.type, argType) }
                                 } else {
-                                    val fixedOk = (0 until vararg.fixedCount).all { i -> paramAccepts(fn, fn.parameters[i].type, argTypes[i]) }
+                                    val fixedOk = (0 until vararg.fixedCount).all { i -> parameterAccepts(fn, fn.parameters[i].type, argTypes[i]) }
                                     val tail = argTypes.drop(vararg.fixedCount)
-                                    fixedOk && (vararg.passThrough || tail.all { paramAccepts(fn, vararg.arrayType.inner, it) })
+                                    fixedOk && (vararg.passThrough || tail.all { parameterAccepts(fn, vararg.arrayType.inner, it) })
                                 }
                                 if (ok) fn to vararg else null
                             }.firstOrNull()
@@ -1131,6 +1133,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                         }
                     }
                 } else {
+                    // 实例成员调用：`obj.method(...)`。此前这里把 `obj.method` 当成一个
+                    // 函数值（JasFunctionType），而该类型只由「首个同名声明」推导，导致
+                    // 第二个重载永远不可达（Q28）。现在先按接收者声明类型收集同名候选，
+                    // 统一做 arity/类型重载决议；返回 null 表示该名字不是函数成员
+                    // （例如字段里存的是函数值），交回下面的函数值调用路径。
+                    if (expr.target is JasPropertyAccess) {
+                        val receiverType = inferExpression(expr.target.target, env)
+                        if (receiverType is JasNamedType) {
+                            inferInstanceMemberCall(expr, expr.target, receiverType, argTypes)?.let { return it }
+                        }
+                    }
                     // callee 不是简单标识符（如函数值/lambda 变量）：按函数类型逐参校验。
                     val targetType = inferExpression(expr.target, env)
                     val memberVararg = if (targetType is JasFunctionType) {
@@ -1408,6 +1421,361 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             if (member is JasFunction && member.name == memberName) return member
         }
         return null
+    }
+
+    /**
+     * 一次成员重载决议的结果。
+     *
+     * 为什么用密封类型而不是「返回 JasFunction? + 错误码」：三种结果携带的信息不同
+     *   （选中项需要 vararg 降级方案；元数不匹配需要可用元数列表；歧义需要候选列表），
+     *   用密封类型让调用方必须显式处理每一种情况，避免再次退化成「静默取第一个」。
+     */
+    private sealed interface MemberOverloadResolution {
+        /** 恰好选中一个候选；[parameterTypes] 已代入接收者泛型实参；[vararg] 为打包/直传方案。 */
+        data class Selected(
+            val function: JasFunction,
+            val parameterTypes: List<JasType>,
+            val vararg: JasVarargCall?
+        ) : MemberOverloadResolution
+
+        /** 没有任何候选接受该实参个数；[availableArities] 是诊断用的去重元数列表。 */
+        data class ArityMismatch(val availableArities: List<Int>) : MemberOverloadResolution
+
+        /** 多个候选同时接受该调用，且无法在本阶段安全裁决。 */
+        data class Ambiguous(val candidates: List<JasFunction>) : MemberOverloadResolution
+    }
+
+    /** 实参类型与单个候选形参的匹配结果；vararg 为 null 表示按普通定长参数调用。 */
+    private data class MemberArgumentsMatch(val vararg: JasVarargCall?)
+
+    /**
+     * 推断一次实例成员调用的返回类型，并完成按元数/类型的选择。
+     *
+     * 做什么：以接收者的声明类型为起点，收集自身与继承链上的同名实例方法，按
+     *   「元数可接受 -> 精确元数优先 -> 实参类型兼容」的顺序裁决，把选中的 vararg
+     *   降级方案写回 AST，并返回该方法的声明返回类型。
+     * 什么时候用：[inferExpression] 的 `JasCall` 分支，且 callee 是 `obj.method` 形式。
+     * 前置条件：receiverType 是已声明的具名类型；argTypes 已推断（可能含 null）。
+     * 失败模式：候选为空时返回 null（交回函数值调用路径）；元数不匹配/歧义时记录
+     *   明确诊断并返回一个兜底类型，不抛异常。
+     * 为什么这样设计：旧路径只把 `obj.method` 当成由「首个同名声明」生成的函数值，
+     *   第二个重载永远不可达。把「候选收集 + 决议 + 诊断」收敛到这一个入口，调用点与
+     *   translator/backend 都只需根据「接收者类型 + 方法名 + 实参个数」得到同一重载。
+     */
+    private fun inferInstanceMemberCall(
+        call: JasCall,
+        target: JasPropertyAccess,
+        receiverType: JasNamedType,
+        argTypes: List<JasType?>
+    ): JasType? {
+        val candidates = findInstanceFunctionMembers(receiverType.name, target.property)
+        if (candidates.isEmpty()) return null
+        return when (val resolution = resolveMemberOverload(candidates, argTypes, receiverType)) {
+            is MemberOverloadResolution.ArityMismatch -> {
+                val available = resolution.availableArities.joinToString(" or ")
+                error(
+                    "Function '${target.property}' expects $available argument(s), got ${call.args.size} " +
+                        "(available overloads: ${resolution.availableArities.joinToString(", ")})",
+                    call
+                )
+                candidates.first().returnType ?: JasUnitType
+            }
+            is MemberOverloadResolution.Ambiguous -> {
+                // 同元数不同类型在 v1 尚未实现完整的特异性排序：宁可明确报歧义，也不能
+                // 静默选中第一个（那正是本任务要消灭的旧行为）。
+                error(
+                    "Ambiguous member overload '${target.property}': ${resolution.candidates.size} candidates " +
+                        "accept ${call.args.size} argument(s) with compatible types; " +
+                        "same-arity overload resolution is not supported yet",
+                    call
+                )
+                candidates.first().returnType ?: JasUnitType
+            }
+            is MemberOverloadResolution.Selected -> {
+                call.varargCall = resolution.vararg
+                validateMemberArguments(call, target.property, resolution.function, resolution.parameterTypes, argTypes)
+                memberReturnType(resolution.function, receiverType)
+            }
+        }
+    }
+
+    /**
+     * 收集接收者类型及其祖先类型上的同名**实例**方法。
+     *
+     * 做什么：先收本类型（含同元数重载），再按 BFS 祖先顺序补充「元数尚未出现」的继承
+     *   方法；子类同元数声明会遮蔽祖先同名方法（override 语义）。
+     * 什么时候用：[inferInstanceMemberCall] 取得候选列表。
+     * 前置条件：层次图已由 [check] 第一遍建立；[directMemberFunctions] 能按限定名解析。
+     * 失败模式：未命中返回空列表；环状继承由 [ancestorTypeNames] 的 visited 保护。
+     * 为什么按元数去重：本任务只支持「不同元数」的重载；同元数由子类覆盖祖先时不应
+     *   人为制造歧义。同一声明类型内部的同元数重载仍全部保留，交由决议层报歧义。
+     */
+    private fun findInstanceFunctionMembers(typeName: String, memberName: String): List<JasFunction> {
+        val result = mutableListOf<JasFunction>()
+        val seenArities = mutableSetOf<Int>()
+        for (fn in directMemberFunctions(typeName, memberName)) {
+            if (isStaticFunction(fn)) continue
+            result.add(fn)
+            seenArities.add(fn.parameters.size)
+        }
+        for (ancestor in ancestorTypeNames(typeName)) {
+            val fresh = mutableListOf<JasFunction>()
+            val freshArities = mutableSetOf<Int>()
+            for (fn in directMemberFunctions(ancestor, memberName)) {
+                if (isStaticFunction(fn)) continue
+                // 同一祖先内部的同元数候选全部保留（可能是歧义）；只过滤已被更近类型
+                // 覆盖的元数。
+                if (fn.parameters.size !in seenArities && freshArities.add(fn.parameters.size)) {
+                    fresh.add(fn)
+                }
+            }
+            result.addAll(fresh)
+            seenArities.addAll(freshArities)
+        }
+        return result
+    }
+
+    /**
+     * 查询单个类型**直接声明**的同名函数；索引未命中时线性遍历 AST 兜底。
+     *
+     * 什么时候用：[findInstanceFunctionMembers] 每处理一个类型时。
+     * 前置条件：symbolTable 已完成 collectDeclarations（注解合成成员已进索引）。
+     * 失败模式：未命中返回空列表；不展开继承链。
+     */
+    private fun directMemberFunctions(typeName: String, memberName: String): List<JasFunction> {
+        val indexed = symbolTable?.findMemberFunctions(typeName, memberName)
+        if (!indexed.isNullOrEmpty()) return indexed
+        val result = mutableListOf<JasFunction>()
+        symbolTable?.findClass(typeName)?.members?.forEach { member ->
+            if (member is JasFunction && member.name == memberName) result.add(member)
+        }
+        symbolTable?.findInterface(typeName)?.members?.forEach { member ->
+            if (member is JasFunction && member.name == memberName) result.add(member)
+        }
+        symbolTable?.findEnum(typeName)?.members?.forEach { member ->
+            if (member is JasFunction && member.name == memberName) result.add(member)
+        }
+        return result
+    }
+
+    /** 判断成员函数是否声明为 static；实例调用路径据此排除静态方法。 */
+    private fun isStaticFunction(fn: JasFunction): Boolean =
+        fn.modifiers.any { it is String && it == "static" }
+
+    /**
+     * 在候选列表中裁决一次调用。
+     *
+     * 规则（顺序不可随意调换，否则精确重载会被 default/vararg 抢走）：
+     *   1. 按元数过滤：required = 无默认值且非 vararg 的形参个数；
+     *      有 vararg 时可接受 >= required 的任意个数，否则只接受 [required, 形参总数]。
+     *   2. 精确元数优先：形参个数恰等于实参个数且最后一个形参不是 vararg 的候选，
+     *      优先于「靠默认值/vararg 扩展」的候选。
+     *   3. 类型匹配：在优先池里找实参类型全部兼容的候选；恰好一个则选中。
+     *   4. 同元数多个兼容 -> 歧义；唯一候选但类型不兼容 -> 仍选中它，让逐参校验给出
+     *      具体的类型错误（保持旧诊断风格）。
+     * 失败模式：不抛异常，以 [MemberOverloadResolution] 表达结果。
+     */
+    private fun resolveMemberOverload(
+        candidates: List<JasFunction>,
+        argTypes: List<JasType?>,
+        receiverType: JasNamedType
+    ): MemberOverloadResolution {
+        val byArity = candidates.filter { acceptsArity(it, argTypes.size) }
+        if (byArity.isEmpty()) {
+            return MemberOverloadResolution.ArityMismatch(
+                candidates.map { it.parameters.size }.distinct().sorted()
+            )
+        }
+        val exactArity = byArity.filter { fn ->
+            fn.parameters.size == argTypes.size && fn.parameters.lastOrNull()?.vararg != true
+        }
+        val pool = if (exactArity.isNotEmpty()) exactArity else byArity
+        val typed = pool.mapNotNull { fn ->
+            val parameterTypes = memberParameterTypes(fn, receiverType)
+            matchMemberArguments(fn, parameterTypes, argTypes)?.let { match -> fn to match }
+        }
+        return when {
+            typed.size == 1 -> {
+                val fn = typed[0].first
+                MemberOverloadResolution.Selected(
+                    fn,
+                    memberParameterTypes(fn, receiverType),
+                    typed[0].second.vararg
+                )
+            }
+            typed.size > 1 -> MemberOverloadResolution.Ambiguous(typed.map { it.first })
+            pool.size == 1 -> {
+                // 唯一候选但类型不兼容：仍选中它，逐参校验会报出 expected/got。
+                val fn = pool[0]
+                val parameterTypes = memberParameterTypes(fn, receiverType)
+                val vararg = if (fn.parameters.lastOrNull()?.vararg == true) {
+                    resolveVarargCall(parameterTypes, true, argTypes)
+                } else null
+                MemberOverloadResolution.Selected(fn, parameterTypes, vararg)
+            }
+            else -> MemberOverloadResolution.Ambiguous(pool)
+        }
+    }
+
+    /**
+     * 判断一个候选能否接受 [argCount] 个实参。
+     *
+     * required 只统计「没有默认值且不是 vararg」的形参；vararg 形参本身不要求实参
+     * （零个尾部实参是合法的）。
+     */
+    private fun acceptsArity(fn: JasFunction, argCount: Int): Boolean {
+        val required = fn.parameters.count { it.defaultValue == null && !it.vararg }
+        val hasVararg = fn.parameters.lastOrNull()?.vararg == true
+        return argCount >= required && (hasVararg || argCount <= fn.parameters.size)
+    }
+
+    /**
+     * 判断实参类型是否全部能传给候选；兼容时返回 vararg 降级方案。
+     *
+     * 失败模式：返回 null 表示不兼容（或 vararg 结构不成立）；不记录诊断。
+     * 默认参数：只校验实际提供的实参，未提供且带默认值的尾部形参不参与比较。
+     */
+    private fun matchMemberArguments(
+        fn: JasFunction,
+        parameterTypes: List<JasType>,
+        argTypes: List<JasType?>
+    ): MemberArgumentsMatch? {
+        val isVarargs = fn.parameters.lastOrNull()?.vararg == true
+        val vararg = resolveVarargCall(parameterTypes, isVarargs, argTypes)
+        if (isVarargs) {
+            // 是 vararg 但实参个数不足以覆盖固定形参：resolveVarargCall 返回 null。
+            if (vararg == null) return null
+            val fixedOk = (0 until vararg.fixedCount).all { i ->
+                parameterAccepts(fn, parameterTypes[i], argTypes[i])
+            }
+            if (!fixedOk) return null
+            if (!vararg.passThrough) {
+                val tailOk = argTypes.drop(vararg.fixedCount).all {
+                    parameterAccepts(fn, vararg.arrayType.inner, it)
+                }
+                if (!tailOk) return null
+            }
+            return MemberArgumentsMatch(vararg)
+        }
+        if (argTypes.size > parameterTypes.size) return null
+        val ok = argTypes.withIndex().all { (index, argType) ->
+            parameterAccepts(fn, parameterTypes[index], argType)
+        }
+        return if (ok) MemberArgumentsMatch(null) else null
+    }
+
+    /**
+     * 单个实参是否可传给形参：类型兼容、任一侧未知、或形参是待推断的裸类型参数。
+     *
+     * 为什么抽到类级：顶层函数重载与成员重载必须使用同一套兼容规则，否则两处诊断会
+     *   随改动漂移（重复逻辑收口到正确层次）。
+     */
+    private fun parameterAccepts(fn: JasFunction, paramType: JasType?, argType: JasType?): Boolean =
+        paramType == null || argType == null ||
+            typesCompatible(argType, paramType) ||
+            (paramType is JasNamedType && fn.typeParameters.any { tp ->
+                tp.name == paramType.name && paramType.typeArguments.isEmpty()
+            })
+
+    /**
+     * 对选中的成员重载逐参校验，产生与顶层函数一致的 `argument N type mismatch` 诊断。
+     *
+     * 什么时候用：重载已选中后；普通类型不匹配或 vararg 尾部元素不匹配时记录错误。
+     * 前置条件：call.varargCall 已由决议结果写入（无 vararg 时为 null）。
+     * 失败模式：不抛异常；只在诊断列表追加错误。
+     */
+    private fun validateMemberArguments(
+        call: JasCall,
+        memberName: String,
+        fn: JasFunction,
+        parameterTypes: List<JasType>,
+        argTypes: List<JasType?>
+    ) {
+        val vararg = call.varargCall
+        if (vararg != null) {
+            for (i in 0 until vararg.fixedCount) {
+                val actual = argTypes.getOrNull(i) ?: continue
+                val expected = parameterTypes[i]
+                if (!parameterAccepts(fn, expected, actual)) {
+                    error(
+                        "Function '$memberName' argument ${i + 1} type mismatch: " +
+                            "expected ${typeDisplayName(expected)}, got ${typeDisplayName(actual)}",
+                        call
+                    )
+                }
+            }
+            if (!vararg.passThrough) {
+                for (i in vararg.fixedCount until argTypes.size) {
+                    val actual = argTypes[i] ?: continue
+                    if (!parameterAccepts(fn, vararg.arrayType.inner, actual)) {
+                        error(
+                            "Function '$memberName' argument ${i + 1} type mismatch: " +
+                                "expected ${typeDisplayName(vararg.arrayType.inner)}, got ${typeDisplayName(actual)}",
+                            call
+                        )
+                    }
+                }
+            }
+            return
+        }
+        for (i in argTypes.indices) {
+            if (i >= parameterTypes.size) break
+            val actual = argTypes[i] ?: continue
+            val expected = parameterTypes[i]
+            if (!parameterAccepts(fn, expected, actual)) {
+                error(
+                    "Function '$memberName' argument ${i + 1} type mismatch: " +
+                        "expected ${typeDisplayName(expected)}, got ${typeDisplayName(actual)}",
+                    call
+                )
+            }
+        }
+    }
+
+    /**
+     * 取选中重载的形参类型，并把接收者泛型实参代入声明类型的类型参数。
+     *
+     * 什么时候用：[resolveMemberOverload] 匹配实参与 [validateMemberArguments] 报错时。
+     * 前置条件：receiverType 是具名类型；fn 来自该接收者可见的成员。
+     * 失败模式：找不到声明类型或接收者无实参时返回原始形参类型（缺失类型按 any）。
+     * 为什么需要：`Repo<Person>.save(x: T)` 在调用点必须按 `Person` 校验，否则合法的
+     *   具体实参会被误报为 `expected T, got Person`（Q28 回归防线）。
+     */
+    private fun memberParameterTypes(fn: JasFunction, receiverType: JasNamedType): List<JasType> {
+        val declared = fn.parameters.map { it.type ?: JasAnyType }
+        val mapping = receiverTypeArgumentMapping(receiverType)
+        if (mapping.isEmpty()) return declared
+        return declared.map { substitute(it, mapping) }
+    }
+
+    /**
+     * 构造「接收者声明类型的类型参数 -> 接收者类型实参」的映射。
+     *
+     * 失败模式：类型未声明、无类型参数、接收者无实参时返回空映射（调用方原样返回）。
+     * 为什么单列：形参校验与返回类型替换必须使用同一份映射，避免两处推导规则漂移。
+     */
+    private fun receiverTypeArgumentMapping(receiverType: JasNamedType): Map<String, JasType> {
+        val declarationTypeParams = symbolTable?.findInterface(receiverType.name)?.typeParameters
+            ?: symbolTable?.findClass(receiverType.name)?.typeParameters
+            ?: return emptyMap()
+        if (declarationTypeParams.isEmpty() || receiverType.typeArguments.isEmpty()) return emptyMap()
+        return declarationTypeParams.map { it.name }.zip(receiverType.typeArguments).toMap()
+    }
+
+    /**
+     * 取选中重载的返回类型，并按接收者的泛型实参替换声明类型的类型参数。
+     *
+     * 什么时候用：[inferInstanceMemberCall] 选中候选后。
+     * 前置条件：receiverType 是具名类型；候选来自该接收者可见的成员。
+     * 失败模式：找不到声明类型、类型参数为空或接收者没有实参时原样返回（退回擦除类型）。
+     * 为什么只按接收者自身类型参数替换：与旧 [findMemberType] 的替换范围保持一致；
+     *   跨继承链的类型实参推导不在本任务范围。
+     */
+    private fun memberReturnType(fn: JasFunction, receiverType: JasNamedType): JasType {
+        val base = fn.returnType ?: JasUnitType
+        val mapping = receiverTypeArgumentMapping(receiverType)
+        if (mapping.isEmpty()) return base
+        return substitute(base, mapping)
     }
 
     /**

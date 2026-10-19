@@ -49,6 +49,7 @@ import jasper.checker.TypeChecker
 import jasper.parser.JasperParser
 import jasper.stdlib.StdLib
 import jasper.translator.JasperToIrTranslator
+import jasper.translator.MemberMethodSignature
 import jasper.translator.TranslationResult
 import jasper.translator.TypeMapper
 import org.jetbrains.kotlin.ir.declarations.IrFile
@@ -283,6 +284,8 @@ class JasperCompiler {
             val mergedInterfaces = mutableMapOf<String, List<String>>()
             val mergedIfaceDeclNames = mutableSetOf<String>()
             val mergedStaticFields = mutableSetOf<IrFieldSymbol>()
+            val mergedMemberSignatures = mutableMapOf<String, Map<String, MemberMethodSignature>>()
+            val mergedMemberCallKeys = mutableMapOf<IrSimpleFunctionSymbol, String>()
 
             // 逐个文件把 IR 与各类索引汇入「合并容器」。
             for ((_, pipeline) in results) {
@@ -296,6 +299,8 @@ class JasperCompiler {
                 // 集合类索引用 addAll（去重并集，不涉及覆盖语义）。
                 mergedIfaceDeclNames.addAll(tr.interfaceDeclNames)
                 mergedStaticFields.addAll(tr.staticFieldSymbols)
+                mergedMemberSignatures.putAll(tr.memberSignaturesByType)
+                mergedMemberCallKeys.putAll(tr.memberCallKeys)
             }
 
             // 后端只需要一个 TypeMapper；取第一个成功 pipeline 的，缺失则新建空实例。
@@ -307,7 +312,9 @@ class JasperCompiler {
                 classSuperclassNames = mergedSuperClasses,
                 classInterfaceNames = mergedInterfaces,
                 interfaceDeclNames = mergedIfaceDeclNames,
-                staticFieldSymbols = mergedStaticFields
+                staticFieldSymbols = mergedStaticFields,
+                memberSignaturesByType = mergedMemberSignatures,
+                memberCallKeys = mergedMemberCallKeys
             )
 
             val backend = JvmIrBackend(typeMapper)
@@ -461,7 +468,9 @@ class JasperCompiler {
                 classSuperclassNames = translated.classSuperclassNames,
                 classInterfaceNames = translated.classInterfaceNames,
                 interfaceDeclNames = translated.interfaceDeclNames,
-                staticFieldSymbols = translated.staticFieldSymbols
+                staticFieldSymbols = translated.staticFieldSymbols,
+                memberSignaturesByType = translated.memberSignaturesByType,
+                memberCallKeys = translated.memberCallKeys
             )
             pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir, annotationIndexes[filename] ?: AnnotationIndex.EMPTY)
         }
