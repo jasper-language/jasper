@@ -2,6 +2,17 @@
 
 This document records the current source-of-truth decisions that supersede older notes in the chapter documents.
 
+## 2026-10-20 D1 裁决
+
+以下决定自 2026-10-20 起生效，并落到对应文档：
+
+1. **W-17 容器**：`Map<K,V>` 是可变接口；`dict<K,V>` 是插入有序的具体实现；`{}` 是声明初始化时的 `dict` 语法糖；不设 `MutableMap`，读写权限由语言机制管理。已落到 `docs/03-类型系统.md` §3.5、§3.6（`{}` 语法糖标注为已裁决、未实现）。
+2. **W-18 错误**：异常为主，`Result` 为辅；明确两者使用边界；错误模型独立于 JVM。已落到 `docs/05-函数.md` §5.7。
+3. **W-20 异步**：公开 `Future<T>`，`Task` 内部化；采用结构化并发，统一取消、生命周期与错误传播。已落到 `docs/10-语句与控制流.md` §10.8（`Future` 运行时与 `TaskGroup` 标注为已裁决、未实现）。
+4. **W-21 关键字**：保留已有语义，核对现有类型、所有权及内存模型，不随意废弃或重复设计。已落到 `docs/03-类型系统.md` §3.9。
+5. **W-2 删除**：容器统一使用 `remove`；`delete`、`clear`、`drop` 按各自语义使用。已落到 `docs/jucs.md` §2。
+6. **同日另两条**：不允许用户自定义运算符重载（运算符行为由语言规范统一定义），已落到 `docs/03-类型系统.md` §3.9.1；`.jaso` 采用独立规范，见 `docs/jaso.md` 与本文 `.jaso` Module Loading 一节。
+
 ## Soft Keywords
 
 The true soft keywords are `get`, `set`, `from`, `onComplete`, `onBreak`,

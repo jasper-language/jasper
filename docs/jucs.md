@@ -40,14 +40,14 @@ jucs fs file list --path . --sort size --order desc --limit 10 --output json
 ## 2. 官方动词
 
 ```text
-list get search create update delete start stop restart status install uninstall run
+list get search create update remove start stop restart status install uninstall run
 ```
 
 不允许用 `show`、`info`、`rm` 等同义变体替代官方动词作为原生标准接口。
 
-> 注意：`delete` 目前是 Jasper 词法的保留字（已在语法中但解析器未启用）。
-> 它作为标准动词进入交互式 Shell 之前，需要先做语法层裁决；在此之前
-> 只有命令契约层使用该动词，Shell 尚不存在。
+> W-2（2026-10-20）：容器 / 集合元素移除统一用 `remove`。`delete`、`clear`、`drop`
+> 按各自语义使用：`clear` = 清空容器，`drop` = 释放所有权 / 资源；`delete`
+> 是 Jasper 词法的保留字（已在语法中但解析器未启用），不得用作容器移除动词。
 
 ## 3. 全生态参数字典
 
