@@ -78,6 +78,8 @@
    （**#1 已修复（本提交）**：该规避现已不再必要，泛型接口可经接口变量分派；探针源保留
    原写法以保留历史证据，未在本轮改写。）
 2. **删除方法命名 `removeById`**，不用 JPA 惯用的 `remove`。原因见 #7。
+   （**#7 已修复（Q31 / C15）**：`remove` 现可按声明签名正常分派，该规避不再必要；
+   探针源保留原写法以保留历史证据。）
 3. **不用 `return null`**：`find()` 查不到时返回数组首元素占位。原因见 #2。
 4. **跨文件字段一律走访问器方法**（`fullName()`/`addressList()`/`ownerId()`/…），
    公有字段只声明不跨文件读取。原因见 #3。
@@ -255,6 +257,22 @@ public function main(): int32 { var b: Base = new Derived(); return b.tag(); }
 
 #### 7. 名为 `remove` 的方法（接口接收者）生成非法字节码
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q31 / C15）**——根因是 JvmIrBackend 的「JDK 流畅 API」兜底按
+  **方法名**全局特判：当成员调用的声明擦除签名没有命中时，`append*`/`get`/`set`/`remove`
+  一律把返回描述符写成接收者类型。用户接口方法 `remove` 一旦未命中签名索引，就会生成
+  `remove(...)LStore;`，而调用点按 `bool` 使用栈上的值，运行期 `ifeq` 处触发
+  `VerifyError: Bad type on operand stack`。
+  修复：①声明签名永远优先（`useDeclared`）；②兜底收窄为
+  `isKnownJdkFluentCall(receiver, method)` 白名单，只对 **JDK 接收者**生效
+  （`StringBuilder`/`StringBuffer` 的 `append*`，以及 `java.util` 容器的
+  `get/set/remove` 旧形状）；白名单外的用户类型（接口/类/枚举）回退到「按 IR 调用点
+  类型推导」，不再被方法名误伤。未引入反射，未改 `.g4`。
+  回归守门：`jasper-compiler/src/test/kotlin/jasper/RemoveMethodTest.kt`（8 用例：真编译 +
+  `URLClassLoader` 真执行 + `javap` 形状断言；覆盖接口分派、具体类型调用、带参签名、
+  StringBuilder 回归、List/Map 兜底边界、同名不同 owner、缺失方法负向、用户类型兜底边界）。
+  修复后 `javap` 证据：`invokeinterface p/Store.remove:(Ljava/lang/String;I)Z`。
+  已知边界（非本任务目标）：JDK 容器 API 仍没有完整的声明签名层（`dict.get/remove` 的
+  参数擦除未建模），本次只保证兜底不再污染用户类型，容器行为保持原状。
 - 触发代码：
 ```jasper
 package p;
@@ -269,11 +287,14 @@ public function main(): int32 {
 }
 ```
 - 期望：`remove` 作为普通方法名正常分派（且返回 `bool`）。
-- 实测：`VerifyError: Bad type on operand stack`
+- 修复前实测：`VerifyError: Bad type on operand stack`
   （`ifeq` 处操作数栈上是接收者 `p/Store` 而非 `bool`；方法描述符被按接收者类型
   生成）。**与返回类型无关**：返回 `int32` 的 `remove` 同样失败。
   对照：返回 `bool`/`int32` 的 `exists`/`empty`/`removeById`/`flush` 均正常。
-- 探针规避：见第四节第 2 条（`EntityManager.removeById`）。
+- 修复后实测：上述代码真跑返回 `100`；`javap` 显示
+  `invokeinterface p/Store.remove:(Ljava/lang/String;I)Z`。
+- 探针规避（**已移除**）：见第四节第 2 条（`EntityManager.removeById`）；探针源保留
+  原写法仅为保留历史证据。
 
 #### 8. `dict<K, V>` 不能作类型 → 注册表/映射表只能用数组
 - 类别：`②标准库缺失`（同 JDBC #16 / R2DBC #16 复核）
@@ -386,7 +407,8 @@ public class Node { public function label(): string { return "n"; } }   // 语�
    （**#3 已修复（Q25 / C6+C16）**：该规避现已不再必要；探针源保留原写法以保留历史证据，
    未在本轮改写。）
 8. **查询不到时返回 `null`** —— 不可用（#2）：`return null`（any）生成非法字节码。
-9. **`remove` 作为方法名** —— 不可用（#7）：改名 `removeById`。
+9. **`remove` 作为方法名** —— ~~不可用（#7）：改名 `removeById`~~：
+   **已修复（Q31 / C15）**，可直接声明/调用 `remove`；探针源保留 `removeById` 仅为历史证据。
 10. **注解实参的运行时读取** —— 不可用（#5）：注解只在编译期索引。
 
 ## 七、结论

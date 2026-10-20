@@ -1891,14 +1891,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                     paramSb.append(typeMapper.jvmDescriptorFromIrType(arg.type))
                                 }
                             }
-                            // 返回描述符：优先用声明的擦除签名；否则用旧的特例
-                            // （StringBuilder.append/set/get/remove 返回接收者、toString 返回 String、
-                            // 其余按 IR 调用类型擦除）。
+                            // 返回描述符：优先用声明的擦除签名；否则只对**已知 JDK 接收者**
+                            // 保留流畅 API 特例（StringBuilder.append* 等），其余按 IR 调用
+                            // 点类型擦除。绝不能按方法名全局特判：用户类型的 remove/get/set
+                            // 会因此拿到接收者描述符（JPA #7 的 VerifyError 根因）。
                             val returnDesc = when {
                                 useDeclared -> declared!!.returnDescriptor
                                 realName == "toString" -> "Ljava/lang/String;"
-                                realName.startsWith("append") || realName == "set" ||
-                                    realName == "get" || realName == "remove" -> receiverDesc
+                                isKnownJdkFluentCall(receiverInternal, realName) -> receiverDesc
                                 else -> typeMapper.jvmReturnDescriptorFromIrType(expr.type)
                             }
                             if (isInterfaceTarget) {
@@ -2244,6 +2244,43 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         return expr is IrConstImpl &&
             expr.kind == IrConstKind.Null &&
             typeMapper.jvmReturnDescriptorFromIrType(expr.type) == "V"
+    }
+
+    /**
+     * 做什么：判断「没有命中声明签名」的成员调用是否可以走 JDK 流畅 API 的
+     *   「返回接收者自身」兜底。
+     *
+     * 什么时候用：生成 `v:<name>` 成员调用、且 [memberSignaturesByType] 未给出
+     *   该接收者上的声明擦除签名时（`useDeclared == false`）。
+     * 前置条件：receiverInternal 是 JVM 内部名（如 `java/lang/StringBuilder`），
+     *   methodName 是去掉 `v:` 前缀后的真实方法名。
+     * 失败模式：纯判定，不抛异常。白名单外的类型/方法一律返回 false，调用方回退到
+     *   「按 IR 调用点类型推导返回描述符」，不会再被方法名误伤。
+     * 为什么这样设计：旧实现按方法名（append 前缀、get、set、remove）**全局**特判，任何
+     *   用户类型只要方法叫 `remove` 就会把返回值当成接收者（JPA #7：`remove(...)`
+     *   的返回描述符变成 `LStore;`，`ifeq` 收到引用而 VerifyError）。JDK 流畅 API
+     *   的知识属于「外部类型事实」，不应污染用户类型的调用生成，因此把它收敛到
+     *   本白名单（隔离的变化点）：这里只登记**确实返回 this** 或**旧行为必须保留**
+     *   的 JDK 接收者，用户声明签名永远优先。
+     *
+     * 边界：`java.util` 容器的 `get/set/remove` 在 JDK 里并不返回接收者；当前语言
+     *   尚无 JDK 容器声明签名层，保留它们是为了不改变旧行为（容器 API 的完整兼容
+     *   不在本任务范围）。StringBuilder/StringBuffer 的 `append*` 是真正的链式 API。
+     */
+    private fun isKnownJdkFluentCall(receiverInternal: String, methodName: String): Boolean {
+        return when (receiverInternal) {
+            // 真正的流畅 API：append* 返回 this，链式调用依赖该描述符。
+            "java/lang/StringBuilder", "java/lang/StringBuffer" ->
+                methodName.startsWith("append")
+            // 旧兜底覆盖过的 JDK 容器形状：保留原行为，避免容器调用回归。
+            // 只按**接收者类型**放行，用户自定义类型不再命中。
+            "java/util/Collection",
+            "java/util/List", "java/util/ArrayList", "java/util/LinkedList", "java/util/Vector",
+            "java/util/Set", "java/util/HashSet", "java/util/LinkedHashSet", "java/util/TreeSet",
+            "java/util/Map", "java/util/HashMap", "java/util/LinkedHashMap", "java/util/TreeMap" ->
+                methodName == "get" || methodName == "set" || methodName == "remove"
+            else -> false
+        }
     }
 
     // 方法体顶层是否已有 return 语句：没有则由 generateIrFunction 补一条。
