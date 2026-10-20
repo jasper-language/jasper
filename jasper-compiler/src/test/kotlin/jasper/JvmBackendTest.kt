@@ -1199,8 +1199,7 @@ class JvmBackendTest {
                 var arr: int32[] = new int32[0];
                 for (x in arr) {
                     return 0;
-                } then {
-                } else {
+                } onZeroRuns {
                     return 42;
                 }
                 return 0;

@@ -4,10 +4,12 @@ This document records the current source-of-truth decisions that supersede older
 
 ## Soft Keywords
 
-The true soft keywords are `get`, `set`, `from`, `then`, `where`.
+The true soft keywords are `get`, `set`, `from`, `onComplete`, `onBreak`,
+`onZeroRuns`, `where`.
 The lexer defines no token for them; the parser matches an `Identifier` by text
 predicate only in the relevant position, so they remain usable as ordinary
-identifiers elsewhere.
+identifiers elsewhere.  `onComplete` / `onBreak` / `onZeroRuns` are only
+recognized in the suffix position of a `for-in` or `while` loop.
 
 The following are intentionally kept as **hard reserved** tokens because they
 appear mid-expression and a predicate would introduce prediction uncertainty:

@@ -239,6 +239,12 @@ data class TranslationContext(
     var currentClassName: String = "",
     // 循环栈：break/continue 指向栈顶最近循环。
     val loopStack: MutableList<IrLoop> = mutableListOf(),
+    // 带标签循环：label -> 目标 IR 循环（break label / continue label 使用）。
+    val loopLabels: MutableMap<String, IrLoop> = mutableMapOf(),
+    // 需要 onBreak 的循环：loop -> broke$ 标志符号；break 指向该循环时先置位。
+    val loopBreakFlags: MutableMap<IrLoop, IrVariableSymbolImpl> = java.util.IdentityHashMap(),
+    // labeledStatement 翻译期间暂存标签，由被包裹的第一个循环消费。
+    var pendingLoopLabel: String? = null,
     // 当前函数内累积的 defer 体；return/yield 时逆序展开。由 scopedDefers 保证不泄漏到相邻函数。
     val deferredBodies: MutableList<IrBlock> = mutableListOf(),
     // 当前函数；return 的目标符号与 defer 作用域依赖它。
@@ -935,6 +941,10 @@ class JasperToIrTranslator {
     private fun translateFunction(
         func: JasFunction, parentClass: IrClassSymbol?, ctx: TranslationContext
     ): IrSimpleFunction {
+        // 标签/循环标志是函数内局部状态，不能泄漏到下一个函数。
+        ctx.loopLabels.clear()
+        ctx.loopBreakFlags.clear()
+        ctx.pendingLoopLabel = null
         // Create type parameters first so they can be referenced by parameter/return types
         val irTypeParams = func.typeParameters.map { tp ->
             val irTp = translateTypeParameter(tp, ctx)
@@ -1815,7 +1825,13 @@ class JasperToIrTranslator {
             is JasContinueStatement -> translateContinue(stmt, ctx)
             is JasThrow -> translateThrow(stmt, ctx)
             is JasTry -> translateTry(stmt, ctx)
-            is JasLabeledStatement -> translateStatement(stmt.statement, ctx)
+            is JasLabeledStatement -> {
+                val previous = ctx.pendingLoopLabel
+                ctx.pendingLoopLabel = stmt.label
+                val translated = translateStatement(stmt.statement, ctx)
+                ctx.pendingLoopLabel = previous
+                translated
+            }
             is JasDefer -> translateDefer(stmt, ctx)
             is JasLock -> translateLock(stmt, ctx)
             is JasAssert -> translateAssert(stmt, ctx)
@@ -1904,8 +1920,28 @@ class JasperToIrTranslator {
         return irWhen
     }
 
-    private fun translateWhile(stmt: JasWhile, ctx: TranslationContext): IrWhileLoop {
+    private fun translateWhile(stmt: JasWhile, ctx: TranslationContext): IrStatement {
+        if (stmt.suffix != null) {
+            val outer = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+            val entered = declareBoolLocal(outer, nextTempName(ctx, "entered").asString(), typeMapper.falseConst())
+            val broke = declareBoolLocal(outer, nextTempName(ctx, "broke").asString(), typeMapper.falseConst())
+            val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+            consumeLoopLabel(irLoop, ctx)
+            ctx.loopBreakFlags[irLoop] = broke
+            ctx.loopStack.add(irLoop)
+            irLoop.condition = translateExpression(stmt.condition, ctx)
+            val body = translateBlock(stmt.body, ctx)
+            val bodyWithEntered = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+            (bodyWithEntered.statements as MutableList<IrStatement>).add(setBoolLocal(entered))
+            (bodyWithEntered.statements as MutableList<IrStatement>).addAll(body.statements)
+            irLoop.body = bodyWithEntered
+            ctx.loopStack.removeAt(ctx.loopStack.size - 1)
+            (outer.statements as MutableList<IrStatement>).add(irLoop)
+            appendLoopSuffix(outer, stmt.suffix, entered, broke, ctx)
+            return outer
+        }
         val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+        consumeLoopLabel(irLoop, ctx)
         ctx.loopStack.add(irLoop)
         irLoop.condition = translateExpression(stmt.condition, ctx)
         irLoop.body = translateBlock(stmt.body, ctx)
@@ -1913,8 +1949,55 @@ class JasperToIrTranslator {
         return irLoop
     }
 
+    /** 在块开头声明一个布尔临时变量。 */
+    private fun declareBoolLocal(
+        block: IrBlock,
+        name: String,
+        initial: IrExpression
+    ): IrVariableSymbolImpl {
+        val symbol = IrVariableSymbolImpl()
+        val variable = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(name),
+            typeMapper.boolType(), symbol, true, false, false
+        )
+        variable.initializer = initial
+        (block.statements as MutableList<IrStatement>).add(variable)
+        return symbol
+    }
+
+    private fun boolGet(symbol: IrVariableSymbolImpl): IrExpression =
+        IrNodeFactory.createGetValue(0, 0, typeMapper.boolType(), symbol, null)
+
+    private fun setBoolLocal(symbol: IrVariableSymbolImpl): IrStatement =
+        IrNodeFactory.createSetValue(0, 0, typeMapper.boolType(), symbol, IrStatementOrigin.EQ, typeMapper.trueConst())
+
+    /** 在循环后按 broke → entered → zero 的顺序生成互斥子句。 */
+    private fun appendLoopSuffix(
+        block: IrBlock,
+        suffix: LoopSuffix?,
+        entered: IrVariableSymbolImpl,
+        broke: IrVariableSymbolImpl,
+        ctx: TranslationContext
+    ) {
+        if (suffix == null) return
+        val whenNode = IrNodeFactory.createWhen(0, 0, typeMapper.unitType(), IrStatementOrigin.IF)
+        suffix.onBreak?.let {
+            whenNode.branches.add(IrNodeFactory.createBranch(0, 0, boolGet(broke), translateBlock(it, ctx)))
+        }
+        suffix.onComplete?.let {
+            whenNode.branches.add(IrNodeFactory.createBranch(0, 0, boolGet(entered), translateBlock(it, ctx)))
+        }
+        suffix.onZeroRuns?.let {
+            whenNode.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), translateBlock(it, ctx)))
+        }
+        if (whenNode.branches.isNotEmpty()) {
+            (block.statements as MutableList<IrStatement>).add(whenNode)
+        }
+    }
+
     private fun translateDoWhile(stmt: JasDoWhile, ctx: TranslationContext): IrDoWhileLoop {
         val irLoop = IrNodeFactory.createDoWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.DO_WHILE_LOOP)
+        consumeLoopLabel(irLoop, ctx)
         ctx.loopStack.add(irLoop)
         irLoop.body = translateBlock(stmt.body, ctx)
         irLoop.condition = translateExpression(stmt.condition, ctx)
@@ -1931,6 +2014,7 @@ class JasperToIrTranslator {
             }
         }
         val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+        consumeLoopLabel(irLoop, ctx)
         ctx.loopStack.add(irLoop)
         irLoop.condition = if (stmt.condition != null) translateExpression(stmt.condition!!, ctx) else typeMapper.trueConst()
         val loopBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
@@ -1992,11 +2076,16 @@ class JasperToIrTranslator {
 
         val didRunSymbol = IrVariableSymbolImpl()
         val didRunVar = IrNodeFactory.createVariable(
-            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("didRun$"),
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "entered"),
             typeMapper.boolType(), didRunSymbol, true, false, false
         )
         didRunVar.initializer = typeMapper.falseConst()
         (block.statements as MutableList<IrStatement>).add(didRunVar)
+        val brokeSymbol = if (stmt.suffix != null) {
+            declareBoolLocal(block, nextTempName(ctx, "broke").asString(), typeMapper.falseConst())
+        } else {
+            null
+        }
 
         val elemSymbol = IrVariableSymbolImpl()
         val elemType = arrayElementType(iterableExpr.type)
@@ -2008,6 +2097,10 @@ class JasperToIrTranslator {
         ctx.varTypes[stmt.varName] = elemType
 
         val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+        consumeLoopLabel(irLoop, ctx)
+        if (brokeSymbol != null) {
+            ctx.loopBreakFlags[irLoop] = brokeSymbol
+        }
         ctx.loopStack.add(irLoop)
 
         val sizeSymbol = IrSimpleFunctionSymbolImpl()
@@ -2027,18 +2120,39 @@ class JasperToIrTranslator {
             ), emptyArray(), lessSymbol, null
         )
 
+        // 下标在循环体开头自增、元素读取用 i-1：这样 `continue` 跳到条件时
+        // 不会跳过自增，避免 for-in 数组循环无限执行。
+        val incSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[incSymbol] = "inc"
+        val incCall = IrNodeFactory.createCall(
+            0, 0, typeMapper.intType(), null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), idxSymbol, null)),
+            emptyArray(), incSymbol, null
+        )
         val loopBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+        (loopBody.statements as MutableList<IrStatement>).add(
+            IrNodeFactory.createSetValue(0, 0, typeMapper.intType(), idxSymbol, IrStatementOrigin.EQ, incCall)
+        )
         (loopBody.statements as MutableList<IrStatement>).add(
             IrNodeFactory.createSetValue(0, 0, typeMapper.boolType(), didRunSymbol, IrStatementOrigin.EQ, typeMapper.trueConst())
         )
 
         val getSymbol = IrSimpleFunctionSymbolImpl()
         ctx.callNames[getSymbol] = "get"
+        val minusSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[minusSymbol] = "-"
+        val readIndex = IrNodeFactory.createCall(
+            0, 0, typeMapper.intType(), null,
+            arrayOf(
+                IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), idxSymbol, null),
+                typeMapper.intConst(1)
+            ), emptyArray(), minusSymbol, null
+        )
         elemVar.initializer = IrNodeFactory.createCall(
             0, 0, elemType, null,
             arrayOf(
                 IrNodeFactory.createGetValue(0, 0, iterableExpr.type, arrSymbol, null),
-                IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), idxSymbol, null)
+                readIndex
             ), emptyArray(), getSymbol, null
         )
         (loopBody.statements as MutableList<IrStatement>).add(elemVar)
@@ -2049,17 +2163,6 @@ class JasperToIrTranslator {
                 (loopBody.statements as MutableList<IrStatement>).add(irBodyStmt)
             }
         }
-
-        val incSymbol = IrSimpleFunctionSymbolImpl()
-        ctx.callNames[incSymbol] = "inc"
-        val incCall = IrNodeFactory.createCall(
-            0, 0, typeMapper.intType(), null,
-            arrayOf(IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), idxSymbol, null)),
-            emptyArray(), incSymbol, null
-        )
-        (loopBody.statements as MutableList<IrStatement>).add(
-            IrNodeFactory.createSetValue(0, 0, typeMapper.intType(), idxSymbol, IrStatementOrigin.EQ, incCall)
-        )
 
         irLoop.body = loopBody
         ctx.loopStack.removeAt(ctx.loopStack.size - 1)
@@ -2074,6 +2177,9 @@ class JasperToIrTranslator {
                 afterLoop.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), translateBlock(stmt.elseBody, ctx)))
             }
             (block.statements as MutableList<IrStatement>).add(afterLoop)
+        }
+        if (stmt.suffix != null && brokeSymbol != null) {
+            appendLoopSuffix(block, stmt.suffix, didRunSymbol, brokeSymbol, ctx)
         }
         return block
     }
@@ -2116,11 +2222,16 @@ class JasperToIrTranslator {
 
         val didRunSymbol = IrVariableSymbolImpl()
         val didRunVar = IrNodeFactory.createVariable(
-            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("didRun$"),
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "entered"),
             typeMapper.boolType(), didRunSymbol, true, false, false
         )
         didRunVar.initializer = typeMapper.falseConst()
         (block.statements as MutableList<IrStatement>).add(didRunVar)
+        val brokeSymbol = if (stmt.suffix != null) {
+            declareBoolLocal(block, nextTempName(ctx, "broke").asString(), typeMapper.falseConst())
+        } else {
+            null
+        }
 
         // Type the loop variable from the concrete iterable's `next()` member.
         val iterableClass = typeMapper.irTypeClassName(iterableExpr.type)
@@ -2136,6 +2247,8 @@ class JasperToIrTranslator {
         ctx.varTypes[stmt.varName] = elemType
 
         val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+        consumeLoopLabel(irLoop, ctx)
+        if (brokeSymbol != null) ctx.loopBreakFlags[irLoop] = brokeSymbol
         ctx.loopStack.add(irLoop)
 
         val hasNextSymbol = IrSimpleFunctionSymbolImpl()
@@ -2181,6 +2294,9 @@ class JasperToIrTranslator {
                 afterLoop.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), translateBlock(stmt.elseBody, ctx)))
             }
             (block.statements as MutableList<IrStatement>).add(afterLoop)
+        }
+        if (stmt.suffix != null && brokeSymbol != null) {
+            appendLoopSuffix(block, stmt.suffix, didRunSymbol, brokeSymbol, ctx)
         }
         return block
     }
@@ -2239,21 +2355,30 @@ class JasperToIrTranslator {
     }
 
     private fun translateBreak(stmt: JasBreakStatement, ctx: TranslationContext): IrStatement {
-        // break 绑定到最近的循环（loopStack 栈顶）；无循环时退化为 no-op（防越界）。
-        if (ctx.loopStack.isNotEmpty()) {
-            val loop = ctx.loopStack.last()
-            return IrNodeFactory.createBreak(0, 0, typeMapper.unitType(), loop)
-        }
-        return typeMapper.unitExpr()
+        // 带标签的 break 指向命名循环；否则指向最近循环。无目标时退化为 no-op。
+        val loop = stmt.label?.let { ctx.loopLabels[it] } ?: ctx.loopStack.lastOrNull()
+            ?: return typeMapper.unitExpr()
+        val breakStmt = IrNodeFactory.createBreak(0, 0, typeMapper.unitType(), loop)
+        val flag = ctx.loopBreakFlags[loop] ?: return breakStmt
+        val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+        (block.statements as MutableList<IrStatement>).add(
+            IrNodeFactory.createSetValue(0, 0, typeMapper.boolType(), flag, IrStatementOrigin.EQ, typeMapper.trueConst())
+        )
+        (block.statements as MutableList<IrStatement>).add(breakStmt)
+        return block
     }
 
     private fun translateContinue(stmt: JasContinueStatement, ctx: TranslationContext): IrStatement {
-        // continue 同理绑定最近循环；无循环时 no-op。
-        if (ctx.loopStack.isNotEmpty()) {
-            val loop = ctx.loopStack.last()
-            return IrNodeFactory.createContinue(0, 0, typeMapper.unitType(), loop)
-        }
-        return typeMapper.unitExpr()
+        val loop = stmt.label?.let { ctx.loopLabels[it] } ?: ctx.loopStack.lastOrNull()
+            ?: return typeMapper.unitExpr()
+        return IrNodeFactory.createContinue(0, 0, typeMapper.unitType(), loop)
+    }
+
+    /** 让被 labeledStatement 包裹的第一个循环消费标签。 */
+    private fun consumeLoopLabel(loop: IrLoop, ctx: TranslationContext) {
+        val label = ctx.pendingLoopLabel ?: return
+        ctx.loopLabels[label] = loop
+        ctx.pendingLoopLabel = null
     }
 
     private fun translateThrow(stmt: JasThrow, ctx: TranslationContext): IrThrow {

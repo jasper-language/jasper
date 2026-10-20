@@ -361,9 +361,9 @@ class FeaturesTranslationTest {
                 var arr: int32[] = new int32[3];
                 for (x in arr) {
                     println(x);
-                } then {
+                } onComplete {
                     println("completed");
-                } else {
+                } onZeroRuns {
                     println("empty");
                 }
             }
@@ -380,7 +380,7 @@ class FeaturesTranslationTest {
                 var arr: int32[] = new int32[3];
                 for (x in arr) {
                     println(x);
-                } then {
+                } onComplete {
                     println("completed");
                 }
             }

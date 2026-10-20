@@ -190,6 +190,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         val isStatic: Boolean,
         // 循环标签栈，元素为 (continue 目标, break 目标)；IrBreak/IrContinue 取栈顶。
         val loopStack: MutableList<Pair<Label, Label>> = mutableListOf(),
+        // 精确到 IR 循环节点的标签：带标签 break/continue 必须跳到指定循环，而不是栈顶。
+        val loopTargets: MutableMap<IrLoop, Pair<Label, Label>> = java.util.IdentityHashMap(),
         // finally 上下文栈：进入 try/finally 的函数体时压栈、离开时弹栈。
         // 生成 IrReturn 时据此在返回前按「内层到外层」顺序执行所有尚未执行的 finally，
         // 这样「提前 return 也执行 finally」才能成立，且每个 finally 只执行一次（FINDINGS #4）。
@@ -1250,7 +1252,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // continue 跳 loopLabel（重新判条件），break 跳 endLabel。
                 val loopLabel = Label()
                 val endLabel = Label()
-                ctx.loopStack.add(Pair(loopLabel, endLabel))
+                val targets = Pair(loopLabel, endLabel)
+                ctx.loopStack.add(targets)
+                ctx.loopTargets[stmt] = targets
                 mv.visitLabel(loopLabel)
                 val cond = stmt.condition
                 generateIrExpression(mv, cond, ctx, owner)
@@ -1266,6 +1270,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitLabel(endLabel)
                 // 出循环后弹栈，恢复上层的 break/continue 目标。
                 ctx.loopStack.removeLast()
+                ctx.loopTargets.remove(stmt)
             }
             is IrDoWhileLoop -> {
                 // do body while(cond)：体至少执行一次，条件在末尾判断。
@@ -1274,7 +1279,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // （由 translator 生成 IR 的方式决定，后端照此翻译）。
                 val loopLabel = Label()
                 val endLabel = Label()
-                ctx.loopStack.add(Pair(loopLabel, endLabel))
+                val targets = Pair(loopLabel, endLabel)
+                ctx.loopStack.add(targets)
+                ctx.loopTargets[stmt] = targets
                 mv.visitLabel(loopLabel)
                 val loopBody = stmt.body
                 if (loopBody is IrBlock) {
@@ -1288,6 +1295,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitJumpInsn(Opcodes.IFNE, loopLabel)
                 mv.visitLabel(endLabel)
                 ctx.loopStack.removeLast()
+                ctx.loopTargets.remove(stmt)
             }
             is IrTry -> {
                 // try/catch/finally 的统一生成。JVM 没有结构化 finally 指令，必须让三条路径都补上
@@ -1407,12 +1415,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitInsn(Opcodes.ATHROW)
             }
             is IrBreak -> {
-                // 目标取最内层循环的「结束」标签；循环外出现 break（IR 不该有）则静默忽略。
-                ctx.loopStack.lastOrNull()?.second?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
+                // 优先跳到 IR 指定的循环；旧 IR/无目标时退回最内层。
+                val target = ctx.loopTargets[stmt.loop] ?: ctx.loopStack.lastOrNull()
+                target?.second?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
             }
             is IrContinue -> {
-                // 目标取最内层循环的「循环头」标签（while 会重判条件、do-while 直接回体）。
-                ctx.loopStack.lastOrNull()?.first?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
+                val target = ctx.loopTargets[stmt.loop] ?: ctx.loopStack.lastOrNull()
+                target?.first?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
             }
             is IrSetValue -> {
                 // 赋值语句形态：符号 → 名字 → 槽，找不到槽就什么都不生成（例如

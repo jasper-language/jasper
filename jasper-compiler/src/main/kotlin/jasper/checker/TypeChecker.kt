@@ -782,6 +782,13 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         }
     }
 
+    private fun checkLoopSuffix(suffix: LoopSuffix?, env: TypeEnvironment, returnType: JasType?) {
+        if (suffix == null) return
+        suffix.onComplete?.let { checkStatement(it, env, returnType) }
+        suffix.onBreak?.let { checkStatement(it, env, returnType) }
+        suffix.onZeroRuns?.let { checkStatement(it, env, returnType) }
+    }
+
     private fun checkStatement(stmt: JasStatement, env: TypeEnvironment, returnType: JasType?) {
         // returnType 用于校验 return/表达式语句；对无返回值的上下文传 null（如 lambda 初查）。
         when (stmt) {
@@ -834,6 +841,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 env.loopDepth++
                 checkStatement(stmt.body, env, returnType)
                 env.loopDepth--
+                checkLoopSuffix(stmt.suffix, env, returnType)
             }
             is JasDoWhile -> {
                 env.loopDepth++
@@ -849,6 +857,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 forEnv.loopDepth++
                 checkStatement(stmt.body, forEnv, returnType)
                 forEnv.loopDepth--
+                if (stmt.suffix != null) {
+                    error("onComplete/onBreak/onZeroRuns are only supported on for-in and while", stmt)
+                }
             }
             is JasForInStatement -> {
                 val iterableType = inferExpression(stmt.iterable, env)
@@ -870,6 +881,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 loopEnv.loopDepth--
                 if (stmt.thenBody != null) checkStatement(stmt.thenBody, env, returnType)
                 if (stmt.elseBody != null) checkStatement(stmt.elseBody, env, returnType)
+                checkLoopSuffix(stmt.suffix, env, returnType)
             }
             is JasThrow -> inferExpression(stmt.expression, env)
             is JasTry -> {

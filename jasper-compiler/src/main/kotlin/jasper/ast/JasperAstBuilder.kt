@@ -765,7 +765,11 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      * whileStatement 规则：条件 + 循环体，产出 JasWhile。
      */
     override fun visitWhileStatement(ctx: JasperParser.WhileStatementContext): JasNode? {
-        return JasWhile(visit(ctx.expression()) as JasExpression, visit(ctx.block()) as JasBlock).at(ctx)
+        return JasWhile(
+            visit(ctx.expression()) as JasExpression,
+            visit(ctx.block()) as JasBlock,
+            buildLoopSuffix(ctx.loopSuffix())
+        ).at(ctx)
     }
 
     /**
@@ -793,19 +797,13 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitForStatement(ctx: JasperParser.ForStatementContext): JasNode? {
         val control = ctx.forControl()
         val body = visit(ctx.block()) as JasBlock
-        var thenBody: JasBlock? = null
-        var elseBody: JasBlock? = null
-        if (ctx.loopThenElse() != null) {
-            val lte = ctx.loopThenElse()
-            thenBody = visit(lte.block(0)) as? JasBlock
-            elseBody = if (lte.block().size > 1) visit(lte.block(1)) as? JasBlock else null
-        }
+        val suffix = buildLoopSuffix(ctx.loopSuffix())
 
         if (control.forInControl() != null) {
             val forInCtx = control.forInControl()
             val varName = doExtractForInVar(forInCtx.forInBinding())
             val iterable = visit(forInCtx.expression()) as JasExpression
-            return JasForInStatement(varName, iterable, body, thenBody, elseBody).at(ctx)
+            return JasForInStatement(varName, iterable, body, null, null, suffix).at(ctx)
         }
 
         if (control.forClassicControl() != null) {
@@ -820,9 +818,35 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
                     else -> null
                 }
             } else null
-            return JasForStatement(init, condition, update, body).at(ctx)
+            return JasForStatement(init, condition, update, body, suffix).at(ctx)
         }
-        return JasForStatement(null, null, null, body).at(ctx)
+        return JasForStatement(null, null, null, body, suffix).at(ctx)
+    }
+
+    /**
+     * 把文法里的循环后置块转成 [LoopSuffix]。
+     *
+     * 三个软关键字子句任选子集；重复子句按第一次出现保留，实际执行由翻译层的
+     * entered/broke 标志互斥选择。没有子句时返回 null。
+     */
+    private fun buildLoopSuffix(ctx: JasperParser.LoopSuffixContext?): LoopSuffix? {
+        if (ctx == null) return null
+        var onComplete: JasBlock? = null
+        var onBreak: JasBlock? = null
+        var onZeroRuns: JasBlock? = null
+        for (clause in ctx.loopClause()) {
+            val block = visit(clause.block()) as? JasBlock ?: continue
+            when {
+                clause.softOnComplete() != null -> if (onComplete == null) onComplete = block
+                clause.softOnBreak() != null -> if (onBreak == null) onBreak = block
+                clause.softOnZeroRuns() != null -> if (onZeroRuns == null) onZeroRuns = block
+            }
+        }
+        return if (onComplete == null && onBreak == null && onZeroRuns == null) {
+            null
+        } else {
+            LoopSuffix(onComplete, onBreak, onZeroRuns)
+        }
     }
 
     /**

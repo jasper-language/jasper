@@ -300,9 +300,23 @@ data class JasExpressionStatement(val expression: JasExpression) : JasStatement(
 data class JasIf(val condition: JasExpression, val thenBody: JasBlock, val elseBody: JasBlock?) : JasStatement()
 
 /**
- * while 循环：condition 循环条件；body 循环体。
+ * 循环后置块。三个块互斥，最多执行一个；AST 层保留用户写的子集，
+ * 翻译层按 entered/broke 标志决定实际执行哪一个。
  */
-data class JasWhile(val condition: JasExpression, val body: JasBlock) : JasStatement()
+data class LoopSuffix(
+    val onComplete: JasBlock? = null,
+    val onBreak: JasBlock? = null,
+    val onZeroRuns: JasBlock? = null
+)
+
+/**
+ * while 循环：condition 循环条件；body 循环体；suffix 可选的循环后置块。
+ */
+data class JasWhile(
+    val condition: JasExpression,
+    val body: JasBlock,
+    val suffix: LoopSuffix? = null
+) : JasStatement()
 
 /**
  * do-while 循环：先执行 body，再判断 condition。
@@ -313,13 +327,27 @@ data class JasDoWhile(val body: JasBlock, val condition: JasExpression) : JasSta
  * 经典三段式 for 循环：init 初始化语句；condition 条件表达式；update 步进表达式；
  * body 循环体。任一可为 null 表示该段省略。
  */
-data class JasForStatement(val init: JasStatement?, val condition: JasExpression?, val update: JasExpression?, val body: JasBlock) : JasStatement()
+data class JasForStatement(
+    val init: JasStatement?,
+    val condition: JasExpression?,
+    val update: JasExpression?,
+    val body: JasBlock,
+    val suffix: LoopSuffix? = null
+) : JasStatement()
 
 /**
  * for-in 遍历语句：varName 迭代变量名；iterable 被遍历表达式；body 循环体；
- * thenBody/elseBody 可选的 then/else 分支（用于带 else 的遍历语义）。
+ * thenBody/elseBody 为旧 then/else 兼容字段（G3 后不再由文法产生）；
+ * suffix 为新的 onComplete/onBreak/onZeroRuns 循环后置块。
  */
-data class JasForInStatement(val varName: String, val iterable: JasExpression, val body: JasBlock, val thenBody: JasBlock? = null, val elseBody: JasBlock? = null) : JasStatement()
+data class JasForInStatement(
+    val varName: String,
+    val iterable: JasExpression,
+    val body: JasBlock,
+    val thenBody: JasBlock? = null,
+    val elseBody: JasBlock? = null,
+    val suffix: LoopSuffix? = null
+) : JasStatement()
 
 /**
  * switch 语句：expression 被匹配的表达式；cases 分支列表。
