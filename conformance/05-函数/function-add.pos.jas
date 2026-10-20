@@ -1,0 +1,13 @@
+// spec: 05-函数.md#5.1 函数声明
+// kind: pos
+// expect: exit 42
+// 顶层函数按参数类型调用，并把返回值传给调用方。
+package test;
+
+function add(a: int32, b: int32): int32 {
+    return a + b;
+}
+
+public function main(): int32 {
+    return add(20, 22);
+}

@@ -1,0 +1,13 @@
+// spec: 04-变量与声明.md#4.5 顶层变量（不是合法文件项）
+// kind: edge
+// expect: exit 11
+// 变量不是合法顶层文件项，但作为类型成员的静态字段应可声明并读取。
+package test;
+
+class Holder {
+    public static var value: int32 = 11;
+}
+
+public function main(): int32 {
+    return Holder.value;
+}

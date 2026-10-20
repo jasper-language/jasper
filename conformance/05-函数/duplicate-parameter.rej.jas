@@ -1,0 +1,13 @@
+// spec: 05-函数.md#5.2 参数
+// kind: rej
+// expect: reject Duplicate parameter 'a' in function 'f'
+// 同一函数的参数名不得重复。
+package test;
+
+function f(a: int32, a: int32): int32 {
+    return a;
+}
+
+public function main(): int32 {
+    return f(1, 2);
+}

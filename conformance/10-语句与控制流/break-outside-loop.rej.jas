@@ -1,0 +1,10 @@
+// spec: 10-语句与控制流.md#10.6 Return / Break / Continue
+// kind: rej
+// expect: reject Break outside loop or switch
+// break 只能出现在循环或 switch 内部。
+package test;
+
+public function main(): int32 {
+    break;
+    return 0;
+}

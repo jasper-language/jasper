@@ -1,0 +1,12 @@
+// spec: 04-变量与声明.md#4.2 类型推断
+// kind: pos
+// expect: exit 42
+// var 与 const 的初始化表达式应能推断出基础类型。
+package test;
+
+public function main(): int32 {
+    var left = 40;
+    const right = 2;
+    var total: int32 = left + right;
+    return total;
+}

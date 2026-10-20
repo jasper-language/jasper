@@ -1,0 +1,9 @@
+// spec: 09-表达式.md#9.6 二元运算符与优先级
+// kind: edge
+// expect: exit 5
+// 减法是左结合：10 - 3 - 2 应得到 5 而不是 9。
+package test;
+
+public function main(): int32 {
+    return 10 - 3 - 2;
+}

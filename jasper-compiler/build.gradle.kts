@@ -19,7 +19,19 @@ dependencies {
     implementation("org.antlr:antlr4-runtime:4.13.2")
     implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.0")
     testImplementation(kotlin("test"))
+    // 一致性套件使用 JUnit Jupiter 的动态测试；Vintage 引擎继续承载既有的
+    // kotlin-test/JUnit 4 测试，确保原有测试全部照常执行。
+    testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.2")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.2")
+    testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.10.2")
+    // 既有部分测试直接 import org.junit.Test / org.junit.Assume，必须继续提供 JUnit 4 API。
+    testImplementation("junit:junit:4.13.2")
     add(antlrTool.name, "org.antlr:antlr4:4.13.2")
+}
+
+tasks.test {
+    // 同时运行 JUnit Jupiter（动态一致性测试）与 Vintage（既有 JUnit 4 测试）。
+    useJUnitPlatform()
 }
 
 application {

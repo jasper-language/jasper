@@ -1,0 +1,10 @@
+// spec: 04-变量与声明.md#4.1 绑定语法
+// kind: rej
+// expect: reject requires an explicit type or an initializer
+// 既没有显式类型也没有初始化器的局部变量不能依赖后续赋值。
+package test;
+
+public function main(): int32 {
+    var value;
+    return 0;
+}

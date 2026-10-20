@@ -1,0 +1,14 @@
+// spec: 10-语句与控制流.md#10.3 If
+// kind: pos
+// expect: exit 1
+// if 条件为真时只执行 then 分支。
+package test;
+
+public function main(): int32 {
+    var value: int32 = 3;
+    if (value > 0) {
+        return 1;
+    } else {
+        return 2;
+    }
+}

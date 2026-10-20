@@ -1,0 +1,21 @@
+// spec: 10-语句与控制流.md#10.4 Switch
+// kind: edge
+// expect: exit 2
+// switch 按 case 精确匹配，不落入其他分支，也不执行 default。
+package test;
+
+public function main(): int32 {
+    var code: int32 = 2;
+    switch (code) {
+        case 1 => {
+            return 1;
+        }
+        case 2 => {
+            return 2;
+        }
+        default => {
+            return 0;
+        }
+    }
+    return -1;
+}

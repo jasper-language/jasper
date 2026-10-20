@@ -1,0 +1,10 @@
+// spec: 02-字面量.md#2.4 布尔与 null
+// kind: rej
+// expect: reject Type mismatch: cannot assign any?
+// null 不能静默赋给非可空的基础类型变量。
+package test;
+
+public function main(): int32 {
+    var value: int32 = null;
+    return value;
+}

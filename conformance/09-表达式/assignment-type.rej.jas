@@ -1,0 +1,11 @@
+// spec: 09-表达式.md#9.3 赋值
+// kind: rej
+// expect: reject Type mismatch: cannot assign bool to int32
+// 赋值表达式的右值必须可赋给左值的类型。
+package test;
+
+public function main(): int32 {
+    var value: int32 = 1;
+    value = true;
+    return value;
+}

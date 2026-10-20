@@ -1,0 +1,13 @@
+// spec: 05-函数.md#5.1 函数声明
+// kind: edge
+// expect: exit 0
+// 省略返回类型等价于 void，调用后主函数继续正常返回。
+package test;
+
+function noop() {
+}
+
+public function main(): int32 {
+    noop();
+    return 0;
+}
