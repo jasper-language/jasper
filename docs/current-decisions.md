@@ -120,6 +120,68 @@ public class User {
 }
 ```
 
+## Source Modes And `.jass`
+
+Strict mode is the default. It is selected for `.jas` and for the
+single-source compiler API unless a mode is passed explicitly:
+
+```text
+JasperCompiler.compile(source)                 -> strict
+JasperCompiler.compileScript(source)           -> script
+JasperCompiler.compile(source, SourceMode)     -> explicit mode
+```
+
+File-name based APIs select script mode only for `.jass`. Mode is never
+inferred from source content, a file header, or a shebang.
+
+Strict mode accepts declarations after the optional `package` / import header
+and rejects executable top-level statements. Script mode accepts the same
+declarations plus executable top-level statements; those statements are
+normalized into one synthetic `main(): void` and enter the same AST pipeline:
+
+```text
+function twice(value: int32): int32 {
+    return value * 2;
+}
+
+var result = twice(21);
+println(result);
+```
+
+The mode boundary is deliberate:
+
+- Mode does not propagate through imports. A `.jass` entry may import strict
+  `.jas` modules, which remain strict.
+- A strict module cannot import a `.jass` unit. Scripts are entry units, not
+  reusable libraries.
+- Script mode reuses the same AST, static type checker, IR, backend, standard
+  library, resource rules, and capability model as strict mode.
+- Script mode does not enable dynamic types, dynamic member lookup, implicit
+  conversions, runtime type mutation, reflection-by-default, or a second
+  interpreter.
+- Scripts do not automatically receive file, network, process, or other host
+  capabilities.
+- Cache keys and IDE/LSP module identity must include the mode as well as the
+  source path.
+
+Variable declaration rules are identical in both modes:
+
+```jasper
+var a = 10;          // infer from the initializer
+var b: int = 20;     // explicit type and initializer
+var c: int;          // explicit type; may be assigned later
+c = 30;
+```
+
+The following are errors:
+
+```jasper
+a = 10;              // assignment never implicitly declares a variable
+var d;               // neither type nor initializer
+var e = 10;
+e = "text";          // inferred type cannot change
+```
+
 ## `.jaso` Module Loading
 
 `.jaso` is the planned compiled Jasper module format. It is a runtime-managed module unit, not a Java-style collection of dynamically loaded classes.

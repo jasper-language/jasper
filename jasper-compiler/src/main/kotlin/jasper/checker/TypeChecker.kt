@@ -798,6 +798,10 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 if (env.contains(stmt.name)) {
                     error("Duplicate local declaration '${stmt.name}'", stmt)
                 }
+                // 没有显式类型时必须有初始化器；禁止 `var x;` 依赖后续赋值来偷偷引入类型。
+                if (stmt.type == null && stmt.initializer == null) {
+                    error("Variable '${stmt.name}' requires an explicit type or an initializer", stmt)
+                }
                 // 变量声明的显式类型必须先校验可见性（未知类型不得静默通过）。
                 checkTypeReferences(stmt.type, env)
                 if (stmt.initializer != null) {
@@ -1037,13 +1041,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                         // Function reference - return function type
                         // 函数引用：具体签名未知，先用无参、返回 any 的函数类型占位。
                         JasFunctionType(emptyList(), JasAnyType)
+                    } else if (expr.name == "this") {
+                        // `this` 是语言内建接收者，由类/方法上下文确定；它不是局部变量。
+                        // 具体类型由 translator 的接收者路径处理，这里不把它误报成未声明名字。
+                        null
                     } else {
-                        // 未解析：仅告警并返回 null，不产生硬错误。
-                        warn("Unresolved reference: '${expr.name}'", expr)
+                        // 名字未声明是静态语言错误；脚本模式同样不能用赋值隐式创建变量。
+                        error("Unresolved reference: '${expr.name}'", expr)
                         null
                     }
                 } else {
-                    warn("Unresolved reference: '${expr.name}' (no symbol table)", expr)
+                    error("Unresolved reference: '${expr.name}' (no symbol table)", expr)
                     null
                 }
             }

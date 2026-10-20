@@ -206,7 +206,7 @@ class JasperCompilerTest {
             println(x);
         """
         val compiler = JasperCompiler()
-        val result = compiler.compile(code)
+        val result = compiler.compileScript(code)
         assertTrue(result is JasperCompiler.CompileResult.Success, "Script compilation failed: ${(result as? JasperCompiler.CompileResult.Error)?.message}")
     }
 
