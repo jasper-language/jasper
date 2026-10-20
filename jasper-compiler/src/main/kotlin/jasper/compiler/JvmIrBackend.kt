@@ -366,12 +366,31 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             // 更具体的引用目标（含数组）补 CHECKCAST，满足验证器对精确类型的要求。
             // `null` 常量走这条分支时 CHECKCAST 也是合法的（结果仍是 null）。
             toDesc == "Ljava/lang/Object;" || toDesc == "Ljava/io/Serializable;" -> Unit
-            else -> {
-                val targetInternal = if (toDesc.startsWith("[")) toDesc
-                else toDesc.removePrefix("L").removeSuffix(";")
-                mv.visitTypeInsn(Opcodes.CHECKCAST, targetInternal)
-            }
+            else -> emitReferenceWidening(mv, fromDesc, toDesc)
         }
+    }
+
+    /**
+     * 做什么：只处理「引用 → 引用」的声明类型宽化：目标更具体（接口/父类/数组）时发 CHECKCAST。
+     *
+     * 什么时候用：变量初始化、赋值、返回值、实参等「已知声明目标类型」的落点；
+     *   这些位置此前只做 widen/box，引用类型的具体实现会原样入栈，虽然 JVM 验证器
+     *   因赋值兼容性放行，但字节码里缺少「按声明类型宽化」的显式证据（C13）。
+     * 前置条件：源/目标描述符均已由 [TypeMapper] 得到；栈顶恰好一个 [fromDesc] 值。
+     * 失败模式：描述符相同、或任一为基本类型时直接返回——基本类型转换仍由调用方
+     *   原有的 widen/box/unbox 原语负责，避免把「值类型与 IR 描述符不一致」的旧路径
+     *   误判成需要拆箱（例如幂运算 `**` 的 IR 类型与栈上 int 的既有近似）。
+     * 为什么单独成函数：它与 [emitStoreConversion] 的差别只在「不处理基本类型互转」，
+     *   把该差异隔离出来，可以让新调用点获得 CHECKCAST 而不改变既有数值/拆箱语义。
+     */
+    private fun emitReferenceWidening(mv: MethodVisitor, fromDesc: String, toDesc: String) {
+        if (fromDesc == toDesc) return
+        if (isPrimitiveDesc(fromDesc) || isPrimitiveDesc(toDesc)) return
+        // 目标为 Object/Serializable 时任何引用都可赋值，不需要 CHECKCAST。
+        if (toDesc == "Ljava/lang/Object;" || toDesc == "Ljava/io/Serializable;") return
+        val targetInternal = if (toDesc.startsWith("[")) toDesc
+        else toDesc.removePrefix("L").removeSuffix(";")
+        mv.visitTypeInsn(Opcodes.CHECKCAST, targetInternal)
     }
 
 
@@ -1159,11 +1178,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val init = stmt.initializer
                 if (init != null) {
                     generateIrExpression(mv, init, ctx, owner)
-                    // 初始化器类型可能与变量声明类型不同（如 int 字面量赋给 long/double）：
-                    // 先按数值拓宽、必要时再装箱，最后才 store，保证槽里的值类型与描述符一致。
+                    // 初始化器类型可能与变量声明类型不同（如 int 字面量赋给 long/double、
+                    // 具体实现赋给接口/父类变量）：按**声明目标类型**做数值拓宽、装箱与
+                    // 引用宽化（CHECKCAST），最后才 store，保证槽里的值类型与描述符一致，
+                    // 也让 javap 能在赋值处看到接口/父类的 CHECKCAST（C13）。
                     val initDesc = typeMapper.jvmDescriptorFromIrType(init.type)
                     widenIfNeeded(mv, initDesc, desc)
                     emitBoxingIfNeeded(mv, initDesc, desc)
+                    emitReferenceWidening(mv, initDesc, desc)
                     storeLocal(mv, desc, slot)
                 }
             }
@@ -1179,10 +1201,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     generateIrExpression(mv, value, ctx, owner)
                     val valueDesc = typeMapper.jvmDescriptorFromIrType(value.type)
                     if (retType != null) {
-                        // 返回值同样要拓宽/装箱到方法声明的返回类型，否则类型不匹配
-                        // （例如返回 Object 却压了个 int，ARETURN 会校验失败）。
+                        // 返回值同样要转换到方法声明的返回类型：数值拓宽/装箱之外，引用类型
+                        // 还要补 CHECKCAST（C13：`function make(): Repo { return new MemRepo(); }`
+                        // 返回处应显式宽化到 Repo）。
+                        // 例外：`return null` 必须保持 `aconst_null; areturn` 的既有形状
+                        // （NULL 常量对接口/类目标再做 CHECKCAST 虽合法，但会破坏可空返回
+                        // 的字节码契约，且没有语义收益）。
                         widenIfNeeded(mv, valueDesc, returnDesc)
                         emitBoxingIfNeeded(mv, valueDesc, returnDesc)
+                        val isNullLiteral = value is IrConstImpl && value.kind == IrConstKind.Null
+                        if (!isNullLiteral) {
+                            emitReferenceWidening(mv, valueDesc, returnDesc)
+                        }
                     }
                 }
                 // ③ 提前 return 路径（FINDINGS #4）：若当前处于 try/finally 体内，必须在真正返回前
@@ -1394,6 +1424,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     // 以登记的 IR 类型为准（可能已拓宽），退化到语句自身的类型。
                     val desc = typeMapper.jvmDescriptorFromIrType(local?.irType ?: stmt.type)
                     generateIrExpression(mv, stmt.value, ctx, owner)
+                    // 赋值目标可能是接口/父类局部变量：按声明的槽类型补 CHECKCAST，
+                    // 而不是把具体实现原样存进声明为接口的槽（C13）。
+                    val valueDesc = typeMapper.jvmDescriptorFromIrType(stmt.value.type)
+                    widenIfNeeded(mv, valueDesc, desc)
+                    emitBoxingIfNeeded(mv, valueDesc, desc)
+                    emitReferenceWidening(mv, valueDesc, desc)
                     storeLocal(mv, desc, slot)
                 }
             }
@@ -1506,9 +1542,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     val local = ctx.locals.find { it.name == name }
                     val desc = typeMapper.jvmDescriptorFromIrType(local?.irType ?: expr.type)
                     generateIrExpression(mv, expr.value, ctx, owner)
-                    // 按目标槽的描述符拓宽，避免窄类型 store 进宽槽后读出来类型不符。
+                    // 按目标槽的声明描述符转换：数值拓宽、装箱，以及引用类型到
+                    // 接口/父类目标的 CHECKCAST（C13）。随后 store+load 保持表达式语义。
                     val valueDesc = typeMapper.jvmDescriptorFromIrType(expr.value.type)
                     widenIfNeeded(mv, valueDesc, desc)
+                    emitBoxingIfNeeded(mv, valueDesc, desc)
+                    emitReferenceWidening(mv, valueDesc, desc)
                     storeLocal(mv, desc, slot)
                     loadLocal(mv, desc, slot)
                 } else if (!ctx.isStatic) {
@@ -1841,8 +1880,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 generateIrExpression(mv, arg, ctx, owner)
                                 if (useDeclared) {
                                     val targetDesc = declared!!.paramDescriptors[i - 1]
-                                    // 实参类型与声明形参不一致时补装箱（如 int → Object）。
-                                    emitBoxingIfNeeded(mv, typeMapper.jvmDescriptorFromIrType(arg.type), targetDesc)
+                                    // 实参按声明形参类型转换：基本类型装箱（int → Object），
+                                    // 具体实现 → 接口/父类时补 CHECKCAST（C13）。这既让栈上
+                                    // 类型与调用描述符一致，也把「传参宽化」显式落在字节码里。
+                                    val argDesc = typeMapper.jvmDescriptorFromIrType(arg.type)
+                                    emitBoxingIfNeeded(mv, argDesc, targetDesc)
+                                    emitReferenceWidening(mv, argDesc, targetDesc)
                                     paramSb.append(targetDesc)
                                 } else {
                                     paramSb.append(typeMapper.jvmDescriptorFromIrType(arg.type))
@@ -1898,7 +1941,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 if (func != null && i < func.valueParameters.size) {
                                     val argDesc = typeMapper.jvmDescriptorFromIrType(arg.type)
                                     val paramDesc = typeMapper.jvmDescriptorFromIrType(func.valueParameters[i].type)
+                                    // 静态调用同样按声明形参转换：装箱 + 接口/父类 CHECKCAST（C13）。
                                     emitBoxingIfNeeded(mv, argDesc, paramDesc)
+                                    emitReferenceWidening(mv, argDesc, paramDesc)
                                 }
                             }
                             // 描述符用被调函数的声明类型（擦除后），拿不到符号时退回实参类型；

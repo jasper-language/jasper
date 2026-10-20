@@ -103,6 +103,10 @@ Flux.declaredFields=[FETCH_SIZE]
 > **Q27 / C16** 修复 `③编译器缺陷` #13（跨包同名类型不可共存）：类型主键改为
 > 「包 + 简单名」，检查器按本包/import 解析简单名，翻译与后端按 JVM 内部名区分
 > 父类/接口/描述符；回归守门见 `jasper.CrossPackageTypeIdentityTest`。
+> **Q30 / C13** 完整修复 `③编译器缺陷` #8（具体类型宽化到声明接口/父类）：变量初始化、
+> 重新赋值、实参（含**构造器**）、返回值、字段写入都按声明目标类型生成 `CHECKCAST`；
+> 接口调用保持 `INVOKEINTERFACE` 与接口描述符，可空接口与类继承宽化不回归。
+> 回归守门见 `jasper.InterfaceWideningTest`。
 
 ## 四、探针为通过验收而采用的规避
 
@@ -119,8 +123,8 @@ Flux.declaredFields=[FETCH_SIZE]
 2. **具体表达式先赋给接口类型局部变量，再传给接口形参/存入接口字段**（#8）。
    例：`var seedSub: Subscription = new MemorySubscription(new Resource()); this.seed = seedSub;`
    以及 `var gateSubscriber: Subscriber = gate; this.source.subscribe(gateSubscriber);`。
-   （**#8 部分修复（本提交）**：「传给接口形参」已可直接传具体类型；「存入接口字段」仍需
-   接口类型局部变量兜底。）
+   （**#8 已由 Q30 / C13 完整修复**：传给接口形参、存入接口字段、返回值与变量赋值
+   均可直接使用具体类型；探针源保留原写法以保留历史证据，未在本轮改写。）
 3. **字段读取改用取值方法**（#5）：`Row` 的字段私有，暴露 `id()`/`name()`；
    这样跨文件读取不再依赖「声明字段的文件先被翻译」的排序。
    （**#5 已修复（Q25 / C6+C16）**：该规避现已不再必要；探针源保留原写法以保留历史证据，
@@ -348,13 +352,23 @@ public class B { public function s(): string { return "x"; } }
 
 #### 8. 具体类型的实参/右值未宽化到声明的接口类型
 - 类别：`③编译器缺陷`
-- 状态：**部分修复（本提交）**——「**成员方法调用**」那一半已修复：调用点对已登记成员
-  改用「声明的擦除签名」发描述符，故 `this.consume(new C())` / `consume(c2)` /
-  `consume(this.c)` 现生成 `consume(Lstd/I;)I` 而非 `consume(Lstd/C;)I`
-  （实测三处均通过，返回 `3`；见 `GenericDispatchTest` 的仓库/接口分派用例同源机制）。
-  **仍未修复**：字段赋值位 `this.slot = c`（字段声明 `I`、右值 `C`）仍按右值类型写
-  `PUTFIELD slot:Lstd/C;`，运行期 `NoSuchFieldError`——本轮任务（Q20 泛型擦除/桥接）
-  未覆盖字段赋值的宽化，保留待后续。
+- 状态：**已修复（Q30 / C13）**——四类落点现在都按**声明目标类型**宽化，并在字节码里
+  显式留下 `CHECKCAST`：
+  1. 局部变量初始化 / 重新赋值（`var r: Repo = new MemRepo(); r = new MemRepo();`）；
+  2. 实参（顶层函数、成员方法、**构造器**；构造器此前会写出类里不存在的
+     `<init>(LMemRepo;)V`，是本缺陷最直接的运行期症状）；
+  3. 返回值（`function make(): Repo { return new MemRepo(); }`）；
+  4. 字段写入（`this.slot = new MemRepo()`，字段声明 `Repo`）。
+  接口接收者的调用保持 `INVOKEINTERFACE` + 接口擦除描述符；可空接口（`Repo?`）在判空后
+  仍按同一 JVM 描述符分派，不丢 null 语义。类继承宽化（C3/C7）保持不回归。
+  宽化实现分两层：translator 预登记构造器声明形参并给实参插 `CAST`
+  （`collectConstructorParamTypes` / `translateNew`），后端在变量初始化、赋值、返回、
+  实参落点用 `emitReferenceWidening` 补 `CHECKCAST`（只处理引用→引用，不改变既有
+  widen/box/unbox 语义）。回归守门：`jasper.InterfaceWideningTest`（8 个用例，
+  真编译 + `URLClassLoader` 真执行 + `javap` 证据）。
+- 历史状态（Q20 泛型擦除/桥接）：成员方法调用那一半先修复——调用点改用声明的擦除签名，
+  故 `this.consume(new C())` / `consume(c2)` / `consume(this.c)` 生成
+  `consume(Lstd/I;)I`；字段赋值与构造器实参当时仍开放，已由 Q30 / C13 收口。
 - 现象：
   - **成员方法调用**的形参描述符取自**实参的静态类型**，而不是被调方法的声明形参类型；
   - **字段赋值**的描述符取自**右值类型**，而不是字段声明类型。

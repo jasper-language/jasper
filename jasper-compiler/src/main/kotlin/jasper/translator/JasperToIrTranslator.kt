@@ -196,6 +196,13 @@ data class TranslationContext(
     val memberSignaturesByType: MutableMap<String, MutableMap<String, MemberMethodSignature>> = mutableMapOf(),
     // 成员调用点符号 -> 成员索引键（元数键或 vararg 通配键），translate 完成时拷出给 backend。
     val memberCallKeys: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
+    // 构造器声明形参类型索引：JVM 风格类型名 -> memberArityKey("<init>", 形参数) -> 形参 IR 类型。
+    // 为什么需要：`new Holder(new MemRepo())` 的 JVM 描述符由实参类型决定（IrConstructorCall
+    //   没有与声明共享的符号），若不先把实参宽化到声明的接口/父类类型，就会写出
+    //   `<init>(LMemRepo;)V`，而类里只有 `<init>(LRepo;)V`，运行期 NoSuchMethodError。
+    // 变化点隔离：把「构造器声明签名」在预登记阶段集中一次，translateNew 只查表并插 CAST，
+    //   后端继续按 IR 实参类型拼描述符，无需理解构造器重载。
+    val constructorParamTypesByType: MutableMap<String, MutableMap<String, List<IrType>>> = mutableMapOf(),
     // Declared type-parameter names per user type (JVM-style name -> [T, ID, ...]).
     // Used to bind a receiver's type arguments onto the declared return type so the call
     // site's IR type is the *source* type (e.g. Repo<Person>.get -> Person).
@@ -322,6 +329,7 @@ class JasperToIrTranslator {
         collectMemberReturnTypes(ast, ctx)
         collectMemberSignatures(ast, ctx)
         collectSuperTypeNames(ast, ctx)
+        collectConstructorParamTypes(ast, ctx)
         predeclareFields(ast, ctx)
         predeclareTopLevelFunctions(ast.declarations, ctx)
         predeclareStaticMemberFunctions(ast, ctx)
@@ -371,6 +379,7 @@ class JasperToIrTranslator {
             collectMemberReturnTypes(ast, ctx)
             collectMemberSignatures(ast, ctx)
             collectSuperTypeNames(ast, ctx)
+            collectConstructorParamTypes(ast, ctx)
             predeclareFields(ast, ctx)
             predeclareTopLevelFunctions(ast.declarations, ctx)
             predeclareStaticMemberFunctions(ast, ctx)
@@ -697,6 +706,40 @@ class JasperToIrTranslator {
                 is JasClass -> record(decl.name, decl.typeParameters, decl.members)
                 is JasInterface -> record(decl.name, decl.typeParameters, decl.members)
                 else -> {}
+            }
+        }
+    }
+
+    /**
+     * 做什么：预登记每个类**构造器声明的形参类型**，按「类型内部名 + 元数」索引。
+     * 什么时候用：translate / translateAll 的第一遍（[collectSuperTypeNames] 之后、翻译声明之前），
+     *   每个文件调用一次；调用前必须先 [installFileContext]。
+     * 前置条件：形参类型已由类型检查器补全（本项目构造器形参必须显式声明类型）。
+     * 失败模式：不抛异常；有未声明类型的形参时整条构造器跳过（[translateNew] 退回旧行为，
+     *   只按实参类型拼描述符）。无显式构造器的类登记一个空形参列表，对应默认 `<init>()V`。
+     * 为什么这样设计：`IrConstructorCall` 的符号与声明符号不同身份，后端拼描述符时只能看实参；
+     *   把「构造器声明签名」提前收敛到一张表，调用点才能把具体实参宽化到声明类型
+     *   （接口/父类），使描述符与类里真实存在的构造器一致。该表只记录、不改声明。
+     * 已知限制：重载仅按元数区分（与成员索引口径一致）；同元数不同类型形参的重载在 v1
+     *   类型检查阶段已不可用，故不会走到这里的歧义选择。
+     */
+    private fun collectConstructorParamTypes(ast: JasSourceFile, ctx: TranslationContext) {
+        for (decl in ast.declarations) {
+            if (decl !is JasClass) continue
+            val owner = typeMapper.resolveNamedTypeName(decl.name)
+            val byKey = ctx.constructorParamTypesByType.getOrPut(owner) { mutableMapOf() }
+            if (decl.constructors.isEmpty()) {
+                // 默认构造器：`new C()` 的声明签名是空形参。
+                byKey.putIfAbsent(memberArityKey("<init>", 0), emptyList())
+                continue
+            }
+            for (ctor in decl.constructors) {
+                // 形参类型缺失时无法得到可靠描述符——整条跳过，避免登记半个签名。
+                if (ctor.parameters.any { it.type == null }) continue
+                byKey.putIfAbsent(
+                    memberArityKey("<init>", ctor.parameters.size),
+                    ctor.parameters.map { typeMapper.mapType(it.type) }
+                )
             }
         }
     }
@@ -1333,11 +1376,25 @@ class JasperToIrTranslator {
             val delegateTarget = if (delegateCall.isSuper) "super:${ctx.currentSuperclassName}" else "this"
             val delegateSymbol = IrSimpleFunctionSymbolImpl()
             ctx.callNames[delegateSymbol] = "ctor_delegate:$delegateTarget"
+            // 委托调用的实参同样按目标构造器的声明形参宽化（C13）。后端用实参 IR 类型
+            // 拼 `<init>` 描述符，若不在此处插 CAST，`super(new MemRepo())` 会写出
+            // 父类不存在的 `(LMemRepo;)V`。this(...) 的 owner 是当前类，super(...)
+            // 是当前父类；外部父类查不到签名时保持原样（旧行为）。
+            val delegateOwner = if (delegateCall.isSuper) ctx.currentSuperclassName else ctx.currentClassName
+            val declaredParams = ctx.constructorParamTypesByType[delegateOwner]
+                ?.get(memberArityKey("<init>", delegateCall.args.size))
+            val translatedArgs = delegateCall.args.map { translateExpression(it, ctx) }
             // Include `this` as first arg so backend emits ALOAD 0
             val allArgs = mutableListOf<IrExpression>()
             val thisGet = IrNodeFactory.createGetValue(0, 0, typeMapper.unitType(), IrValueParameterSymbolImpl(), null)
             allArgs.add(thisGet)
-            allArgs.addAll(delegateCall.args.map { translateExpression(it, ctx) })
+            allArgs.addAll(translatedArgs.mapIndexed { i, arg ->
+                if (declaredParams != null && i < declaredParams.size) {
+                    castToDeclared(declaredParams[i], arg)
+                } else {
+                    arg
+                }
+            })
             val delegateCallExpr = IrNodeFactory.createCall(
                 0, 0, typeMapper.unitType(), null,
                 allArgs.toTypedArray(),
@@ -3157,11 +3214,24 @@ class JasperToIrTranslator {
     private fun translateNew(expr: JasNew, ctx: TranslationContext): IrExpression {
         val ctorSymbol = IrConstructorSymbolImpl()
         val type = typeMapper.mapType(expr.type)
-        val args = expr.args.map { translateExpression(it, ctx) }.toTypedArray()
+        val args = expr.args.map { translateExpression(it, ctx) }.toMutableList()
+        // 构造器实参按**声明形参类型**宽化：`new Holder(new MemRepo())` 必须生成
+        // `<init>(LRepo;)V` 并在实参处补 CHECKCAST。IrConstructorCall 的符号不与声明共享
+        // 身份，后端只能按实参类型拼描述符；因此把「声明目标类型」这一变化点放在翻译层，
+        // 后端继续只读 IR 类型。查不到签名（外部/合成构造器）时保持原样，维持旧行为。
+        val owner = typeMapper.irTypeClassName(type)
+        val declaredParams = owner?.let {
+            ctx.constructorParamTypesByType[it]?.get(memberArityKey("<init>", expr.args.size))
+        }
+        if (declaredParams != null && declaredParams.size == args.size) {
+            for (i in args.indices) {
+                args[i] = castToDeclared(declaredParams[i], args[i])
+            }
+        }
         ctx.constructorTypes[ctorSymbol] = "object"
         return IrNodeFactory.createConstructorCall(
             0, 0, type, null,
-            args, emptyArray(), ctorSymbol,
+            args.toTypedArray(), emptyArray(), ctorSymbol,
             SourceElement.NO_SOURCE, 0
         )
     }
