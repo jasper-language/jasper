@@ -147,8 +147,17 @@ data class AnnotationError(val message: String, val line: Int = 0, val column: I
  *   而「方法体」需要类型信息，故推迟到 lowering 阶段，由
  *   `JasperToIrTranslator` 依据 [JasSyntheticAccessor]/[JasSyntheticEquality]/[JasSyntheticMapper] 生成。
  *   这样把「签名先于实现可用」这一变化点隔离在注解阶段，避免了在注解阶段重造类型系统。
+ *
+ * 规则校验（Q32 / C17）：在登记注解索引的同一趟，把注解交给 [AnnotationValidator]，
+ *   按 [AnnotationRuleSet] 检查目标/元素/重复/互斥/组合约束。规则集通过构造参数注入，
+ *   默认使用 [AnnotationRuleSet.DEFAULT]；这样新增注解族只改规则表，本类主流程不变。
  */
-class AnnotationProcessor {
+class AnnotationProcessor(
+    annotationRules: AnnotationRuleSet = AnnotationRuleSet.DEFAULT
+) {
+
+    /** 规则执行器：无状态、可在多文件编译中复用；构造时绑定规则集。 */
+    private val annotationValidator = AnnotationValidator(annotationRules)
 
     /**
      * 做什么：扫描整份源文件，按注解名分派处理：类上合成 getter/setter/equals/hash 签名，
@@ -188,7 +197,7 @@ class AnnotationProcessor {
         for (decl in ast.declarations) {
             when (decl) {
                 is JasClass -> {
-                    val processed = processClass(decl, records)
+                    val processed = processClass(decl, records, errors)
                     if (processed !== decl) changed = true
                     declarations.add(processed)
                 }
@@ -210,7 +219,8 @@ class AnnotationProcessor {
 
     private fun processClass(
         cls: JasClass,
-        records: MutableMap<String, MutableList<AnnotationRecord>>
+        records: MutableMap<String, MutableList<AnnotationRecord>>,
+        errors: MutableList<AnnotationError>
     ): JasClass {
         val classAnnotations = cls.modifiers.filterIsInstance<JasAnnotationUse>()
         // Registry 分派（按注解简单名路由）：类级注解先解析出「是否启用某类派生成员」的开关。
@@ -224,6 +234,16 @@ class AnnotationProcessor {
         for (annotation in classAnnotations) {
             record(records, cls.name, "class", cls.name, annotation)
         }
+
+        // 编译期规则校验：与索引登记同一趟完成，错误进入统一诊断；有错误时编译器不会进入
+        // 类型检查/字节码阶段（见 JasperCompiler），因此不会产出实体 class。
+        annotationValidator.validateContainer(
+            ownerName = cls.name,
+            containerTarget = AnnotationTarget.CLASS,
+            containerAnnotations = classAnnotations,
+            members = annotatedMemberViews(cls.members),
+            errors = errors
+        )
 
         // 手写方法名集合：作为「资格判定」的最后一道闸。注解合成的成员若与手写同名则不再生成，
         // 保证幂等（重复处理同一 AST 不会叠加），也让手写实现始终覆盖派生实现（last-writer-wins 的镜像）。
@@ -346,6 +366,16 @@ class AnnotationProcessor {
                 else -> {}
             }
         }
+
+        // 与类相同的编译期规则校验：接口本身按 INTERFACE 目标检查（@Mapper 合法，
+        // @Entity/@Getter 等目标不匹配会在这里报错），方法上的 @Mapping 等同样受检。
+        annotationValidator.validateContainer(
+            ownerName = iface.name,
+            containerTarget = AnnotationTarget.INTERFACE,
+            containerAnnotations = annotations,
+            members = annotatedMemberViews(iface.members),
+            errors = errors
+        )
 
         // Registry 分派：只有接口带 @Mapper（按简单名匹配）才继续，否则本阶段对它无事可做。
         if (annotations.none { simpleName(it.name) == MAPPER }) return null
@@ -722,6 +752,33 @@ class AnnotationProcessor {
     }
 
     private fun simpleName(qualified: String): String = qualified.substringAfterLast('.')
+
+    /**
+     * 把 AST 成员裁剪成校验器需要的「目标种类 + 名字 + 注解」视图。
+     *
+     * 做什么：只保留属性和方法；构造器/嵌套类型等不参与当前注解规则，直接忽略。
+     * 什么时候用：processClass / processInterface 调用 validateContainer 之前。
+     * 前置条件：members 为类/接口的直接成员，顺序与源码一致。
+     * 失败模式：无（无匹配成员时返回空列表）。
+     * 为什么这样设计：校验器不应依赖 JasProperty/JasFunction 的具体结构；裁剪后
+     *   规则执行面更小，也更难被未来新增成员种类意外影响（隔离 AST 形状变化）。
+     */
+    private fun annotatedMemberViews(members: List<JasDeclaration>): List<AnnotatedMember> =
+        members.mapNotNull { member ->
+            when (member) {
+                is JasProperty -> AnnotatedMember(
+                    target = AnnotationTarget.PROPERTY,
+                    name = member.name,
+                    annotations = member.modifiers.filterIsInstance<JasAnnotationUse>()
+                )
+                is JasFunction -> AnnotatedMember(
+                    target = AnnotationTarget.FUNCTION,
+                    name = member.name,
+                    annotations = member.modifiers.filterIsInstance<JasAnnotationUse>()
+                )
+                else -> null
+            }
+        }
 
     // 注解索引登记：把一次注解使用追加进 `类名 -> 记录列表`。只做记录、不改 AST 语义，
     // 因此任何注解（无论是否被本阶段处理）都会被登记，供 `.jaso` 清单/扩展点索引用。

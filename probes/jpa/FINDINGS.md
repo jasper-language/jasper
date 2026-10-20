@@ -65,6 +65,12 @@
 > 与 R2DBC #5 同源）：字段符号/类型改为在第二遍翻译前按类统一预登记，声明处复用同一
 > `IrFieldSymbol` 身份，文件顺序不再影响字段解析。因此当前开放的 `③编译器缺陷` 由 6 条
 > 降为 5 条；回归守门见 `jasper.CrossFileFieldTest`。
+>
+> **Q32 / C17** 修复 #6：新增编译期注解规则注册表（`AnnotationRuleSet` /
+> `AnnotationValidator`），`@Entity` 缺 `@Id`、目标不匹配、重复/互斥、未知/缺失/
+> 非常量元素都会在注解处理阶段报 `ANNOTATION` 诊断，并在进入 IR/字节码前终止，
+> 因此不会产出实体 class。运行期 `MappingRegistry.register()` 的缺主键检查保留为
+> 纵深防御。回归守门见 `jasper.AnnotationValidationTest`。
 
 > 说明：本探针是新增探针，**未修改任何 `.g4`、未改编译器**。下列条目的大部分
 > 与 JDBC/R2DBC 探针的既有发现同源（#6 枚举、#8 静态字段、#9 类继承、#16 dict），
@@ -86,6 +92,8 @@
 5. **生命周期回调用 `Lifecycled` 接口承担**，`@PrePersist`/`@PostLoad` 仅作编译期
    标注。原因见 #5。
 6. **缺 @Id 的校验下移到运行期** `MappingRegistry.register()`（手写元数据）。原因见 #6。
+   （**#6 已修复（Q32 / C17）**：缺 `@Id` 现于编译期报错且不产出 class；运行期检查保留
+   为纵深防御，探针的历史规避写法不改写。）
 7. **元数据/表用显式类 + 对象数组**，不用 `dict<string, …>`。原因见 #8（同 JDBC #16）。
 8. **自增计数器用实例字段**（`nextId`），不用静态字段。原因见 #10（同 JDBC #8）。
 9. ~~**`@GeneratedValue.strategy` 用 `string`** 而非枚举~~ —— **本提交已修复**（#11，
@@ -216,8 +224,9 @@ public function main(): int32 {
 - 状态：**已修复（本提交）**——与 R2DBC #9 同源：`TypeChecker.classExtends` + `isSubtype`
   传递闭包让类继承进入子类型关系；子类实例可赋给基类变量并虚分派。回归守门见
   `InheritanceTest`（虚分派 / 三层继承 / 接口+继承组合 / 继承字段 / 描述符 / 跨文件）。
-  实体继承（`@Inheritance`、`@MappedSuperclass`）的**元数据**部分（#5/#6 的运行期注解读取、
-  缺 `@Id` 校验）仍未覆盖，属另两条独立缺陷，不在本次范围内。
+  实体继承（`@Inheritance`、`@MappedSuperclass`）的**元数据**部分（#5 的运行期注解读取、
+  缺 `@Id` 校验）仍未覆盖；其中「缺 `@Id`」已由 Q32 / C17 在编译期补上（#6），
+  运行期注解反射（#5）仍是独立缺陷。
 - 触发代码：
 ```jasper
 package p;
@@ -243,15 +252,41 @@ public function main(): int32 { var b: Base = new Derived(); return b.tag(); }
 
 #### 6. 编译期不校验实体注解：缺 `@Id` 不会在编译期报错
 - 类别：`③编译器缺陷`（注解处理阶段只识别它认识的四类注解）
-- 现象：`AnnotationProcessor` 只对 `@Getter`/`@Setter`/`@EqualsAndHashCode`/`@Mapper`
-  有语义分派；其余注解（含 `@Entity`/`@Id`）一律「只登记、不校验」。
+- 状态：**已修复（Q32 / C17）**——新增编译期注解规则注册表
+  （`AnnotationRuleSet`）与执行器（`AnnotationValidator`）：
+  - 注解名 → 允许目标（class/interface/property/function）、元素表（名字、常量类型、
+    是否必需）、互斥集合、组合约束；
+  - `@Entity` 规则声明「只允许 class，且至少有一个 property 上的 `@Id`」；
+    `@Id`/`@Column`/`@Table`/`@GeneratedValue`/`@OneToMany`/`@ManyToOne`/
+    `@PrePersist`/`@PostLoad` 同时校验目标与元素；
+  - 错误以 `CompileError.Annotation` 进入统一诊断；`JasperCompiler` 在进入 IR/字节码
+    阶段前中止，因此**不产生实体 class**；
+  - 现有 `@Getter`/`@Setter`/`@EqualsAndHashCode`/`@Mapper`/`@Mapping` 的 codegen
+    行为保留，只增加目标/重复/互斥/元素校验；
+  - 运行期 `MappingRegistry.register()` 的 `idField == ""` 检查**保留**，作为绕过注解
+    或手写元数据时的纵深防御。
+- 边界：这是「注解校验框架」的第一片，不是完整 JPA/Hibernate 实现；未登记的注解
+  （如 `@Deprecated`/用户自定义注解）仍只登记索引、不校验；不做运行期反射。
+- 回归守门：`jasper-compiler/src/test/kotlin/jasper/AnnotationValidationTest.kt`
+  （合法实体、缺 `@Id` 无 class 产物、非法目标、重复/互斥、必需/未知/非常量元素、
+  四类既有注解 codegen、跨文件/跨包 `@Id`、运行期 `MappingRegistry` 负向）。
+- 修复前现象：`AnnotationProcessor` 只对 `@Getter`/`@Setter`/`@EqualsAndHashCode`/
+  `@Mapper` 有语义分派；其余注解（含 `@Entity`/`@Id`）一律「只登记、不校验」。
   于是「实体缺 `@Id`」既不是编译错误、也不会产生任何警告。
-- 触发代码：任意 `@Entity` 类，不写 `@Id` —— 正常编译通过（静默）。
-- 期望：至少给出「实体缺少标识」的编译期（或注解处理阶段）诊断；
-  否则应明确「注解不在扫描范围内」。
-- 实测：静默通过。
+- 触发代码（修复前会静默通过）：
+```jasper
+package p;
+@Entity
+public class Legacy {
+    public var name: string;
+    public constructor(name: string) { this.name = name; }
+}
+```
+- 期望：给出「实体缺少标识」的编译期（注解处理阶段）诊断；修复后实测为
+  `@Entity class 'Legacy' must declare at least one @Id property`，且不产出
+  `p/Legacy.class`。
 - 探针规避：见第四节第 6 条（运行期 `MappingRegistry` 校验 `idField` 非空并抛
-  `JpaMappingException`，即验收点 ③ 的落点）。
+  `JpaMappingException`）。该规避仍保留为验收点 ③ 的运行期防御证据。
 
 ### 很啰嗦
 
@@ -398,7 +433,7 @@ public class Node { public function label(): string { return "n"; } }   // 语�
    实体必须实现 `Identifiable`/`Lifecycled` 接口，元数据手写。
 3. ~~**实体继承 / `@MappedSuperclass`** —— 不可用（#4）~~：**本提交已修复**类继承赋值子类型
    （子类实例可赋给基类变量并虚分派）；但实体继承的**元数据驱动**依赖运行期注解读取，仍
-   受 #5/#6 阻塞（见下）。
+   受 #5 阻塞（#6 的缺 `@Id` 编译期校验已由 Q32 / C17 补上，见下）。
 4. **`Map<主键, 实体>` 一级缓存** —— 不可用（#8）：`dict<K,V>` 不能作类型。
 5. **`@GeneratedValue` 全局序列（静态计数器）** —— 不可用（#10）：静态字段坏。
 6. ~~**`GenerationType` 枚举** —— 不可用（#11）~~：**本提交已修复**，枚举已可比较、
@@ -418,7 +453,8 @@ public class Node { public function label(): string { return "n"; } }   // 语�
   足以拼出一个可运行的 JPA 假实现（验收点 ①②③ 全部真跑通过）。
 - 最影响「写不出 JPA 形状」的是前 6 条：泛型接口分派（#1）、`return null`（#2）、
   跨文件字段（#3）、实体继承（#4）、运行期注解反射缺失（#5）、缺 `@Id` 无编译期
-  校验（#6）。其中 #1/#5/#6 直接决定「注解驱动」能不能成立。（#1、#3 已修复。）
+  校验（#6）。其中 #1/#5/#6 直接决定「注解驱动」能不能成立。（#1、#3、#6 已修复；
+  #6 现为编译期诊断 + 运行期纵深防御。）
 - 13 个摩擦点里有 5 个（原 9 个；#1、#13、#11 已随更早提交修复，#3 随 Q25 / C6+C16
   修复）是 `③编译器缺陷`，且多为
   **静默错误字节码**
@@ -440,7 +476,7 @@ public class Node { public function label(): string { return "n"; } }   // 语�
 | #1 泛型接口分派 | R2DBC #3（`LT;` 描述符） | 扩展：本条进一步区分「可声明/可实现/不可接口分派」；**已修复（本提交）** |
 | #2 `return null` | 新增 | 本探针首次记录 |
 | #5 运行期注解反射缺失 | 新增 | 本探针首次记录 |
-| #6 缺 @Id 无编译期校验 | 新增 | 本探针首次记录 |
+| #6 缺 @Id 无编译期校验 | 新增 | 本探针首次记录；**已修复（Q32 / C17）** |
 | #7 `remove` 方法名 | 新增 | 本探针首次记录（与后端名字特判相关，需进一步定位） |
 | #9 注解命名实参/无元注解 | JDBC/R2DBC 注解用法 | 扩展：读取注解实参的适配成本 |
 | #13 未知类型不报编译错 | 新增 | 本探针首次记录；**已修复（本提交）** |
