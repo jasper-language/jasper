@@ -162,6 +162,11 @@ class SchemaValidationTest {
         val reasons = problems(base(id = "demo.thing.delete"))
         assertTrue(reasons.any { it.contains("非官方动词") })
         assertTrue(reasons.any { it.contains("remove") && it.contains("已退役") })
+
+        // 其他非官方动词只报非官方，不附带 remove 提示。
+        val other = problems(base(id = "demo.thing.show"))
+        assertTrue(other.any { it.contains("非官方动词") })
+        assertTrue(other.none { it.contains("已退役") })
     }
 
     @Test

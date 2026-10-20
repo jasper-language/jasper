@@ -53,7 +53,7 @@ interface PermissionGate {
  *
  * 判定顺序：
  * 1. 契约声明的操作分类不是 [OperationClass.READ_ONLY] → 拒绝；
- * 2. 声明的任一能力名的末段属于写入类（write/manage/remove/execute/admin）→ 拒绝
+ * 2. 声明的任一能力名的末段属于写入类（write/manage/remove/delete/execute/admin 等）→ 拒绝
  *    （防止"自称只读却申请写能力"的自相矛盾契约混过去）；
  * 3. 其余放行。
  *
@@ -62,7 +62,10 @@ interface PermissionGate {
  */
 class MinimalReadOnlyGate : PermissionGate {
 
-    private val writeVerbs = setOf("write", "manage", "remove", "execute", "admin", "create", "update")
+    private val writeVerbs = setOf("write", "manage", "remove", "execute", "admin", "create", "update",
+        // delete 虽已不是官方命令动词，但能力名仍可能以它结尾；拒绝集合只增不减，宁严勿松。
+        // `delete` stays in the deny set: retiring a verb must never loosen the gate.
+        "delete")
 
     override fun check(
         registration: Registration,

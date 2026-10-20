@@ -63,4 +63,28 @@ class PermissionGateTest {
         assertTrue(decision is PermissionDecision.Denied)
         assertEquals("demo.remove", (decision as PermissionDecision.Denied).capability)
     }
+
+    @Test
+    fun retiredDeleteCapabilityIsStillDeniedForReadOnlySchema() {
+        // 失败路径：动词退役不得放松权限门，demo.delete 仍按写能力拒绝。
+        val schema = CommandSchema(
+            id = "demo.thing.list",
+            publisher = "org.jasper.test",
+            version = "1.0.0",
+            summaryZh = "列出资源",
+            summaryEn = "List resources.",
+            params = emptyList(),
+            outputType = "Record<Demo>",
+            effects = Effects(readOnly = true),
+            permissions = listOf(Permission("demo.delete")),
+        )
+        val decision = MinimalReadOnlyGate().check(
+            registration(schema),
+            CommandCall(schema.id, emptyMap()),
+            ctx(),
+        )
+
+        assertTrue(decision is PermissionDecision.Denied)
+        assertEquals("demo.delete", (decision as PermissionDecision.Denied).capability)
+    }
 }
