@@ -134,11 +134,11 @@ class InvokerTest {
         val registry = CommandRegistry()
         var called = false
         val schema = CommandSchema(
-            id = "demo.thing.delete",
+            id = "demo.thing.remove",
             publisher = "org.jasper.test",
             version = "1.0.0",
-            summaryZh = "删除",
-            summaryEn = "Delete.",
+            summaryZh = "移除",
+            summaryEn = "Remove.",
             params = listOf(ParamSpec("id", ParamKind.STRING, "标识", "Identifier.", required = true)),
             outputType = "Record<Demo>",
             effects = Effects(readOnly = false, destructive = true),
@@ -149,7 +149,7 @@ class InvokerTest {
             CommandOutcome(CommandData.Record(emptyList()))
         }
         val invoker = Invoker(registry)
-        val error = assertFailsWith<JucsException> { invoker.invoke("demo.thing.delete", mapOf("id" to "x"), ctx()) }
+        val error = assertFailsWith<JucsException> { invoker.invoke("demo.thing.remove", mapOf("id" to "x"), ctx()) }
         assertEquals(JucsCode.PERMISSION_DENIED, error.error.code)
         assertTrue(!called, "权限拒绝时处理器不得被调用")
     }

@@ -49,7 +49,12 @@ object SchemaValidation {
         // 动作段必须是官方动词，否则生态会出现 show/info/rm 这类同义变体。
         val action = schema.id.split('.').getOrNull(2)
         if (action != null && JucsNames.isKebab(action) && !OfficialVocabulary.isOfficialVerb(action)) {
-            problems += "动作 \"$action\" 不在官方动词表内；官方动词：${OfficialVocabulary.VERBS.keys.joinToString(" ")}"
+            // 非官方动词一律拒绝；同时给出可操作的迁移提示。
+            // 这里特意不把已退役名字作为可接受别名：注册与解析路径只有官方表一份事实来源，
+            // 提示只影响错误信息，绝不改变"拒绝"这一结果。
+            // The retired verb is mentioned only in prose; it is never accepted as an alias.
+            val removeHint = "若意图是移除资源，请改用 \"remove\"（delete 已退役，不再作为命令动词）"
+            problems += "动作 \"$action\" 是非官方动词；官方动词：${OfficialVocabulary.VERBS.keys.joinToString(" ")}；$removeHint"
         }
 
         val seen = mutableSetOf<String>()

@@ -153,6 +153,18 @@ class SchemaValidationTest {
     }
 
     @Test
+    fun removeIsOfficialAndRetiredDeleteGetsRemoveHint() {
+        // 正向：remove 是官方动词，合法命令身份可以通过校验。
+        assertEquals(emptyList(), problems(base(id = "demo.thing.remove")))
+        assertTrue(OfficialVocabulary.isOfficialVerb("remove"))
+
+        // 反向：delete 作为命令动词必须被拒绝，并明确提示改用 remove。
+        val reasons = problems(base(id = "demo.thing.delete"))
+        assertTrue(reasons.any { it.contains("非官方动词") })
+        assertTrue(reasons.any { it.contains("remove") && it.contains("已退役") })
+    }
+
+    @Test
     fun namingRulesAreConsistent() {
         assertTrue(JucsNames.isKebab("dry-run"))
         assertTrue(!JucsNames.isKebab("dry--run"))

@@ -36,7 +36,7 @@ object OfficialVocabulary {
         "search" to "按条件检索",
         "create" to "创建资源",
         "update" to "修改已有资源",
-        "delete" to "删除资源（必须声明可恢复性）",
+        "remove" to "移除资源（必须声明可恢复性）",
         "start" to "启动资源",
         "stop" to "停止资源",
         "restart" to "重启资源",
