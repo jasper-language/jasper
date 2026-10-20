@@ -795,7 +795,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 checkTypeReferences(stmt.type, env)
                 if (stmt.initializer != null) {
                     // 声明类型显式给出时，要求初始化表达式可赋给它。
-                    val initType = inferExpression(stmt.initializer, env)
+                    // 把声明类型作为「期望类型」传入：数组字面量据此直接采用目标元素类型，
+                    // 既避免公共父类型推断的歧义，也保证翻译器拿到正确的数组描述符。
+                    val initType = inferExpression(stmt.initializer, env, stmt.type)
                     if (stmt.type != null && initType != null) {
                         if (!typesCompatible(initType, stmt.type!!)) {
                             error("Type mismatch: cannot assign ${typeDisplayName(initType)} to variable of type ${typeDisplayName(stmt.type!!)}", stmt)
@@ -808,8 +810,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             is JasExpressionStatement -> checkExpression(stmt.expression, env)
             is JasReturn -> {
                 if (stmt.value != null) {
-                    // 带值 return：值类型必须可赋给声明返回类型。
-                    val valueType = inferExpression(stmt.value, env)
+                    // 带值 return：值类型必须可赋给声明返回类型。返回类型作为期望类型传入，
+                    // 使 `return [a, b]` 能按声明的数组类型生成正确元素描述符。
+                    val valueType = inferExpression(stmt.value, env, returnType)
                     if (returnType != null && valueType != null) {
                         if (!typesCompatible(valueType, returnType)) {
                             error("Return type mismatch: expected ${typeDisplayName(returnType)}, got ${typeDisplayName(valueType)}", stmt)
@@ -977,7 +980,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
         inferExpression(expr, env)
     }
 
-    private fun inferExpression(expr: JasExpression, env: TypeEnvironment): JasType? {
+    /**
+     * 做什么：推断表达式的静态类型；[expected] 是调用方已知的「期望类型」，用于有上下文的推断。
+     * 什么时候用：类型检查的表达式入口；变量声明/赋值/return 会传入目标类型，其余位置省略。
+     * 前置条件：env 已包含当前作用域可见的局部/形参；expected 可为 null。
+     * 失败模式：返回 null 表示无法推断（通常已伴随 warn）；不抛异常。
+     * 为什么需要 expected：裸数组字面量 `[a, b]` 自身没有元素类型，仅靠元素求公共父类型
+     *   在「多个互不相关的接口」或「用户想显式声明更宽类型」时会得到不精确甚至错误的结果。
+     *   把上下文类型下传后，字面量可直接采用目标元素类型，翻译器也能生成正确描述符；
+     *   这是「上下文相关推断」的最小落点，不改变其它表达式的既有行为（默认 null）。
+     */
+    private fun inferExpression(expr: JasExpression, env: TypeEnvironment, expected: JasType? = null): JasType? {
         // 返回 null 表示「无法推断」（多数由 warn 记录）；调用方普遍以 ?: JasAnyType 兜底。
         return when (expr) {
             is JasIntLiteral -> {
@@ -993,6 +1006,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             is JasStringLiteral -> JasStringType
             is JasBoolLiteral -> JasPrimitiveType("bool")
             is JasNullLiteral -> JasNullableType(JasAnyType)
+            is JasArrayLiteral -> inferArrayLiteral(expr, env, expected)
             is JasIdentifier -> {
                 // 解析优先级：局部/形参 -> 类型参数 -> 符号表中的类型名 -> 函数名 -> 未解析。
                 if (env.contains(expr.name)) {
@@ -1321,8 +1335,10 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             is JasDictLiteral -> JasNamedType("Map")
             is JasAssignment -> {
                 // 赋值兼容性：右值类型必须可赋给左值（目标）类型；结果类型为目标类型。
-                val valueType = inferExpression(expr.value, env)
+                // 先推断目标再带期望类型推断右值：数组字面量赋值 `a = [x, y]` 需要知道
+                // a 的数组元素类型，才能逐元素校验并让翻译器生成正确的 aastore 描述符。
                 val targetType = inferExpression(expr.target, env)
+                val valueType = inferExpression(expr.value, env, targetType)
                 if (valueType != null && targetType != null && !typesCompatible(valueType, targetType)) {
                     error("Type mismatch: cannot assign ${typeDisplayName(valueType)} to ${typeDisplayName(targetType)}", expr)
                 }
@@ -2133,6 +2149,124 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             return true
         }
         return false
+    }
+
+    /**
+     * 做什么：推断裸数组字面量 `[a, b, ...]` 的类型，并把最终元素类型回填到
+     *   [JasArrayLiteral.inferredElementType] 供翻译器使用。
+     * 什么时候用：[inferExpression] 命中 `JasArrayLiteral` 时。
+     * 前置条件：env 已建立；values 中的表达式可被正常推断。
+     * 失败模式：不抛异常。显式期望类型为数组时逐元素比对，类型不兼容会记录 error；
+     *   无期望类型且元素无法收敛时兜底 `any[]`（不生成 V 描述符）。
+     * 为什么优先用 expected：`Base[] = [new A(), new B()]`、`I[] = [...]` 的目标元素类型
+     *   是调用方已经知道的精确类型；直接采用它比「猜公共父类型」更稳定，也能保证
+     *   JVM 数组描述符与目标声明一致（C12）。只有无上下文时才回退到公共类型推断。
+     */
+    private fun inferArrayLiteral(expr: JasArrayLiteral, env: TypeEnvironment, expected: JasType?): JasType {
+        val expectedArray = when (expected) {
+            is JasArrayType -> expected
+            is JasNullableType -> expected.inner as? JasArrayType
+            else -> null
+        }
+        val valueTypes = expr.values.map { inferExpression(it, env) }
+        if (expectedArray != null) {
+            val element = expectedArray.inner
+            // 逐元素校验：不能只比较「数组整体类型」，否则公共类型退化成 any 时会静默放行
+            // 不兼容元素（例如 Base[] = [new A(), new Unrelated()]）。
+            for ((i, valueType) in valueTypes.withIndex()) {
+                if (valueType != null && !typesCompatible(valueType, element)) {
+                    error(
+                        "Array literal element ${i + 1} has type ${typeDisplayName(valueType)}, " +
+                            "incompatible with array element type ${typeDisplayName(element)}",
+                        expr.values[i]
+                    )
+                }
+            }
+            expr.inferredElementType = element
+            return JasArrayType(element)
+        }
+        val element = commonElementType(valueTypes) ?: JasAnyType
+        expr.inferredElementType = element
+        return JasArrayType(element)
+    }
+
+    /**
+     * 做什么：求一组元素类型的公共类型，供无上下文的数组字面量推断使用。
+     * 什么时候用：[inferArrayLiteral] 没有显式期望元素类型时。
+     * 前置条件：types 可含 null（无法推断的元素）。
+     * 失败模式：无法收敛时返回 null（调用方兜底 any）；不抛异常。
+     * 为什么这样设计：先处理「全同 / 数值拓宽 / 部分 any」，再沿已知类/接口继承图求
+     *   祖先交集。把「公共类型」收敛到一个函数，避免 translator 另写一份几乎相同的规则
+     *   （隔离的变化点：元素类型收敛策略）。
+     */
+    private fun commonElementType(types: List<JasType?>): JasType? {
+        val present = types.filterNotNull()
+        if (present.isEmpty()) return null
+        val firstKey = canonicalTypeKey(present.first())
+        if (firstKey != null && present.all { canonicalTypeKey(it) == firstKey }) return present.first()
+
+        // any 元素不参与收敛：它们可赋给任何元素类型；只有「全是 any」时才落为 any。
+        val concrete = present.filterNot { isAnyLike(it) }
+        if (concrete.isEmpty()) return JasAnyType
+        if (concrete.size != present.size) return commonElementType(concrete)
+
+        // 数值类型：选一个所有元素都能拓宽到的目标（如 int32 + int64 -> int64）。
+        if (concrete.all { isNumericType(it) }) {
+            return concrete.firstOrNull { candidate ->
+                concrete.all { typesCompatible(it, candidate) }
+            }
+        }
+
+        // 具名类型的祖先交集：A/B 都继承 Base 或实现 I 时得到 Base/I。
+        val ancestorSets = concrete.map { namedTypeAncestors(it) ?: return JasAnyType }
+        val common = ancestorSets.reduce { acc, set -> acc.intersect(set) }
+        if (common.isEmpty()) return JasAnyType
+        // 选最具体（最靠下）的公共祖先：它仍是所有元素类型的父类型，但能保留更多类型信息。
+        val mostSpecific = common.filter { candidate ->
+            common.all { other -> other == candidate || isSubtype(candidate, other) }
+        }
+        return JasNamedType(mostSpecific.firstOrNull() ?: common.first())
+    }
+
+    /**
+     * 做什么：把任意 Jasper 类型落成「可比较的规范键」。
+     * 什么时候用：[commonElementType] 判断元素类型是否相同、[isNumericType] 查数值表时。
+     * 为什么单独抽：`canonicalTypeName(JasType)` 对具名类型只返回源码原名，不做包限定；
+     *   跨包同名类型会被误判为同一类型。具名类型统一走字符串重载，才能拿到 `pkg.A`。
+     * 失败模式：无法规范化的类型返回 null；调用方按「不可比较」处理。
+     */
+    private fun canonicalTypeKey(type: JasType): String? =
+        if (type is JasNamedType) canonicalTypeName(type.name) else canonicalTypeName(type)
+
+    /** 判断类型是否为可参与数值拓宽的内建数值类型。 */
+    private fun isNumericType(type: JasType): Boolean {
+        val name = canonicalTypeKey(type) ?: return false
+        return name in setOf("byte", "short", "char", "int32", "int64", "float32", "float64")
+    }
+
+    /**
+     * 做什么：收集一个具名类型自身及其所有已知父类/接口（传递闭包）。
+     * 什么时候用：[commonElementType] 求公共祖先交集时。
+     * 前置条件：继承图（classExtends/classImplements/interfaceExtends）已完成第一遍收集。
+     * 失败模式：非具名类型或名字无法规范化时返回 null；visited 集合防止继承环导致死循环。
+     * 为什么返回规范化名：继承图以 TypeKey 规范名为键，用规范名求交才能跨包正确匹配。
+     */
+    private fun namedTypeAncestors(type: JasType): Set<String>? {
+        if (type !is JasNamedType) return null
+        // 用「字符串重载」把简单名落到包限定名；类型重载对 JasNamedType 只返回原名，
+        // 直接拿它查 classExtends 会因键是 `pkg.A` 而全部落空，导致公共类型退化成 any。
+        val start = canonicalTypeName(type.name)
+        val result = linkedSetOf<String>()
+        val queue = ArrayDeque<String>()
+        queue.add(start)
+        while (queue.isNotEmpty()) {
+            val current = queue.removeFirst()
+            if (!result.add(current)) continue
+            classExtends[current]?.let { queue.add(it) }
+            classImplements[current]?.forEach { queue.add(it) }
+            interfaceExtends[current]?.forEach { queue.add(it) }
+        }
+        return result
     }
 
     /**

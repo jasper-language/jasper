@@ -240,6 +240,12 @@ data class TranslationContext(
     var currentFile: IrFile? = null,
     // 匿名闭包类名自增计数器（Lambda$N）。
     var lambdaIdCounter: Int = 0,
+    // 编译器生成临时局部变量的自增计数器（aa$/ai$/av$/arr$/inc$ 等）。
+    // 为什么必须唯一：后端按「变量名」登记槽位（variables/locals 都以 name 为键），
+    //   同一函数里若两次使用同名临时变量，第二次读取会命中第一个槽位的类型，
+    //   在「先 int32[] 后 string[]」等多元素类型赋值场景直接生成非法字节码（C12）。
+    //   用符号而非名字做键是更大的重构；先在源头保证名字唯一，改动小且风险可控。
+    var tempIdCounter: Int = 0,
     // 当前类的父类（JVM 内部名）；构造器 super() 委托需要。
     var currentSuperclassName: String = "",
     // 当前包名；限定字段/类型内部名时用。
@@ -1913,7 +1919,7 @@ class JasperToIrTranslator {
 
         val arrSymbol = IrVariableSymbolImpl()
         val arrVar = IrNodeFactory.createVariable(
-            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("arr$"),
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "arr"),
             iterableExpr.type, arrSymbol, true, false, false
         )
         arrVar.initializer = iterableExpr
@@ -2465,6 +2471,7 @@ class JasperToIrTranslator {
             is JasCall -> translateCall(expr, ctx)
             is JasPropertyAccess -> translatePropertyAccess(expr, ctx)
             is JasArrayAccess -> translateArrayAccess(expr, ctx)
+            is JasArrayLiteral -> translateArrayLiteral(expr, ctx)
             is JasNew -> translateNew(expr, ctx)
             is JasArrayCreation -> translateArrayCreation(expr, ctx)
             is JasLambdaExpr -> translateLambda(expr, ctx)
@@ -3102,6 +3109,17 @@ class JasperToIrTranslator {
     private fun isArrayIrType(type: IrType): Boolean =
         typeMapper.jvmDescriptorFromIrType(type).startsWith("[")
 
+    /**
+     * 做什么：为编译器生成的临时局部变量分配一个函数内唯一的名字。
+     * 什么时候用：数组读/写、自增、数组构造等 lowering 需要临时槽时。
+     * 前置条件：ctx 属于当前正在翻译的函数；调用次数单调递增。
+     * 失败模式：纯字符串生成，不会失败。
+     * 为什么需要：后端用「变量名」作为局部槽的键（见 [TranslationContext.tempIdCounter] 注释）；
+     *   固定名字会让同函数内不同元素类型的临时变量互相污染，生成 C12 的非法字节码。
+     */
+    private fun nextTempName(ctx: TranslationContext, prefix: String): Name =
+        Name.identifier("$prefix\$${ctx.tempIdCounter++}")
+
     private fun translateArrayAccess(expr: JasArrayAccess, ctx: TranslationContext): IrExpression {
         val target = translateExpression(expr.target, ctx)
         val index = translateExpression(expr.index, ctx)
@@ -3115,6 +3133,25 @@ class JasperToIrTranslator {
             0, 0, elementType, null,
             arrayOf(target, index), emptyArray(), getSymbol, null
         )
+    }
+
+    /**
+     * 做什么：把裸数组字面量 `[a, b, ...]` 降级为「新建数组 + 逐元素 arraySet」的块表达式。
+     * 什么时候用：翻译器处理 [JasArrayLiteral] 时（变量初始化、赋值右侧、return 等）。
+     * 前置条件：checker 已尽量回填 [JasArrayLiteral.inferredElementType]；缺失时按 `any` 兜底。
+     * 失败模式：不抛异常；元素类型与数组描述符不一致时由 [buildArrayFromValues] 插 CAST，
+     *   避免把元素按错误类型 astore（C12 的非法字节码来源之一）。
+     * 为什么复用 [buildArrayFromValues]：它与 `new T[]{...}`、varargs 打包共享同一套
+     *   「创建 + 填充」逻辑，元素宽化/转型策略只维护一份（隔离的变化点：数组构造方式）。
+     */
+    private fun translateArrayLiteral(expr: JasArrayLiteral, ctx: TranslationContext): IrExpression {
+        val elementType = expr.inferredElementType ?: JasAnyType
+        val resultType = typeMapper.mapType(JasArrayType(elementType))
+        val arrayDesc = typeMapper.jvmDescriptorFromIrType(resultType)
+        val elemDesc = if (arrayDesc.startsWith("[")) arrayDesc.substring(1)
+            else typeMapper.jvmDescriptorFromIrType(typeMapper.mapType(elementType))
+        val values = expr.values.map { translateExpression(it, ctx) }
+        return buildArrayFromValues(resultType, values, ctx, elemDesc)
     }
 
     private fun translateNew(expr: JasNew, ctx: TranslationContext): IrExpression {
@@ -3176,7 +3213,7 @@ class JasperToIrTranslator {
         )
         val arrSymbol = IrVariableSymbolImpl()
         val arrVar = IrNodeFactory.createVariable(
-            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("arr$"),
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "arr"),
             resultType, arrSymbol, true, false, false
         )
         arrVar.initializer = createArray
@@ -3606,11 +3643,11 @@ class JasperToIrTranslator {
             val resultType = value.type
             val block = IrNodeFactory.createBlock(0, 0, resultType, null)
             val arrSymbol = IrVariableSymbolImpl()
-            val arrVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("aa$"), arrayExpr.type, arrSymbol, true, false, false)
+            val arrVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "aa"), arrayExpr.type, arrSymbol, true, false, false)
             arrVar.initializer = arrayExpr
             (block.statements as MutableList<IrStatement>).add(arrVar)
             val idxSymbol = IrVariableSymbolImpl()
-            val idxVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("ai$"), indexExpr.type, idxSymbol, true, false, false)
+            val idxVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "ai"), indexExpr.type, idxSymbol, true, false, false)
             idxVar.initializer = indexExpr
             (block.statements as MutableList<IrStatement>).add(idxVar)
             if (expr.op != "=") {
@@ -3631,7 +3668,7 @@ class JasperToIrTranslator {
                     arrayOf(getCall, value), emptyArray(), stubSymbol, null
                 )
                 val valSymbol = IrVariableSymbolImpl()
-                val valVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("av$"), resultType, valSymbol, true, false, false)
+                val valVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "av"), resultType, valSymbol, true, false, false)
                 valVar.initializer = binOp
                 (block.statements as MutableList<IrStatement>).add(valVar)
                 val setSymbol = IrSimpleFunctionSymbolImpl()
@@ -3648,7 +3685,7 @@ class JasperToIrTranslator {
                 (block.statements as MutableList<IrStatement>).add(IrNodeFactory.createGetValue(0, 0, resultType, valSymbol, null))
             } else {
                 val valSymbol = IrVariableSymbolImpl()
-                val valVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("av$"), resultType, valSymbol, true, false, false)
+                val valVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "av"), resultType, valSymbol, true, false, false)
                 valVar.initializer = value
                 (block.statements as MutableList<IrStatement>).add(valVar)
                 val setSymbol = IrSimpleFunctionSymbolImpl()
@@ -3682,7 +3719,7 @@ class JasperToIrTranslator {
                 if (needsResult) {
                     val resultSymbol = IrVariableSymbolImpl()
                     val resultVar = IrNodeFactory.createVariable(
-                        0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
+                        0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "inc"),
                         typeMapper.intType(), resultSymbol, true, false, false
                     )
                     resultVar.initializer = getX
@@ -3740,7 +3777,7 @@ class JasperToIrTranslator {
                 val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
                 val resultSymbol = IrVariableSymbolImpl()
                 val resultVar = IrNodeFactory.createVariable(
-                    0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
+                    0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "inc"),
                     typeMapper.intType(), resultSymbol, true, false, false
                 )
                 if (op == "++") {
@@ -3766,10 +3803,10 @@ class JasperToIrTranslator {
             val arrayExpr = translateExpression(aa.target, ctx)
             val indexExpr = translateExpression(aa.index, ctx)
             val arrSymbol = IrVariableSymbolImpl()
-            val arrVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("aa$"), arrayExpr.type, arrSymbol, true, false, false)
+            val arrVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "aa"), arrayExpr.type, arrSymbol, true, false, false)
             arrVar.initializer = arrayExpr
             val idxSymbol = IrVariableSymbolImpl()
-            val idxVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("ai$"), indexExpr.type, idxSymbol, true, false, false)
+            val idxVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "ai"), indexExpr.type, idxSymbol, true, false, false)
             idxVar.initializer = indexExpr
             val getSymbol = IrSimpleFunctionSymbolImpl()
             ctx.callNames[getSymbol] = "get"
@@ -3802,7 +3839,7 @@ class JasperToIrTranslator {
                 (block.statements as MutableList<IrStatement>).add(idxVar)
                 val resultSymbol = IrVariableSymbolImpl()
                 val resultVar = IrNodeFactory.createVariable(
-                    0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("inc$"),
+                    0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "inc"),
                     typeMapper.intType(), resultSymbol, true, false, false
                 )
                 if (op == "++") {

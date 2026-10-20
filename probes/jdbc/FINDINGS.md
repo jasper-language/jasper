@@ -54,15 +54,18 @@
 > **第二批（commit `e544e5a`）** 已修复 4 条「跨包/链接」缺陷——`③编译器缺陷`
 > #14/#12/#1/#7；**本提交** 已修复 `③编译器缺陷` #6（枚举常量比较 / `switch` / `match`）。
 > **Q24 / C19** 另**部分修复** `①语法层` #18（`throws` 解析进 AST 并写入编译器 manifest；
-> 按裁决不做 checked exception）。剩余未修复 8 条（#18 已部分修复）。
+> 按裁决不做 checked exception）。**Q29 / C11+C12** 修复 `③编译器缺陷` #2/#3
+> （数组元素读取类型 / 多元素类型数组赋值），并补上裸数组字面量 `[a, b, ...]` 的
+> AST/类型推断/翻译链路。剩余未修复 6 条（#18 已部分修复）。
 > 修复详情见第五节各条目的「状态」行。
 
 ## 四、探针为通过验收而采用的规避（原 5 处；第 1、2 条已随本批修复移除）
 
 > 说明：下列规避是探针源码**编写时**为绕开缺陷所采用的写法。
 > 第 1、2 条已在**第二批（commit `e544e5a`）** 修复后从探针中**移除**（见下）；
-> 第 5 条与 #4、#15 相关，二者已在第一批（`dbe8f17`）修复，该规避不再必要，
-> 但探针仍保留其原始写法。
+> 第 4 条（多元素类型数组赋值拆成单类型辅助函数）已随 **Q29** 修复 #3 而不再必要，
+> 探针保留这些小函数仅为可读性；第 5 条与 #4、#15 相关，二者已在第一批（`dbe8f17`）
+> 修复，该规避不再必要，但探针仍保留其原始写法。
 
 1. ~~**全部探针文件放在 `package std;`**~~ —— **已移除**：`SQLException.jas` 现位于
    `package probes.jdbc;` 并通过 `import std.Error;` 扩展 `std.Error`，
@@ -74,8 +77,9 @@
 3. **存储用 `int32[]`/`string[]`/`bool[]` 三组并行数组，而不是 `Row[]`**：
    这是该假实现的**设计选择**，不再是缺陷规避——用户类对象数组已可正确读写
    （#1）；探针保留并行数组仅为可读性。
-4. **数组填充拆成「每个函数只处理一种元素类型」的辅助函数**：仍需要，
-   同方法内多元素类型数组赋值会产生非法字节码（见 #3，未修）。
+4. **数组填充拆成「每个函数只处理一种元素类型」的辅助函数**：~~仍需要~~
+   **不再必要**——同方法内多元素类型数组赋值已随 **Q29 / C12** 修复（#3），
+   临时局部变量现在按函数内唯一名字分配；探针保留这些小函数仅为可读性。
 5. **不写 `this.方法()`，并把含 `defer` 的 `main` 放到文件最后**：
    `this.m()` 的接收者类型错误（见 #4），`defer` 会泄漏到后续函数（见 #15）。
    ——两者均已在 `dbe8f17` 修复，此规避不再必要，但探针保留原始写法。
@@ -112,6 +116,10 @@ public function main(): int32 {
 
 #### 2. 数组元素读取的 IR 类型是 `void`，只能用于 `return`
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q29 / C11）**——`translateArrayAccess` 的结果类型改为从数组目标
+  类型反推的**元素类型**；checker 的 `JasArrayAccess` 分支同样返回元素类型。
+  `var x = a[i]`、`this.field = a[i]`、`a[i] + 1`、`a[i].m()` 均可用。
+  回归：`ArrayElementTest`（5 个用例，含 javap `iaload`/`aaload` 断言）。
 - 现象：`a[i]` 的表达式类型被记为 `unit`（JVM 描述符 `V`）。一旦把它当
   参数、字段赋值右值或比较操作数，就会生成 `V` 描述符的指令。
 - 触发代码：
@@ -139,11 +147,17 @@ public function main(): int32 {
 - 期望：`this.b = this.a[0];` 与 `a[0] == "x"` 正常。
 - 实测：前者 `ClassFormatError: Field "b" ... illegal signature "V"`；
   后者 `VerifyError: Bad type on operand stack`。
-- 探针规避：读取后先赋给显式类型的局部变量，再使用
-  （`var isNull: bool = this.nullCells[i]; this.lastNull = isNull;`）。
+- 探针规避：~~读取后先赋给显式类型的局部变量，再使用~~
+  **已移除**——`MemoryResultSet` 现直接写 `this.lastNull = this.nullCells[i];`。
 
 #### 3. 同一方法内「多元素类型数组赋值」生成非法字节码
 - 类别：`③编译器缺陷`
+- 状态：**已修复（Q29 / C12）**——数组读/写与数组构造的临时局部变量改为
+  `nextTempName` 生成的函数内唯一名字（`aa$N`/`ai$N`/`av$N`/`arr$N`），
+  后端按名字取槽位时不再命中第一个同名变量。同时裸数组字面量 `[a, b, ...]`
+  现在有独立 AST 节点 `JasArrayLiteral`，checker 用上下文元素类型（或公共父类型）
+  回填 `inferredElementType`，translator 据此生成正确数组描述符并逐元素 `aastore`。
+  回归：`ArrayAssignTest`（8 个用例，含 `Base[]`/`I[]` 宽化、跨包、负向与 javap）。
 - 现象：数组赋值的临时局部变量名固定为 `aa$`/`ai$`/`av$`，后端用
   `locals.find { it.name == name }` 取**第一个**同名局部变量的类型。当同一方法里先给
   `int32[]` 再给 `string[]` 赋值时，字符串赋值复用了 int 临时变量的描述符。
@@ -166,8 +180,9 @@ public function main(): int32 { var t = new T(); return t.v(); }
 - 期望：两条赋值都正确。
 - 实测：`VerifyError: Bad local variable type`（`MemoryConnection.<init>` 中
   `iload` 加载了 `String` 槽位）。反汇编可见 `astore 10` 之后紧接 `iload 10`。
-- 探针规避：把每种元素类型的填充拆到独立函数中（`makeIntCells`/`makeStrCells`/
-  `makeNullCells` 各自只做一种类型）。
+- 探针规避：~~把每种元素类型的填充拆到独立函数中~~
+  **已不再必要**（Q29 / C12 修复）；探针保留 `makeIntCells`/`makeStrCells`/
+  `makeNullCells` 仅为可读性，不再作为规避。
 
 #### 4. `this.方法()` 不可调用
 - 类别：`③编译器缺陷`

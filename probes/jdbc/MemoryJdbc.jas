@@ -17,18 +17,21 @@ import probes.jdbc.SQLException;
 // arrays work at runtime again (FINDINGS #1); see `MemoryResultSet` / the
 // regression tests for that path.
 //
-// Several workarounds are still visible here; each is documented in FINDINGS.md:
-//   * array cells are filled by helper functions that return the array, and
-//     each helper touches a single element type, because two array-element
-//     assignments of different element types in one method still collide on the
-//     reused temporary local (FINDINGS #3);
-//   * no method calls itself through `this.` even though #4 is fixed — the
-//     probe is kept in its originally-shipped shape.
+// Historical workarounds are documented in FINDINGS.md. Two of them are no
+// longer required by the compiler:
+//   * array cells no longer *need* one helper per element type: two
+//     array-element assignments of different element types in one method now
+//     use unique temporary locals (FINDINGS #3 fixed). The small builders are
+//     kept only for readability;
+//   * `MemoryResultSet` now assigns an array element straight to a field,
+//     without the old explicit-typed local (FINDINGS #2 fixed).
+// `this.`-calls remain inlined because the probe is kept in its shipped shape,
+// even though FINDINGS #4 is fixed.
 //
 
 // ---------------------------------------------------------------------------
-// Array builders. One element type per function, and a non-void return on
-// purpose (see header note).
+// Array builders. One element type per function (readability only), and a
+// non-void return on purpose (see header note).
 // ---------------------------------------------------------------------------
 
 function makeIntCells(): int32[] {

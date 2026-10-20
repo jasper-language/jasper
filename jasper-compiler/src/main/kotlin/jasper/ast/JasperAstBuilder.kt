@@ -1490,10 +1490,18 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     /**
-     * primaryAtom 的 ArrayLiteral 标签（{...}）：转发到 arrayInitializer。
+     * primaryAtom 的 ArrayLiteral 标签（`[...]`）：构造无显式元素类型的 [JasArrayLiteral]。
+     *
+     * 为什么不能直接转发 `arrayInitializer`：该规则产出的是 [JasArrayInitValues]（一个
+     *   [JasArrayInit]，不是 [JasExpression]），而 `variableBinding` 的初始化器要求
+     *   `expression`；直接转发会让 `var a: T[] = [..]` 在 AST 构树时因非空强转失败而
+     *   报“Failed to parse source”。这里显式包成表达式节点，元素类型留给 checker 推断。
+     * 边界：嵌套数组初始化（`[[1],[2]]`）当前语言不支持，`arrayInitializer` 会过滤掉
+     *   嵌套项；空字面量 `[]` 产出空 values，由 checker 兜底为 `any[]`。
      */
     override fun visitPrimaryAtomArrayLiteral(ctx: JasperParser.PrimaryAtomArrayLiteralContext): JasNode? {
-        return visit(ctx.arrayInitializer())
+        val init = visit(ctx.arrayInitializer()) as? JasArrayInitValues
+        return JasArrayLiteral(init?.values ?: emptyList()).at(ctx)
     }
 
     /**

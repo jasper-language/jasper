@@ -547,6 +547,28 @@ data class JasNew(val type: JasType, val args: List<JasExpression>) : JasExpress
 data class JasArrayCreation(val type: JasType, val dims: List<JasExpression>, val init: JasArrayInit?) : JasExpression()
 
 /**
+ * 无显式元素类型的数组字面量表达式（`[a, b, c]`）。
+ *
+ * 做什么：保存字面量里按源码顺序排列的元素表达式；数组的元素类型由类型检查器
+ *   根据各元素类型求公共类型后回填到 [inferredElementType]，翻译器据此选数组描述符。
+ * 什么时候用：变量/字段初始化、赋值右侧、return 等位置直接写 `[...]`。
+ * 前置条件：语法树已由 `primaryAtom` 的 ArrayLiteral 分支构造；元素列表可以为空。
+ * 失败模式：元素类型无法收敛到公共类型时，[inferredElementType] 保持 null，
+ *   由类型检查器/赋值兼容性检查给出诊断；翻译器兜底为 `any[]`（不会生成 V 描述符）。
+ * 为什么单独建节点而不是复用 [JasArrayCreation]：后者带显式元素类型（来自 `new T[]{...}`），
+ *   而裸字面量没有类型可抄；把「元素类型待推断」这一状态显式建模，避免用一个假的
+ *   `any` 类型污染后续检查（隔离的变化点：数组字面量的类型来源）。
+ */
+class JasArrayLiteral(val values: List<JasExpression>) : JasExpression() {
+    /**
+     * 类型检查阶段回填的元素类型；null 表示尚未推断或无法收敛。
+     * 为什么可变：类型推断发生在 checker 第二遍，而 AST 节点在解析阶段就创建；
+     *   与 [JasCall.inferredTypeArgs] 采用同样的「检查阶段回填」模式，翻译器只读。
+     */
+    var inferredElementType: JasType? = null
+}
+
+/**
  * 数组初始化器的 sealed 根，区分「显式元素列表」与「仅给定长度」两种形态。
  */
 sealed class JasArrayInit : JasNode()
