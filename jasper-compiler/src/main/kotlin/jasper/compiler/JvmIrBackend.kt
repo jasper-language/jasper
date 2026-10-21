@@ -1448,15 +1448,39 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 generateIrExpression(mv, stmt as IrExpression, ctx, owner)
             }
             else -> {
-                // 兜底：表达式语句——生成后 POP 掉它留给栈的值，维持语句边界栈为空。
+                // 兜底：表达式语句——生成后弹掉它留给栈的值，维持语句边界栈为空。
                 // 前提是各生成器都遵守「表达式恰好留一个值」的约定（void 调用用 ACONST_NULL
-                // 占位），否则这里会栈下溢。
+                // 占位），否则这里会栈下溢。弹栈宽度由 [discardExpressionValue] 按描述符决定（C26）。
                 if (stmt is IrExpression) {
                     generateIrExpression(mv, stmt as IrExpression, ctx, owner)
-                    mv.visitInsn(Opcodes.POP)
+                    discardExpressionValue(mv, stmt as IrExpression)
                 }
             }
         }
+    }
+
+    /**
+     * 做什么：在语句边界弹掉一个「只取副作用、结果被丢弃」的表达式留在操作数栈上的值，
+     *   并按该表达式的 JVM 描述符选择**宽度正确**的弹栈指令。
+     *
+     * 什么时候用：所有「求值后丢弃结果」的生成点——表达式语句（缺陷 C26）、`when` 分支体
+     *   是单个表达式、`finally` 里只作副作用的表达式。只要表达式恰好留一个值，就应走这里。
+     * 前置条件：调用前栈顶正好是 [expr] 求值留下的那一个值；[expr] 的 IR 类型可被
+     *   [TypeMapper] 还原为 JVM 描述符（这是本函数判断宽度的唯一依据）。
+     * 失败模式：若 IR 类型与栈上实际宽度不符（上游类型推断错误），这里会发出宽度不匹配的
+     *   弹栈指令，错误由 JVM 验证器在类加载时报出——本函数不猜测、不兜底，避免把真实
+     *   缺陷掩盖成更隐蔽的栈错位。
+     * 为什么这样设计：JVM 的 `pop` 只弹一个「category 1」槽位（int/float 及其子宽度与引用），
+     *   而 `long`/`double`（描述符 `J`/`D`）占两个槽位，必须用 `pop2`；对它们发 `pop` 会
+     *   让验证器报 `VerifyError: Type double_2nd ... not assignable to category1 type`
+     *   （缺陷 C26 的现场）。描述符 → 指令的映射收敛到本函数这**一处**，四个丢弃点共用，
+     *   隔离的变化点是「JVM 值宽度规则」：将来若新增宽类型或改占位约定，只改这里。
+     *   void 表达式（描述符 `V`）走 `POP`：按本后端的约定，void 调用会补一个 ACONST_NULL
+     *   占位值（category 1），弹一个槽位才是对的。
+     */
+    private fun discardExpressionValue(mv: MethodVisitor, expr: IrExpression) {
+        val desc = typeMapper.jvmDescriptorFromIrType(expr.type)
+        mv.visitInsn(if (desc == "D" || desc == "J") Opcodes.POP2 else Opcodes.POP)
     }
 
     // while/if 链的语句位置生成：条件求值 → IFEQ 到 nextLabel → 分支体 → GOTO end。
@@ -1477,9 +1501,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     generateIrStatement(mv, s, ctx, owner)
                 }
             } else {
-                // 分支体是单个表达式：它作为一个值留下，语句位置必须弹掉。
+                // 分支体是单个表达式：它作为一个值留下，语句位置必须弹掉（宽度按描述符，C26）。
                 generateIrExpression(mv, result, ctx, owner)
-                mv.visitInsn(Opcodes.POP)
+                discardExpressionValue(mv, result)
             }
             // 命中分支后跳过其余分支。
             mv.visitJumpInsn(Opcodes.GOTO, endLabel)
@@ -1493,7 +1517,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
             } else {
                 generateIrExpression(mv, result, ctx, owner)
-                mv.visitInsn(Opcodes.POP)
+                discardExpressionValue(mv, result)
             }
         }
         mv.visitLabel(endLabel)
@@ -2321,9 +2345,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
             else -> {
                 generateIrExpression(mv, expr, ctx, owner)
-                // finally 表达式只作副作用时，留在栈上的值必须弹掉，保持栈平衡。
+                // finally 表达式只作副作用时，留在栈上的值必须弹掉，保持栈平衡；
+                // 弹栈宽度同样按描述符选（宽类型要 POP2，见 C26），V 保持原有的「不弹」行为。
                 if (typeMapper.jvmDescriptorFromIrType(expr.type) != "V") {
-                    mv.visitInsn(Opcodes.POP)
+                    discardExpressionValue(mv, expr)
                 }
             }
         }
