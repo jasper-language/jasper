@@ -124,6 +124,9 @@ class DocExamplesParseTest {
             "T\nT?\n*T\nT[]\nList<T>\n(A, B)",
             // 03: explicitly unsupported type forms.
             "T!\nT??\n&T\n&&T\nraw T\nshared T",
+            // 03: Map initialised by its dict implementation; `dict` is still a lexer keyword,
+            // so `new dict<K, V>()` does not parse until the grammar admits it.
+            "var names: List<string> = new List<string>();\nvar table: Map<string, int32> = new dict<string, int32>();",
             // 03: tuple/grouping illustration (third line marked 非法).
             "(a)\n(a, b)\n(a,)",
             // 04: binding syntax fragment.
