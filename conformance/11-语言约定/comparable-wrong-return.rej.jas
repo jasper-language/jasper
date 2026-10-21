@@ -1,0 +1,19 @@
+// spec: 07-类与接口.md#7.2 接口声明
+// kind: rej
+// expect: reject Incompatible override
+// 协议族拒绝例：Comparable.compareTo 的契约返回 int32，实现类写成 bool 必须被拒绝。
+package test;
+
+public interface Comparable<T> {
+    public function compareTo(other: T): int32;
+}
+
+public class Version implements Comparable<Version> {
+    public function compareTo(other: Version): bool {
+        return true;
+    }
+}
+
+public function main(): int32 {
+    return 0;
+}

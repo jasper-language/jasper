@@ -82,7 +82,11 @@ object StdLib {
         "Reducer.jas",
         "Comparator.jas",
         "Action.jas",
+        "Equatable.jas",
+        "Hashable.jas",
+        "Comparable.jas",
         "Iterator.jas",
+        "Iterable.jas",
         "Error.jas",
         "RecoverableError.jas",
         "FatalError.jas"

@@ -712,7 +712,75 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             }
         }
         checkOverrideReturnTypes(cls)
+        checkRequiredInterfaceMethods(cls)
     }
+
+    /**
+     * 做什么：校验具体类是否实现了其（直接或间接）接口声明的全部抽象方法。
+     *
+     * 什么时候用：[checkClass] 成员与构造器检查完成后；此时继承图已由 [check] 第一遍建立。
+     * 前置条件：cls 是普通类；symbolTable 可空（为空时无法取得接口声明，直接跳过）。
+     * 失败模式：不抛异常；每缺一个方法追加一条含类名、方法名与接口名的诊断。
+     * 为什么需要：JVM 允许具体类不实现接口抽象方法，直到调用点才抛 AbstractMethodError；
+     *   这会把「声明即错误」的契约问题推迟到运行期。语言层要求在编译期拒绝，否则
+     *   `class P implements Hashable<P>` 缺 `hash()` 这类错误会被静默写进 class 文件。
+     * 边界：只检查抽象方法（body == null）；接口默认方法（有 body）不强制实现。
+     *   继承来的实现（父类方法）视为满足；方法按「名字 + 形参个数」匹配，与当前
+     *   语言「同元数即同一签名」的成员重载限制一致。
+     * 为什么放在 checker 而不是后端：这是语言级契约，不是某个后端的编码细节；
+     *   放在这里可同时约束所有后端，并让诊断在生成字节码之前出现。
+     */
+    private fun checkRequiredInterfaceMethods(cls: JasClass) {
+        // 抽象类本来就可以把实现留给子类；具体类才要求方法齐全。
+        if (cls.modifiers.contains("abstract")) return
+        val symbols = symbolTable ?: return
+
+        // 已提供的方法签名集合：本类声明 + 父类继承。接口抽象方法体为 null。
+        val provided = mutableSetOf<String>()
+        val addMethods: (List<JasDeclaration>) -> Unit = { members ->
+            for (member in members) {
+                if (member is JasFunction) {
+                    provided.add(methodImplementationKey(member.name, member.parameters.size))
+                }
+            }
+        }
+        addMethods(cls.members)
+        // 继承图以「包 + 简单名」为键；先算一次祖先闭包，供实现继承与接口闭包共用。
+        val selfName = qualifiedTypeName(cls)
+        val ancestors = ancestorTypeNames(selfName)
+        for (ancestor in ancestors) {
+            symbols.findClass(ancestor)?.let { addMethods(it.members) }
+        }
+
+        // 直接实现的接口 + 经接口继承可达的父接口。ancestorTypeNames 已做传递闭包与去重。
+        val interfaces = LinkedHashSet<String>()
+        classImplements[selfName]?.forEach { interfaces.add(it) }
+        interfaces.addAll(ancestors)
+        for (interfaceName in interfaces) {
+            val iface = symbols.findInterface(interfaceName) ?: continue
+            for (member in iface.members) {
+                if (member !is JasFunction || member.body != null) continue
+                val key = methodImplementationKey(member.name, member.parameters.size)
+                if (key !in provided) {
+                    error(
+                        "Class '${cls.name}' does not implement method '${member.name}' " +
+                            "required by interface '${iface.name}'",
+                        cls
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 做什么：把「方法名 + 形参个数」编码成实现匹配用的稳定键。
+     * 什么时候用：[checkRequiredInterfaceMethods] 对比接口契约与类实现。
+     * 前置条件：name 非空；arity 为非负整数。
+     * 失败模式：无（纯字符串拼接）。
+     * 为什么不用 `JasFunctionType`：当前语言不支持同元数重载，名字+元数已足够区分，
+     *   且不引入泛型实参替换的复杂度（接口方法存在性只关心签名骨架）。
+     */
+    private fun methodImplementationKey(name: String, arity: Int): String = "$name/$arity"
 
     /**
      * 做什么：校验类方法对祖先（父类/接口）同签名方法的返回类型覆盖是否协变兼容。

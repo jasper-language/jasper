@@ -1,0 +1,7 @@
+package std;
+
+// Equality protocol: a type decides whether another value of the same type is
+// equal to it. Implementations must be reflexive, symmetric, and transitive.
+public interface Equatable<T> {
+    public function equals(other: T): bool;
+}

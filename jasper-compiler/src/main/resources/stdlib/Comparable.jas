@@ -1,0 +1,8 @@
+package std;
+
+// Ordering protocol: compares two values of type T and returns a negative,
+// zero, or positive int32 when the receiver is less than, equal to, or greater
+// than the argument. Implementations must define a consistent total order.
+public interface Comparable<T> {
+    public function compareTo(other: T): int32;
+}

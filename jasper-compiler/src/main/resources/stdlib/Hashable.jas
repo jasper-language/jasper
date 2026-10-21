@@ -1,0 +1,7 @@
+package std;
+
+// Hashing protocol built on equality: hash() must return the same int32 for
+// values that compare equal (`equals` true); unequal values may collide.
+public interface Hashable<T> extends Equatable<T> {
+    public function hash(): int32;
+}

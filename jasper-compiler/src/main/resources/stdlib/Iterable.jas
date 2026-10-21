@@ -1,0 +1,8 @@
+package std;
+
+// Iteration protocol: supplies an Iterator<T> over the receiver's elements.
+// Each call returns an iterator positioned before the first element; callers
+// drive it with hasNext() / next() from the Iterator protocol.
+public interface Iterable<T> {
+    public function iterator(): Iterator<T>;
+}

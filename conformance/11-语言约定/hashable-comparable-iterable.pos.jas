@@ -1,0 +1,123 @@
+// spec: 11-语言约定.md#11.6 相等与哈希协议
+// kind: pos
+// expect: exit 97
+// 协议族正例：Hashable/Comparable/Iterable 均可由用户类实现并显式调用。
+// 用例内自声明协议接口，因为一致性后端只编译单文件、不加载标准库。
+package test;
+
+public interface Equatable<T> {
+    public function equals(other: T): bool;
+}
+
+public interface Hashable<T> extends Equatable<T> {
+    public function hash(): int32;
+}
+
+public interface Comparable<T> {
+    public function compareTo(other: T): int32;
+}
+
+public interface Iterator<T> {
+    public function hasNext(): bool;
+    public function next(): T;
+}
+
+public interface Iterable<T> {
+    public function iterator(): Iterator<T>;
+}
+
+public class Point implements Hashable<Point>, Equatable<Point> {
+    private var x: int32;
+    private var y: int32;
+
+    public constructor(x: int32, y: int32) {
+        this.x = x;
+        this.y = y;
+    }
+
+    public function equals(other: Point): bool {
+        return this.x == other.x && this.y == other.y;
+    }
+
+    public function hash(): int32 {
+        return this.x * 31 + this.y;
+    }
+}
+
+public class Version implements Comparable<Version> {
+    private var major: int32;
+
+    public constructor(major: int32) {
+        this.major = major;
+    }
+
+    public function compareTo(other: Version): int32 {
+        return this.major - other.major;
+    }
+}
+
+public class RangeIterator implements Iterator<int32> {
+    private var n: int32;
+    private var i: int32;
+
+    public constructor(n: int32) {
+        this.n = n;
+        this.i = 0;
+    }
+
+    public function hasNext(): bool {
+        return this.i < this.n;
+    }
+
+    public function next(): int32 {
+        var value: int32 = this.i;
+        this.i = this.i + 1;
+        return value;
+    }
+}
+
+public class Range implements Iterable<int32> {
+    private var n: int32;
+
+    public constructor(n: int32) {
+        this.n = n;
+    }
+
+    public function iterator(): Iterator<int32> {
+        return new RangeIterator(this.n);
+    }
+}
+
+public function main(): int32 {
+    var point: Point = new Point(3, 4);
+    var same: Point = new Point(3, 4);
+    var asEquatable: Equatable<Point> = point;
+    if (!asEquatable.equals(same)) {
+        return 1;
+    }
+
+    var hash: int32 = point.hash();
+    if (hash != 97) {
+        return 2;
+    }
+
+    var newer: Version = new Version(5);
+    var older: Version = new Version(3);
+    if (newer.compareTo(older) <= 0) {
+        return 3;
+    }
+    if (newer.compareTo(newer) != 0) {
+        return 4;
+    }
+
+    var it: Iterator<int32> = new Range(4).iterator();
+    var sum: int32 = 0;
+    while (it.hasNext()) {
+        sum = sum + it.next();
+    }
+    if (sum != 6) {
+        return 5;
+    }
+
+    return hash;
+}
