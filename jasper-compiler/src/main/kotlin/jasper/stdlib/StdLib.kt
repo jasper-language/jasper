@@ -28,7 +28,7 @@
  *   - 新增标准库文件时，必须**同时**把文件名追加到 FILES，并保证对应资源
  *     存在于 `/stdlib/` 下；这里刻意不做 classpath 扫描，换取确定性顺序
  *     与 GraalVM native-image 友好（原生镜像里扫描不可靠且构建期无法固化）。
- *   - 当前只覆盖 v1 第一阶段：函数对象协议、Error 层级、迭代协议。
+ *   - 当前只覆盖 v1 第一阶段：函数对象协议、Error 层级、迭代协议、文本构建器。
  * ========================================================================= */
 
 package jasper.stdlib
@@ -51,7 +51,8 @@ package jasper.stdlib
  *   一份易腐化的清单副本。
  *
  * Loader for the Jasper standard library v1 (first phase: function-object
- * protocols, the `Error` hierarchy, and the iteration protocol).
+ * protocols, the `Error` hierarchy, the iteration protocol, and the text
+ * builder).
  *
  * The library is distributed as Jasper **source** resources under
  * `/stdlib/` on the compiler's classpath. The file list is explicit (no
@@ -87,6 +88,7 @@ object StdLib {
         "Comparable.jas",
         "Iterator.jas",
         "Iterable.jas",
+        "StringBuilder.jas",
         "Error.jas",
         "RecoverableError.jas",
         "FatalError.jas"

@@ -1,0 +1,67 @@
+// spec: 07-类与接口.md#7.1 类声明
+// kind: pos
+// expect: exit 7
+// StringBuilder 正例：类持有平台 java.lang.StringBuilder，提供 append/appendLine/isEmpty/clear/toString。
+// 一致性后端只编译单文件、不加载标准库，因此这里声明同形状的本地类型来验证所依赖的语言能力。
+package test;
+
+public class StringBuilder {
+    private var sb: java.lang.StringBuilder;
+
+    public constructor() {
+        this.sb = new java.lang.StringBuilder();
+    }
+
+    public function append(text: string): StringBuilder {
+        this.sb.append(text);
+        return this;
+    }
+
+    public function appendLine(text: string): StringBuilder {
+        this.sb.append(text);
+        this.sb.append("\n");
+        return this;
+    }
+
+    public function isEmpty(): bool {
+        var current: string = this.sb.toString();
+        return current == "";
+    }
+
+    public function clear(): StringBuilder {
+        this.sb = new java.lang.StringBuilder();
+        return this;
+    }
+
+    public function toString(): string {
+        return this.sb.toString();
+    }
+}
+
+public function main(): int32 {
+    var sb: StringBuilder = new StringBuilder();
+    if (!sb.isEmpty()) {
+        return 1;
+    }
+
+    sb.append("你好").append("🙂");
+    var snapshot: string = sb.toString();
+    sb.appendLine(" Jasper");
+    if (snapshot != "你好🙂") {
+        return 2;
+    }
+    if (sb.toString() != "你好🙂 Jasper\n") {
+        return 3;
+    }
+
+    sb.clear();
+    if (!sb.isEmpty()) {
+        return 4;
+    }
+    sb.append("ok");
+    if (sb.toString() != "ok") {
+        return 5;
+    }
+
+    return 7;
+}

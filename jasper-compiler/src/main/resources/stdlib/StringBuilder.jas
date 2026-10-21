@@ -1,0 +1,87 @@
+package std;
+
+// A growable text buffer for the standard library. It holds (does not extend)
+// java.lang.StringBuilder so the platform's full method surface is not exposed
+// as Jasper API; only append / appendLine / isEmpty / clear / toString are public.
+//
+// 模块说明：本文件提供标准库最小文本构建器，用「持有平台类型」而非继承来隔离
+// java.lang.StringBuilder 的完整方法面；变化点集中在私有字段 sb 上，后续若替换
+// 平台实现只需改本文件，不会泄漏到语言 API。
+public class StringBuilder {
+    // 私有平台缓冲：只在本类内部使用，避免把 JDK 的 length/insert/reverse 等
+    // 方法意外变成语言 API（这些语义留给后续标准库步骤单独裁决）。
+    private var sb: java.lang.StringBuilder;
+
+    /**
+     * 做什么：构造一个内容为空的文本构建器。
+     * 什么时候用：需要逐段累积文本、且不希望产生大量中间字符串时。
+     * 前置条件：无。
+     * 失败模式：不会失败；平台缓冲的分配失败会以 JVM OutOfMemoryError 形式出现。
+     * 为什么这样设计：把平台缓冲封装在私有字段里，外部只能走本类公开方法。
+     */
+    public constructor() {
+        this.sb = new java.lang.StringBuilder();
+    }
+
+    /**
+     * 做什么：把 text 追加到当前内容末尾，并返回自身以支持链式调用。
+     * 什么时候用：需要逐段拼接文本且希望保持同一构建器实例时。
+     * 前置条件：text 非 null（语言 string 类型本身不可空）。
+     * 失败模式：不会失败；内存不足时由平台抛 OutOfMemoryError。
+     * 为什么返回自身：与常见文本构建器习惯一致，链式调用不会额外复制缓冲。
+     */
+    public function append(text: string): StringBuilder {
+        this.sb.append(text);
+        return this;
+    }
+
+    /**
+     * 做什么：先追加 text，再追加一个换行符 "\n"，并返回自身。
+     * 什么时候用：逐行生成文本时，避免调用方重复写换行常量。
+     * 前置条件：text 非 null（语言 string 类型本身不可空）。
+     * 失败模式：不会失败；内存不足时由平台抛 OutOfMemoryError。
+     * 为什么固定用 "\n"：跨平台文本语义由标准库固定，避免依赖宿主换行符。
+     */
+    public function appendLine(text: string): StringBuilder {
+        this.sb.append(text);
+        this.sb.append("\n");
+        return this;
+    }
+
+    /**
+     * 做什么：判断当前内容是否为空。
+     * 什么时候用：在清空后或追加前检查是否已有文本。
+     * 前置条件：无。
+     * 失败模式：不会失败；通过快照比较实现，不依赖平台方法的返回类型推断。
+     * 为什么用 toString 比较：避免向语言 API 引入 length 计数语义。
+     */
+    public function isEmpty(): bool {
+        // 先把平台快照落到 string 局部变量：外部调用的 IR 返回类型是 any，
+        // 直接参与比较会退化成整数比较；显式 string 绑定让比较走字符串值语义。
+        var current: string = this.sb.toString();
+        return current == "";
+    }
+
+    /**
+     * 做什么：清空当前内容，并返回自身以支持链式调用。
+     * 什么时候用：复用同一个构建器重新开始累积文本时。
+     * 前置条件：无。
+     * 失败模式：不会失败；重新分配平台缓冲，内存不足时由平台抛 OutOfMemoryError。
+     * 为什么重新分配：不暴露平台的 setLength 方法，保持公开 API 只有五个方法。
+     */
+    public function clear(): StringBuilder {
+        this.sb = new java.lang.StringBuilder();
+        return this;
+    }
+
+    /**
+     * 做什么：返回当前内容的字符串快照。
+     * 什么时候用：需要把累积结果交给只读字符串接口时。
+     * 前置条件：无。
+     * 失败模式：不会失败；返回值与构建器后续修改互不影响。
+     * 为什么是快照：平台 toString 生成不可变字符串，满足调用方持有稳定值。
+     */
+    public function toString(): string {
+        return this.sb.toString();
+    }
+}

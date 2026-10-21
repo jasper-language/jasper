@@ -418,4 +418,163 @@ class StdlibTest {
             assertTrue(text.isNotBlank(), "$file should not be empty")
         }
     }
+
+    /**
+     * 做什么：验证空构造的 StringBuilder 同时满足 isEmpty() 为真、toString() 为 ""。
+     * 失败模式：若平台缓冲未初始化或 isEmpty 判定错误，断言会给出实际返回值。
+     * 为什么：空构造是链式追加与 clear 的共同基线，必须先固定下来。
+     */
+    @Test
+    fun `StringBuilder empty construction reports empty and renders empty text`() {
+        val (value, _) = runMain(
+            "string-builder-empty",
+            """
+            package std;
+            public function main(): string {
+                var sb: StringBuilder = new StringBuilder();
+                if (!sb.isEmpty()) {
+                    return "not-empty";
+                }
+                return sb.toString();
+            }
+            """.trimIndent()
+        )
+        assertEquals("", value, "A fresh StringBuilder must be empty and render as an empty string")
+    }
+
+    /**
+     * 做什么：验证 append 返回接收者，链式调用可依次追加中文与 emoji。
+     * 失败模式：返回值不是自身或 UTF-8 文本受损时，最终字符串断言失败。
+     * 为什么：链式契约与源码原样往返是文本模块的最小可用保证。
+     */
+    @Test
+    fun `StringBuilder append chains text including Chinese and emoji`() {
+        val (value, _) = runMain(
+            "string-builder-append",
+            """
+            package std;
+            public function main(): string {
+                var sb: StringBuilder = new StringBuilder();
+                sb.append("你好").append("🙂").append(" Jasper");
+                return sb.toString();
+            }
+            """.trimIndent()
+        )
+        assertEquals("你好🙂 Jasper", value, "Chained append must preserve UTF-8 text and return the receiver")
+    }
+
+    /**
+     * 做什么：验证 appendLine 在文本后追加且只追加一个 "\n"。
+     * 失败模式：换行缺失或重复时，完整字符串断言失败。
+     * 为什么：逐行生成文本依赖固定的换行语义，不能随宿主的行分隔符漂移。
+     */
+    @Test
+    fun `StringBuilder appendLine appends text and a newline`() {
+        val (value, _) = runMain(
+            "string-builder-append-line",
+            """
+            package std;
+            public function main(): string {
+                var sb: StringBuilder = new StringBuilder();
+                sb.appendLine("第一行").appendLine("第二行");
+                return sb.toString();
+            }
+            """.trimIndent()
+        )
+        assertEquals("第一行\n第二行\n", value, "appendLine must append the text followed by a single newline")
+    }
+
+    /**
+     * 做什么：验证 clear 之后 isEmpty() 为真，且同一实例仍可继续 append。
+     * 失败模式：clear 未清空或使实例不可用时，后续断言失败。
+     * 为什么：复用构建器是 clear 的唯一价值，必须覆盖清空后的继续使用。
+     */
+    @Test
+    fun `StringBuilder clear empties the buffer and stays usable`() {
+        val (value, _) = runMain(
+            "string-builder-clear",
+            """
+            package std;
+            public function main(): string {
+                var sb: StringBuilder = new StringBuilder();
+                sb.append("旧内容");
+                sb.clear();
+                if (!sb.isEmpty()) {
+                    return "not-empty";
+                }
+                sb.append("重来");
+                return sb.toString();
+            }
+            """.trimIndent()
+        )
+        assertEquals("重来", value, "clear must empty the buffer while keeping it usable for later appends")
+    }
+
+    /**
+     * 做什么：验证 toString 返回的快照不随后续 append 改变。
+     * 失败模式：若返回的是可变视图或延迟渲染，快照会变成 "snaptail"。
+     * 为什么：调用方需要持有稳定的只读字符串，快照语义是文本模块的边界。
+     */
+    @Test
+    fun `StringBuilder toString returns a snapshot unaffected by later appends`() {
+        val (value, _) = runMain(
+            "string-builder-snapshot",
+            """
+            package std;
+            public function main(): string {
+                var sb: StringBuilder = new StringBuilder();
+                sb.append("snap");
+                var snapshot: string = sb.toString();
+                sb.append("tail");
+                return snapshot + "|" + sb.toString();
+            }
+            """.trimIndent()
+        )
+        assertEquals("snap|snaptail", value, "A string obtained from toString must not change after further appends")
+    }
+
+    /**
+     * 做什么：验证公开面之外的 sb.length() 在编译期被拒绝，且诊断包含方法名。
+     * 失败模式：编译意外成功或诊断不含 "length" 时断言失败。
+     * 为什么：标准库刻意不提供长度语义，必须证明平台方法没有泄漏到语言 API。
+     */
+    @Test
+    fun `StringBuilder rejects methods outside its public surface`() {
+        val error = compileWithStdlibError(
+            "string-builder-unknown-method",
+            """
+            package std;
+            public function main(): int32 {
+                var sb: StringBuilder = new StringBuilder();
+                sb.length();
+                return 0;
+            }
+            """.trimIndent()
+        )
+        assertTrue(
+            error.errors.any { it.message.contains("length") },
+            "Calling the absent StringBuilder.length() must produce a diagnostic naming 'length', got: ${error.message}"
+        )
+    }
+
+    /**
+     * 做什么：验证 StdLib.FILES 登记了 StringBuilder，且排在协议族之后。
+     * 失败模式：漏登记、顺序错误或资源不可读时断言失败。
+     * 为什么：标准库以显式清单分发，登记与资源必须同步，否则装载期才暴露缺文件。
+     */
+    @Test
+    fun `standard library registers StringBuilder after the protocol family`() {
+        assertTrue(
+            StdLib.FILES.contains("StringBuilder.jas"),
+            "StdLib.FILES must list the StringBuilder source"
+        )
+        assertTrue(
+            StdLib.FILES.indexOf("Iterable.jas") < StdLib.FILES.indexOf("StringBuilder.jas"),
+            "StringBuilder must be translated after the protocol family"
+        )
+        assertTrue(
+            StdLib.sources().getValue("StringBuilder.jas").contains("package std;"),
+            "StringBuilder.jas should declare package std"
+        )
+    }
 }
