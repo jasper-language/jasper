@@ -2872,8 +2872,15 @@ class JasperToIrTranslator {
             // 参数个数错误由 TypeChecker 负责诊断；这里仅在没有实参时生成字节码。
             if (expr.args.isEmpty()) return emitStringByteLength(memberReceiver, ctx)
         }
-        val symbol = ctx.functionSymbols[name]
-            ?: IrSimpleFunctionSymbolImpl()
+        // 成员调用必须使用**独立的**调用符号：后端用符号身份查 [TranslationContext.callNames]，
+        // 若复用同名顶层函数的符号，`subtract(10, 3)` 与 `big.subtract(other)` 会互相覆盖
+        // 调用名（一个写成 `subtract`，另一个写成 `v:subtract`），最终把成员调用发成
+        // INVOKESTATIC 并触发 VerifyError。顶层函数符号只服务于不带接收者的调用。
+        val symbol = if (expr.target is JasPropertyAccess) {
+            IrSimpleFunctionSymbolImpl()
+        } else {
+            ctx.functionSymbols[name] ?: IrSimpleFunctionSymbolImpl()
+        }
         ctx.callNames[symbol] = if (expr.target is JasPropertyAccess) "v:$name" else name
         // 成员调用：记录本次调用应使用的索引键（源码元数或 vararg 通配）。
         // backend 只看到打包后的 IR 实参，无法自行区分 `q(string)` 与 `q(int32...)`；
@@ -2936,7 +2943,25 @@ class JasperToIrTranslator {
         val memberReturnType = receiverOwner?.let { owner ->
             memberIndexKey?.let { key -> ctx.memberReturnTypesByType[owner]?.get(key) }
         }
-        val baseReturnType = memberReturnType ?: ctx.functionReturnTypes[name] ?: typeMapper.unitType()
+        // 成员调用的返回类型只能来自「接收者的声明类型」；接收者不是本次编译单元
+        // 声明的类型时（JDK 类型、未知类型），绝不能回退到全局 functionReturnTypes：
+        // 那张表按名字 last-writer-wins，用户恰好声明了同名顶层函数（如 subtract）
+        // 时会把平台成员调用的 IR 类型污染成顶层函数的返回类型，进而让后端拼出
+        // 错误的 owner/描述符（C27 第二步的同名回归）。类型未知就保持 Unit，交给
+        // 后端用 PlatformMethodResolver 按真实签名回填（见 receiverJvmDescriptor）。
+        // 判定必须同时看简单名：枚举没有进 memberReturnTypesByType/memberSignaturesByType
+        // 索引，但它的成员仍由 translator 的声明信息决定，不能被当成平台类型。
+        val receiverSimpleName = receiverOwner?.substringAfterLast('/')
+        val receiverHasDeclaredType = receiverOwner != null && (
+            receiverSimpleName in ctx.declaredTypeNames ||
+                ctx.memberReturnTypesByType.containsKey(receiverOwner) ||
+                ctx.memberSignaturesByType.containsKey(receiverOwner)
+            )
+        val baseReturnType = when {
+            memberReturnType != null -> memberReturnType
+            expr.target is JasPropertyAccess && !receiverHasDeclaredType -> typeMapper.unitType()
+            else -> ctx.functionReturnTypes[name] ?: typeMapper.unitType()
+        }
         var returnType = if (expr.inferredTypeArgs != null && expr.inferredTypeArgs!!.isNotEmpty()) {
             substituteIrType(baseReturnType, expr.inferredTypeArgs!!)
         } else {

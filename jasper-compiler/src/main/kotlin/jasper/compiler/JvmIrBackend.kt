@@ -1957,7 +1957,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // 决定每个实参要不要装箱/宽化。
                             val argExpressions = (1 until expr.valueArgumentsCount)
                                 .mapNotNull { expr.getValueArgument(it) }
-                            val argDescriptors = argExpressions.map { typeMapper.jvmDescriptorFromIrType(it.type) }
+                            // 实参的描述符同样要按「平台感知」方式取：实参本身可能是
+                            // 平台调用链（如 `a.add(b.pow(2))`），其 IR 类型是 Unit，
+                            // 直接取会得到 `V` 并把重载决议带偏。
+                            val argDescriptors = argExpressions.map { receiverJvmDescriptor(it) }
                             // 平台方法真实签名：仅在「没有声明签名」且接收者不是本次编译
                             // 单元声明的类型时尝试。toString 与 isKnownJdkFluentCall 是既有
                             // 契约（RemoveMethodTest 锁死了 StringBuilder.append / 容器
@@ -2409,20 +2412,27 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     }
 
     /**
-     * 做什么：推断成员调用接收者的 JVM 描述符；当 IR 调用点类型缺失（`V`）且接收者
-     *   本身是一次平台成员调用时，用平台解析器找回真实返回描述符。
+     * 做什么：推断一个 IR 表达式的 JVM 描述符；当 IR 调用点类型缺失（`V`）且表达式
+     *   本身是一次平台成员调用时，递归地用平台解析器找回真实返回描述符。
      *
-     * 什么时候用：生成 `v:<name>` 调用、需要 receiver 的内部名/描述符之前。
-     * 前置条件：receiver 是已由 translator 翻译好的 IR 表达式；resolver 已就绪。
+     * 什么时候用：生成 `v:<name>` 调用时取 receiver 的描述符/内部名；也用于判断
+     *   平台方法的实参描述符（实参本身可能又是一层平台调用）。
+     * 前置条件：expression 是已由 translator 翻译好的 IR 表达式；resolver 已就绪；
+     *   [callNames] 已由 translator 填好（`v:` 前缀表示实例成员调用）。
      * 失败模式：任何一步无法确定都原样返回 `V`（调用方随后会得到 `void` 内部名并
      *   退回旧行为），不抛异常。
      * 为什么需要：translator 对没有声明签名的平台调用把 IR 类型记为 Unit（描述符
-     *   `V`）；`new BigInteger("1").shiftLeft(10).toString()` 里外层调用只看
-     *   receiver.type 会得到 `test/void` 这个不存在的 owner（C27 的链式表现）。
-     *   这里只在**后端描述符选择**范围内复用同一个解析器，把内层调用的真实返回
-     *   描述符当作外层的静态类型；不改检查器/translator 的类型推断（任务书边界）。
-     *   注意：这是「类型信息缺失时的事实回填」，不是把链式调用改写成顶层函数
-     *   （C27 第二步不在本函数职责内）。
+     *   `V`）。`new BigInteger("2").pow(10).subtract(...)` 里 subtract 的接收者是
+     *   pow 调用，而 pow 的 IR 类型同样是 `V`；若只看接收者自身的 IR 类型，owner
+     *   会退化成不存在的 `test/void`，直到运行期才以 NoClassDefFoundError 暴露
+     *   （C27 第二步的链式表现）。
+     * 为什么递归：链的深度由 IR 表达式树天然限定（每次递归都下降到 receiver/
+     *   argument 子树，树无环），无需深度上限；只回填一层会在三层及以上的链上
+     *   再次退化为 `void`。这里复用同一个解析器，把内层平台调用的真实返回描述符
+     *   当作外层的静态类型，不改检查器/translator 的类型推断（任务书边界）。
+     * 边界：只在**后端描述符选择**范围内做「类型信息缺失时的事实回填」，不把
+     *   链式调用改写成顶层函数；用户声明类型的成员签名由 translator 预登记，
+     *   这里遇到本次编译单元声明的类型时保持原行为（返回 `V`），不越权猜测。
      */
     private fun receiverJvmDescriptor(receiver: IrExpression): String {
         val direct = typeMapper.jvmDescriptorFromIrType(receiver.type)
@@ -2432,14 +2442,24 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         if (!innerCallName.startsWith("v:")) return direct
         val innerRealName = innerCallName.substring(2)
         val innerReceiver = receiver.getValueArgument(0) ?: return direct
-        val innerRawOwner = typeMapper.jvmInternalNameFromIrType(innerReceiver.type)
+        // 关键点：innerReceiver 自己的 IR 类型也可能是 `V`（它就是更内一层的平台
+        // 调用），所以 owner 必须递归地按「平台感知描述符」取，而不能只看 IR 类型。
+        val innerReceiverDesc = receiverJvmDescriptor(innerReceiver)
+        val innerRawOwner = when {
+            innerReceiverDesc.startsWith("L") ->
+                innerReceiverDesc.removePrefix("L").removeSuffix(";")
+            innerReceiverDesc.startsWith("[") -> innerReceiverDesc
+            else -> typeMapper.jvmInternalNameFromIrType(innerReceiver.type)
+        }
         val innerOwner = if (innerRawOwner.contains("/")) innerRawOwner else "$currentPkg/$innerRawOwner"
         // 用户类型不在平台解析范围内：它们的调用点类型应由声明签名给出，缺失时
         // 不在这里猜测，继续走旧路径。
         if (isCompilationUnitDeclaredType(innerRawOwner, innerOwner)) return direct
         val innerArgs = (1 until receiver.valueArgumentsCount)
             .mapNotNull { receiver.getValueArgument(it) }
-        val innerArgDescriptors = innerArgs.map { typeMapper.jvmDescriptorFromIrType(it.type) }
+        // 实参同样可能是更内一层的平台调用（如 `a.add(b.pow(2)).subtract(c)`），
+        // 用同一个函数递归取描述符，避免把 `V` 当作形参类型去解析签名。
+        val innerArgDescriptors = innerArgs.map { receiverJvmDescriptor(it) }
         return platformMethodResolver.resolve(innerOwner, innerRealName, innerArgDescriptors)
             ?.returnDescriptor
             ?: direct
