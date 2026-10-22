@@ -284,6 +284,7 @@ class JasperCompiler {
             val mergedStaticFields = mutableSetOf<IrFieldSymbol>()
             val mergedMemberSignatures = mutableMapOf<String, Map<String, MemberMethodSignature>>()
             val mergedMemberCallKeys = mutableMapOf<IrSimpleFunctionSymbol, String>()
+            val mergedPlatformStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
 
             // 逐个文件把 IR 与各类索引汇入「合并容器」。
             for ((_, pipeline) in results) {
@@ -299,6 +300,7 @@ class JasperCompiler {
                 mergedStaticFields.addAll(tr.staticFieldSymbols)
                 mergedMemberSignatures.putAll(tr.memberSignaturesByType)
                 mergedMemberCallKeys.putAll(tr.memberCallKeys)
+                mergedPlatformStaticCallOwners.putAll(tr.platformStaticCallOwners)
             }
 
             // 后端只需要一个 TypeMapper；取第一个成功 pipeline 的，缺失则新建空实例。
@@ -312,7 +314,8 @@ class JasperCompiler {
                 interfaceDeclNames = mergedIfaceDeclNames,
                 staticFieldSymbols = mergedStaticFields,
                 memberSignaturesByType = mergedMemberSignatures,
-                memberCallKeys = mergedMemberCallKeys
+                memberCallKeys = mergedMemberCallKeys,
+                platformStaticCallOwners = mergedPlatformStaticCallOwners
             )
 
             val backend = JvmIrBackend(typeMapper)
@@ -480,7 +483,8 @@ class JasperCompiler {
                 interfaceDeclNames = translated.interfaceDeclNames,
                 staticFieldSymbols = translated.staticFieldSymbols,
                 memberSignaturesByType = translated.memberSignaturesByType,
-                memberCallKeys = translated.memberCallKeys
+                memberCallKeys = translated.memberCallKeys,
+                platformStaticCallOwners = translated.platformStaticCallOwners
             )
             pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir, annotationIndexes[filename] ?: AnnotationIndex.EMPTY)
         }

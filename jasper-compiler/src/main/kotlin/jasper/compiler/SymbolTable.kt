@@ -123,6 +123,10 @@ data class SymbolError(val message: String, val kind: String, val name: String, 
  * 为什么：为检查器与翻译器提供统一、与 AST 解耦的符号视图，避免各自重复遍历。
  */
 class SymbolTable {
+    // 平台静态调用的类加载/重载事实查询。放在 SymbolTable 内供 checker 经现有允许的依赖方向
+    // 查询，底层仍是同一个 PlatformMethodResolver，不复制反射入口。
+    private val platformMethodResolver = PlatformMethodResolver()
+
     val functions: MutableMap<String, MutableList<JasFunction>> = mutableMapOf()
     /**
      * 已声明类，键是 [TypeKey]（包名 + 简单名）。
@@ -192,6 +196,23 @@ class SymbolTable {
     val memberFunctions: MutableMap<TypeKey, MutableMap<String, MutableList<JasFunction>>> = mutableMapOf()
     var currentPackage: String? = null
     var errors: MutableList<SymbolError> = mutableListOf()
+
+    /**
+     * 做什么：查询全限定平台类上的真实 public static 方法签名。
+     *
+     * 什么时候用：TypeChecker 验证 `a.b.C.m(...)`，以及平台静态返回参与后续重载时。
+     * 前置条件：ownerInternalName 为 JVM 内部名，argumentDescriptors 与源码实参一一对应。
+     * 失败模式：类/方法不存在、无唯一候选或实参不匹配时返回 null，不抛内部异常。
+     * 为什么放在 SymbolTable：checker 已依赖本设施，而直接依赖 compiler 包会形成环；
+     *   这里只转发到唯一 PlatformMethodResolver，类加载与重载逻辑仍只有一份实现。
+     */
+    fun resolvePlatformStaticMethod(
+        ownerInternalName: String,
+        methodName: String,
+        argumentDescriptors: List<String>
+    ): PlatformMethodSignature? {
+        return platformMethodResolver.resolveStatic(ownerInternalName, methodName, argumentDescriptors)
+    }
 
     /**
      * 本次编译中**已出现过的类型身份**及类别（class/interface/enum/annotation）。

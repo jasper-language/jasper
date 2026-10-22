@@ -138,6 +138,9 @@ data class TranslationResult(
     // 合成静态调用（枚举 values()/valueOf(String)）：符号 -> JVM 内部宿主名。
     // 方法名取自 callNames；描述符由后端据实参类型与调用 IR 类型推导。
     val syntheticStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap(),
+    // 全限定平台静态调用：符号 -> 平台类 JVM 内部名。方法名取自 callNames；
+    // 后端必须用 PlatformMethodResolver.resolveStatic 取得真实描述符，而不是按调用点 Unit 猜。
+    val platformStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap(),
     // 每个用户类型的成员方法「声明擦除签名」：JVM 风格类型名 -> 方法名 -> (形参描述符列表, 返回描述符)。
     // 后端据此在经接口/泛型接收者调用时写出被调方法的真实（擦除后）描述符。
     // 中文：成员方法声明擦除签名索引；键/值规则见 MemberMethodSignature 文档。
@@ -293,6 +296,8 @@ data class TranslationContext(
     // Synthetic static call owner index: symbol -> owner internal name (enum synth methods).
     // 合成静态调用的宿主索引：符号 -> 宿主内部名（枚举合成方法）。
     val syntheticStaticCallOwners: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
+    // 检查器确认的平台静态调用：符号 -> 平台类 JVM 内部名。
+    val platformStaticCallOwners: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
     // Enum constants: JVM internal class name -> constant name -> IR enum-entry symbol.
     // 枚举常量索引：JVM 内部类名 -> 常量名 -> IR 枚举项符号。
     // 为什么必须预登记：`Color.Red` 可能出现在枚举声明之前（同文件靠后声明或跨文件），
@@ -362,6 +367,7 @@ class JasperToIrTranslator {
             staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
             staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
             syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap(),
+            platformStaticCallOwners = ctx.platformStaticCallOwners.toMap(),
             memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap(),
             memberCallKeys = ctx.memberCallKeys.toMap())
     }
@@ -420,6 +426,7 @@ class JasperToIrTranslator {
             staticFieldSymbols = ctx.staticFieldSymbols.toSet(),
             staticFunctionSymbols = ctx.staticFunctionSymbols.toSet(),
             syntheticStaticCallOwners = ctx.syntheticStaticCallOwners.toMap(),
+            platformStaticCallOwners = ctx.platformStaticCallOwners.toMap(),
             memberSignaturesByType = ctx.memberSignaturesByType.mapValues { it.value.toMap() }.toMap(),
             memberCallKeys = ctx.memberCallKeys.toMap())
     }
@@ -2850,6 +2857,11 @@ class JasperToIrTranslator {
                 return translateLambdaInvocation(lambda, expr.args, ctx)
             }
         }
+        // 检查器已确认的全限定平台静态调用：生成无接收者 IR，并把 owner/方法名作为
+        // 显式协议交给后端。不能落入成员调用路径，否则 `java.lang.Integer` 会被当成值链。
+        expr.platformStaticOwner?.let { owner ->
+            return translatePlatformStaticCall(expr, owner, ctx)
+        }
         // 类名静态方法调用：`A.f()` 与枚举合成方法 `Types.values()`/`valueOf(...)`。
         // 必须在实例成员调用路径之前分流：静态调用不生成接收者实参，后端走 INVOKESTATIC。
         val staticCall = resolveStaticCallTarget(expr, ctx)
@@ -3092,6 +3104,31 @@ class JasperToIrTranslator {
         return IrNodeFactory.createCall(
             0, 0, ref.returnType, IrStatementOrigin.INVOKE,
             irArgs, emptyArray<IrType>(), ref.symbol, null
+        )
+    }
+
+    /**
+     * 做什么：把检查器确认的平台全限定静态调用翻译成无接收者 IrCall，并登记真实宿主。
+     *
+     * 什么时候用：[translateCall] 发现 expr.platformStaticOwner 非空时。
+     * 前置条件：检查器已通过 PlatformMethodResolver 验证类、静态方法和实参可匹配。
+     * 失败模式：不抛异常；缺失方法名等结构错误由上游 AST/checker 保证不会到达。
+     * 为什么返回 Unit：平台调用的真实返回类型由后端解析；沿用平台实例调用「调用点未知，
+     *   后端回填」的策略，可避免把真实 int 过早装箱成 any，破坏算术调用点。
+     */
+    private fun translatePlatformStaticCall(
+        expr: JasCall,
+        owner: String,
+        ctx: TranslationContext
+    ): IrExpression {
+        val target = expr.target as JasPropertyAccess
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = target.property
+        ctx.platformStaticCallOwners[symbol] = owner
+        val args = expr.args.map { translateExpression(it, ctx) }.toTypedArray()
+        return IrNodeFactory.createCall(
+            0, 0, typeMapper.unitType(), IrStatementOrigin.INVOKE,
+            args, emptyArray<IrType>(), symbol, null
         )
     }
 

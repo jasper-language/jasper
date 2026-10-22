@@ -1151,6 +1151,11 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 if (staticTarget is JasPropertyAccess && isTypeNameReference(staticTarget.target, env)) {
                     return inferStaticMemberCall(expr, staticTarget, argTypes)
                 }
+                // 全限定平台类名（java.lang.Integer.parseInt）不是单段 JasIdentifier 类型名。
+                // 在推断目标属性链之前分流，否则根的 `java` 会被当作普通值并报 Unresolved reference。
+                qualifiedPlatformStaticTarget(staticTarget, env)?.let { platformTarget ->
+                    return inferQualifiedPlatformStaticCall(expr, platformTarget, argTypes)
+                }
                 if (symbolTable != null && expr.target is JasIdentifier) {
                     val name = (expr.target as JasIdentifier).name
                     val funcs = symbolTable.findFunctions(name)
@@ -1522,6 +1527,206 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             error("Cannot resolve static method '$memberName' on type '$typeName'", expr)
         }
         return JasAnyType
+    }
+
+    /**
+     * 一个结构上完整的全限定静态调用目标。
+     * ownerInternalName 供解析/后端使用；className 保留源码点分形式用于可读诊断。
+     */
+    private data class QualifiedStaticTarget(
+        val className: String,
+        val ownerInternalName: String,
+        val methodName: String
+    )
+
+    /**
+     * 做什么：把 `a.b.C.m` 的属性链拆成全限定类名与方法名；不符合平台静态形态时返回 null。
+     *
+     * 什么时候用：[inferExpression] 的 JasCall 分支，在单段用户类静态调用之后、实例调用之前。
+     * 前置条件：target 可为任意表达式；env 是当前作用域。
+     * 失败模式：非属性链、安全调用、根名被变量/类型参数/已声明类型遮蔽，或少于
+     *   「包 + 类 + 方法」三段时返回 null，交回既有路径。
+     * 为什么按根名排除：`obj.a.b()` 与 `A.Inner.m()` 不是平台全限定类；只有根既不是值也不是
+     *   本编译单元类型时才是类路径候选。完整的类/方法存在性由 PlatformMethodResolver 判定。
+     */
+    private fun qualifiedPlatformStaticTarget(
+        target: JasExpression?,
+        env: TypeEnvironment
+    ): QualifiedStaticTarget? {
+        if (target !is JasPropertyAccess || target.isSafe) return null
+        val segments = mutableListOf<String>()
+        var cursor: JasExpression = target
+        while (cursor is JasPropertyAccess && !cursor.isSafe) {
+            segments.add(cursor.property)
+            cursor = cursor.target
+        }
+        if (cursor !is JasIdentifier) return null
+        val root = cursor.name
+        // `this.field.method()` / `super.field.method()` 的根是接收者语法节点，不在普通
+        // 局部变量环境里；绝不能把 `this.sb.append` 拆成类 `this.sb` 的平台静态调用。
+        if (root == "this" || root == "super") return null
+        if (env.contains(root) || env.hasTypeParameter(root)) return null
+        if (symbolTable?.resolveType(root) != null) return null
+        segments.add(root)
+        segments.reverse()
+        if (segments.size < 3) return null
+        val className = segments.dropLast(1).joinToString(".")
+        return QualifiedStaticTarget(
+            className = className,
+            ownerInternalName = className.replace('.', '/'),
+            methodName = segments.last()
+        )
+    }
+
+    /**
+     * 做什么：验证全限定平台类上的静态方法并登记 AST，成功时按既有平台策略返回 any。
+     *
+     * 什么时候用：[qualifiedPlatformStaticTarget] 产出结构候选后。
+     * 前置条件：实参类型已推断；候选根名不在当前值/类型作用域中。
+     * 失败模式：类加载、静态候选或实参匹配失败时记录含完整类名/方法名的语义错误并返回 any；
+     *   不抛内部异常。成功后回写 platformStaticOwner，供 translator 生成无接收者静态调用。
+     * 为什么用实参描述符解析：同名重载（Math.max）必须在编译期选出真实签名；只查名字会把
+     *   无法匹配的调用推迟到运行期，并让后端无签名可回填。
+     */
+    private fun inferQualifiedPlatformStaticCall(
+        expr: JasCall,
+        target: QualifiedStaticTarget,
+        argTypes: List<JasType?>
+    ): JasType {
+        val descriptors = expr.args.mapIndexed { index, arg ->
+            platformExpressionDescriptor(arg, argTypes.getOrNull(index))
+        }
+        val signature = symbolTable?.resolvePlatformStaticMethod(
+            target.ownerInternalName,
+            target.methodName,
+            descriptors
+        )
+        if (signature == null) {
+            error(
+                "Cannot resolve static method '${target.methodName}' on class '${target.className}'",
+                expr
+            )
+            return JasAnyType
+        }
+        expr.platformStaticOwner = target.ownerInternalName
+        // 与平台实例调用保持一致：调用点类型不冒充 Java 返回类型，后端按真实签名回填。
+        return JasAnyType
+    }
+
+    /**
+     * 做什么：为平台重载匹配推导表达式实参的 JVM 描述符，必要时递归读取内层静态调用。
+     * 什么时候用：[inferQualifiedPlatformStaticCall] 构造 argumentDescriptors 时。
+     * 前置条件：expr 已完成当前层之前的推断；内层平台调用已回写 platformStaticOwner。
+     * 失败模式：无法确定时退回 [platformArgumentDescriptor] 的推断类型/保守 Object，不抛异常。
+     * 为什么递归：平台调用结果在语言类型层是 any，但 `parseInt("7") * 6` 的字节码实参
+     *   实际是 int；若只看 any 会错误选择 Object 重载并拒绝合法的 toString(int)。
+     */
+    private fun platformExpressionDescriptor(expr: JasExpression, inferredType: JasType?): String {
+        return when (expr) {
+            is JasCall -> {
+                val target = expr.target as? JasPropertyAccess
+                val owner = expr.platformStaticOwner
+                if (target != null && owner != null) {
+                    symbolTable?.resolvePlatformStaticMethod(
+                        owner,
+                        target.property,
+                        expr.args.map { platformExpressionDescriptor(it, null) }
+                    )?.returnDescriptor ?: platformArgumentDescriptor(inferredType)
+                } else {
+                    platformArgumentDescriptor(inferredType)
+                }
+            }
+            is JasBinaryOp -> {
+                if (expr.op in setOf("==", "!=", "<", ">", "<=", ">=", "&&", "||")) {
+                    "Z"
+                } else {
+                    val left = platformExpressionDescriptor(expr.left, null)
+                    val right = platformExpressionDescriptor(expr.right, null)
+                    if (expr.op == "+" &&
+                        (left == "Ljava/lang/String;" || right == "Ljava/lang/String;")
+                    ) {
+                        "Ljava/lang/String;"
+                    } else if (expr.op in setOf("<<", ">>", ">>>")) {
+                        left
+                    } else {
+                        widerPlatformDescriptor(left, right)
+                    }
+                }
+            }
+            is JasUnaryOp -> {
+                if (expr.op == "!") "Z" else platformExpressionDescriptor(expr.operand, inferredType)
+            }
+            is JasIntLiteral -> if (expr.raw.endsWith("L") || expr.raw.endsWith("l")) "J" else "I"
+            is JasFloatLiteral -> "D"
+            is JasStringLiteral -> "Ljava/lang/String;"
+            is JasBoolLiteral -> "Z"
+            is JasNullLiteral -> "Ljava/lang/Object;"
+            is JasTernaryExpr -> {
+                val thenDesc = platformExpressionDescriptor(expr.thenExpr, null)
+                val elseDesc = platformExpressionDescriptor(expr.elseExpr, null)
+                if (thenDesc == elseDesc) thenDesc else platformArgumentDescriptor(inferredType)
+            }
+            else -> platformArgumentDescriptor(inferredType)
+        }
+    }
+
+    /**
+     * 做什么：按 JVM 数值提升规则选择两个基本描述符中更宽的一个。
+     * 什么时候用：[platformExpressionDescriptor] 推导算术表达式实参类型。
+     * 前置条件：desc 为 JVM 描述符；引用/未知类型按一侧原样返回。
+     * 失败模式：无法比较时返回左描述符，仅影响平台重载候选；不改变源码类型推断。
+     * 为什么集中：与后端二元运算的 I<F/J<D 近似保持一致，避免检查器与生成器选不同重载。
+     */
+    private fun widerPlatformDescriptor(left: String, right: String): String {
+        if (left == right) return left
+        val rank = mapOf("I" to 0, "F" to 1, "J" to 1, "D" to 2)
+        val leftRank = rank[left] ?: return left
+        val rightRank = rank[right] ?: return right
+        return if (leftRank >= rightRank) left else right
+    }
+
+    /**
+     * 做什么：把源码 JasType 转成平台重载匹配所需的 JVM 实参描述符。
+     * 什么时候用：[inferQualifiedPlatformStaticCall] 调用 PlatformMethodResolver 前。
+     * 前置条件：type 来自已完成的表达式推断，可为 null（推断失败）。
+     * 失败模式：未知/函数/Tuple 等不可精确描述的类型保守落为 Object；此近似只影响
+     *   平台重载选择，不改变语言类型系统。null/any 也落为 Object。
+     * 为什么放在 checker：检查器不能依赖 translator 的有状态 TypeMapper，但平台候选筛选需要
+     *   与字节码相同的 JVM 描述符；这里只实现无状态、必要的 JasType→描述符映射。
+     */
+    private fun platformArgumentDescriptor(type: JasType?): String = when (type) {
+        is JasPrimitiveType -> when (type.name.lowercase()) {
+            "int8", "byte" -> "B"
+            "int16", "short" -> "S"
+            "int32", "int" -> "I"
+            "int64", "long" -> "J"
+            "float32", "float" -> "F"
+            "float64", "double" -> "D"
+            "bool", "boolean" -> "Z"
+            "char" -> "C"
+            else -> "Ljava/lang/Object;"
+        }
+        is JasStringType -> "Ljava/lang/String;"
+        is JasArrayType -> "[" + platformArgumentDescriptor(type.inner)
+        is JasNullableType -> platformArgumentDescriptor(type.inner)
+        is JasNonNullType -> platformArgumentDescriptor(type.inner)
+        is JasNamedType -> {
+            val name = type.name.replace('.', '/')
+            when (name) {
+                "kotlin/String" -> "Ljava/lang/String;"
+                "kotlin/Any" -> "Ljava/lang/Object;"
+                "kotlin/Int" -> "I"
+                "kotlin/Long" -> "J"
+                "kotlin/Float" -> "F"
+                "kotlin/Double" -> "D"
+                "kotlin/Boolean" -> "Z"
+                "kotlin/Byte" -> "B"
+                "kotlin/Short" -> "S"
+                "kotlin/Char" -> "C"
+                else -> "L$name;"
+            }
+        }
+        else -> "Ljava/lang/Object;"
     }
 
     /**

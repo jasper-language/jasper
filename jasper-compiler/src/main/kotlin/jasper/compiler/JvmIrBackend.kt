@@ -244,6 +244,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 合成静态调用的宿主：符号 -> JVM 内部类名（枚举 values/valueOf）。方法名取自 callNames，
     // 描述符由实参类型 + 调用 IR 类型推导；它们没有 IR 声明，故 owner 不能靠 functionSymbolToOwner。
     private var syntheticStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap()
+    // 全限定平台静态调用：符号 -> 平台类内部名。方法名取自 callNames；描述符必须由
+    // PlatformMethodResolver.resolveStatic 按真实 public static 候选选出。
+    private var platformStaticCallOwners: Map<IrSimpleFunctionSymbol, String> = emptyMap()
     // 函数符号 → translator 赋予的语义调用名（"+"、"v:foo"、"ctor_delegate:" 等）；
     // 这是后端与 translator 之间的核心协议，决定走哪条专用生成路径。
     private var callNames: Map<IrSimpleFunctionSymbol, String> = emptyMap()
@@ -435,6 +438,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         staticFieldSymbols = translationResult.staticFieldSymbols
         staticFunctionSymbols = translationResult.staticFunctionSymbols
         syntheticStaticCallOwners = translationResult.syntheticStaticCallOwners
+        platformStaticCallOwners = translationResult.platformStaticCallOwners
         memberSignaturesByType = translationResult.memberSignaturesByType
         memberCallKeys = translationResult.memberCallKeys
         checkGraalvmHostilePatterns(translationResult)
@@ -1483,7 +1487,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      *   占位值（category 1），弹一个槽位才是对的。
      */
     private fun discardExpressionValue(mv: MethodVisitor, expr: IrExpression) {
-        val desc = typeMapper.jvmDescriptorFromIrType(expr.type)
+        // 平台调用的 IR 调用点常被记为 Unit，但实际返回可能是 long/double。丢弃宽度必须
+        // 按平台感知描述符判断：若静态/实例平台调用留下 D/J，这里必须 POP2；不能只看 Unit
+        // 占位。非平台表达式仍按自身 IR 类型得到原宽度。
+        val desc = receiverJvmDescriptor(expr)
         mv.visitInsn(if (desc == "D" || desc == "J") Opcodes.POP2 else Opcodes.POP)
     }
 
@@ -1603,7 +1610,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // 于是同一棵 IR 能落到不同指令序列上。这是后端与翻译层之间最关键、
                 // 也最容易受影响的契约（新增语义名要在此处补分支，否则落到 else 的静态调用）。
                 val irName = callNames[expr.symbol] ?: functionSymbolToName[expr.symbol] ?: "invoke"
-                when (irName) {
+                val platformOwner = platformStaticCallOwners[expr.symbol]
+                if (platformOwner != null) {
+                    // 平台静态调用必须先于语义名分派：普通 `toString` 既有内建路径会改成
+                    // String.valueOf，但全限定 `Integer.toString(int)` 是真实静态方法。
+                    emitPlatformStaticCall(mv, expr, platformOwner, irName, ctx, owner)
+                } else when (irName) {
                     "invoke_lambda" -> {
                         // 闭包调用：translator 把 lambda 编译成一个带 invoke 方法的匿名类，
                         // 这里退化为对接收者的 INVOKEVIRTUAL invoke(...)。接收者类型的
@@ -1709,10 +1721,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitInsn(Opcodes.ARRAYLENGTH)
                     }
                     "negate" -> {
-                        // 一元取负：直接 INEG（long 的取负由 translator 拆成 0L - x 之类，
-                        // 不会走到这里；若将来遇到 long 需另加 LNEG）。
-                        generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
-                        mv.visitInsn(Opcodes.INEG)
+                        // 一元取负按操作数槽型选择 NEG 指令。平台静态调用的实参可能是
+                        // double（如 Math.abs(-2.5)）；统一发 INEG 会在类加载时抛 VerifyError。
+                        val operand = expr.getValueArgument(0)!!
+                        val operandDesc = receiverJvmDescriptor(operand)
+                        generateIrExpression(mv, operand, ctx, owner)
+                        val opcode = when (operandDesc) {
+                            "J" -> Opcodes.LNEG
+                            "F" -> Opcodes.FNEG
+                            "D" -> Opcodes.DNEG
+                            else -> Opcodes.INEG
+                        }
+                        mv.visitInsn(opcode)
                     }
                     "not" -> {
                         // 逻辑非：用「IFEQ 为真」分支把非 0 归 1、0 归 0，避免依赖
@@ -1993,8 +2013,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                     // 实参按目标形参类型转换：基本类型装箱（int → Object），
                                     // 具体实现 → 接口/父类时补 CHECKCAST（C13）。这既让栈上
                                     // 类型与调用描述符一致，也把「传参宽化」显式落在字节码里。
-                                    emitBoxingIfNeeded(mv, argDesc, targetDesc)
-                                    emitReferenceWidening(mv, argDesc, targetDesc)
+                                    emitCallArgumentConversion(mv, argDesc, targetDesc)
                                     paramSb.append(targetDesc)
                                 } else {
                                     paramSb.append(argDesc)
@@ -2412,6 +2431,72 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     }
 
     /**
+     * 做什么：发射一次全限定平台静态调用，并按真实签名适配实参和返回值。
+     * 什么时候用：JvmIrBackend 的分派层发现调用点符号登记在 platformStaticCallOwners。
+     * 前置条件：检查器已确认候选；实参表达式均已翻译，owner 是 JVM 内部名。
+     * 失败模式：解析器返回 null 说明前端/后端协议被破坏，抛出的异常由编译入口归为 Internal；
+     *   正常缺类/缺方法必须在检查器阶段先被拦截，不能到达这里。
+     * 为什么集中：INVOKESTATIC 的 owner/name/descriptor/itf 与参数转换必须成组生成；
+     *   返回值沿用 emitCallReturnAdaptation，避免复制平台实例调用的宽类型规则。
+     */
+    private fun emitPlatformStaticCall(
+        mv: MethodVisitor,
+        expr: IrCall,
+        ownerInternalName: String,
+        methodName: String,
+        ctx: MethodContext,
+        currentOwner: String
+    ) {
+        val argExpressions = (0 until expr.valueArgumentsCount).mapNotNull { expr.getValueArgument(it) }
+        val argDescriptors = argExpressions.map { receiverJvmDescriptor(it) }
+        val signature = platformMethodResolver.resolveStatic(
+            ownerInternalName,
+            methodName,
+            argDescriptors
+        ) ?: error("platform static call was not resolved by checker: $ownerInternalName.$methodName($argDescriptors)")
+        for ((i, arg) in argExpressions.withIndex()) {
+            generateIrExpression(mv, arg, ctx, currentOwner)
+            emitCallArgumentConversion(mv, argDescriptors[i], signature.parameterDescriptors[i])
+        }
+        mv.visitMethodInsn(
+            Opcodes.INVOKESTATIC,
+            ownerInternalName,
+            methodName,
+            signature.descriptor,
+            signature.declaringClassIsInterface
+        )
+        emitCallReturnAdaptation(
+            mv,
+            signature.returnDescriptor,
+            typeMapper.jvmDescriptorFromIrType(expr.type)
+        )
+        if (signature.returnDescriptor == "V") {
+            mv.visitInsn(Opcodes.ACONST_NULL)
+        }
+    }
+
+    /**
+     * 做什么：把平台调用实参从当前栈描述符转换到目标形参描述符。
+     * 什么时候用：[emitPlatformStaticCall] 以及后续平台实例调用需要真实形参转换时。
+     * 前置条件：src/dst 是合法 JVM 描述符，栈顶恰有一个 src 值。
+     * 失败模式：不支持的组合不额外发指令，最终由验证器暴露；不静默丢弃实参。
+     * 为什么需要：int 实参可匹配 long 形参（BigInteger.valueOf(5)），但 JVM 不会自动
+     *   把 int 压栈值变成 long；必须显式 I2L/I2F/I2D，之后的装箱/引用检查才有正确输入。
+     */
+    private fun emitCallArgumentConversion(mv: MethodVisitor, src: String, dst: String) {
+        if (src == dst) return
+        if (isPrimitiveDesc(src) && isPrimitiveDesc(dst)) {
+            // byte/short/char 在 JVM 栈上就是 int；先归一到 I 再执行 JVM 数值宽化。
+            val normalizedSrc = if (src in "BSC") "I" else src
+            val normalizedDst = if (dst in "BSC") "I" else dst
+            widenIfNeeded(mv, normalizedSrc, normalizedDst)
+            return
+        }
+        emitBoxingIfNeeded(mv, src, dst)
+        emitReferenceWidening(mv, src, dst)
+    }
+
+    /**
      * 做什么：推断一个 IR 表达式的 JVM 描述符；当 IR 调用点类型缺失（`V`）且表达式
      *   本身是一次平台成员调用时，递归地用平台解析器找回真实返回描述符。
      *
@@ -2436,9 +2521,39 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      */
     private fun receiverJvmDescriptor(receiver: IrExpression): String {
         val direct = typeMapper.jvmDescriptorFromIrType(receiver.type)
-        if (direct != "V" || receiver !is IrCall) return direct
-        // 只处理 translator 标记为实例成员调用的内层表达式；其它形态保持旧行为。
+        if (receiver !is IrCall) return direct
         val innerCallName = callNames[receiver.symbol] ?: return direct
+        // 平台静态调用的 IR 类型同样在调用点记为 Unit；真实返回类型由同一解析器回填。
+        // 这是「BigInteger.valueOf(5).pow(3)」能把对象返回继续作为实例接收者的关键。
+        val staticOwner = platformStaticCallOwners[receiver.symbol]
+        if (staticOwner != null) {
+            val args = (0 until receiver.valueArgumentsCount)
+                .mapNotNull { receiver.getValueArgument(it) }
+                .map { receiverJvmDescriptor(it) }
+            return platformMethodResolver.resolveStatic(staticOwner, innerCallName, args)
+                ?.returnDescriptor
+                ?: direct
+        }
+        // 运算表达式的 IR 类型可能仍是 Unit（左操作数是未知平台调用），但栈上结果类型
+        // 可由操作数真实描述符恢复。例如 `parseInt("7") * 6` 作为静态方法实参时必须是 I，
+        // 不能把 V 送给重载解析器。
+        if (innerCallName == "string_plus") return "Ljava/lang/String;"
+        if (innerCallName in setOf("==", "!=", "<", ">", "<=", ">=", "!")) return "Z"
+        if (innerCallName in setOf("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>")) {
+            val left = receiver.getValueArgument(0)?.let { receiverJvmDescriptor(it) } ?: return direct
+            if (innerCallName == "<<") return left
+            if (innerCallName in setOf(">>", ">>>")) return left
+            val right = receiver.getValueArgument(1)?.let { receiverJvmDescriptor(it) } ?: return left
+            return binaryOpWiderDesc(left, right)
+        }
+        if (innerCallName in setOf("negate", "unaryPlus", "inc", "dec", "inv")) {
+            return receiver.getValueArgument(0)?.let { receiverJvmDescriptor(it) } ?: direct
+        }
+        // 运算表达式的调用点 IR 类型既可能是 Unit，也可能因操作数 any 被推成 Object；
+        // 只要语义仍是数值运算，就按操作数真实描述符恢复。必须在下面的 Unit 提前返回
+        // 之前处理，否则 parseInt(...) * 6 会错误选择 Object 重载。
+        if (direct != "V") return direct
+        // 只处理 translator 标记为实例成员调用的内层表达式；其它形态保持旧行为。
         if (!innerCallName.startsWith("v:")) return direct
         val innerRealName = innerCallName.substring(2)
         val innerReceiver = receiver.getValueArgument(0) ?: return direct
@@ -2486,11 +2601,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         // void 没有栈上值可适配；描述符一致时也无需任何指令。
         if (actualReturnDesc == "V" || callSiteReturnDesc == actualReturnDesc) return
         if (callSiteReturnDesc == "V") {
-            // 调用点类型缺失（Unit）时，丢弃点按 void 约定只弹一个槽位；long/double
-            // 占两个槽位，装箱成引用后才与该约定一致（否则验证器报栈型错误，同 C26）。
-            if (actualReturnDesc == "J" || actualReturnDesc == "D") {
-                emitBoxingIfNeeded(mv, actualReturnDesc, "Ljava/lang/Object;")
-            }
+            // 调用点类型缺失（Unit）时保留真实栈型。值位置（返回、实参、链式接收者）
+            // 需要真实 D/J；丢弃位置由 discardExpressionValue 按同一平台感知描述符选 POP2。
             return
         }
         if (callSiteReturnDesc.startsWith("L") && actualReturnDesc.startsWith("L")) {

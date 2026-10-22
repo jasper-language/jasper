@@ -1,13 +1,12 @@
 // ============================================================================
-// PlatformMethodResolver —— 平台（JDK）类型实例方法的真实签名解析器
+// PlatformMethodResolver —— 平台（JDK）类型方法调用的真实签名解析器
 // 所属层次：compiler 后端（JvmIrBackend）的协作组件，只做「平台类型事实查询」，
 //           不参与 IR 生成、不写字节码、也不做诊断。
-// 与谁协作：JvmIrBackend 在生成 `v:<name>` 成员调用、且该接收者不是本次编译单元
-//           声明的类型时调用本类；本类用 JDK 反射（Class.getMethods）找到唯一的
-//           公开实例方法，返回其真实 JVM 描述符与「声明类是否接口」。
-// 对外契约：resolve(receiverInternalName, methodName, argumentDescriptors)：
+// 与谁协作：TypeChecker 用本类确认全限定平台类的静态调用可解析；JvmIrBackend
+//           在生成平台实例/静态调用时用本类取得真实 JVM 描述符。
+// 对外契约：resolve / resolveStatic：
 //           命中唯一候选时返回 [PlatformMethodSignature]；加载失败/零候选/多候选
-//           一律返回 null，调用方必须退回原有描述符推导逻辑。
+//           一律返回 null，调用方必须把失败转成语义诊断或退回既有路径。
 // 设计要点（隔离的变化点）：
 //   - 「平台类型有哪些方法」只在本类里通过反射回答，JvmIrBackend 不再需要维护
 //     JDK 方法签名白名单；将来要换/扩展平台类型识别，只改本类。
@@ -15,8 +14,7 @@
 //   - 结果按（接收者, 方法名, 实参描述符串）缓存在实例内；JvmIrBackend 本身不可
 //     并发/重入，因此这里不再加锁。
 // 已知边界：
-//   - 只解析接收者类 **自身及其父类型** 的 public 实例方法；平台静态方法（C28）
-//     与链式调用类型传播（C27 第二步）不在本类职责内。
+//   - 只解析 public 实例/静态方法；实例与静态候选共用同一套实参匹配和重载选择。
 //   - 不初始化被加载的类（Class.forName(..., false, loader)），避免触发静态初始化
 //     副作用；类初始化失败不会被本类观察到。
 // ============================================================================
@@ -43,7 +41,7 @@ import org.jetbrains.org.objectweb.asm.Type
 data class PlatformMethodSignature(
     /** 方法的真实 JVM 描述符，如 `(I)Ljava/math/BigInteger;`。 */
     val descriptor: String,
-    /** 声明该方法的类是否为接口；决定调用指令（INVOKEINTERFACE / INVOKEVIRTUAL）。 */
+    /** 声明该方法的类是否为接口；决定实例派发指令与静态调用的 itf 标志。 */
     val declaringClassIsInterface: Boolean
 ) {
     /** 形参描述符列表，顺序与 [descriptor] 一致。 */
@@ -78,6 +76,12 @@ data class PlatformMethodSignature(
  */
 class PlatformMethodResolver {
 
+    /** 平台调用的两种 JVM 形态；缓存键必须区分，否则同名同实参可能命中错误候选。 */
+    private enum class CallKind {
+        INSTANCE,
+        STATIC
+    }
+
     /**
      * 缓存键：接收者内部名 + 方法名 + 实参描述符串。
      * 用数据类而不是拼接字符串，避免方法名/描述符里出现分隔符时发生键冲突。
@@ -85,7 +89,8 @@ class PlatformMethodResolver {
     private data class CacheKey(
         val receiverInternalName: String,
         val methodName: String,
-        val argumentDescriptors: List<String>
+        val argumentDescriptors: List<String>,
+        val kind: CallKind
     )
 
     /**
@@ -115,10 +120,43 @@ class PlatformMethodResolver {
         methodName: String,
         argumentDescriptors: List<String>
     ): PlatformMethodSignature? {
-        val key = CacheKey(receiverInternalName, methodName, argumentDescriptors)
+        return resolveMethod(receiverInternalName, methodName, argumentDescriptors, CallKind.INSTANCE)
+    }
+
+    /**
+     * 做什么：解析平台类上唯一的 public static 方法，返回其真实描述符。
+     *
+     * 什么时候用：检查器确认全限定平台静态调用，以及后端生成对应 INVOKESTATIC 时。
+     * 前置条件：arguments 与源码实参一一对应，owner 是 JVM 内部名。
+     * 失败模式：类/方法不存在、重载不唯一或无法匹配时返回 null；不抛内部异常。
+     * 为什么与 [resolve] 共用入口：静态/实例的反射字段只差 Modifier.isStatic，
+     *   实参兼容与重载消歧必须保持同一口径，不能为 C28 复制第二套选择机制。
+     */
+    fun resolveStatic(
+        ownerInternalName: String,
+        methodName: String,
+        argumentDescriptors: List<String>
+    ): PlatformMethodSignature? {
+        return resolveMethod(ownerInternalName, methodName, argumentDescriptors, CallKind.STATIC)
+    }
+
+    /**
+     * 做什么：按调用形态执行缓存查询与未命中解析。
+     * 什么时候用：公共 resolve/resolveStatic 的共同入口。
+     * 前置条件：argumentDescriptors 已按 JVM 实参顺序给出。
+     * 失败模式：反射失败收敛为 null；缓存中的 null 也视为已解析结果。
+     * 为什么集中：调用形态进入缓存键和候选筛选，二者必须在同一处绑定。
+     */
+    private fun resolveMethod(
+        receiverInternalName: String,
+        methodName: String,
+        argumentDescriptors: List<String>,
+        kind: CallKind
+    ): PlatformMethodSignature? {
+        val key = CacheKey(receiverInternalName, methodName, argumentDescriptors, kind)
         // containsKey 与 get 分开：缓存的 null 也要被视为「已解析过」。
         if (cache.containsKey(key)) return cache[key]
-        val resolved = resolveUncached(receiverInternalName, methodName, argumentDescriptors)
+        val resolved = resolveUncached(receiverInternalName, methodName, argumentDescriptors, kind)
         cache[key] = resolved
         return resolved
     }
@@ -133,14 +171,15 @@ class PlatformMethodResolver {
     private fun resolveUncached(
         receiverInternalName: String,
         methodName: String,
-        argumentDescriptors: List<String>
+        argumentDescriptors: List<String>,
+        kind: CallKind
     ): PlatformMethodSignature? {
         val receiverClass = loadClass(internalNameToBinaryName(receiverInternalName)) ?: return null
         val candidates = try {
             receiverClass.methods.filter { method ->
-                // 只考虑 public 实例方法：static 不在此机制范围（C28），
+                // getMethods 已只返回 public 方法；再按调用形态过滤 static。
                 // bridge/synthetic 是编译器生成的转发器，保留它们会让候选重复。
-                !Modifier.isStatic(method.modifiers) &&
+                (Modifier.isStatic(method.modifiers) == (kind == CallKind.STATIC)) &&
                     !method.isBridge &&
                     !method.isSynthetic &&
                     method.name == methodName &&
@@ -155,10 +194,19 @@ class PlatformMethodResolver {
                 argumentAssignable(argumentDescriptors[i], method.parameterTypes[i])
             }
         }
-        // 零个或多个都不猜：多个候选说明仅凭 JVM 描述符无法消歧（例如 int 实参
-        // 同时匹配 int 与 Object 形参），此时交给调用方沿用旧逻辑。
-        if (matched.size != 1) return null
-        val method = matched.single()
+        // 优先选择参数描述符逐项完全一致的候选。Math.max(3, 9) 既匹配 (int,int)，也
+        // 可宽化匹配 (long,long)；若不先取精确项就会把合法调用误判成重载歧义。
+        val exact = matched.filter { method ->
+            method.parameterTypes.map(::primitiveDescriptorOrReference) == argumentDescriptors
+        }
+        // 有多个精确候选仍说明仅凭描述符无法消歧；没有精确候选时，只有唯一宽化/装箱
+        // 候选才接受，避免在多个可行重载之间任意猜测。
+        val method = when {
+            exact.size == 1 -> exact.single()
+            exact.isNotEmpty() -> return null
+            matched.size == 1 -> matched.single()
+            else -> return null
+        }
         return try {
             PlatformMethodSignature(
                 descriptor = Type.getMethodDescriptor(method),
@@ -182,8 +230,11 @@ class PlatformMethodResolver {
     private fun argumentAssignable(argDescriptor: String, parameterClass: Class<*>): Boolean {
         val primitiveClass = primitiveClassForDescriptor(argDescriptor)
         if (primitiveClass != null) {
-            // 基本类型：形参必须是同一基本类型；或目标形参是其包装类 / Object（装箱）。
-            if (parameterClass.isPrimitive) return primitiveClass == parameterClass
+            // 基本类型：形参允许 JVM 原语宽化（如 BigInteger.valueOf(int→long)）；
+            // 引用形参只接受对应包装类或 Object（装箱）。
+            if (parameterClass.isPrimitive) {
+                return primitiveWideningAllowed(argDescriptor, primitiveDescriptor(parameterClass))
+            }
             return parameterClass == java.lang.Object::class.java ||
                 parameterClass == boxedClassFor(primitiveClass)
         }
@@ -278,6 +329,59 @@ class PlatformMethodResolver {
             java.lang.Short.TYPE -> java.lang.Short::class.java
             java.lang.Character.TYPE -> java.lang.Character::class.java
             else -> java.lang.Object::class.java
+        }
+    }
+
+    /**
+     * 做什么：把反射的基本类型 Class 映射回 JVM 单字符描述符。
+     * 什么时候用：[argumentAssignable] 判断原语宽化时。
+     * 前置条件：parameterClass 已由调用方确认 isPrimitive。
+     * 失败模式：未知原语返回空串，后续宽化判定为 false。
+     * 为什么集中：避免在候选筛选里散落 int.class 到 "I" 的多份映射。
+     */
+    private fun primitiveDescriptor(primitiveClass: Class<*>): String {
+        return when (primitiveClass) {
+            java.lang.Integer.TYPE -> "I"
+            java.lang.Long.TYPE -> "J"
+            java.lang.Float.TYPE -> "F"
+            java.lang.Double.TYPE -> "D"
+            java.lang.Boolean.TYPE -> "Z"
+            java.lang.Byte.TYPE -> "B"
+            java.lang.Short.TYPE -> "S"
+            java.lang.Character.TYPE -> "C"
+            else -> ""
+        }
+    }
+
+    /**
+     * 做什么：生成反射参数 Class 的 JVM 描述符，供「精确重载优先」比较。
+     * 什么时候用：候选匹配后挑选参数描述符与调用实参完全相同的方法。
+     * 前置条件：parameterClass 来自公开方法签名。
+     * 失败模式：类型变量等无法精确定位的类型按 Object 描述；只影响重载优选，不抛异常。
+     * 为什么用 ASM：引用/数组描述符的嵌套规则交给 Type.getDescriptor，避免手写漏分支。
+     */
+    private fun primitiveDescriptorOrReference(parameterClass: Class<*>): String {
+        if (parameterClass.isPrimitive) return primitiveDescriptor(parameterClass)
+        return Type.getDescriptor(parameterClass)
+    }
+
+    /**
+     * 做什么：判断 JVM 基本类型实参能否按 Java 赋值转换宽化到目标形参。
+     * 什么时候用：平台静态/实例重载候选匹配时。
+     * 前置条件：from/to 是单字符原语描述符。
+     * 失败模式：未知描述符或不允许的窄化返回 false。
+     * 为什么需要：JVM 不会为调用自动做基本类型宽化，解析器接受后后端仍必须显式发 I2L/I2D 等指令。
+     */
+    private fun primitiveWideningAllowed(from: String, to: String): Boolean {
+        if (from == to) return true
+        return when (from) {
+            "B" -> to in setOf("S", "I", "J", "F", "D")
+            "S" -> to in setOf("I", "J", "F", "D")
+            "C" -> to in setOf("I", "J", "F", "D")
+            "I" -> to in setOf("J", "F", "D")
+            "J" -> to in setOf("F", "D")
+            "F" -> to == "D"
+            else -> false
         }
     }
 }

@@ -538,6 +538,15 @@ class JasCall(
     var inferredTypeArgs: Map<String, JasType>? = null
 
     /**
+     * 检查器确认的全限定平台静态调用宿主（JVM 内部名）。
+     *
+     * null 表示不是平台静态调用。非 null 时 translator 必须生成无接收者的静态 IR 调用，
+     * 后端再复用 PlatformMethodResolver 按实参解析真实描述符。把该事实显式回写到 AST，
+     * 避免 translator 重新做类加载或靠类名大小写猜测，也保证检查器与字节码生成使用同一判定。
+     */
+    var platformStaticOwner: String? = null
+
+    /**
      * varargs 调用点的解析结果（由类型检查器回填，翻译器只按它降级）：
      * null 表示不是 varargs 调用；否则见 [JasVarargCall]。
      */
