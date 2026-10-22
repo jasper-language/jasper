@@ -257,6 +257,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 接口 JVM 内部名 → 其声明的方法（不含 <init>/合成访问器）。生成桥接方法时用来
     // 找到「本类实现的接口要求哪些擦除后签名」。
     private var interfaceMethods: Map<String, List<IrSimpleFunction>> = emptyMap()
+    // 平台（JDK）实例方法签名解析器：只在接收者不是本次编译单元声明的类型时使用。
+    // 为什么放在后端实例上：解析结果缓存可以跨 generate() 复用（平台类的签名不随
+    // 编译单元变化）；JvmIrBackend 明确不可并发/重入，解析器因此也无需加锁。
+    private val platformMethodResolver = PlatformMethodResolver()
 
     // 由字段符号反查 owner 内部名；查不到时退化为当前包，避免写出空 owner 导致
     // ClassWriter 抛异常（宁可生成一个可能 NoSuchFieldError 的引用，也不崩在生成期）。
@@ -1922,9 +1926,16 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // 是接收者，其余是参数。
                             val realName = irName.substring(2)
                             val receiver = expr.getValueArgument(0)!!
-                            val rawReceiverInternal = typeMapper.jvmInternalNameFromIrType(receiver.type)
+                            // 平台调用链的 IR 类型可能缺失（Unit/`V`）：先尝试从内层
+                            // 平台调用恢复真实返回描述符，再据此得到 receiver owner。
+                            val receiverDesc = receiverJvmDescriptor(receiver)
+                            val rawReceiverInternal = when {
+                                receiverDesc.startsWith("L") ->
+                                    receiverDesc.removePrefix("L").removeSuffix(";")
+                                receiverDesc.startsWith("[") -> receiverDesc
+                                else -> typeMapper.jvmInternalNameFromIrType(receiver.type)
+                            }
                             val receiverInternal = if (rawReceiverInternal.contains("/")) rawReceiverInternal else "$currentPkg/$rawReceiverInternal"
-                            val receiverDesc = typeMapper.jvmDescriptorFromIrType(receiver.type)
                             // Determine if receiver is an interface
                             // 接口方法必须用 INVOKEINTERFACE（且参数 isInterface=true，
                             // 末尾 4 字节要求 count 参数），用错会导致 IncompatibleClassChangeError。
@@ -1941,56 +1952,79 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             val declared = memberSignaturesByType[rawReceiverInternal]?.get(declaredKey)
                             val useDeclared = declared != null &&
                                 declared.paramDescriptors.size == expr.valueArgumentsCount - 1
+                            // 先把实参表达式与它们的 IR 描述符收集起来：平台签名解析必须
+                            // 在发射任何实参字节码之前完成，因为「用哪个描述符」会反过来
+                            // 决定每个实参要不要装箱/宽化。
+                            val argExpressions = (1 until expr.valueArgumentsCount)
+                                .mapNotNull { expr.getValueArgument(it) }
+                            val argDescriptors = argExpressions.map { typeMapper.jvmDescriptorFromIrType(it.type) }
+                            // 平台方法真实签名：仅在「没有声明签名」且接收者不是本次编译
+                            // 单元声明的类型时尝试。toString 与 isKnownJdkFluentCall 是既有
+                            // 契约（RemoveMethodTest 锁死了 StringBuilder.append / 容器
+                            // get/set/remove 的描述符形状），继续走原路径，保证既有测试不变。
+                            val platformSignature = if (!useDeclared &&
+                                realName != "toString" &&
+                                !isKnownJdkFluentCall(receiverInternal, realName) &&
+                                !isCompilationUnitDeclaredType(rawReceiverInternal, receiverInternal)
+                            ) {
+                                platformMethodResolver.resolve(receiverInternal, realName, argDescriptors)
+                            } else {
+                                null
+                            }
+                            // 形参描述符来源：声明签名优先，其次平台真实签名；都没有时
+                            // 沿用旧行为（按实参 IR 类型拼描述符）。
+                            val targetParamDescriptors = when {
+                                useDeclared -> declared!!.paramDescriptors
+                                platformSignature != null -> platformSignature.parameterDescriptors
+                                else -> null
+                            }
                             // Generate receiver
                             generateIrExpression(mv, receiver, ctx, owner)
                             // Generate remaining args and build descriptor
                             val paramSb = StringBuilder()
-                            for (i in 1 until expr.valueArgumentsCount) {
-                                val arg = expr.getValueArgument(i) ?: continue
+                            for ((i, arg) in argExpressions.withIndex()) {
                                 generateIrExpression(mv, arg, ctx, owner)
-                                if (useDeclared) {
-                                    val targetDesc = declared!!.paramDescriptors[i - 1]
-                                    // 实参按声明形参类型转换：基本类型装箱（int → Object），
+                                val argDesc = argDescriptors[i]
+                                if (targetParamDescriptors != null) {
+                                    val targetDesc = targetParamDescriptors[i]
+                                    // 实参按目标形参类型转换：基本类型装箱（int → Object），
                                     // 具体实现 → 接口/父类时补 CHECKCAST（C13）。这既让栈上
                                     // 类型与调用描述符一致，也把「传参宽化」显式落在字节码里。
-                                    val argDesc = typeMapper.jvmDescriptorFromIrType(arg.type)
                                     emitBoxingIfNeeded(mv, argDesc, targetDesc)
                                     emitReferenceWidening(mv, argDesc, targetDesc)
                                     paramSb.append(targetDesc)
                                 } else {
-                                    paramSb.append(typeMapper.jvmDescriptorFromIrType(arg.type))
+                                    paramSb.append(argDesc)
                                 }
                             }
-                            // 返回描述符：优先用声明的擦除签名；否则只对**已知 JDK 接收者**
-                            // 保留流畅 API 特例（StringBuilder.append* 等），其余按 IR 调用
-                            // 点类型擦除。绝不能按方法名全局特判：用户类型的 remove/get/set
-                            // 会因此拿到接收者描述符（JPA #7 的 VerifyError 根因）。
+                            // 返回描述符：优先用声明的擦除签名；其次平台真实签名；否则只对
+                            // **已知 JDK 接收者**保留流畅 API 特例（StringBuilder.append* 等），
+                            // 其余按 IR 调用点类型擦除。绝不能按方法名全局特判：用户类型的
+                            // remove/get/set 会因此拿到接收者描述符（JPA #7 的 VerifyError 根因）。
                             val returnDesc = when {
                                 useDeclared -> declared!!.returnDescriptor
+                                platformSignature != null -> platformSignature.returnDescriptor
                                 realName == "toString" -> "Ljava/lang/String;"
                                 isKnownJdkFluentCall(receiverInternal, realName) -> receiverDesc
                                 else -> typeMapper.jvmReturnDescriptorFromIrType(expr.type)
                             }
-                            if (isInterfaceTarget) {
+                            // 接口方法必须用 INVOKEINTERFACE：用户接口由 interfaceDeclNames
+                            // 判定，平台接口（如 java.util.List）由解析器回报的声明类判定。
+                            val invokeInterface = isInterfaceTarget ||
+                                platformSignature?.declaringClassIsInterface == true
+                            if (invokeInterface) {
                                 mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, receiverInternal, realName, "($paramSb)$returnDesc", true)
                             } else {
                                 mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, receiverInternal, realName, "($paramSb)$returnDesc", false)
                             }
-                            // 声明的擦除返回（如 Object）与调用点静态类型（如 Person）不一致时，
+                            // 真实返回（声明擦除或平台签名）与调用点静态类型不一致时，
                             // 在调用点补 CHECKCAST / 拆箱-装箱，使栈上值的类型与 IR 视角一致。
-                            if (useDeclared) {
-                                val callReturnDesc = typeMapper.jvmDescriptorFromIrType(expr.type)
-                                if (returnDesc != "V" && callReturnDesc != returnDesc) {
-                                    if (callReturnDesc.startsWith("L") && returnDesc.startsWith("L")) {
-                                        mv.visitTypeInsn(
-                                            Opcodes.CHECKCAST,
-                                            callReturnDesc.substring(1, callReturnDesc.length - 1)
-                                        )
-                                    } else {
-                                        emitUnboxingIfNeeded(mv, returnDesc, callReturnDesc)
-                                        emitBoxingIfNeeded(mv, returnDesc, callReturnDesc)
-                                    }
-                                }
+                            if (useDeclared || platformSignature != null) {
+                                emitCallReturnAdaptation(
+                                    mv,
+                                    returnDesc,
+                                    typeMapper.jvmDescriptorFromIrType(expr.type)
+                                )
                             }
                             // Void member calls (e.g. generated setters) leave no value on
                             // the stack, but the statement emitter always expects one to POP.
@@ -2350,6 +2384,97 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             "java/util/Map", "java/util/HashMap", "java/util/LinkedHashMap", "java/util/TreeMap" ->
                 methodName == "get" || methodName == "set" || methodName == "remove"
             else -> false
+        }
+    }
+
+    /**
+     * 做什么：判断接收者是不是**本次编译单元声明**的类型（用户类/接口/枚举）。
+     *
+     * 什么时候用：决定是否允许 [PlatformMethodResolver] 介入之前。用户类型的成员方法
+     *   必须继续走 translator 预登记的声明擦除签名，平台解析器不能越权改写它们。
+     * 前置条件：rawReceiverInternal 是 TypeMapper 反查出的名字（可能是简单名），
+     *   receiverInternal 是后端补齐包名后的内部名；两张表由 generate() 从
+     *   TranslationResult 装入。
+     * 失败模式：纯查表，不抛异常。两张表都查不到就返回 false（视为平台类型候选），
+     *   真正的「加载不到」由解析器自己收敛为 null。
+     * 为什么这样设计：任务书把「本次编译单元声明」定义为 memberSignaturesByType 与
+     *   接口表的命中；把判定集中在本函数，调用点不必重复理解两张表的键格式差异
+     *   （简单名 vs 内部名），也让「是否允许平台解析」只有一个变化点。
+     */
+    private fun isCompilationUnitDeclaredType(rawReceiverInternal: String, receiverInternal: String): Boolean {
+        return memberSignaturesByType.containsKey(rawReceiverInternal) ||
+            memberSignaturesByType.containsKey(receiverInternal) ||
+            interfaceDeclNames.contains(rawReceiverInternal) ||
+            interfaceDeclNames.contains(receiverInternal)
+    }
+
+    /**
+     * 做什么：推断成员调用接收者的 JVM 描述符；当 IR 调用点类型缺失（`V`）且接收者
+     *   本身是一次平台成员调用时，用平台解析器找回真实返回描述符。
+     *
+     * 什么时候用：生成 `v:<name>` 调用、需要 receiver 的内部名/描述符之前。
+     * 前置条件：receiver 是已由 translator 翻译好的 IR 表达式；resolver 已就绪。
+     * 失败模式：任何一步无法确定都原样返回 `V`（调用方随后会得到 `void` 内部名并
+     *   退回旧行为），不抛异常。
+     * 为什么需要：translator 对没有声明签名的平台调用把 IR 类型记为 Unit（描述符
+     *   `V`）；`new BigInteger("1").shiftLeft(10).toString()` 里外层调用只看
+     *   receiver.type 会得到 `test/void` 这个不存在的 owner（C27 的链式表现）。
+     *   这里只在**后端描述符选择**范围内复用同一个解析器，把内层调用的真实返回
+     *   描述符当作外层的静态类型；不改检查器/translator 的类型推断（任务书边界）。
+     *   注意：这是「类型信息缺失时的事实回填」，不是把链式调用改写成顶层函数
+     *   （C27 第二步不在本函数职责内）。
+     */
+    private fun receiverJvmDescriptor(receiver: IrExpression): String {
+        val direct = typeMapper.jvmDescriptorFromIrType(receiver.type)
+        if (direct != "V" || receiver !is IrCall) return direct
+        // 只处理 translator 标记为实例成员调用的内层表达式；其它形态保持旧行为。
+        val innerCallName = callNames[receiver.symbol] ?: return direct
+        if (!innerCallName.startsWith("v:")) return direct
+        val innerRealName = innerCallName.substring(2)
+        val innerReceiver = receiver.getValueArgument(0) ?: return direct
+        val innerRawOwner = typeMapper.jvmInternalNameFromIrType(innerReceiver.type)
+        val innerOwner = if (innerRawOwner.contains("/")) innerRawOwner else "$currentPkg/$innerRawOwner"
+        // 用户类型不在平台解析范围内：它们的调用点类型应由声明签名给出，缺失时
+        // 不在这里猜测，继续走旧路径。
+        if (isCompilationUnitDeclaredType(innerRawOwner, innerOwner)) return direct
+        val innerArgs = (1 until receiver.valueArgumentsCount)
+            .mapNotNull { receiver.getValueArgument(it) }
+        val innerArgDescriptors = innerArgs.map { typeMapper.jvmDescriptorFromIrType(it.type) }
+        return platformMethodResolver.resolve(innerOwner, innerRealName, innerArgDescriptors)
+            ?.returnDescriptor
+            ?: direct
+    }
+
+    /**
+     * 做什么：把栈顶的「方法真实返回类型」适配到调用点 IR 期望的类型。
+     *
+     * 什么时候用：成员调用使用「声明擦除签名」或「平台真实签名」生成之后。这两条路径
+     *   都可能让真实返回描述符与 IR 调用点类型不同（泛型擦除成 Object、平台方法返回
+     *   int 而 IR 只知道 Unit/any 等）。
+     * 前置条件：栈顶恰好有一个 [actualReturnDesc] 类型的值；[callSiteReturnDesc] 是
+     *   IR 调用点类型的 JVM 描述符（可能是 `V`，表示类型信息缺失）。
+     * 失败模式：不支持/不改变栈型的组合静默返回；若上游类型信息与真实描述符冲突到
+     *   无法用 CHECKCAST/装箱消解，错误留给 JVM 验证器，本函数不猜。
+     * 为什么单独成函数：声明签名与平台签名是两条不同来源，但「返回值对齐」是同一个
+     *   变化点；抽出来可避免复制 CHECKCAST/拆箱-装箱逻辑，也保证两条路径行为一致。
+     */
+    private fun emitCallReturnAdaptation(
+        mv: MethodVisitor,
+        actualReturnDesc: String,
+        callSiteReturnDesc: String
+    ) {
+        // void 没有栈上值可适配；描述符一致时也无需任何指令。
+        if (actualReturnDesc == "V" || callSiteReturnDesc == actualReturnDesc) return
+        if (callSiteReturnDesc.startsWith("L") && actualReturnDesc.startsWith("L")) {
+            // 引用 → 更具体的引用：补 CHECKCAST，让栈上类型与 IR 视角一致（C13）。
+            mv.visitTypeInsn(
+                Opcodes.CHECKCAST,
+                callSiteReturnDesc.substring(1, callSiteReturnDesc.length - 1)
+            )
+        } else {
+            // 其余组合：Object/Serializable → 基本类型走拆箱；基本类型 → Object 走装箱。
+            emitUnboxingIfNeeded(mv, actualReturnDesc, callSiteReturnDesc)
+            emitBoxingIfNeeded(mv, actualReturnDesc, callSiteReturnDesc)
         }
     }
 
