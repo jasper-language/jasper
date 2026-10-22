@@ -1667,6 +1667,43 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Math", "pow", "(DD)D", false)
                         mv.visitInsn(Opcodes.D2I)
                     }
+                    "__jasper_string_length__" -> {
+                        // string.length = Unicode 码点数（不是 UTF-16 单元数）：
+                        //   s.codePointCount(0, s.length())
+                        // 必须先 DUP 留住接收者再求 UTF-16 长度，且接收者表达式只求值一次
+                        // （翻译层已保证只把接收者放进 IR 一次，这里不能重新 generate 原表达式）。
+                        // 栈序：s -> s,s -> s,len -> s,len,0 -> s,0,len -> codePointCount。
+                        // 用 SWAP 而不是临时局部槽，避免额外分配槽位、也不影响后续槽号。
+                        generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
+                        mv.visitInsn(Opcodes.DUP)
+                        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "length", "()I", false)
+                        mv.visitInsn(Opcodes.ICONST_0)
+                        mv.visitInsn(Opcodes.SWAP)
+                        mv.visitMethodInsn(
+                            Opcodes.INVOKEVIRTUAL, "java/lang/String", "codePointCount", "(II)I", false
+                        )
+                    }
+                    "__jasper_string_byte_length__" -> {
+                        // string.byteLength() = UTF-8 编码后的字节数：
+                        //   s.getBytes(StandardCharsets.UTF_8).length
+                        // 不能退回无参 getBytes()（那是平台默认字符集，结果不稳定），
+                        // 也不能用 String.length()（那是 UTF-16 单元数）。
+                        generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
+                        mv.visitFieldInsn(
+                            Opcodes.GETSTATIC,
+                            "java/nio/charset/StandardCharsets",
+                            "UTF_8",
+                            "Ljava/nio/charset/Charset;"
+                        )
+                        mv.visitMethodInsn(
+                            Opcodes.INVOKEVIRTUAL,
+                            "java/lang/String",
+                            "getBytes",
+                            "(Ljava/nio/charset/Charset;)[B",
+                            false
+                        )
+                        mv.visitInsn(Opcodes.ARRAYLENGTH)
+                    }
                     "negate" -> {
                         // 一元取负：直接 INEG（long 的取负由 translator 拆成 0L - x 之类，
                         // 不会走到这里；若将来遇到 long 需另加 LNEG）。

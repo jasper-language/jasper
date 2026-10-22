@@ -1242,6 +1242,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                     // （例如字段里存的是函数值），交回下面的函数值调用路径。
                     if (expr.target is JasPropertyAccess) {
                         val receiverType = inferExpression(expr.target.target, env)
+                        // string 的内建方法不来自成员声明，必须在具名类型重载解析之前分流。
+                        // `byteLength()` 返回 UTF-8 编码后的字节数（int32）；参数个数是
+                        // 编译期可判定的，多给实参直接报错，避免后端生成不存在的方法调用。
+                        if (receiverType is JasStringType && expr.target.property == "byteLength") {
+                            if (expr.args.isNotEmpty()) {
+                                error("Function 'byteLength' expects 0 argument(s), got ${expr.args.size}", expr)
+                            }
+                            return JasPrimitiveType("int32")
+                        }
                         if (receiverType is JasNamedType) {
                             inferInstanceMemberCall(expr, expr.target, receiverType, argTypes)?.let { return it }
                         }
@@ -1333,6 +1342,11 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                             JasAnyType
                         }
                     }
+                    // string 的 length 是 Unicode **码点数**（O(n)），不是 JVM String.length()
+                    // 的 UTF-16 code unit 数；补充平面字符（如 emoji）算 1 个码点、2 个
+                    // UTF-16 单元，所以这里绝不能把接收者当成数组或按 UTF-16 长度推断。
+                    // 该属性同样不来自成员声明，必须紧挨数组 length 特例处理。
+                    targetType is JasStringType && expr.property == "length" -> JasPrimitiveType("int32")
                     // 数组的 length 是语言内建属性，不来自成员声明。
                     targetType is JasArrayType && expr.property == "length" -> JasPrimitiveType("int32")
                     targetType != null -> {
@@ -1347,7 +1361,11 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasArrayAccess -> {
-                // 下标必须是 int32；元素类型：数组取元素类型，字符串下标取 int32（字符码）。
+                // 下标必须是 int32；元素类型：数组取元素类型。
+                // 字符串**不允许**用整数索引（语言约定 §11.3）：JVM 的 `charAt` 返回的是
+                // UTF-16 单元，与 string 的「Unicode 码点序列」语义不一致，且会让
+                // `s[i]` 看起来像按字符访问。这里显式拒绝并降级为 any，防止后续代码
+                // 继续按 int32 使用一个并不存在的下标读写实现。
                 val targetType = inferExpression(expr.target, env)
                 val indexType = inferExpression(expr.index, env)
                 if (indexType != null && !typesCompatible(indexType, JasPrimitiveType("int32"))) {
@@ -1355,7 +1373,10 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
                 when (targetType) {
                     is JasArrayType -> targetType.inner
-                    is JasStringType -> JasPrimitiveType("int32")
+                    is JasStringType -> {
+                        error("String cannot be indexed by integer; use explicit code point APIs", expr)
+                        JasAnyType
+                    }
                     null -> {
                         warn("Array access on unresolved type", expr)
                         JasAnyType

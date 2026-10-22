@@ -2856,6 +2856,22 @@ class JasperToIrTranslator {
         if (staticCall != null) {
             return translateStaticCall(expr, staticCall, ctx)
         }
+        // 成员调用的接收者只翻译一次：既用于 string 内建方法分流，也用于后续实参列表。
+        // 这样 `next().byteLength()` 这类接收者有副作用的表达式在字节码里也只求值一次。
+        val memberReceiver = if (expr.target is JasPropertyAccess) {
+            translateExpression(expr.target.target, ctx)
+        } else {
+            null
+        }
+        // string 的 `byteLength()` 是语言内建方法，JVM 的 String 没有同名方法。
+        // 必须在通用成员调用路径之前分流，否则后端会拼出 `String.byteLength()`
+        // 的调用描述符，运行期抛 NoSuchMethodError。
+        if (memberReceiver != null && expr.target is JasPropertyAccess &&
+            expr.target.property == "byteLength" && isStringIrType(memberReceiver.type)
+        ) {
+            // 参数个数错误由 TypeChecker 负责诊断；这里仅在没有实参时生成字节码。
+            if (expr.args.isEmpty()) return emitStringByteLength(memberReceiver, ctx)
+        }
         val symbol = ctx.functionSymbols[name]
             ?: IrSimpleFunctionSymbolImpl()
         ctx.callNames[symbol] = if (expr.target is JasPropertyAccess) "v:$name" else name
@@ -2867,8 +2883,8 @@ class JasperToIrTranslator {
         } else null
         if (memberIndexKey != null) ctx.memberCallKeys[symbol] = memberIndexKey
         val args = mutableListOf<IrExpression>()
-        if (expr.target is JasPropertyAccess) {
-            args.add(translateExpression(expr.target.target, ctx))
+        if (memberReceiver != null) {
+            args.add(memberReceiver)
         }
         args.addAll(expr.args.map { translateExpression(it, ctx) }.toTypedArray())
         // Member-call arguments are widened to the declared parameter type when
@@ -3154,6 +3170,11 @@ class JasperToIrTranslator {
             )
         }
         val target = translateExpression(expr.target, ctx)
+        // string.length 的语义是 Unicode 码点数，JVM 没有直接对应的字段/指令；
+        // 在翻译层分流成合成调用，接收者已在这里求值一次（副作用不会重复）。
+        if (isStringIrType(target.type) && expr.property == "length") {
+            return emitStringCodePointLength(target, ctx)
+        }
         val fieldSymbol = resolveFieldSymbol(expr.property, expr.target, target, ctx)
         val fieldType = resolveFieldType(expr.property, expr.target, target, ctx) ?: typeMapper.unitType()
         val irGetField = IrNodeFactory.createGetField(
@@ -3165,6 +3186,44 @@ class JasperToIrTranslator {
             irGetField.receiver = target
         }
         return irGetField
+    }
+
+    /**
+     * 做什么：把 `string.length` 降级成一个后端可识别的合成调用（Unicode 码点数）。
+     * 什么时候用：[translatePropertyAccess] 判定接收者静态类型是 string 且属性为 `length` 时。
+     * 前置条件：receiver 已翻译且只翻译一次——调用方必须复用它，不能再求值原表达式，
+     *   否则 `next().length` 会把接收者的副作用执行两次。
+     * 失败模式：运行期 receiver 为 null 时与 JVM 语义一致抛 NPE（语言 string 类型不可空，
+     *   只有 any/平台边界才可能出现 null）。
+     * 为什么这样设计：IR 没有「码点计数」专用节点，复用 translator 与后端既有的
+     *   `callNames` 契约（与 `__jasper_pow__` 同款），把 JVM 指令细节留在后端。
+     *   这样「是不是 string」的类型判定只发生在本层，后端无需按字段名猜语义。
+     */
+    private fun emitStringCodePointLength(receiver: IrExpression, ctx: TranslationContext): IrExpression {
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = "__jasper_string_length__"
+        return IrNodeFactory.createCall(
+            0, 0, typeMapper.intType(), null,
+            arrayOf(receiver), emptyArray(), symbol, null
+        )
+    }
+
+    /**
+     * 做什么：把 `string.byteLength()` 降级成后端可识别的合成调用（UTF-8 字节数）。
+     * 什么时候用：[translateCall] 判定接收者静态类型是 string、方法名 `byteLength` 且无实参时。
+     * 前置条件：receiver 由调用方翻译一次并复用；实参个数已由 TypeChecker 校验为 0。
+     * 失败模式：同 [emitStringCodePointLength]（null 接收者运行期 NPE）。
+     * 为什么这样设计：JVM 的 String 没有 byteLength()，且「UTF-8」是语言层决定，
+     *   不能依赖平台默认字符集；把「用哪个字符集/怎么取长度」封装到后端一处，
+     *   将来换目标平台时只改该实现（隔离的变化点：编码与计数实现）。
+     */
+    private fun emitStringByteLength(receiver: IrExpression, ctx: TranslationContext): IrExpression {
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = "__jasper_string_byte_length__"
+        return IrNodeFactory.createCall(
+            0, 0, typeMapper.intType(), null,
+            arrayOf(receiver), emptyArray(), symbol, null
+        )
     }
 
     /**
@@ -3290,6 +3349,17 @@ class JasperToIrTranslator {
 
     private fun isArrayIrType(type: IrType): Boolean =
         typeMapper.jvmDescriptorFromIrType(type).startsWith("[")
+
+    /**
+     * 做什么：判断一个 IR 类型是否就是语言内建的 `string`。
+     * 什么时候用：属性/方法翻译时识别 string 内建语义（`.length`、`.byteLength()`）。
+     * 前置条件：type 已由 typeMapper 映射（任意 IR 类型均可）。
+     * 失败模式：无法解析的引用类型会退化成 Object 描述符，因此返回 false（不误判）。
+     * 为什么用描述符比较：`string` 在 IR 里是 kotlin.String，与 JVM 的 java.lang.String
+     *   一一对应；复用 TypeMapper 的既有映射，避免再维护一份类型名到描述符的对照表。
+     */
+    private fun isStringIrType(type: IrType): Boolean =
+        typeMapper.jvmDescriptorFromIrType(type) == "Ljava/lang/String;"
 
     /**
      * 做什么：为编译器生成的临时局部变量分配一个函数内唯一的名字。
