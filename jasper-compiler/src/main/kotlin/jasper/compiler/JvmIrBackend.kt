@@ -2465,6 +2465,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     ) {
         // void 没有栈上值可适配；描述符一致时也无需任何指令。
         if (actualReturnDesc == "V" || callSiteReturnDesc == actualReturnDesc) return
+        if (callSiteReturnDesc == "V") {
+            // 调用点类型缺失（Unit）时，丢弃点按 void 约定只弹一个槽位；long/double
+            // 占两个槽位，装箱成引用后才与该约定一致（否则验证器报栈型错误，同 C26）。
+            if (actualReturnDesc == "J" || actualReturnDesc == "D") {
+                emitBoxingIfNeeded(mv, actualReturnDesc, "Ljava/lang/Object;")
+            }
+            return
+        }
         if (callSiteReturnDesc.startsWith("L") && actualReturnDesc.startsWith("L")) {
             // 引用 → 更具体的引用：补 CHECKCAST，让栈上类型与 IR 视角一致（C13）。
             mv.visitTypeInsn(

@@ -122,6 +122,24 @@ class PlatformMethodDescriptorRegressionTest {
     }
 
     /**
+     * 宽类型返回丢弃：`BigInteger.longValue()` 的真实描述符是 `()J`，放在语句位置时
+     * 调用点 IR 类型缺失（Unit），丢弃时必须按双槽位处理，否则验证器在加载时报
+     * 栈型错误（与 C26 同类）。随后的 return 证明方法体正常执行完。
+     */
+    @Test
+    fun `discarded platform method returning long keeps stack consistent`() {
+        val source = """
+            package test;
+            public function main(): int32 {
+                new java.math.BigInteger("5").longValue();
+                return 1;
+            }
+        """.trimIndent()
+        val out = compile(source, "long-return-discarded")
+        assertEquals(1, invokeStatic(out, "test.main", "main"))
+    }
+
+    /**
      * 接口派发：`java.util.List.size()` 必须用 INVOKEINTERFACE，且真实返回是 `()I`。
      * 若按类调用发 INVOKEVIRTUAL，链接期会报 IncompatibleClassChangeError；
      * 若按旧逻辑拼 `()V`/`()Ljava/lang/Object;`，调用期失败。
