@@ -1720,6 +1720,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         )
                         mv.visitInsn(Opcodes.ARRAYLENGTH)
                     }
+                    "__jasper_string_code_point_at__" -> {
+                        // string.codePointAt(i) 的语言语义：i 是**码点序号**，返回该处
+                        // Unicode scalar value。JVM 字符串是 UTF-16，不能把 i 直接传给
+                        // java/lang/String.codePointAt(I)I（那会按码元索引解释，emoji 错位）。
+                        // 具体转换/校验见 emitStringCodePointAtCall。
+                        emitStringCodePointAtCall(mv, expr, ctx, owner)
+                    }
                     "negate" -> {
                         // 一元取负按操作数槽型选择 NEG 指令。平台静态调用的实参可能是
                         // double（如 Math.abs(-2.5)）；统一发 INEG 会在类加载时抛 VerifyError。
@@ -3006,6 +3013,315 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         }
         generateIrExpression(mv, arg, ctx, owner)
         mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", valueOfMethod, false)
+    }
+
+    /**
+     * 做什么：为 `string.codePointAt(i)` 生成字节码——把**码点序号** `i` 转成
+     *   UTF-16 偏移，读取该处的 Unicode scalar value，并在越界/畸形输入时抛
+     *   结构化异常。
+     *
+     * 什么时候用：仅由 [generateIrExpression] 的 `__jasper_string_code_point_at__`
+     *   分支调用；IR 约定实参 0 是接收者（java.lang.String），实参 1 是 int32 索引。
+     *
+     * 前置条件：检查器已保证实参个数/类型正确；接收者与索引表达式在这里各只求值
+     *   一次，顺序为「接收者 → 索引」。局部槽从 [MethodContext.nextSlot] 顺延，
+     *   不回收，避免与仍在使用的槽位重叠。
+     *
+     * 失败模式（均为运行期、由生成代码主动抛出，不是编译器内部错误）：
+     *   - `i < 0` 或 `i >= 码点数`：`IndexOutOfBoundsException`，消息含方法名、索引
+     *     与码点长度；不返回 -1、不钳制、不回绕。
+     *   - 扫描范围内出现未配对代理项：`IllegalArgumentException`，消息含方法名、
+     *     请求索引与 UTF-16 偏移；不返回 U+FFFD 替换字符。
+     *   - 接收者为 null：第一次调用 `String.length()` 时按 JVM 语义抛 NPE。
+     *
+     * 为什么这样设计：
+     *   1. JVM 的 `String.codePointAt(int)` 参数是 UTF-16 偏移，而语言层 `i` 是码点
+     *      序号；直接把 `i` 传进去会让 `"a😀b".codePointAt(1)` 取到代理项，语义错位。
+     *   2. 手动扫描而不是 `offsetByCodePoints(0, i)`：后者不校验未配对代理项，会把
+     *      孤立代理项当成一个“码点”静默返回，违反语言层「合法 string 是 scalar
+     *      value 序列」的前提。扫描同时完成「码点序号 → 偏移」与代理对校验。
+     *   3. 只在需要时扫描到目标位置（含目标），保持设计文档中的 O(i) 复杂度；
+     *      目标之后的畸形代理项不会被本次读取触及，符合「在读取时校验」的裁决。
+     *   4. 异常消息用 `StringBuilder` 拼装而不是 `String.format`，避免装箱与
+     *      Locale/格式串依赖；生成的 class 仍是 Java 8（无 invokedynamic）。
+     *
+     * 栈/槽位说明：所有中间值先落到局部槽，保证异常分支处操作数栈为空；
+     *   ASM 的 COMPUTE_FRAMES 可以据此安全计算栈帧。
+     */
+    private fun emitStringCodePointAtCall(
+        mv: MethodVisitor,
+        expr: IrCall,
+        ctx: MethodContext,
+        owner: String
+    ) {
+        // 槽位：s / index / utf16Len / offset / codePointIndex / char / message。
+        // 每个槽只占 1（String 引用与 int 都不是宽类型），分配后不复用。
+        val stringSlot = ctx.nextSlot++
+        val indexSlot = ctx.nextSlot++
+        val utf16LengthSlot = ctx.nextSlot++
+        val offsetSlot = ctx.nextSlot++
+        val codePointIndexSlot = ctx.nextSlot++
+        val charSlot = ctx.nextSlot++
+        val messageSlot = ctx.nextSlot++
+
+        // 求值顺序：接收者 → 索引（与语言级求值顺序一致，且各只求值一次）。
+        generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
+        storeLocal(mv, "Ljava/lang/String;", stringSlot)
+        generateIrExpression(mv, expr.getValueArgument(1)!!, ctx, owner)
+        storeLocal(mv, "I", indexSlot)
+
+        // UTF-16 长度只取一次；后续循环与异常消息复用，避免重复调用。
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "length", "()I", false)
+        storeLocal(mv, "I", utf16LengthSlot)
+
+        val nonNegative = Label()
+        val loopStart = Label()
+        val loopDone = Label()
+        val notHighSurrogate = Label()
+        val advanceIndex = Label()
+        val targetNotHighSurrogate = Label()
+        val resultReady = Label()
+        val outOfBounds = Label()
+        val invalidUnicode = Label()
+
+        // 负索引直接拒绝：不做 Python 式“从末尾数”，避免与 s.length - 1 混淆。
+        loadLocal(mv, "I", indexSlot)
+        mv.visitJumpInsn(Opcodes.IFGE, nonNegative)
+        emitThrowIndexOutOfBounds(mv, indexSlot, stringSlot, utf16LengthSlot, messageSlot)
+        mv.visitLabel(nonNegative)
+
+        // offset = 0（UTF-16 偏移）；codePointIndex = 0（已消费的码点数）。
+        pushInt(mv, 0)
+        storeLocal(mv, "I", offsetSlot)
+        pushInt(mv, 0)
+        storeLocal(mv, "I", codePointIndexSlot)
+
+        mv.visitLabel(loopStart)
+        // while (codePointIndex < index)：每次前进一个完整码点（代理对一次走 2 个码元）。
+        loadLocal(mv, "I", codePointIndexSlot)
+        loadLocal(mv, "I", indexSlot)
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, loopDone)
+
+        // 若还没走到 index 就已耗尽字符串，说明 index >= 码点数：越界。
+        loadLocal(mv, "I", offsetSlot)
+        loadLocal(mv, "I", utf16LengthSlot)
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, outOfBounds)
+
+        // char c = s.charAt(offset)
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        loadLocal(mv, "I", offsetSlot)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "charAt", "(I)C", false)
+        storeLocal(mv, "I", charSlot)
+
+        // 高代理项必须紧跟低代理项，否则是畸形输入。
+        loadLocal(mv, "I", charSlot)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "isHighSurrogate", "(C)Z", false)
+        mv.visitJumpInsn(Opcodes.IFEQ, notHighSurrogate)
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        loadLocal(mv, "I", utf16LengthSlot)
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, invalidUnicode)
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "charAt", "(I)C", false)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "isLowSurrogate", "(C)Z", false)
+        mv.visitJumpInsn(Opcodes.IFEQ, invalidUnicode)
+        // 合法代理对：一次消费 2 个 UTF-16 码元。
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 2)
+        mv.visitInsn(Opcodes.IADD)
+        storeLocal(mv, "I", offsetSlot)
+        mv.visitJumpInsn(Opcodes.GOTO, advanceIndex)
+
+        mv.visitLabel(notHighSurrogate)
+        // 低代理项出现在非配对位置：同样是畸形输入（不能当作 scalar value 返回）。
+        loadLocal(mv, "I", charSlot)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "isLowSurrogate", "(C)Z", false)
+        mv.visitJumpInsn(Opcodes.IFNE, invalidUnicode)
+        // 普通 BMP 码元：消费 1 个。
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        storeLocal(mv, "I", offsetSlot)
+
+        mv.visitLabel(advanceIndex)
+        loadLocal(mv, "I", codePointIndexSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        storeLocal(mv, "I", codePointIndexSlot)
+        mv.visitJumpInsn(Opcodes.GOTO, loopStart)
+
+        mv.visitLabel(loopDone)
+        // index == 码点数（或更大）时，offset 已到末尾：统一按越界处理。
+        loadLocal(mv, "I", offsetSlot)
+        loadLocal(mv, "I", utf16LengthSlot)
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, outOfBounds)
+
+        // 读取目标位置的第一个码元。
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        loadLocal(mv, "I", offsetSlot)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "charAt", "(I)C", false)
+        storeLocal(mv, "I", charSlot)
+
+        // 目标若是高代理项，必须与后一个低代理项组成合法代理对，并合并为一个码点。
+        loadLocal(mv, "I", charSlot)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "isHighSurrogate", "(C)Z", false)
+        mv.visitJumpInsn(Opcodes.IFEQ, targetNotHighSurrogate)
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        loadLocal(mv, "I", utf16LengthSlot)
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, invalidUnicode)
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "charAt", "(I)C", false)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "isLowSurrogate", "(C)Z", false)
+        mv.visitJumpInsn(Opcodes.IFEQ, invalidUnicode)
+        // Character.toCodePoint(high, low) 把代理对合并成 U+10000..U+10FFFF。
+        loadLocal(mv, "I", charSlot)
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        loadLocal(mv, "I", offsetSlot)
+        pushInt(mv, 1)
+        mv.visitInsn(Opcodes.IADD)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "charAt", "(I)C", false)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "toCodePoint", "(CC)I", false)
+        mv.visitJumpInsn(Opcodes.GOTO, resultReady)
+
+        mv.visitLabel(targetNotHighSurrogate)
+        // 目标若是孤立低代理项：拒绝，不能把代理区数值当 scalar value 返回。
+        loadLocal(mv, "I", charSlot)
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "isLowSurrogate", "(C)Z", false)
+        mv.visitJumpInsn(Opcodes.IFNE, invalidUnicode)
+        // 普通 BMP 码元直接就是码点。
+        loadLocal(mv, "I", charSlot)
+        mv.visitJumpInsn(Opcodes.GOTO, resultReady)
+
+        // 异常块：都先构造消息再 ATHROW；此处操作数栈为空，符合 COMPUTE_FRAMES 的前提。
+        mv.visitLabel(outOfBounds)
+        emitThrowIndexOutOfBounds(mv, indexSlot, stringSlot, utf16LengthSlot, messageSlot)
+        mv.visitLabel(invalidUnicode)
+        emitThrowInvalidUnicode(mv, indexSlot, offsetSlot, messageSlot)
+
+        // 正常结果（int32）留在栈顶，交给调用方。
+        mv.visitLabel(resultReady)
+    }
+
+    /**
+     * 做什么：生成并抛出 `IndexOutOfBoundsException`，消息形如
+     *   `String.codePointAt: index -1 out of bounds for length 3`。
+     * 什么时候用：[emitStringCodePointAtCall] 检测到负索引或索引 >= 码点数时。
+     * 前置条件：三个槽分别存着 int32 索引、java.lang.String 接收者、UTF-16 长度；
+     *   [messageSlot] 是空闲的引用槽。
+     * 失败模式：无（生成代码必然 ATHROW；若槽内容被调用方破坏则属于编译器内部错误）。
+     * 为什么消息含码点长度：调用方通常拿 `s.length`（码点数）比较，报错时显示同一
+     *   单位才不会误导；UTF-16 长度只用于内部偏移，不暴露给语言层。
+     */
+    private fun emitThrowIndexOutOfBounds(
+        mv: MethodVisitor,
+        indexSlot: Int,
+        stringSlot: Int,
+        utf16LengthSlot: Int,
+        messageSlot: Int
+    ) {
+        mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder")
+        mv.visitInsn(Opcodes.DUP)
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
+        appendStringBuilderString(mv, "String.codePointAt: index ")
+        loadLocal(mv, "I", indexSlot)
+        appendStringBuilderInt(mv)
+        appendStringBuilderString(mv, " out of bounds for length ")
+        // 码点数 = s.codePointCount(0, s.length())，与语言层 .length 完全一致。
+        loadLocal(mv, "Ljava/lang/String;", stringSlot)
+        pushInt(mv, 0)
+        loadLocal(mv, "I", utf16LengthSlot)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "codePointCount", "(II)I", false)
+        appendStringBuilderInt(mv)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false)
+        storeLocal(mv, "Ljava/lang/String;", messageSlot)
+        throwWithMessage(mv, "java/lang/IndexOutOfBoundsException", messageSlot)
+    }
+
+    /**
+     * 做什么：生成并抛出 `IllegalArgumentException`，消息形如
+     *   `String.codePointAt: invalid Unicode at code point index 1:
+     *    unpaired surrogate at UTF-16 offset 1`。
+     * 什么时候用：[emitStringCodePointAtCall] 在扫描/目标位置遇到未配对代理项时。
+     * 前置条件：indexSlot 是请求的码点索引，offsetSlot 是当前 UTF-16 偏移，
+     *   [messageSlot] 是空闲引用槽。
+     * 失败模式：无（生成代码必然 ATHROW）。
+     * 为什么单独用 IllegalArgumentException：输入字符串不是合法 Unicode scalar
+     *   value 序列，属于参数/数据非法而非索引越界；调用方可以按异常类型区分
+     *   「索引写错」与「平台边界传入了畸形字符串」，无需解析消息文本。
+     */
+    private fun emitThrowInvalidUnicode(
+        mv: MethodVisitor,
+        indexSlot: Int,
+        offsetSlot: Int,
+        messageSlot: Int
+    ) {
+        mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder")
+        mv.visitInsn(Opcodes.DUP)
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
+        appendStringBuilderString(mv, "String.codePointAt: invalid Unicode at code point index ")
+        loadLocal(mv, "I", indexSlot)
+        appendStringBuilderInt(mv)
+        appendStringBuilderString(mv, ": unpaired surrogate at UTF-16 offset ")
+        loadLocal(mv, "I", offsetSlot)
+        appendStringBuilderInt(mv)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false)
+        storeLocal(mv, "Ljava/lang/String;", messageSlot)
+        throwWithMessage(mv, "java/lang/IllegalArgumentException", messageSlot)
+    }
+
+    /** 向栈顶的 `StringBuilder` 追加一个字符串常量（append(String)）。 */
+    private fun appendStringBuilderString(mv: MethodVisitor, value: String) {
+        mv.visitLdcInsn(value)
+        mv.visitMethodInsn(
+            Opcodes.INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            false
+        )
+    }
+
+    /** 向栈顶的 `StringBuilder` 追加一个 int（append(int)）。 */
+    private fun appendStringBuilderInt(mv: MethodVisitor) {
+        mv.visitMethodInsn(
+            Opcodes.INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "append",
+            "(I)Ljava/lang/StringBuilder;",
+            false
+        )
+    }
+
+    /**
+     * 做什么：用 [messageSlot] 里的消息构造指定异常并 ATHROW。
+     * 什么时候用：两个字符串内建错误分支共用，保证「NEW/DUP/<init>(String)/ATHROW」
+     *   序列只维护一份。
+     * 前置条件：messageSlot 已存非 null 的 java.lang.String；exceptionInternal 是
+     *   具有 `(String)` 构造器的 JVM 异常内部名。
+     * 失败模式：无（生成代码必然 ATHROW）。
+     */
+    private fun throwWithMessage(mv: MethodVisitor, exceptionInternal: String, messageSlot: Int) {
+        mv.visitTypeInsn(Opcodes.NEW, exceptionInternal)
+        mv.visitInsn(Opcodes.DUP)
+        loadLocal(mv, "Ljava/lang/String;", messageSlot)
+        mv.visitMethodInsn(
+            Opcodes.INVOKESPECIAL,
+            exceptionInternal,
+            "<init>",
+            "(Ljava/lang/String;)V",
+            false
+        )
+        mv.visitInsn(Opcodes.ATHROW)
     }
 
     // 把「栈顶那一个值」按描述符装箱成包装类（覆盖全部 8 种基本类型）。

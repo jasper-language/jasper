@@ -1256,6 +1256,28 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                             }
                             return JasPrimitiveType("int32")
                         }
+                        // `codePointAt(int32)` 返回该**码点索引**处的 Unicode scalar value。
+                        // 索引单位与 `.length` 完全一致（0 基码点序号），不是 JVM 的 UTF-16
+                        // 码元索引；后端负责单位转换，检查器只做语言层签名校验。
+                        // 参数个数/类型在编译期判定，避免把错误留到后端生成一个语义不同
+                        // 或不存在的 JVM 调用（例如把 index 直接传给 java.lang.String）。
+                        if (receiverType is JasStringType && expr.target.property == "codePointAt") {
+                            if (expr.args.size != 1) {
+                                error("Function 'codePointAt' expects 1 argument(s), got ${expr.args.size}", expr)
+                            } else {
+                                val indexType = argTypes[0]
+                                if (indexType != null &&
+                                    !typesCompatible(indexType, JasPrimitiveType("int32"))
+                                ) {
+                                    error(
+                                        "Function 'codePointAt' argument 1 type mismatch: " +
+                                            "expected int32, got ${typeDisplayName(indexType)}",
+                                        expr
+                                    )
+                                }
+                            }
+                            return JasPrimitiveType("int32")
+                        }
                         if (receiverType is JasNamedType) {
                             inferInstanceMemberCall(expr, expr.target, receiverType, argTypes)?.let { return it }
                         }

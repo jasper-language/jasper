@@ -2884,6 +2884,19 @@ class JasperToIrTranslator {
             // 参数个数错误由 TypeChecker 负责诊断；这里仅在没有实参时生成字节码。
             if (expr.args.isEmpty()) return emitStringByteLength(memberReceiver, ctx)
         }
+        // `string.codePointAt(i)` 的索引单位是 Unicode 码点序号，而 JVM 的
+        // `String.codePointAt(int)` 使用 UTF-16 码元索引；两者同名不同义，绝不能
+        // 落入通用成员调用路径。这里把「码点索引 → UTF-16 偏移 → 取码点」的转换
+        // 交给后端，并保证接收者与索引各只求值一次（顺序：接收者 → 索引）。
+        if (memberReceiver != null && expr.target is JasPropertyAccess &&
+            expr.target.property == "codePointAt" && isStringIrType(memberReceiver.type)
+        ) {
+            // 参数个数/类型错误由 TypeChecker 负责诊断；这里只在签名正确时生成字节码。
+            if (expr.args.size == 1) {
+                val index = translateExpression(expr.args[0], ctx)
+                return emitStringCodePointAt(memberReceiver, index, ctx)
+            }
+        }
         // 成员调用必须使用**独立的**调用符号：后端用符号身份查 [TranslationContext.callNames]，
         // 若复用同名顶层函数的符号，`subtract(10, 3)` 与 `big.subtract(other)` 会互相覆盖
         // 调用名（一个写成 `subtract`，另一个写成 `v:subtract`），最终把成员调用发成
@@ -3285,6 +3298,33 @@ class JasperToIrTranslator {
         return IrNodeFactory.createCall(
             0, 0, typeMapper.intType(), null,
             arrayOf(receiver), emptyArray(), symbol, null
+        )
+    }
+
+    /**
+     * 做什么：把 `string.codePointAt(i)` 降级成后端可识别的合成调用，返回 Unicode
+     *   scalar value（int32）。
+     * 什么时候用：[translateCall] 判定接收者静态类型是 string、方法名 `codePointAt`
+     *   且恰好有一个实参时。
+     * 前置条件：receiver 由调用方翻译一次并复用；index 也必须由调用方翻译一次后传入。
+     *   顺序固定为「接收者 → 索引」，与语言级求值顺序一致。
+     * 失败模式：运行期 receiver 为 null 时与 JVM 语义一致抛 NPE（语言 string 类型不可空）；
+     *   索引越界/孤立代理项由后端抛结构化异常，本层不吞错、不返回哨兵值。
+     * 为什么这样设计：语言层的索引单位是「码点序号」，JVM 的 `String.codePointAt`
+     *   用的是「UTF-16 码元偏移」；若让翻译层直接发平台调用，会把同名不同义的语义
+     *   泄漏给用户。把转换细节收口到后端（隔离的变化点：字符编码与索引单位），
+     *   未来原生 UTF-8 后端只需实现同一个合成调用契约，不改检查器/翻译器。
+     */
+    private fun emitStringCodePointAt(
+        receiver: IrExpression,
+        index: IrExpression,
+        ctx: TranslationContext
+    ): IrExpression {
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = "__jasper_string_code_point_at__"
+        return IrNodeFactory.createCall(
+            0, 0, typeMapper.intType(), null,
+            arrayOf(receiver, index), emptyArray(), symbol, null
         )
     }
 

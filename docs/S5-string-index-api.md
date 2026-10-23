@@ -273,7 +273,7 @@ E 负责线性扫描，避免“用 O(n) 的 `codePointAt` 写 O(n²) 循环”�
 
 **采用方案 B：**
 
-```jasper
+```text
 String.codePointAt(index: int32): int32
 ```
 
