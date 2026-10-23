@@ -188,6 +188,39 @@ class CollectionRegressionTest {
     }
 
     // ------------------------------------------------------------------
+    // 1b. S1 原始报告的最小复现：未标注类型的 dict 字面量 + 字段 dict 类型，
+    //     并调用曾经被数组特判误伤的 size()/get()。修复前该形状会分别触发
+    //     「类型解析到不存在的类」、VerifyError 或 HashMap.put 的伪造描述符；
+    //     现在必须真跑出 2，且不得退化为 any/运行期链接错误。
+    // ------------------------------------------------------------------
+    @Test
+    fun `s1 reported dict type and collection methods now run`() {
+        val source = """
+            package test;
+            public class Table {
+                public var cols: dict<string, int32>;
+                public constructor() { this.cols = dict{ "a": 1 }; }
+            }
+            public function main(): int32 {
+                var m = dict{ "a": 1, "b": 2 };
+                if (m.get("a") != 1) { return 1; }
+                return m.size();
+            }
+        """.trimIndent()
+        val out = compile(source, "s1-reported-repro")
+        assertEquals(2, runMain(out), "S1 原始复现的形状应可编译并真跑出 size()=2")
+        val code = javap(out, "test.main", "s1-reported-repro")
+        assertTrue(
+            code.contains("Method java/util/HashMap.get:(Ljava/lang/Object;)Ljava/lang/Object;"),
+            "S1 的 get 必须生成 HashMap 真实签名，而不是数组读特判:\n$code"
+        )
+        assertTrue(
+            code.contains("Method java/util/HashMap.size:()I"),
+            "S1 的 size 必须生成 HashMap.size()I，而不是 ARRAYLENGTH:\n$code"
+        )
+    }
+
+    // ------------------------------------------------------------------
     // 2b. 同一个类里同时出现数组参数与集合参数（S1 原症状的最小复现）。
     //     S1 的根因是按「成员名」而不是「接收者真实类型」分派：`length` 与
     //     `size` 一旦被全局特判，数组与集合就会互相串线。本用例把两者放进
