@@ -272,7 +272,16 @@ class TypeMapper {
         "void" to "kotlin.Unit",
         "byte" to "kotlin.Byte",
         "short" to "kotlin.Short",
-        "char" to "kotlin.Char"
+        "char" to "kotlin.Char",
+        // 集合族：语言层名字统一落到 JDK 集合类型，成员调用再由 BuiltinCollections
+        // 决定语义。dict 是 Map 的具体实现；List/MutableList 共用 java.util.List
+        // 接口，具体实例由 translator 的 `new` 路径落到 ArrayList。
+        "dict" to "java.util.HashMap",
+        "map" to "java.util.Map",
+        "hashmap" to "java.util.HashMap",
+        "list" to "java.util.List",
+        "mutablelist" to "java.util.List",
+        "arraylist" to "java.util.ArrayList"
     )
 
     // Kotlin 全限定名 → JVM 字段/参数描述符。
@@ -290,7 +299,14 @@ class TypeMapper {
         "kotlin.Char" to "C",
         "kotlin.String" to "Ljava/lang/String;",
         "kotlin.Unit" to "V",
-        "kotlin.Any" to "Ljava/lang/Object;"
+        "kotlin.Any" to "Ljava/lang/Object;",
+        // 集合类型的描述符必须显式登记：这些名字走 builtinTypes 归一后已是
+        // java.util.* 全限定名，若只依赖兜底拼装也能工作，但集中登记能让后端
+        // 的 JDK 探测、泛型签名和测试断言的字符串来源保持一致。
+        "java.util.List" to "Ljava/util/List;",
+        "java.util.ArrayList" to "Ljava/util/ArrayList;",
+        "java.util.Map" to "Ljava/util/Map;",
+        "java.util.HashMap" to "Ljava/util/HashMap;"
     )
 
     // Kotlin 全限定名 → JVM 内部名。基本类型用单关键字（int/long/...），
@@ -306,7 +322,11 @@ class TypeMapper {
         "kotlin.Char" to "char",
         "kotlin.String" to "java/lang/String",
         "kotlin.Unit" to "void",
-        "kotlin.Any" to "java/lang/Object"
+        "kotlin.Any" to "java/lang/Object",
+        "java.util.List" to "java/util/List",
+        "java.util.ArrayList" to "java/util/ArrayList",
+        "java.util.Map" to "java/util/Map",
+        "java.util.HashMap" to "java/util/HashMap"
     )
 
     /**
@@ -727,6 +747,54 @@ class TypeMapper {
     fun charType(): IrType = type("kotlin.Char")
     /** 做什么：造 kotlin.String 类型。 */
     fun stringType(): IrType = type("kotlin.String")
+
+    /**
+     * 做什么：读取集合 IR 类型的第 [index] 个类型实参（如 `HashMap<string,int32>` 的
+     *   string/int32）；缺失、星投影或非 IrSimpleType 时返回 null。
+     *
+     * 什么时候用：translator 降低集合调用、for-in 与嵌套泛型返回类型时。
+     * 前置条件：receiver 是 TypeMapper 造出的 IR 类型（集合名已登记）。
+     * 失败模式：返回 null 表示「类型信息缺失」，调用方应退回 any，而不是猜一个
+     *   具体类型；不抛异常。
+     * 为什么需要：集合成员的返回类型由类型实参决定（`get` 返回元素/值），不能像
+     *   `size` 那样写死；把读取规则集中到本类，避免 translator 到处拆 IrSimpleType。
+     */
+    fun irCollectionTypeArgument(receiver: IrType, index: Int): IrType? {
+        val simple = receiver as? IrSimpleType ?: return null
+        val argument = simple.arguments.getOrNull(index) as? IrTypeProjection ?: return null
+        return argument.type
+    }
+
+    /** 取 LIST 元素类型；类型信息缺失时退回 kotlin.Any。 */
+    fun irCollectionElementType(receiver: IrType): IrType =
+        irCollectionTypeArgument(receiver, 0) ?: type("kotlin.Any")
+
+    /** 取 MAP 键类型；类型信息缺失时退回 kotlin.Any。 */
+    fun irCollectionKeyType(receiver: IrType): IrType =
+        irCollectionTypeArgument(receiver, 0) ?: type("kotlin.Any")
+
+    /** 取 MAP 值类型；类型信息缺失时退回 kotlin.Any。 */
+    fun irCollectionValueType(receiver: IrType): IrType =
+        irCollectionTypeArgument(receiver, 1) ?: type("kotlin.Any")
+
+    /**
+     * 做什么：按集合成员声明 [spec] 与接收者 IR 类型计算调用点的返回 IR 类型。
+     *
+     * 什么时候用：translator 生成 `c:` 集合调用时；后端据此决定拆箱/CHECKCAST 的
+     *   目标类型。
+     * 前置条件：spec 来自 BuiltinCollections.member，且 receiver 是集合 IR 类型。
+     * 失败模式：缺失泛型实参时返回 kotlin.Any；不抛异常。
+     * 为什么不在 translator 里写 when：返回种类属于集合元数据的一部分，写在这里
+     *   可与参数/返回规则集中维护。
+     */
+    fun irCollectionMemberReturnType(receiver: IrType, spec: CollectionMemberSpec): IrType =
+        when (spec.returnKind) {
+            CollectionReturnKind.INT -> intType()
+            CollectionReturnKind.BOOL -> boolType()
+            CollectionReturnKind.ELEMENT -> irCollectionElementType(receiver)
+            CollectionReturnKind.VALUE -> irCollectionValueType(receiver)
+            CollectionReturnKind.ANY -> type("kotlin.Any")
+        }
 
     /** 做什么：造 Unit 常量表达式（IR 常量 null、类型 Unit）；用于补空返回占位。 */
     fun unitExpr(): IrExpression = IrConstImpl.constNull(0, 0, unitType())

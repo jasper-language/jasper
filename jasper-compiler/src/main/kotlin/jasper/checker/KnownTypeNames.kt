@@ -83,12 +83,16 @@ object KnownTypeNames {
      *     用未导入的 `List` 证明「嵌套泛型类型可解析」。注释已说明该函数**不在
      *     运行期构造**，因此保留它作为 `java.util.List` 的互操作引用，不改变探针
      *     行为，也不引入对不存在类的运行期引用（值不会被构造）。
+     *   - `MutableList`：集合回归测试在**不装载 stdlib** 的独立编译模式下使用
+     *     `var xs: MutableList<int32> = new MutableList<int32>()`，验证语言内建集合
+     *     元数据不依赖标准库源码是否存在；带 stdlib 编译时同名接口来自 `List.jas`。
      *
-     * 纪律：除已证实的 `List` 外，**不**预先塞入其它 JDK 名字；后续若某个真实
-     *   程序需要（例如 `Map`/`Object`），必须在同一次改动中补证据与本注释再登记。
+     * 纪律：除已证实的 `List` / `MutableList` 外，**不**预先塞入其它 JDK 名字；
+     *   后续若某个真实程序需要（例如 `Object`），必须在同一次改动中补证据并更新注释。
      */
     private val JDK_INTEROP: Set<String> = setOf(
-        "List"
+        "List",
+        "MutableList"
     )
 
     /**

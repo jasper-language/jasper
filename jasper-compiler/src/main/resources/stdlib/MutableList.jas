@@ -1,0 +1,57 @@
+package std;
+
+// ============================================================================
+// MutableList.jas —— Jasper 标准库的最小可变序列接口
+// ============================================================================
+// 职责：
+//   在 List<T> 的只读成员之上声明 add/set/remove。JVM 后端把 MutableList<T>
+//   映射到 java.util.List，`new MutableList<T>()` 由语言翻译器实例化为
+//   java.util.ArrayList。
+//
+// 与 List 的关系：
+//   继承 List<T>，因此所有只读操作在可变序列上同样可用；反向（List 当
+//   MutableList 用）不应由调用方依赖，语言元数据对只读 List 不开放可变成员。
+//
+// 为什么这样分：
+//   可变性是 API 契约的一部分。把 add/set/remove 放在独立接口里，检查器可以
+//   只根据接收者声明类型拒绝「只读 List 上写元素」，无需运行时检查。
+// ============================================================================
+
+/**
+ * 可修改元素的序列。
+ *
+ * 什么时候用：需要构造、追加或按下标替换元素时。
+ * 前置条件：T 与所有写入值类型兼容。
+ * 失败模式：下标越界由 JVM List 抛 IndexOutOfBoundsException；不支持的实现
+ *   可能抛 UnsupportedOperationException（本接口的默认实现是 ArrayList）。
+ * 为什么继承 List：读取操作与可变操作共享同一套下标/元素类型语义。
+ */
+public interface MutableList<T> extends List<T> {
+    /**
+     * 做什么：把 value 追加到序列末尾。
+     * 什么时候用：逐项构建序列时。
+     * 前置条件：value 与 T 类型兼容。
+     * 失败模式：实现拒绝添加时可能抛 UnsupportedOperationException；本语言
+     *   默认的 ArrayList 实现不会拒绝。
+     * 为什么返回 bool：与 JDK List.add 的可观察结果保持一致，便于调用方判断
+     *   容器是否接受了元素。
+     */
+    public function add(value: T): bool;
+
+    /**
+     * 做什么：把下标 index 处的元素替换为 value，并返回被替换的旧元素。
+     * 什么时候用：需要原地更新且关心旧值时。
+     * 前置条件：0 <= index < size()；value 与 T 类型兼容。
+     * 失败模式：下标越界抛 IndexOutOfBoundsException。
+     */
+    public function set(index: int32, value: T): T;
+
+    /**
+     * 做什么：移除第一个与 value 相等的元素。
+     * 什么时候用：按值删除且不关心下标时。
+     * 前置条件：value 与 T 类型兼容。
+     * 失败模式：未找到时返回 false，不抛异常；下标越界不适用于按值删除。
+     * 边界：本接口只表达「按值删除」；按下标删除需要后续独立 API 设计。
+     */
+    public function remove(value: T): bool;
+}

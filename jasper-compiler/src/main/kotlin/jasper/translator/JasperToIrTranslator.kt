@@ -2049,20 +2049,70 @@ class JasperToIrTranslator {
     private fun translateForIn(stmt: JasForInStatement, ctx: TranslationContext): IrStatement {
         val iterableExpr = translateExpression(stmt.iterable, ctx)
         val desc = typeMapper.jvmDescriptorFromIrType(iterableExpr.type)
-        // Arrays keep the index-based lowering. A declared object type is treated
-        // as an instance of the iteration protocol (`hasNext()` / `next()`); any
-        // other/unknown shape falls back to the array lowering to preserve the
-        // previous behaviour.
-        // 分派规则：数组描述符以 "[ " 开头 → 按下标循环；对象描述符以 "L" 开头 → 按迭代协议（hasNext/next）；
-        // 其余/未知形态回退到数组 lowering，保持既有行为（不引入新的语法）。
-        return when {
-            desc.startsWith("[") -> translateForInArray(stmt, iterableExpr, ctx)
-            desc.startsWith("L") -> translateForInIterator(stmt, iterableExpr, ctx)
-            else -> translateForInArray(stmt, iterableExpr, ctx)
+        // 集合的迭代语义由语言内建元数据决定，必须先于通用的「描述符前缀」分派：
+        //   - List/MutableList/ArrayList → 下标循环（c:size / c:get），元素类型取类型实参；
+        //   - Map/dict/HashMap → keySet().iterator() 循环，循环变量是键类型。
+        // 如果落到下面的 "L" 分支，List 会被误当成实现了 hasNext/next 的迭代协议对象，
+        // 生成对 java/util/List.hasNext 的调用并在链接期失败。
+        val iterableClassName = typeMapper.irTypeClassName(iterableExpr.type)
+        return when (iterableClassName?.let(BuiltinCollections::familyOf)) {
+            CollectionFamily.LIST -> translateForInIndexed(
+                stmt,
+                iterableExpr,
+                ctx,
+                typeMapper.irCollectionElementType(iterableExpr.type),
+                sizeCallName = "c:size",
+                getCallName = "c:get"
+            )
+            CollectionFamily.MAP -> translateForInMapKeys(stmt, iterableExpr, ctx)
+            null -> when {
+                desc.startsWith("[") -> translateForInIndexed(
+                    stmt,
+                    iterableExpr,
+                    ctx,
+                    arrayElementType(iterableExpr.type),
+                    sizeCallName = "size",
+                    getCallName = "get"
+                )
+                // Arrays keep the index-based lowering. A declared object type is treated
+                // as an instance of the iteration protocol (`hasNext()` / `next()`); any
+                // other/unknown shape falls back to the array lowering to preserve the
+                // previous behaviour.
+                // 分派规则：数组描述符以 "[ " 开头 → 按下标循环；对象描述符以 "L" 开头 → 按迭代协议（hasNext/next）；
+                // 其余/未知形态回退到数组 lowering，保持既有行为（不引入新的语法）。
+                desc.startsWith("L") -> translateForInIterator(stmt, iterableExpr, ctx)
+                else -> translateForInIndexed(
+                    stmt,
+                    iterableExpr,
+                    ctx,
+                    arrayElementType(iterableExpr.type),
+                    sizeCallName = "size",
+                    getCallName = "get"
+                )
+            }
         }
     }
 
-    private fun translateForInArray(stmt: JasForInStatement, iterableExpr: IrExpression, ctx: TranslationContext): IrStatement {
+    /**
+     * 做什么：把「下标可寻址序列」的 for-in 降为 `while (i < seq.size()) { elem = seq.get(i); ... }`。
+     *
+     * 什么时候用：数组、List/MutableList 的 for-in；前者的 size/get 由后端数组指令特判，
+     *   后者走 `c:` 集合调用。
+     * 前置条件：iterableExpr 已翻译且恰好求值一次；elemType 已按接收者解析。
+     * 失败模式：不抛异常；size/get 的真实描述符由后端按接收者平台类型解析，解析失败时
+     *   由验证器暴露（属于前端/后端协议破坏）。
+     * 为什么用参数而不是复制两份循环：数组与集合的下标循环在控制流、break/continue、
+     *   then/else 语义上完全一致，差异只在 size/get 的调用名与元素类型。把差异参数化，
+     *   避免两套循环各自演化（隔离的变化点：序列种类）。
+     */
+    private fun translateForInIndexed(
+        stmt: JasForInStatement,
+        iterableExpr: IrExpression,
+        ctx: TranslationContext,
+        elemType: IrType,
+        sizeCallName: String,
+        getCallName: String
+    ): IrStatement {
         val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.FOR_LOOP)
 
         val arrSymbol = IrVariableSymbolImpl()
@@ -2095,7 +2145,6 @@ class JasperToIrTranslator {
         }
 
         val elemSymbol = IrVariableSymbolImpl()
-        val elemType = arrayElementType(iterableExpr.type)
         val elemVar = IrNodeFactory.createVariable(
             0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(stmt.varName),
             elemType, elemSymbol, true, false, false
@@ -2111,7 +2160,7 @@ class JasperToIrTranslator {
         ctx.loopStack.add(irLoop)
 
         val sizeSymbol = IrSimpleFunctionSymbolImpl()
-        ctx.callNames[sizeSymbol] = "size"
+        ctx.callNames[sizeSymbol] = sizeCallName
         val sizeCall = IrNodeFactory.createCall(
             0, 0, typeMapper.intType(), null,
             arrayOf(IrNodeFactory.createGetValue(0, 0, iterableExpr.type, arrSymbol, null)),
@@ -2145,7 +2194,7 @@ class JasperToIrTranslator {
         )
 
         val getSymbol = IrSimpleFunctionSymbolImpl()
-        ctx.callNames[getSymbol] = "get"
+        ctx.callNames[getSymbol] = getCallName
         val minusSymbol = IrSimpleFunctionSymbolImpl()
         ctx.callNames[minusSymbol] = "-"
         val readIndex = IrNodeFactory.createCall(
@@ -2174,6 +2223,135 @@ class JasperToIrTranslator {
         irLoop.body = loopBody
         ctx.loopStack.removeAt(ctx.loopStack.size - 1)
         (block.statements as MutableList<IrStatement>).add(irLoop)
+        if (stmt.thenBody != null || stmt.elseBody != null) {
+            val afterLoop = IrNodeFactory.createWhen(0, 0, typeMapper.unitType(), IrStatementOrigin.IF)
+            val didRun = IrNodeFactory.createGetValue(0, 0, typeMapper.boolType(), didRunSymbol, null)
+            if (stmt.thenBody != null) {
+                afterLoop.branches.add(IrNodeFactory.createBranch(0, 0, didRun, translateBlock(stmt.thenBody, ctx)))
+            }
+            if (stmt.elseBody != null) {
+                afterLoop.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), translateBlock(stmt.elseBody, ctx)))
+            }
+            (block.statements as MutableList<IrStatement>).add(afterLoop)
+        }
+        if (stmt.suffix != null && brokeSymbol != null) {
+            appendLoopSuffix(block, stmt.suffix, didRunSymbol, brokeSymbol, ctx)
+        }
+        return block
+    }
+
+    /**
+     * 做什么：把 Map/dict 的 for-in 降为「遍历键集合」的循环：
+     *   `val it$ = map.keySet().iterator(); while (it$.hasNext()) { key = it$.next(); ... }`。
+     *
+     * 什么时候用：translateForIn 判定可迭代类型属于 MAP 族时。
+     * 前置条件：iterableExpr 已翻译且只求值一次；键类型取 Map 的第 0 个类型实参。
+     * 失败模式：keySet/iterator/hasNext/next 的真实描述符由后端平台解析器给出；
+     *   任何一环失败都会在链接期暴露，而不是静默生成错误的下标循环。
+     * 为什么遍历键而不是值：语言层 `for (k in map)` 的直觉是迭代「条目视图」；v1
+     *   选择键语义，既能让 `dict<string,int32>` 的循环变量保持 `string`，也不需要
+     *   引入新的 `Map.Entry` 类型。把该语义固定在翻译层，检查器与 for-in 类型推断
+     *   引用同一个 [BuiltinCollections.keyType]，两边不会漂移。
+     */
+    private fun translateForInMapKeys(
+        stmt: JasForInStatement,
+        iterableExpr: IrExpression,
+        ctx: TranslationContext
+    ): IrStatement {
+        val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), IrStatementOrigin.FOR_LOOP)
+
+        val mapSymbol = IrVariableSymbolImpl()
+        val mapVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "map"),
+            iterableExpr.type, mapSymbol, true, false, false
+        )
+        mapVar.initializer = iterableExpr
+        (block.statements as MutableList<IrStatement>).add(mapVar)
+
+        // keySet()：HashMap/Map 上的平台方法，返回 java.util.Set。
+        // IR 类型显式写 java.util.Set，后端才能据其得到真实返回描述符并补 CHECKCAST。
+        val keySetSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[keySetSymbol] = "v:keySet"
+        val keySetType = typeMapper.type("java.util.Set")
+        val keySetCall = IrNodeFactory.createCall(
+            0, 0, keySetType, null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, iterableExpr.type, mapSymbol, null)),
+            emptyArray(), keySetSymbol, null
+        )
+
+        val itSymbol = IrVariableSymbolImpl()
+        val itVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("it$"),
+            typeMapper.type("java.util.Iterator"), itSymbol, true, false, false
+        )
+        val iteratorSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[iteratorSymbol] = "v:iterator"
+        itVar.initializer = IrNodeFactory.createCall(
+            0, 0, itVar.type, null,
+            arrayOf(keySetCall), emptyArray(), iteratorSymbol, null
+        )
+        (block.statements as MutableList<IrStatement>).add(itVar)
+
+        val didRunSymbol = IrVariableSymbolImpl()
+        val didRunVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "entered"),
+            typeMapper.boolType(), didRunSymbol, true, false, false
+        )
+        didRunVar.initializer = typeMapper.falseConst()
+        (block.statements as MutableList<IrStatement>).add(didRunVar)
+        val brokeSymbol = if (stmt.suffix != null) {
+            declareBoolLocal(block, nextTempName(ctx, "broke").asString(), typeMapper.falseConst())
+        } else {
+            null
+        }
+
+        val elemType = typeMapper.irCollectionKeyType(iterableExpr.type)
+        val elemSymbol = IrVariableSymbolImpl()
+        val elemVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(stmt.varName),
+            elemType, elemSymbol, true, false, false
+        )
+        ctx.symbols[stmt.varName] = elemSymbol
+        ctx.varTypes[stmt.varName] = elemType
+
+        val irLoop = IrNodeFactory.createWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.WHILE_LOOP)
+        consumeLoopLabel(irLoop, ctx)
+        if (brokeSymbol != null) ctx.loopBreakFlags[irLoop] = brokeSymbol
+        ctx.loopStack.add(irLoop)
+
+        val hasNextSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[hasNextSymbol] = "v:hasNext"
+        irLoop.condition = IrNodeFactory.createCall(
+            0, 0, typeMapper.boolType(), null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, itVar.type, itSymbol, null)),
+            emptyArray(), hasNextSymbol, null
+        )
+
+        val loopBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+        (loopBody.statements as MutableList<IrStatement>).add(
+            IrNodeFactory.createSetValue(0, 0, typeMapper.boolType(), didRunSymbol, IrStatementOrigin.EQ, typeMapper.trueConst())
+        )
+
+        val nextSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[nextSymbol] = "v:next"
+        elemVar.initializer = IrNodeFactory.createCall(
+            0, 0, elemType, null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, itVar.type, itSymbol, null)),
+            emptyArray(), nextSymbol, null
+        )
+        (loopBody.statements as MutableList<IrStatement>).add(elemVar)
+
+        for (bodyStmt in stmt.body.statements) {
+            val irBodyStmt = translateStatement(bodyStmt, ctx)
+            if (irBodyStmt != null) {
+                (loopBody.statements as MutableList<IrStatement>).add(irBodyStmt)
+            }
+        }
+
+        irLoop.body = loopBody
+        ctx.loopStack.removeAt(ctx.loopStack.size - 1)
+        (block.statements as MutableList<IrStatement>).add(irLoop)
+
         if (stmt.thenBody != null || stmt.elseBody != null) {
             val afterLoop = IrNodeFactory.createWhen(0, 0, typeMapper.unitType(), IrStatementOrigin.IF)
             val didRun = IrNodeFactory.createGetValue(0, 0, typeMapper.boolType(), didRunSymbol, null)
@@ -2671,7 +2849,11 @@ class JasperToIrTranslator {
             is JasTernaryExpr -> translateTernary(expr, ctx)
             is JasStringTemplate -> translateStringTemplate(expr, ctx)
             is JasDictLiteral -> {
-                val resultType = typeMapper.type("java.util.HashMap")
+                // 字面量的静态类型优先使用检查器回填的具体 `dict<K,V>`：它保留了
+                // 键/值类型，决定 get/put 的调用点 IR 类型与后续拆箱/CHECKCAST。
+                // 没有回填时退回裸 HashMap，保持旧行为（独立构造 AST 的调用方）。
+                val resultType = expr.inferredType?.let(typeMapper::mapType)
+                    ?: typeMapper.type("java.util.HashMap")
                 val block = IrNodeFactory.createBlock(0, 0, resultType, null)
                 val ctorSymbol = IrConstructorSymbolImpl()
                 val irCtor = IrNodeFactory.createConstructorCall(
@@ -2690,9 +2872,13 @@ class JasperToIrTranslator {
                     val key = translateExpression(entry.key, ctx)
                     val value = translateExpression(entry.value, ctx)
                     val putSymbol = IrSimpleFunctionSymbolImpl()
-                    ctx.callNames[putSymbol] = "put"
+                    // `c:` 前缀让后端强制使用平台真实签名 `Map.put(Object,Object)Object`，
+                    // 而不是旧的 JDK 容器「返回接收者」流畅 API 兜底。字面量中的 put 结果
+                    // 永远被丢弃，因此调用点类型记为 any（=Object）：绝不能记成值类型，
+                    // 否则后端会对 HashMap.put 返回的 null（新键没有旧值）做拆箱并抛 NPE。
+                    ctx.callNames[putSymbol] = "c:put"
                     val putCall = IrNodeFactory.createCall(
-                        0, 0, typeMapper.unitType(), null,
+                        0, 0, typeMapper.type("kotlin.Any"), null,
                         arrayOf(
                             IrNodeFactory.createGetValue(0, 0, resultType, mapSymbol, null),
                             key, value
@@ -2897,6 +3083,11 @@ class JasperToIrTranslator {
                 return emitStringCodePointAt(memberReceiver, index, ctx)
             }
         }
+        // 语言内建集合成员：按接收者的真实集合族生成 `c:` 调用。必须在通用 v: 成员
+        // 路径之前分流，否则后端会命中旧 JDK 容器兜底（get/set/remove 返回接收者），
+        // 与语言层声明的 get/size/containsKey/put 返回类型不一致。
+        val collectionReturn = translateCollectionCallIfApplicable(expr, memberReceiver, ctx)
+        if (collectionReturn != null) return collectionReturn
         // 成员调用必须使用**独立的**调用符号：后端用符号身份查 [TranslationContext.callNames]，
         // 若复用同名顶层函数的符号，`subtract(10, 3)` 与 `big.subtract(other)` 会互相覆盖
         // 调用名（一个写成 `subtract`，另一个写成 `v:subtract`），最终把成员调用发成
@@ -3000,6 +3191,65 @@ class JasperToIrTranslator {
             irArgs, emptyArray<IrType>(), symbol, null
         )
     }
+
+    /**
+     * 做什么：识别「接收者是语言内建集合」的成员调用，按 [BuiltinCollections] 的成员
+     *   元数据生成 `c:<method>` 调用，并计算调用点的 IR 返回类型。
+     *
+     * 什么时候用：[translateCall] 在通用 `v:` 成员路径之前调用。
+     * 前置条件：memberReceiver 已由调用方翻译且只翻译一次；expr.target 是属性访问。
+     * 失败模式：接收者不是集合、或方法不在集合元数据中时返回 null，调用方继续走通用
+     *   成员路径；不抛异常。参数个数/类型已由检查器诊断，本函数不重复报错。
+     * 为什么返回 null 而不是抛异常：集合成员与用户类型成员共享同一套调用语法，翻译层
+     *   必须能把「不是集合调用」原样交还给既有路径；用 null 表达「不适用」比用异常
+     *   表达更符合分派语义。
+     * 为什么要 `c:` 前缀：后端对裸 `get/set/remove/put/size` 保留了历史 JDK 容器
+     *   「返回接收者」的流畅兜底；集合语义要求真实 JDK 签名（`get→元素/值`、
+     *   `put→旧值`、`size→int`）。前缀把「必须走平台真实签名解析」这一事实显式传给
+     *   后端，而不是让后端按方法名猜（隔离的变化点：调用点签名来源）。
+     */
+    private fun translateCollectionCallIfApplicable(
+        expr: JasCall,
+        memberReceiver: IrExpression?,
+        ctx: TranslationContext
+    ): IrExpression? {
+        val access = expr.target as? JasPropertyAccess ?: return null
+        val receiver = memberReceiver ?: return null
+        // IR 类型已经过 TypeMapper 归一（MutableList → java.util.List、dict → java.util.HashMap）；
+        // 用归一后的类型名判族，避免按源码拼写维护第二套分支。
+        val receiverName = typeMapper.irTypeClassName(receiver.type) ?: return null
+        if (BuiltinCollections.familyOf(receiverName) == null) return null
+        val spec = BuiltinCollections.loweringMember(receiverName, access.property) ?: return null
+        val args = ArrayList<IrExpression>(expr.args.size + 1)
+        args.add(receiver)
+        args.addAll(expr.args.map { translateExpression(it, ctx) })
+        // `Map.put` / `Map.remove` 的返回是「旧值」，键不存在时为 null；若把调用点
+        // IR 类型记成值类型，后端会在调用后立即拆箱，**即使调用结果被丢弃**（语句
+        // 位置）也会对 null 抛 NPE。语言 v1 没有把「旧值」建模为可空，因此这里把
+        // IR 调用点类型保守地记为 any；真正把结果赋给具体类型的调用点仍会在赋值/
+        // 返回处按目标类型拆箱（语义与 JDK 的 null 一致，不会静默伪造值）。
+        val returnType = if (spec.name in COLLECTION_NULLABLE_RESULT_MEMBERS &&
+            spec.returnKind == CollectionReturnKind.VALUE
+        ) {
+            typeMapper.type("kotlin.Any")
+        } else {
+            typeMapper.irCollectionMemberReturnType(receiver.type, spec)
+        }
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = "c:${spec.name}"
+        return IrNodeFactory.createCall(
+            0, 0, returnType, IrStatementOrigin.INVOKE,
+            args.toTypedArray(), emptyArray(), symbol, null
+        )
+    }
+
+    /**
+     * 做什么：集合中返回「旧值/缺失即 null」的成员名集合。
+     * 什么时候用：[translateCollectionCallIfApplicable] 计算调用点 IR 类型时。
+     * 为什么单独列出：这些成员的返回值不能安全地按值类型立即拆箱；把「哪些成员
+     *   可能返回 null」集中成一个常量，避免在翻译逻辑里散落字符串判断。
+     */
+    private val COLLECTION_NULLABLE_RESULT_MEMBERS = setOf("put", "remove")
 
     /**
      * 做什么：用接收者的泛型实参替换声明返回类型里的类型变量（如 `Repo<Person>.get` 的
@@ -3510,7 +3760,18 @@ class JasperToIrTranslator {
 
     private fun translateNew(expr: JasNew, ctx: TranslationContext): IrExpression {
         val ctorSymbol = IrConstructorSymbolImpl()
-        val type = typeMapper.mapType(expr.type)
+        // 接口不能直接 NEW：`new List`/`new MutableList` 必须落到具体实现 ArrayList，
+        // `new Map`/`new dict` 落到 HashMap。实例化策略由 BuiltinCollections 统一给出，
+        // 翻译器只负责把「声明的源码类型」替换成「实际要 NEW 的 JVM 类型」并保留泛型
+        // 实参，保证 `new List<string>` 的 IR 类型仍是 List<string> 的等价描述符来源。
+        val declaredType = expr.type
+        val allocationName = (declaredType as? JasNamedType)
+            ?.let { BuiltinCollections.allocationTypeName(it.name) }
+        val type = if (allocationName != null) {
+            typeMapper.mapType(JasNamedType(allocationName, (declaredType as JasNamedType).typeArguments))
+        } else {
+            typeMapper.mapType(declaredType)
+        }
         val args = expr.args.map { translateExpression(it, ctx) }.toMutableList()
         // 构造器实参按**声明形参类型**宽化：`new Holder(new MemRepo())` 必须生成
         // `<init>(LRepo;)V` 并在实参处补 CHECKCAST。IrConstructorCall 的符号不与声明共享
