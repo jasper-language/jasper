@@ -2671,7 +2671,11 @@ class JasperToIrTranslator {
             is JasTernaryExpr -> translateTernary(expr, ctx)
             is JasStringTemplate -> translateStringTemplate(expr, ctx)
             is JasDictLiteral -> {
-                val resultType = typeMapper.type("java.util.HashMap")
+                // 字面量的静态类型优先使用检查器回填的具体 `dict<K,V>`：它保留了
+                // 键/值类型，决定 get/put 的调用点 IR 类型与后续拆箱/CHECKCAST。
+                // 没有回填时退回裸 HashMap，保持旧行为（独立构造 AST 的调用方）。
+                val resultType = expr.inferredType?.let(typeMapper::mapType)
+                    ?: typeMapper.type("java.util.HashMap")
                 val block = IrNodeFactory.createBlock(0, 0, resultType, null)
                 val ctorSymbol = IrConstructorSymbolImpl()
                 val irCtor = IrNodeFactory.createConstructorCall(
@@ -2690,9 +2694,13 @@ class JasperToIrTranslator {
                     val key = translateExpression(entry.key, ctx)
                     val value = translateExpression(entry.value, ctx)
                     val putSymbol = IrSimpleFunctionSymbolImpl()
-                    ctx.callNames[putSymbol] = "put"
+                    // `c:` 前缀让后端强制使用平台真实签名 `Map.put(Object,Object)Object`，
+                    // 而不是旧的 JDK 容器「返回接收者」流畅 API 兜底。字面量中的 put 结果
+                    // 永远被丢弃，因此调用点类型记为 any（=Object）：绝不能记成值类型，
+                    // 否则后端会对 HashMap.put 返回的 null（新键没有旧值）做拆箱并抛 NPE。
+                    ctx.callNames[putSymbol] = "c:put"
                     val putCall = IrNodeFactory.createCall(
-                        0, 0, typeMapper.unitType(), null,
+                        0, 0, typeMapper.type("kotlin.Any"), null,
                         arrayOf(
                             IrNodeFactory.createGetValue(0, 0, resultType, mapSymbol, null),
                             key, value
@@ -2897,6 +2905,11 @@ class JasperToIrTranslator {
                 return emitStringCodePointAt(memberReceiver, index, ctx)
             }
         }
+        // 语言内建集合成员：按接收者的真实集合族生成 `c:` 调用。必须在通用 v: 成员
+        // 路径之前分流，否则后端会命中旧 JDK 容器兜底（get/set/remove 返回接收者），
+        // 与语言层声明的 get/size/containsKey/put 返回类型不一致。
+        val collectionReturn = translateCollectionCallIfApplicable(expr, memberReceiver, ctx)
+        if (collectionReturn != null) return collectionReturn
         // 成员调用必须使用**独立的**调用符号：后端用符号身份查 [TranslationContext.callNames]，
         // 若复用同名顶层函数的符号，`subtract(10, 3)` 与 `big.subtract(other)` 会互相覆盖
         // 调用名（一个写成 `subtract`，另一个写成 `v:subtract`），最终把成员调用发成
@@ -3000,6 +3013,65 @@ class JasperToIrTranslator {
             irArgs, emptyArray<IrType>(), symbol, null
         )
     }
+
+    /**
+     * 做什么：识别「接收者是语言内建集合」的成员调用，按 [BuiltinCollections] 的成员
+     *   元数据生成 `c:<method>` 调用，并计算调用点的 IR 返回类型。
+     *
+     * 什么时候用：[translateCall] 在通用 `v:` 成员路径之前调用。
+     * 前置条件：memberReceiver 已由调用方翻译且只翻译一次；expr.target 是属性访问。
+     * 失败模式：接收者不是集合、或方法不在集合元数据中时返回 null，调用方继续走通用
+     *   成员路径；不抛异常。参数个数/类型已由检查器诊断，本函数不重复报错。
+     * 为什么返回 null 而不是抛异常：集合成员与用户类型成员共享同一套调用语法，翻译层
+     *   必须能把「不是集合调用」原样交还给既有路径；用 null 表达「不适用」比用异常
+     *   表达更符合分派语义。
+     * 为什么要 `c:` 前缀：后端对裸 `get/set/remove/put/size` 保留了历史 JDK 容器
+     *   「返回接收者」的流畅兜底；集合语义要求真实 JDK 签名（`get→元素/值`、
+     *   `put→旧值`、`size→int`）。前缀把「必须走平台真实签名解析」这一事实显式传给
+     *   后端，而不是让后端按方法名猜（隔离的变化点：调用点签名来源）。
+     */
+    private fun translateCollectionCallIfApplicable(
+        expr: JasCall,
+        memberReceiver: IrExpression?,
+        ctx: TranslationContext
+    ): IrExpression? {
+        val access = expr.target as? JasPropertyAccess ?: return null
+        val receiver = memberReceiver ?: return null
+        // IR 类型已经过 TypeMapper 归一（MutableList → java.util.List、dict → java.util.HashMap）；
+        // 用归一后的类型名判族，避免按源码拼写维护第二套分支。
+        val receiverName = typeMapper.irTypeClassName(receiver.type) ?: return null
+        if (BuiltinCollections.familyOf(receiverName) == null) return null
+        val spec = BuiltinCollections.loweringMember(receiverName, access.property) ?: return null
+        val args = ArrayList<IrExpression>(expr.args.size + 1)
+        args.add(receiver)
+        args.addAll(expr.args.map { translateExpression(it, ctx) })
+        // `Map.put` / `Map.remove` 的返回是「旧值」，键不存在时为 null；若把调用点
+        // IR 类型记成值类型，后端会在调用后立即拆箱，**即使调用结果被丢弃**（语句
+        // 位置）也会对 null 抛 NPE。语言 v1 没有把「旧值」建模为可空，因此这里把
+        // IR 调用点类型保守地记为 any；真正把结果赋给具体类型的调用点仍会在赋值/
+        // 返回处按目标类型拆箱（语义与 JDK 的 null 一致，不会静默伪造值）。
+        val returnType = if (spec.name in COLLECTION_NULLABLE_RESULT_MEMBERS &&
+            spec.returnKind == CollectionReturnKind.VALUE
+        ) {
+            typeMapper.type("kotlin.Any")
+        } else {
+            typeMapper.irCollectionMemberReturnType(receiver.type, spec)
+        }
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = "c:${spec.name}"
+        return IrNodeFactory.createCall(
+            0, 0, returnType, IrStatementOrigin.INVOKE,
+            args.toTypedArray(), emptyArray(), symbol, null
+        )
+    }
+
+    /**
+     * 做什么：集合中返回「旧值/缺失即 null」的成员名集合。
+     * 什么时候用：[translateCollectionCallIfApplicable] 计算调用点 IR 类型时。
+     * 为什么单独列出：这些成员的返回值不能安全地按值类型立即拆箱；把「哪些成员
+     *   可能返回 null」集中成一个常量，避免在翻译逻辑里散落字符串判断。
+     */
+    private val COLLECTION_NULLABLE_RESULT_MEMBERS = setOf("put", "remove")
 
     /**
      * 做什么：用接收者的泛型实参替换声明返回类型里的类型变量（如 `Repo<Person>.get` 的
@@ -3510,7 +3582,18 @@ class JasperToIrTranslator {
 
     private fun translateNew(expr: JasNew, ctx: TranslationContext): IrExpression {
         val ctorSymbol = IrConstructorSymbolImpl()
-        val type = typeMapper.mapType(expr.type)
+        // 接口不能直接 NEW：`new List`/`new MutableList` 必须落到具体实现 ArrayList，
+        // `new Map`/`new dict` 落到 HashMap。实例化策略由 BuiltinCollections 统一给出，
+        // 翻译器只负责把「声明的源码类型」替换成「实际要 NEW 的 JVM 类型」并保留泛型
+        // 实参，保证 `new List<string>` 的 IR 类型仍是 List<string> 的等价描述符来源。
+        val declaredType = expr.type
+        val allocationName = (declaredType as? JasNamedType)
+            ?.let { BuiltinCollections.allocationTypeName(it.name) }
+        val type = if (allocationName != null) {
+            typeMapper.mapType(JasNamedType(allocationName, (declaredType as JasNamedType).typeArguments))
+        } else {
+            typeMapper.mapType(declaredType)
+        }
         val args = expr.args.map { translateExpression(it, ctx) }.toMutableList()
         // 构造器实参按**声明形参类型**宽化：`new Holder(new MemRepo())` 必须生成
         // `<init>(LRepo;)V` 并在实参处补 CHECKCAST。IrConstructorCall 的符号不与声明共享

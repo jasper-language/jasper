@@ -1278,6 +1278,26 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                             }
                             return JasPrimitiveType("int32")
                         }
+                        // 集合成员必须先于通用「用户类型成员」路径分流：List/Map/dict
+                        // 可能同时被标准库声明为接口，若不先按语言内建集合元数据解析，
+                        // 就会依赖符号表里某个声明是否存在，独立编译（不带 stdlib）
+                        // 与带 stdlib 编译得到不同结果。BuiltinCollections 是唯一事实来源。
+                        if (receiverType is JasArrayType &&
+                            BuiltinCollections.isCollectionMemberName(expr.target.property)
+                        ) {
+                            // 数组是语言内建序列，但成员面只有 `length` 与 `[i]`；
+                            // `arr.size()`/`arr.get(i)` 在 JVM 上不存在，必须编译期拒绝，
+                            // 否则会把错误留到运行期 NoSuchMethodError。
+                            error(
+                                "Array has no member '${expr.target.property}'; use 'length' " +
+                                    "for the element count and 'arr[index]' for element access",
+                                expr
+                            )
+                            return JasAnyType
+                        }
+                        if (receiverType is JasNamedType && BuiltinCollections.familyOf(receiverType.name) != null) {
+                            return inferCollectionMemberCall(expr, expr.target, receiverType, argTypes)
+                        }
                         if (receiverType is JasNamedType) {
                             inferInstanceMemberCall(expr, expr.target, receiverType, argTypes)?.let { return it }
                         }
@@ -1356,6 +1376,17 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                         }
                     }
                 } else when {
+                    targetType is JasNamedType && BuiltinCollections.familyOf(targetType.name) != null -> {
+                        // 集合没有语言层属性；尤其不能把数组的 `length` 语义套到集合上。
+                        // 显式报错而不是静默 any，能让「数组 length 与集合 size 共存」的
+                        // 误用（`list.length` / `dict.length`）在编译期就暴露。
+                        error(
+                            "Cannot resolve member '${expr.property}' on collection type " +
+                                "'${typeDisplayName(targetType)}'; use size() for the element count",
+                            expr
+                        )
+                        JasAnyType
+                    }
                     targetType is JasNamedType -> {
                         findMemberType(targetType.name, expr.property, targetType.typeArguments) ?: run {
                             // 只有「符号表中确有的具名类型」才把未命中升级为错误；类型参数
@@ -1376,6 +1407,16 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                     targetType is JasStringType && expr.property == "length" -> JasPrimitiveType("int32")
                     // 数组的 length 是语言内建属性，不来自成员声明。
                     targetType is JasArrayType && expr.property == "length" -> JasPrimitiveType("int32")
+                    targetType is JasArrayType && BuiltinCollections.isCollectionMemberName(expr.property) -> {
+                        // `arr.size` 是把集合属性误用到数组；数组只有 `length`。
+                        // 与调用形式 `arr.size()` 保持同一条诊断，避免两处行为分叉。
+                        error(
+                            "Array has no property '${expr.property}'; use 'length' " +
+                                "for the element count",
+                            expr
+                        )
+                        JasAnyType
+                    }
                     targetType != null -> {
                         val typeName = typeDisplayName(targetType)
                         warn("Property access '${expr.property}' on non-named type '$typeName'", expr)
@@ -1468,7 +1509,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasStringTemplate -> JasStringType
-            is JasDictLiteral -> JasNamedType("Map")
+            is JasDictLiteral -> inferDictLiteral(expr, env, expected)
             is JasAssignment -> {
                 // 赋值兼容性：右值类型必须可赋给左值（目标）类型；结果类型为目标类型。
                 // 先推断目标再带期望类型推断右值：数组字面量赋值 `a = [x, y]` 需要知道
@@ -1849,6 +1890,51 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 memberReturnType(resolution.function, receiverType)
             }
         }
+    }
+
+    /**
+     * 做什么：按语言内建集合元数据解析一次实例成员调用（`size/get/containsKey/put/...`）。
+     *
+     * 什么时候用：[inferExpression] 的 `JasCall` 分支，接收者已确认属于 List 或 Map 族。
+     * 前置条件：receiverType 是集合具名类型；argTypes 已推断（元素可能为 null）。
+     * 失败模式：成员不存在、元数不符或实参类型不兼容时记录诊断并返回一个兜底类型；
+     *   不抛异常。把所有无效组合收敛为编译期错误，而不是留给后端生成不存在的方法。
+     * 为什么单独成函数：集合成员不是用户声明的成员，不能走 SymbolTable 的继承/重载
+     *   逻辑；把「元数据查询 + 参数校验 + 返回类型推断」集中在这里，translator 只需
+     *   按同一个 spec 生成调用（隔离的变化点：集合 API）。
+     */
+    private fun inferCollectionMemberCall(
+        call: JasCall,
+        target: JasPropertyAccess,
+        receiverType: JasNamedType,
+        argTypes: List<JasType?>
+    ): JasType {
+        val memberName = target.property
+        val spec = BuiltinCollections.member(receiverType.name, memberName)
+        if (spec == null) {
+            error("Cannot resolve member '$memberName' on collection type '${typeDisplayName(receiverType)}'", call)
+            return JasAnyType
+        }
+        val parameterTypes = BuiltinCollections.parameterTypes(spec, receiverType)
+        if (call.args.size != parameterTypes.size) {
+            error(
+                "Function '$memberName' expects ${parameterTypes.size} argument(s), got ${call.args.size}",
+                call
+            )
+            return BuiltinCollections.returnType(spec, receiverType)
+        }
+        for ((index, actualType) in argTypes.withIndex()) {
+            if (actualType == null) continue
+            val expected = parameterTypes[index]
+            if (!typesCompatible(actualType, expected)) {
+                error(
+                    "Function '$memberName' argument ${index + 1} type mismatch: " +
+                        "expected ${typeDisplayName(expected)}, got ${typeDisplayName(actualType)}",
+                    call
+                )
+            }
+        }
+        return BuiltinCollections.returnType(spec, receiverType)
     }
 
     /**
@@ -2444,6 +2530,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
     private fun typesCompatible(actual: JasType, expected: JasType): Boolean {
         // 兼容性规则按顺序短路；顺序本身有意义（可空性先于 any 兜底等），勿随意调整。
         if (actual == expected) return true
+        // 集合族必须在「按名字归一」之前比较：canonicalTypeName 只保留族名，比较不出
+        // `dict<string,int32>` 与 `dict<int32,string>` 的差异；集合实参不兼容必须拒绝。
+        if (actual is JasNamedType && expected is JasNamedType) {
+            val actualFamily = BuiltinCollections.familyOf(actual.name)
+            val expectedFamily = BuiltinCollections.familyOf(expected.name)
+            if (actualFamily != null && expectedFamily != null) {
+                return collectionTypesCompatible(actual, expected, actualFamily, expectedFamily)
+            }
+        }
         // 规范化后同名视为兼容（如 int32/Int、string/String、map 别名）。
         if (canonicalTypeName(actual) == canonicalTypeName(expected)) return true
         // Nullability: assigning nullable to non-null is rejected
@@ -2485,6 +2580,65 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             return true
         }
         return false
+    }
+
+    /**
+     * 做什么：推断 `dict{...}` 字面量的具体类型（`dict<K,V>`），并把结果回填到
+     *   [JasDictLiteral.inferredType] 供翻译器选择泛型描述符与成员返回类型。
+     *
+     * 什么时候用：[inferExpression] 命中 `JasDictLiteral` 时。
+     * 前置条件：env 已建立；entries 中的表达式可正常推断；expected 可为 null。
+     * 失败模式：键/值类型与上下文不兼容时记录诊断并继续推断；不抛异常。空字面量
+     *   且无上下文时退化为 `dict<any,any>`。
+     * 为什么需要上下文：`var d: dict<string,int32> = dict{}` 的键值类型只能从声明
+     *   目标得到；若只看 entries，空字典会丢失类型信息，后续 `get` 只能返回 any。
+     *   这与数组字面量使用 expected 元素类型的理由一致，是「上下文相关推断」在
+     *   字典上的最小落点。
+     */
+    private fun inferDictLiteral(
+        expr: JasDictLiteral,
+        env: TypeEnvironment,
+        expected: JasType?
+    ): JasType {
+        val expectedMap = when (expected) {
+            is JasNamedType -> expected.takeIf {
+                BuiltinCollections.familyOf(it.name) == CollectionFamily.MAP && it.typeArguments.size >= 2
+            }
+            is JasNullableType -> (expected.inner as? JasNamedType)?.takeIf {
+                BuiltinCollections.familyOf(it.name) == CollectionFamily.MAP && it.typeArguments.size >= 2
+            }
+            else -> null
+        }
+        val expectedKey = expectedMap?.let(BuiltinCollections::keyType)
+        val expectedValue = expectedMap?.let(BuiltinCollections::valueType)
+
+        val keyTypes = mutableListOf<JasType?>()
+        val valueTypes = mutableListOf<JasType?>()
+        for ((index, entry) in expr.entries.withIndex()) {
+            val keyType = inferExpression(entry.key, env, expectedKey)
+            val valueType = inferExpression(entry.value, env, expectedValue)
+            keyTypes.add(keyType)
+            valueTypes.add(valueType)
+            if (keyType != null && expectedKey != null && !typesCompatible(keyType, expectedKey)) {
+                error(
+                    "Dictionary key ${index + 1} has type ${typeDisplayName(keyType)}, " +
+                        "incompatible with key type ${typeDisplayName(expectedKey)}",
+                    entry.key
+                )
+            }
+            if (valueType != null && expectedValue != null && !typesCompatible(valueType, expectedValue)) {
+                error(
+                    "Dictionary value ${index + 1} has type ${typeDisplayName(valueType)}, " +
+                        "incompatible with value type ${typeDisplayName(expectedValue)}",
+                    entry.value
+                )
+            }
+        }
+        val keyType = expectedKey ?: commonElementType(keyTypes) ?: JasAnyType
+        val valueType = expectedValue ?: commonElementType(valueTypes) ?: JasAnyType
+        val inferred = JasNamedType("dict", listOf(keyType, valueType))
+        expr.inferredType = inferred
+        return inferred
     }
 
     /**
@@ -2704,7 +2858,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 "Bool", "Boolean", "boolean", "bool" -> "bool"
                 "String", "string", "java.lang.String" -> "string"
                 "Int", "int", "int32" -> "int32"
-                "Map", "HashMap", "java.util.Map", "java.util.HashMap" -> "map"
+                "Map", "HashMap", "dict", "java.util.Map", "java.util.HashMap", "java.util.LinkedHashMap" -> "map"
+                "List", "MutableList", "ArrayList", "java.util.List", "java.util.ArrayList" -> "list"
                 else -> type.name
             }
             is JasStringType -> "string"
@@ -2715,7 +2870,33 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
 
     private fun mapTypesCompatible(actual: String, expected: String): Boolean {
         // Map 家族的所有写法视为互相兼容。
-        val mapNames = setOf("Map", "HashMap", "java.util.Map", "java.util.HashMap")
+        val mapNames = setOf("Map", "HashMap", "dict", "java.util.Map", "java.util.HashMap", "java.util.LinkedHashMap")
         return actual in mapNames && expected in mapNames
+    }
+
+    /**
+     * 做什么：判断两个集合族类型是否可赋值，并把泛型实参逐项递归比较。
+     *
+     * 什么时候用：[typesCompatible] 在两侧都是集合具名类型时。
+     * 前置条件：actualFamily/expectedFamily 已由 BuiltinCollections 判定非空。
+     * 失败模式：族不同、实参个数不同、任一实参不兼容时返回 false；不抛异常。
+     * 为什么需要：`dict<string,int32>` 与 `dict<int32,string>` 名字相同但语义完全不同；
+     *   旧规则只比较族名会静默放行，最终把 String 当 Integer 拆箱并在运行期崩溃。
+     * 已知边界：裸集合（无类型实参）视为通配，接受任意实参，保持既有宽松行为；
+     *   List 与 MutableList 在本层不区分读写方向（可变性由成员集合约束），因此
+     *   `MutableList<T>` 可赋给 `List<T>`，反之也放行。
+     */
+    private fun collectionTypesCompatible(
+        actual: JasNamedType,
+        expected: JasNamedType,
+        actualFamily: CollectionFamily,
+        expectedFamily: CollectionFamily
+    ): Boolean {
+        if (actualFamily != expectedFamily) return false
+        if (actual.typeArguments.isEmpty() || expected.typeArguments.isEmpty()) return true
+        if (actual.typeArguments.size != expected.typeArguments.size) return false
+        return actual.typeArguments.zip(expected.typeArguments).all { (actualArg, expectedArg) ->
+            typesCompatible(actualArg, expectedArg)
+        }
     }
 }

@@ -1948,9 +1948,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // Leave a dummy null on stack so POP (from IrExpression statement handler) works
                             // 中文：<init> 返回 void，但语句生成器会 POP，补 null 占位。
                             mv.visitInsn(Opcodes.ACONST_NULL)
-                        } else if (irName.startsWith("v:")) {
-                            // 成员调用：真实方法名是去掉 "v:" 前缀后的部分。第 0 个实参
-                            // 是接收者，其余是参数。
+                        } else if (irName.startsWith("v:") || irName.startsWith("c:")) {
+                            // 成员调用：真实方法名是去掉 "v:"/"c:" 前缀后的部分。第 0 个实参
+                            // 是接收者，其余是参数。`c:` 是集合调用的显式协议：语言层集合成员
+                            // 必须使用 JDK 真实签名（get/put/remove/size 等），不能命中下面的
+                            // 历史容器流畅兜底（它假设 get/set/remove 返回接收者）。
+                            val forcedPlatform = irName.startsWith("c:")
                             val realName = irName.substring(2)
                             val receiver = expr.getValueArgument(0)!!
                             // 平台调用链的 IR 类型可能缺失（Unit/`V`）：先尝试从内层
@@ -1976,8 +1979,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // 调用点可能拿到另一个重载的描述符并触发 NoSuchMethodError。
                             val declaredKey = memberCallKeys[expr.symbol]
                                 ?: memberArityKey(realName, expr.valueArgumentsCount - 1)
-                            val declared = memberSignaturesByType[rawReceiverInternal]?.get(declaredKey)
-                            val useDeclared = declared != null &&
+                            // `c:` 调用不接受声明签名：集合成员的语义签名由 BuiltinCollections
+                            // 定义，但 JVM 描述符必须来自 JDK 反射；若误用用户类型的声明签名，
+                            // `dict<string,int32>` 的 get/put 会拿到错误的擦除描述符。
+                            val declared = if (forcedPlatform) {
+                                null
+                            } else {
+                                memberSignaturesByType[rawReceiverInternal]?.get(declaredKey)
+                            }
+                            val useDeclared = !forcedPlatform && declared != null &&
                                 declared.paramDescriptors.size == expr.valueArgumentsCount - 1
                             // 先把实参表达式与它们的 IR 描述符收集起来：平台签名解析必须
                             // 在发射任何实参字节码之前完成，因为「用哪个描述符」会反过来
@@ -1990,16 +2000,27 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             val argDescriptors = argExpressions.map { receiverJvmDescriptor(it) }
                             // 平台方法真实签名：仅在「没有声明签名」且接收者不是本次编译
                             // 单元声明的类型时尝试。toString 与 isKnownJdkFluentCall 是既有
-                            // 契约（RemoveMethodTest 锁死了 StringBuilder.append / 容器
-                            // get/set/remove 的描述符形状），继续走原路径，保证既有测试不变。
+                            // 契约（RemoveMethodTest 锁死 StringBuilder.append 的流畅形状）；
+                            // 语言内建集合已改走 `c:` 前缀强制真实签名，不再命中该兜底。
                             val platformSignature = if (!useDeclared &&
-                                realName != "toString" &&
-                                !isKnownJdkFluentCall(receiverInternal, realName) &&
-                                !isCompilationUnitDeclaredType(rawReceiverInternal, receiverInternal)
+                                (forcedPlatform ||
+                                    (realName != "toString" &&
+                                        !isKnownJdkFluentCall(receiverInternal, realName) &&
+                                        !isCompilationUnitDeclaredType(rawReceiverInternal, receiverInternal)))
                             ) {
                                 platformMethodResolver.resolve(receiverInternal, realName, argDescriptors)
                             } else {
                                 null
+                            }
+                            // `c:` 是编译期契约：检查器只放行 BuiltinCollections 声明的成员，
+                            // 而这些成员在 JDK 集合接口上必然存在。解析失败说明前后端对集合族
+                            // 或类型实参的认知已不一致，继续拼描述符只会产出运行期才暴露的
+                            // NoSuchMethodError；这里 fail fast 并给出可定位的调用信息。
+                            if (forcedPlatform && platformSignature == null) {
+                                error(
+                                    "collection call was not resolved by platform resolver: " +
+                                        "$receiverInternal.$realName($argDescriptors)"
+                                )
                             }
                             // 形参描述符来源：声明签名优先，其次平台真实签名；都没有时
                             // 沿用旧行为（按实参 IR 类型拼描述符）。

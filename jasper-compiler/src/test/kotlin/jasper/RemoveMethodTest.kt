@@ -7,7 +7,7 @@
 //     1. 接口 `remove` + 实现类，经接口变量调用 → `invokeinterface Store.remove(...)`；
 //     2. 类方法 `remove` 经具体类型调用 → `invokevirtual` + 声明描述符；
 //     3. 带参数/返回值的接口方法，javap 看到声明的擦除描述符；
-//     4. StringBuilder.append 旧行为不回归；List/Map 的容器兜底仍限定在 JDK 接收者；
+//     4. StringBuilder.append 旧行为不回归；List/Map 集合成员改用 JDK 真实签名；
 //     5. 同名但不同 owner 的两个 remove，各自使用自己的描述符；
 //     6. 负向：接口没有 remove 时给出明确编译错误，且不产出 .class。
 //
@@ -249,13 +249,13 @@ class RemoveMethodTest {
     }
 
     // ------------------------------------------------------------------
-    // 4b. List/Map 的容器兜底仍只按 JDK 接收者放行（描述符形状锁）。
-    //     当前语言没有 JDK 容器声明签名层（见 probes 的已知限制），因此本用例只
-    //     断言「兜底仍作用在 JDK 接收者上、没有被收窄误删」，不执行 JDK 容器调用；
-    //     容器 API 的完整兼容是本任务明确列出的非目标。
+    // 4b. List/Map 的成员调用使用 JDK 真实签名（描述符形状锁）。
+    //     语言内建集合元数据把 java.util.ArrayList/HashMap 也归入 LIST/MAP 族，
+    //     因此 get/set/remove 必须走 PlatformMethodResolver 的真实签名，而不是
+    //     旧的「返回接收者」流畅兜底。该用例把真实描述符固定在字节码形状上。
     // ------------------------------------------------------------------
     @Test
-    fun `jdk list and map container fallback stays scoped to jdk receivers`() {
+    fun `jdk list and map containers use real platform signatures`() {
         val out = compile(
             """
             package test;
@@ -273,26 +273,26 @@ class RemoveMethodTest {
             "containers",
         )
         val code = javap(out, "test.main", "containers")
-        // get/set/remove 仍是 JDK 接收者兜底（返回接收者），证明白名单包含这些形状。
+        // get/set/remove 使用 JDK 真实签名：参数按其真实形参描述符，返回 Object/boolean。
         assertTrue(
-            code.contains("Method java/util/ArrayList.get:(I)Ljava/util/ArrayList;"),
-            "ArrayList.get 的旧兜底形状应保持不变:\n$code"
+            code.contains("Method java/util/ArrayList.get:(I)Ljava/lang/Object;"),
+            "ArrayList.get 必须使用 JDK 真实签名 (I)Ljava/lang/Object;:\n$code"
         )
         assertTrue(
-            code.contains("Method java/util/ArrayList.set:(ILjava/lang/String;)Ljava/util/ArrayList;"),
-            "ArrayList.set 的旧兜底形状应保持不变:\n$code"
+            code.contains("Method java/util/ArrayList.set:(ILjava/lang/Object;)Ljava/lang/Object;"),
+            "ArrayList.set 必须使用 JDK 真实签名 (ILjava/lang/Object;)Ljava/lang/Object;:\n$code"
         )
         assertTrue(
-            code.contains("Method java/util/ArrayList.remove:(Ljava/lang/String;)Ljava/util/ArrayList;"),
-            "ArrayList.remove 的旧兜底形状应保持不变:\n$code"
+            code.contains("Method java/util/ArrayList.remove:(Ljava/lang/Object;)Z"),
+            "ArrayList.remove 必须使用 JDK 真实签名 (Ljava/lang/Object;)Z:\n$code"
         )
         assertTrue(
-            code.contains("Method java/util/HashMap.get:(Ljava/lang/String;)Ljava/util/HashMap;"),
-            "HashMap.get 的旧兜底形状应保持不变:\n$code"
+            code.contains("Method java/util/HashMap.get:(Ljava/lang/Object;)Ljava/lang/Object;"),
+            "HashMap.get 必须使用 JDK 真实签名 (Ljava/lang/Object;)Ljava/lang/Object;:\n$code"
         )
         assertTrue(
-            code.contains("Method java/util/HashMap.remove:(Ljava/lang/String;)Ljava/util/HashMap;"),
-            "HashMap.remove 的旧兜底形状应保持不变:\n$code"
+            code.contains("Method java/util/HashMap.remove:(Ljava/lang/Object;)Ljava/lang/Object;"),
+            "HashMap.remove 必须使用 JDK 真实签名 (Ljava/lang/Object;)Ljava/lang/Object;:\n$code"
         )
     }
 

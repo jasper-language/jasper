@@ -680,8 +680,17 @@ data class JasTemplateExpr(val expr: JasExpression) : JasTemplatePart()
 
 /**
  * 字典/映射字面量表达式：entries 键值对列表。
+ *
+ * [inferredType] 是类型检查阶段回填的**具体字典类型**（如 `dict<string,int32>`）。
+ * 为什么需要：字面量本身只给出 entries，无法表达「目标声明是 dict<string,List<int32>>」
+ * 这类上下文信息；翻译器必须用回填类型选择 JVM 泛型描述符与成员返回类型，否则
+ * `dict{}` 会退化成裸 HashMap，后续 `get` 只能得到 any。该字段与
+ * [JasArrayLiteral.inferredElementType]、[JasCall.inferredTypeArgs] 一样，属于
+ * 「检查阶段写、翻译阶段只读」的可变回填状态；未经过检查时为 null。
  */
-data class JasDictLiteral(val entries: List<JasDictEntry>) : JasExpression()
+data class JasDictLiteral(val entries: List<JasDictEntry>) : JasExpression() {
+    var inferredType: JasType? = null
+}
 
 /**
  * 字典字面量中的一个键值对：key 键表达式；value 值表达式。

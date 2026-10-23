@@ -170,7 +170,11 @@ private fun lexAll(source: String): List<Token> {
  *   才进入「全拆起点 + 逐候选裁剪」搜索，实测每轮首个可裁候选即被接受，总解析次数接近线性。
  */
 internal fun createNestedGenericAwareParser(source: String): Pair<JasperParser, JasperErrorListener> {
-    val baseTokens = lexAll(source)
+    // 先做一次与泛型无关、但同属「文法不接受、又不能改 .g4」的 token 规范化：
+    // `new dict<K,V>()` 的构造位置需要把 Dict 关键字视作标识符。该改写只命中
+    // `new` 之后的位置，不影响 `dict{...}` 字面量与类型位置（见
+    // DictConstructorTokenSupport 的模块说明）。
+    val baseTokens = rewriteDictConstructorKeywords(lexAll(source))
     val candidateStartIndices = baseTokens
         .filter { it.type == JasperParser.RSHIFT || it.type == JasperParser.URSHIFT }
         .map { it.startIndex }
