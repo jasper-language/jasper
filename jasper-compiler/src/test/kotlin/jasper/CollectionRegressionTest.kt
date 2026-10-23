@@ -118,6 +118,11 @@ class CollectionRegressionTest {
                 public function has(k: string): bool { return this.counts.containsKey(k); }
                 public function valueOf(k: string): int32 { return this.counts.get(k); }
                 public function snapshot(): dict<string, int32> { return this.counts; }
+                // dict 作为函数形参：接收者内部字段与外部字典必须使用同一套
+                // 键/值类型校验与 JDK 真实签名，不能因为来源不同而退化。
+                public function totalOf(other: dict<string, int32>): int32 {
+                    return other.get("a") + other.size();
+                }
             }
             public function main(): int32 {
                 var inv: Inventory = new Inventory();
@@ -126,12 +131,15 @@ class CollectionRegressionTest {
                 if (!inv.has("a")) { return 1; }
                 var d: dict<string, int32> = inv.snapshot();
                 if (!d.containsKey("b")) { return 2; }
-                return inv.count() * 10 + d.get("b") + inv.valueOf("a");
+                var extra: dict<string, int32> = dict{ "a": 5, "c": 6 };
+                // 形参字典：get("a")=5，size()=2 → 7。
+                if (inv.totalOf(extra) != 7) { return 3; }
+                // 2 个键 → size()=2；2*10 + 4 + 3 + 7 = 34。
+                return inv.count() * 10 + d.get("b") + inv.valueOf("a") + inv.totalOf(extra);
             }
         """.trimIndent()
         val out = compile(source, "dict-field-param-return")
-        // 2 个键 → size()=2；2*10 + 4 + 3 = 27。
-        assertEquals(27, runMain(out), "dict<string,int32> 的字段/形参/返回值与成员调用应真跑")
+        assertEquals(34, runMain(out), "dict<string,int32> 的字段/形参/返回值与成员调用应真跑")
         val code = javap(out, "test.main", "dict-field-param-return")
         val inventoryCode = javap(out, "test.Inventory", "dict-field-param-return")
         assertTrue(
@@ -176,6 +184,40 @@ class CollectionRegressionTest {
         assertTrue(
             code.contains("InterfaceMethod java/util/List.size:()I"),
             "集合 size 必须是 List.size()I 的接口调用:\n$code"
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // 2b. 同一个类里同时出现数组参数与集合参数（S1 原症状的最小复现）。
+    //     S1 的根因是按「成员名」而不是「接收者真实类型」分派：`length` 与
+    //     `size` 一旦被全局特判，数组与集合就会互相串线。本用例把两者放进
+    //     同一个类的同一个方法，任何按名字特判的实现都会在这里暴露。
+    // ------------------------------------------------------------------
+    @Test
+    fun `one class dispatches array length and collection size by receiver type`() {
+        val source = """
+            package test;
+            public class Mixed {
+                public function combined(xs: int32[], ys: MutableList<int32>): int32 {
+                    return xs.length * 10 + ys.size();
+                }
+            }
+            public function main(): int32 {
+                var m: Mixed = new Mixed();
+                var xs: int32[] = [1, 2, 3];
+                var ys: MutableList<int32> = new MutableList<int32>();
+                ys.add(5);
+                ys.add(6);
+                return m.combined(xs, ys);
+            }
+        """.trimIndent()
+        val out = compile(source, "same-class-length-size")
+        assertEquals(32, runMain(out), "同一类的数组 length 与集合 size() 必须按接收者分派")
+        val code = javap(out, "test.Mixed", "same-class-length-size")
+        assertTrue(code.contains("arraylength"), "数组参数的长度必须编译成 ARRAYLENGTH:\n$code")
+        assertTrue(
+            code.contains("InterfaceMethod java/util/List.size:()I"),
+            "集合参数的大小必须是 List.size()I:\n$code"
         )
     }
 
