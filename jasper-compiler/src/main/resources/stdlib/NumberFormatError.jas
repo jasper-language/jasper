@@ -1,0 +1,21 @@
+package std;
+
+// Raised when a numeric parser rejects its input. It extends RecoverableError so
+// callers can distinguish bad input from fatal failures with a single catch.
+//
+// 模块说明：数值解析失败的可恢复错误类型。本类只承担错误层级语义，不绑定具体
+// 解析器文案；调用方（Numbers.parseInt / parseFloat）负责把原始输入拼进消息，
+// 从而让 catch 到错误的代码能直接看到被拒绝的文本。
+public class NumberFormatError extends RecoverableError {
+    /**
+     * 做什么：用调用方已经拼好的诊断消息构造错误。
+     * 什么时候用：整数/浮点解析器发现空串、非法字符、溢出等可恢复输入问题时。
+     * 前置条件：message 非 null（语言 string 类型本身不可空），且应包含原始输入文本。
+     * 失败模式：构造本身不会失败；随后由 throw 交给调用方的 try/catch。
+     * 为什么由调用方拼消息：错误类型保持稳定，解析器可以按失败原因组织细节，
+     *   而 catch 方只需依赖 RecoverableError / NumberFormatError 的层级。
+     */
+    public constructor(message: string) {
+        super(message);
+    }
+}

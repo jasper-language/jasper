@@ -1,0 +1,191 @@
+// spec: 05-函数.md#5.1 函数声明
+// kind: pos
+// expect: exit 42
+// 数值解析正例：顶层函数 parseInt / parseFloat 用码点扫描完成符号、十进制位、
+// 小数与指数解析，并通过 NumberFormatError -> RecoverableError 层级拒绝非法输入。
+// 一致性运行器只编译单文件、不加载标准库，因此这里按 StringBuilder 用例的先例
+// 声明同形状的本地错误类型与解析函数，验证所依赖的语言能力（而不是引用 stdlib）。
+package test;
+
+public class Error extends java.lang.Throwable {
+    private var msg: string;
+
+    public constructor(message: string) {
+        super(message);
+        this.msg = message;
+    }
+
+    public function message(): string {
+        return this.msg;
+    }
+}
+
+public class RecoverableError extends Error {
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+public class NumberFormatError extends RecoverableError {
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+public function parseInt(text: string): int32 {
+    var length: int32 = text.length;
+    if (length == 0) {
+        throw new NumberFormatError("empty");
+    }
+    var index: int32 = 0;
+    var negative: bool = false;
+    var first: int32 = text.codePointAt(0);
+    if (first == 43 || first == 45) {
+        negative = first == 45;
+        index = 1;
+        if (index == length) {
+            throw new NumberFormatError("sign");
+        }
+    }
+    var magnitude: int32 = 0;
+    while (index < length) {
+        var codePoint: int32 = text.codePointAt(index);
+        if (codePoint < 48 || codePoint > 57) {
+            throw new NumberFormatError("digit");
+        }
+        var digit: int32 = codePoint - 48;
+        if (magnitude < 0 - 214748364) {
+            throw new NumberFormatError("range");
+        }
+        magnitude = magnitude * 10;
+        if (negative) {
+            if (magnitude < (0 - 2147483647 - 1) + digit) {
+                throw new NumberFormatError("range");
+            }
+        } else {
+            if (magnitude < (0 - 2147483647) + digit) {
+                throw new NumberFormatError("range");
+            }
+        }
+        magnitude = magnitude - digit;
+        index = index + 1;
+    }
+    if (negative) {
+        return magnitude;
+    }
+    return 0 - magnitude;
+}
+
+public function parseFloat(text: string): float64 {
+    var length: int32 = text.length;
+    if (length == 0) {
+        throw new NumberFormatError("empty");
+    }
+    var index: int32 = 0;
+    var negative: bool = false;
+    var first: int32 = text.codePointAt(0);
+    if (first == 43 || first == 45) {
+        negative = first == 45;
+        index = 1;
+        if (index == length) {
+            throw new NumberFormatError("sign");
+        }
+    }
+    var value: float64 = 0.0;
+    var scale: float64 = 1.0;
+    var sawDigit: bool = false;
+    var fraction: bool = false;
+    while (index < length) {
+        var codePoint: int32 = text.codePointAt(index);
+        if (codePoint >= 48 && codePoint <= 57) {
+            var digit: int32 = codePoint - 48;
+            sawDigit = true;
+            if (fraction) {
+                scale = scale / 10.0;
+                value = value + scale * digit;
+            } else {
+                value = value * 10.0 + digit;
+            }
+            index = index + 1;
+        } else if (codePoint == 46 && !fraction) {
+            fraction = true;
+            index = index + 1;
+        } else if ((codePoint == 101 || codePoint == 69) && sawDigit) {
+            index = index + 1;
+            var exponentNegative: bool = false;
+            if (index < length) {
+                var exponentFirst: int32 = text.codePointAt(index);
+                if (exponentFirst == 43 || exponentFirst == 45) {
+                    exponentNegative = exponentFirst == 45;
+                    index = index + 1;
+                }
+            }
+            var exponent: int32 = 0;
+            var exponentDigits: int32 = 0;
+            while (index < length) {
+                var exponentCodePoint: int32 = text.codePointAt(index);
+                if (exponentCodePoint < 48 || exponentCodePoint > 57) {
+                    throw new NumberFormatError("exponent");
+                }
+                exponent = exponent * 10 + (exponentCodePoint - 48);
+                exponentDigits = exponentDigits + 1;
+                index = index + 1;
+            }
+            if (exponentDigits == 0) {
+                throw new NumberFormatError("exponent");
+            }
+            var step: int32 = 0;
+            if (exponentNegative) {
+                while (step < exponent) {
+                    value = value / 10.0;
+                    step = step + 1;
+                }
+            } else {
+                while (step < exponent) {
+                    value = value * 10.0;
+                    step = step + 1;
+                }
+            }
+        } else {
+            throw new NumberFormatError("digit");
+        }
+    }
+    if (!sawDigit) {
+        throw new NumberFormatError("digit");
+    }
+    if (negative) {
+        return 0.0 - value;
+    }
+    return value;
+}
+
+public function main(): int32 {
+    if (parseInt("2147483647") != 2147483647) {
+        return 1;
+    }
+    if (parseInt("-2147483648") != (0 - 2147483647 - 1)) {
+        return 2;
+    }
+    if (parseInt("+42") != 42) {
+        return 3;
+    }
+    if (parseFloat("1.5") != 1.5) {
+        return 4;
+    }
+    if (parseFloat("-2e3") != 0.0 - 2000.0) {
+        return 5;
+    }
+    if (parseFloat(".25") != 0.25) {
+        return 6;
+    }
+    var rejected: bool = false;
+    try {
+        parseInt("2147483648");
+    } catch (e: RecoverableError) {
+        rejected = true;
+    }
+    if (!rejected) {
+        return 7;
+    }
+    return 42;
+}
