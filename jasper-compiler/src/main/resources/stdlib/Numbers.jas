@@ -1,0 +1,291 @@
+package std;
+
+// Decimal text-to-number parsers implemented entirely in Jasper. Both scanners
+// walk Unicode code points, accumulate values by hand, and reject malformed or
+// out-of-range input with NumberFormatError.
+//
+// 模块说明：标准库数值解析入口。parseInt 解析十进制 int32，parseFloat 解析十进制
+// 小数与科学计数法 float64。逐字符扫描、符号处理、十进制位累加、溢出与范围判定
+// 全部在本文件完成，不调用平台的整数/浮点解析函数。平台能力只用 codePointAt
+// 取码点；错误文案用语言级字符串拼接构造。变化点隔离：输入语法与诊断文案集中在
+// 本文件，后续若调整接受的数字文法则只改这里，不影响错误层级与调用方。
+
+/**
+ * 做什么：把十进制文本解析成 int32。
+ * 什么时候用：需要把用户输入或配置文本转换成整数，且希望非法输入以异常而不是
+ *   哨兵值/ null 表达时。
+ * 前置条件：text 是语言 string（不可空）。
+ * 失败模式：空串、单独的正负号、前后空白、任何非十进制数字字符（含小数点、
+ *   0x 前缀、类型后缀）、超出 [-2147483648, 2147483647] 时抛 NumberFormatError；
+ *   消息包含原始输入文本。
+ * 为什么这样设计：调用方明确要求「异常为主、Result 为辅」，因此本函数不返回
+ *   哨兵值。幅值用负数累加，才能在 int32 内完整表示 -2147483648 并做精确溢出
+ *   判定；整个判定不依赖平台的宽类型或解析函数。
+ */
+public function parseInt(text: string): int32 {
+    var length: int32 = text.length;
+    if (length == 0) {
+        throw new NumberFormatError("cannot parse int \"" + text + "\": empty input");
+    }
+
+    var index: int32 = 0;
+    var negative: bool = false;
+    var first: int32 = text.codePointAt(0);
+    if (first == 43 || first == 45) {
+        // 43 是 '+'，45 是 '-'。符号本身不算数字，后面必须至少有一位。
+        negative = first == 45;
+        index = 1;
+        if (index == length) {
+            throw new NumberFormatError("cannot parse int \"" + text + "\": sign without digits");
+        }
+    }
+
+    // 始终把幅值存成 <= 0：int32 的正向范围是 2147483647，而绝对值 2147483648
+    // 无法用正 int32 表示。负数累加让两端边界都落在可表示区间内，溢出判定只需
+    // 比较「减掉当前位之后是否小于下限」。
+    var magnitude: int32 = 0;
+    var sawDigit: bool = false;
+    while (index < length) {
+        var codePoint: int32 = text.codePointAt(index);
+        if (codePoint < 48 || codePoint > 57) {
+            // 48..57 是 ASCII '0'..'9'；小数点、空白、0x 前缀等都在这里被拒绝。
+            throw new NumberFormatError("cannot parse int \"" + text + "\": invalid character");
+        }
+        var digit: int32 = codePoint - 48;
+        sawDigit = true;
+
+        // 乘 10 之前的早退检查：幅值已小于 -214748364，再乘 10 必然越界。
+        // 这一步让超长输入（例如 30 位数字）在累加到第 11 位时就报溢出，而不是
+        // 让 int32 乘法先绕回成一个看似合法的值。
+        if (magnitude < 0 - 214748364) {
+            throw new NumberFormatError("cannot parse int \"" + text + "\": out of int32 range");
+        }
+        magnitude = magnitude * 10;
+
+        // 比较「magnitude - digit < 下限」，等价地写成 magnitude < 下限 + digit，
+        // 避免先做减法时发生 int32 下溢。正数下限是 -2147483647，负数下限是
+        // -2147483648（用 0 - 2147483647 - 1 构造，不写不可表示的正数常量）。
+        if (negative) {
+            if (magnitude < (0 - 2147483647 - 1) + digit) {
+                throw new NumberFormatError("cannot parse int \"" + text + "\": out of int32 range");
+            }
+        } else {
+            if (magnitude < (0 - 2147483647) + digit) {
+                throw new NumberFormatError("cannot parse int \"" + text + "\": out of int32 range");
+            }
+        }
+        magnitude = magnitude - digit;
+        index = index + 1;
+    }
+
+    // 防御性检查：正常路径下循环至少执行一次，且非数字字符会先抛错；保留此
+    // 分支是为了让「将来放宽语法时忘记保证至少一位数字」也能明确失败。
+    if (!sawDigit) {
+        throw new NumberFormatError("cannot parse int \"" + text + "\": no digits");
+    }
+    if (negative) {
+        return magnitude;
+    }
+    return 0 - magnitude;
+}
+
+/**
+ * 做什么：把十进制小数或科学计数法文本解析成 float64。
+ * 什么时候用：需要把用户输入或配置文本转换成双精度浮点数时。
+ * 前置条件：text 是语言 string（不可空）。
+ * 失败模式：空串、单独的正负号、前后空白、NaN / Infinity 字面文本、十六进制
+ *   浮点、缺失小数位或指数位、任何非法字符、以及超出 float64 有限范围时抛
+ *   NumberFormatError；消息包含原始输入文本。数值下溢到 0 不属于失败（与常见
+ *   浮点解析约定一致）。
+ * 为什么这样设计：语法与范围判定全部显式写在这里，不借用平台的浮点解析函数；
+ *   有效数字先收敛到 int64 尾数，再按十进制指数整体缩放，避免逐位浮点累加带来
+ *   更大的误差。指数绝对值过大时直接按溢出/下溢裁决，避免无界循环。
+ */
+public function parseFloat(text: string): float64 {
+    var length: int32 = text.length;
+    if (length == 0) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": empty input");
+    }
+
+    var index: int32 = 0;
+    var negative: bool = false;
+    var first: int32 = text.codePointAt(0);
+    if (first == 43 || first == 45) {
+        negative = first == 45;
+        index = 1;
+        if (index == length) {
+            throw new NumberFormatError("cannot parse float \"" + text + "\": sign without digits");
+        }
+    }
+
+    // 尾数最多保留 18 位有效数字：int64 能精确容纳这个范围，足以覆盖 float64
+    // 约 17 位十进制精度；更多位只影响舍入，不影响数量级。
+    var mantissa: int64 = 0;
+    var significantDigits: int32 = 0;
+    // 整数部分超过 18 位有效数字时，每多一位就把整体量级提高 10 倍。
+    var extraIntegerDigits: int32 = 0;
+    // 被尾数表示的十进制小数位数；决定尾数需要除以多少个 10。
+    var fractionDigits: int32 = 0;
+    // 小数点后实际出现的数字字符数（含前导零），用于拒绝 "1." 这类空小数。
+    var fractionChars: int32 = 0;
+    var sawDigit: bool = false;
+    var sawDot: bool = false;
+    var sawExponent: bool = false;
+    var exponentNegative: bool = false;
+    var exponentSignSeen: bool = false;
+    var exponentDigits: int32 = 0;
+    var exponentValue: int64 = 0;
+    var exponentOverflow: bool = false;
+    // 0 = 整数部分，1 = 小数部分，2 = 指数部分。
+    var phase: int32 = 0;
+
+    while (index < length) {
+        var codePoint: int32 = text.codePointAt(index);
+        if (phase == 2) {
+            if ((codePoint == 43 || codePoint == 45) && exponentDigits == 0 && !exponentSignSeen) {
+                exponentNegative = codePoint == 45;
+                exponentSignSeen = true;
+                index = index + 1;
+            } else if (codePoint >= 48 && codePoint <= 57) {
+                var exponentDigit: int32 = codePoint - 48;
+                exponentDigits = exponentDigits + 1;
+                // 指数只需要分辨「是否超过可影响 float64 的量级」；超过 100000 后
+                // 继续累加没有意义，还能避免 int64 被超长指数串撑爆。
+                if (!exponentOverflow) {
+                    if (exponentValue > 100000) {
+                        exponentOverflow = true;
+                    } else {
+                        exponentValue = exponentValue * 10 + exponentDigit;
+                        if (exponentValue > 100000) {
+                            exponentOverflow = true;
+                        }
+                    }
+                }
+                index = index + 1;
+            } else {
+                throw new NumberFormatError("cannot parse float \"" + text + "\": invalid character");
+            }
+        } else if (codePoint >= 48 && codePoint <= 57) {
+            var digit: int32 = codePoint - 48;
+            sawDigit = true;
+            if (phase == 0) {
+                if (significantDigits < 18) {
+                    // 前导零不占总有效位，也不改变量级；直接跳过。
+                    if (!(mantissa == 0 && digit == 0)) {
+                        mantissa = mantissa * 10 + digit;
+                        significantDigits = significantDigits + 1;
+                    }
+                } else {
+                    extraIntegerDigits = extraIntegerDigits + 1;
+                }
+            } else {
+                fractionChars = fractionChars + 1;
+                if (significantDigits < 18) {
+                    // 小数部分的前导零必须计入小数位数，否则 0.001 会被当成 1。
+                    if (mantissa == 0 && digit == 0) {
+                        fractionDigits = fractionDigits + 1;
+                    } else {
+                        mantissa = mantissa * 10 + digit;
+                        significantDigits = significantDigits + 1;
+                        fractionDigits = fractionDigits + 1;
+                    }
+                }
+                // 超过 18 位有效数字后只舍弃，不再增加 fractionDigits：这些位已经
+                // 超出尾数精度，若继续增加分母会把已截断的尾数再错误缩小。
+            }
+            index = index + 1;
+        } else if (codePoint == 46 && phase == 0) {
+            phase = 1;
+            sawDot = true;
+            index = index + 1;
+        } else if ((codePoint == 101 || codePoint == 69) && sawDigit && !sawExponent) {
+            // 101/69 是 'e'/'E'。指数标记只能出现一次，且必须已有数字。
+            phase = 2;
+            sawExponent = true;
+            index = index + 1;
+        } else {
+            throw new NumberFormatError("cannot parse float \"" + text + "\": invalid character");
+        }
+    }
+
+    if (!sawDigit) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": no digits");
+    }
+    if (sawDot && fractionChars == 0) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": missing fraction digits");
+    }
+    if (phase == 2 && exponentDigits == 0) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": missing exponent digits");
+    }
+
+    // 指数过大时无法进入逐次缩放循环：尾数为 0 或指数为负都收敛到带符号零，
+    // 正指数配非零尾数则必然超出 float64 有限范围。
+    if (exponentOverflow) {
+        if (mantissa == 0 || exponentNegative) {
+            if (negative) {
+                return 0.0 - 0.0;
+            }
+            return 0.0;
+        }
+        throw new NumberFormatError("cannot parse float \"" + text + "\": out of float64 range");
+    }
+
+    // 十进制总量级 = 显式指数 + 超长整数部分多出的位数 - 尾数覆盖的小数位数。
+    var totalExponent: int64 = exponentValue;
+    if (exponentNegative) {
+        // 用一元负号而不是 `0 - x`：一元负号的 IR 类型直接沿用操作数（int64），
+        // 不会因为左侧字面量是 int32 而把结果类型误标成 int32。
+        totalExponent = -totalExponent;
+    }
+    totalExponent = totalExponent + extraIntegerDigits - fractionDigits;
+
+    if (mantissa == 0) {
+        // 保留 "-0" / "-0.0" 的符号零语义，与 IEEE 754 的浮点表示一致。
+        if (negative) {
+            return 0.0 - 0.0;
+        }
+        return 0.0;
+    }
+    if (totalExponent > 400) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": out of float64 range");
+    }
+    if (totalExponent < 0 - 400) {
+        // 下溢：值小到 float64 无法区分于 0，按解析约定返回 0 而不是报错。
+        if (negative) {
+            return 0.0 - 0.0;
+        }
+        return 0.0;
+    }
+
+    // 尾数先转成 float64，再按十进制指数逐次缩放。循环上限由上面的 400 保证，
+    // 不会因为用户输入超长指数串而无限执行。
+    var value: float64 = mantissa;
+    var step: int64 = 0;
+    if (totalExponent > 0) {
+        while (step < totalExponent) {
+            value = value * 10.0;
+            step = step + 1;
+        }
+    } else {
+        while (step > totalExponent) {
+            value = value / 10.0;
+            step = step - 1;
+        }
+    }
+
+    // 缩放后可能已经溢出成 Infinity；用 float64 最大值做显式范围检查，把
+    // 非有限结果转换成统一的 NumberFormatError，而不是把 Infinity 泄漏给调用方。
+    if (value > 1.7976931348623157e308 || value < 0.0 - 1.7976931348623157e308) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": out of float64 range");
+    }
+    // 防御性检查：当前算法不会产生 NaN（尾数非零且没有 0/0），保留以便未来
+    // 扩展语法时仍能遵守「只返回有限 float64」的契约。
+    if (value != value) {
+        throw new NumberFormatError("cannot parse float \"" + text + "\": result is not a finite number");
+    }
+
+    if (negative) {
+        return 0.0 - value;
+    }
+    return value;
+}

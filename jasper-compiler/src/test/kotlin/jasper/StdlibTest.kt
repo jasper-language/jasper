@@ -577,4 +577,339 @@ class StdlibTest {
             "StringBuilder.jas should declare package std"
         )
     }
+
+    /**
+     * 做什么：编译一个只调用 `call` 并返回其错误消息的 Jasper 程序。
+     * 什么时候用：断言解析器拒绝非法输入、且异常类型与消息都符合契约时。
+     * 前置条件：call 是 `Numbers.parseInt` / `parseFloat` 的完整调用表达式。
+     * 失败模式：若调用没有抛 NumberFormatError，main 返回 "no-error"；若抛了别的
+     *   异常类型，runMain 会把 InvocationTargetException 抛出来，让测试直接失败。
+     * 为什么让 Jasper 侧 catch NumberFormatError：这样同时验证了「抛的是该类型」与
+     *   「消息可由 catch 方读取」，比在 Kotlin 侧猜测异常包装更接近用户用法。
+     */
+    private fun rejectedMessage(name: String, call: String): String {
+        val (value, _) = runMain(
+            name,
+            """
+            package std;
+            public function main(): string {
+                try {
+                    $call;
+                    return "no-error";
+                } catch (e: NumberFormatError) {
+                    return e.message();
+                }
+            }
+            """.trimIndent()
+        )
+        return value as String
+    }
+
+    /**
+     * 做什么：断言解析调用被 NumberFormatError 拒绝，且消息包含原始输入。
+     * 什么时候用：每个失败样例只需给出调用表达式与原始文本时。
+     * 前置条件：input 是调用中传入的原始文本；空串用 contains 检查 `""` 标记。
+     * 失败模式：没有抛错或消息不含输入时，以带真实消息的断言失败。
+     * 为什么单独抽 helper：失败路径的装配（编译、catch、取 message）完全一致，
+     *   避免十多个用例各自复制一遍。
+     */
+    private fun assertRejected(name: String, call: String, input: String) {
+        val message = rejectedMessage(name, call)
+        assertTrue(message != "no-error", "Expected $call to be rejected, but it returned normally")
+        val marker = if (input.isEmpty()) "\"\"" else input
+        assertTrue(
+            message.contains(marker),
+            "Rejection message must contain the original input '$input', got: $message"
+        )
+    }
+
+    @Test
+    fun `parseInt parses valid decimal integers`() {
+        val (value, _) = runMain(
+            "parse-int-valid",
+            """
+            package std;
+            public function main(): int32 {
+                if (parseInt("42") != 42) { return 1; }
+                if (parseInt("-7") != 0 - 7) { return 2; }
+                if (parseInt("+0") != 0) { return 3; }
+                if (parseInt("2147483647") != 2147483647) { return 4; }
+                if (parseInt("-2147483648") != (0 - 2147483647 - 1)) { return 5; }
+                return 42;
+            }
+            """.trimIndent()
+        )
+        assertEquals(42, value, "parseInt should accept the specified signed decimal forms")
+    }
+
+    @Test
+    fun `parseInt rejects empty input`() {
+        assertRejected("parse-int-empty", "parseInt(\"\")", "")
+    }
+
+    @Test
+    fun `parseInt rejects leading whitespace`() {
+        assertRejected("parse-int-leading-space", "parseInt(\" 1\")", " 1")
+    }
+
+    @Test
+    fun `parseInt rejects a decimal point`() {
+        assertRejected("parse-int-decimal", "parseInt(\"1.0\")", "1.0")
+    }
+
+    @Test
+    fun `parseInt rejects hexadecimal prefixes`() {
+        assertRejected("parse-int-hex", "parseInt(\"0x10\")", "0x10")
+    }
+
+    @Test
+    fun `parseInt rejects values above int32 max`() {
+        assertRejected("parse-int-overflow", "parseInt(\"2147483648\")", "2147483648")
+    }
+
+    @Test
+    fun `parseInt rejects values below int32 min`() {
+        assertRejected("parse-int-underflow", "parseInt(\"-2147483649\")", "-2147483649")
+    }
+
+    /**
+     * 做什么：验证超长输入在累加早期就按溢出拒绝，而不是被平台宽类型截断。
+     * 失败模式：若实现先转成平台整数再检查范围，可能得到截断后的伪合法值。
+     * 为什么：这是「溢出判定由 Jasper 自己算」的关键证据之一。
+     */
+    @Test
+    fun `parseInt rejects a long digit string as overflow`() {
+        assertRejected(
+            "parse-int-long-overflow",
+            "parseInt(\"123456789012345678901234567890\")",
+            "123456789012345678901234567890"
+        )
+    }
+
+    @Test
+    fun `parseFloat parses decimals and scientific notation`() {
+        val (value, _) = runMain(
+            "parse-float-valid",
+            """
+            package std;
+            public function main(): int32 {
+                var decimal: float64 = parseFloat("1.5");
+                if (decimal != 1.5) { return 1; }
+                var scientific: float64 = parseFloat("-2e3");
+                if (scientific != 0.0 - 2000.0) { return 2; }
+                var fraction: float64 = parseFloat(".25");
+                if (fraction != 0.25) { return 3; }
+                var exponentSign: float64 = parseFloat("+1.5E-1");
+                if (exponentSign != 0.15) { return 4; }
+                var zero: float64 = parseFloat("-0");
+                if (zero != 0.0) { return 5; }
+                return 42;
+            }
+            """.trimIndent()
+        )
+        assertEquals(42, value, "parseFloat should accept decimal and scientific forms")
+    }
+
+    @Test
+    fun `parseFloat rejects NaN text`() {
+        assertRejected("parse-float-nan", "parseFloat(\"NaN\")", "NaN")
+    }
+
+    @Test
+    fun `parseFloat rejects Infinity text`() {
+        assertRejected("parse-float-infinity", "parseFloat(\"Infinity\")", "Infinity")
+    }
+
+    @Test
+    fun `parseFloat rejects type suffixes`() {
+        assertRejected("parse-float-suffix", "parseFloat(\"1f\")", "1f")
+    }
+
+    @Test
+    fun `parseFloat rejects empty input`() {
+        assertRejected("parse-float-empty", "parseFloat(\"\")", "")
+    }
+
+    /**
+     * 做什么：验证 NumberFormatError 位于 RecoverableError 分支下，可被父类型捕获。
+     * 失败模式：若层级挂错，`catch (e: RecoverableError)` 不会命中，main 会返回
+     *   "no-error" 或让异常逃逸。
+     * 为什么：任务书要求错误模型「异常为主」，且可恢复输入错误必须能被统一捕获。
+     */
+    @Test
+    fun `NumberFormatError is catchable as RecoverableError`() {
+        val (value, _) = runMain(
+            "number-format-error-hierarchy",
+            """
+            package std;
+            public function main(): string {
+                try {
+                    parseInt("not-a-number");
+                    return "no-error";
+                } catch (e: RecoverableError) {
+                    return e.message();
+                }
+            }
+            """.trimIndent()
+        )
+        val message = value as String
+        assertTrue(message != "no-error", "RecoverableError must catch NumberFormatError")
+        assertTrue(message.contains("not-a-number"), "Caught message should carry the original input")
+    }
+
+    @Test
+    fun `standard library registers the numeric parsers after RecoverableError`() {
+        assertTrue(StdLib.FILES.contains("NumberFormatError.jas"), "StdLib.FILES must list NumberFormatError.jas")
+        assertTrue(StdLib.FILES.contains("Numbers.jas"), "StdLib.FILES must list Numbers.jas")
+        assertTrue(
+            StdLib.FILES.indexOf("RecoverableError.jas") < StdLib.FILES.indexOf("NumberFormatError.jas"),
+            "NumberFormatError must be translated after RecoverableError"
+        )
+        assertTrue(
+            StdLib.FILES.indexOf("NumberFormatError.jas") < StdLib.FILES.indexOf("Numbers.jas"),
+            "Numbers must be translated after NumberFormatError"
+        )
+        assertTrue(
+            StdLib.sources().getValue("NumberFormatError.jas").contains("extends RecoverableError"),
+            "NumberFormatError.jas should extend RecoverableError"
+        )
+    }
+
+    /**
+     * 做什么：把任意文本安全地嵌入 Jasper 字符串字面量。
+     * 什么时候用：属性测试把随机输入拼进生成的 Jasper 源码时。
+     * 前置条件：text 不含换行（本用例的输入都是单行数字文本）。
+     * 失败模式：若遗漏转义，生成的源码会语法错误并让编译断言失败。
+     * 为什么不用库函数：测试内部只需要最小转义，显式写出更易审计。
+     */
+    private fun jasperStringLiteral(text: String): String {
+        val escaped = text.replace("\\", "\\\\").replace("\"", "\\\"")
+        return "\"$escaped\""
+    }
+
+    /**
+     * 做什么：固定种子生成合法/非法数字串，与 Kotlin 侧参考实现逐条比对。
+     * 什么时候用：验证 Jasper 手写扫描/累加与平台解析结果在数量级与边界上一致。
+     * 前置条件：随机种子固定，失败可复现；浮点比较使用 1e-12 相对容差（正确舍入
+     *   与逐次乘除缩放可能有末位 ulp 差异）。
+     * 失败模式：任一用例不一致时 main 返回该用例的编号，Kotlin 断言给出编号。
+     * 为什么在测试侧可以用平台函数：它们只作参考对照，不进入标准库实现；这正是
+     *   验收要求「Jasper 实现与参考实现逐条比对」的落地方式。
+     */
+    @Test
+    fun `numeric parsers agree with a fixed-seed reference corpus`() {
+        val random = kotlin.random.Random(20261023)
+        val code = StringBuilder()
+        var check = 0
+
+        code.appendLine("package std;")
+        code.appendLine("public function main(): int32 {")
+
+        // 合法整数：显式覆盖边界，再随机覆盖整个 int32 范围。
+        val validInts = linkedSetOf("0", "+0", "-0", "1", "-1", "2147483647", "-2147483648")
+        repeat(30) {
+            validInts.add(
+                random.nextLong(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong() + 1).toInt().toString()
+            )
+        }
+        for (text in validInts) {
+            check += 1
+            val expected = text.toInt()
+            val expectedExpr = if (expected == Int.MIN_VALUE) "(0 - 2147483647 - 1)" else expected.toString()
+            code.appendLine("    if (parseInt(${jasperStringLiteral(text)}) != $expectedExpr) { return $check; }")
+        }
+
+        // 合法浮点：十进制小数、指数、符号、前导零与点号前省略整数部分的组合。
+        val validFloats = linkedSetOf("1.5", "-2e3", "0.1", "-0.0", "1e-5", "1e308", "5e-324", ".25")
+        repeat(40) {
+            val sign = when (random.nextInt(3)) {
+                0 -> "-"
+                1 -> "+"
+                else -> ""
+            }
+            val integerPart = buildString {
+                repeat(1 + random.nextInt(9)) {
+                    append(('0'.code + random.nextInt(10)).toChar())
+                }
+            }
+            val fractionPart = if (random.nextBoolean()) {
+                buildString {
+                    append('.')
+                    repeat(1 + random.nextInt(9)) {
+                        append(('0'.code + random.nextInt(10)).toChar())
+                    }
+                }
+            } else {
+                ""
+            }
+            val exponentPart = if (random.nextBoolean()) {
+                val exponentSign = if (random.nextBoolean()) "-" else "+"
+                "e$exponentSign${random.nextInt(0, 21)}"
+            } else {
+                ""
+            }
+            val text = sign + integerPart + fractionPart + exponentPart
+            val reference = text.toDouble()
+            if (reference.isFinite()) {
+                validFloats.add(text)
+            }
+        }
+        for (text in validFloats) {
+            check += 1
+            val reference = text.toDouble()
+            // Double.toString 对有限值总会产生带小数点或指数的 Jasper 浮点字面量。
+            val literal = reference.toString()
+            val suffix = check.toString()
+            code.appendLine("    var actual$suffix: float64 = parseFloat(${jasperStringLiteral(text)});")
+            code.appendLine("    var expected$suffix: float64 = $literal;")
+            code.appendLine("    var diff$suffix: float64 = actual$suffix - expected$suffix;")
+            code.appendLine("    if (diff$suffix < 0.0) { diff$suffix = -diff$suffix; }")
+            code.appendLine("    var scale$suffix: float64 = expected$suffix;")
+            code.appendLine("    if (scale$suffix < 0.0) { scale$suffix = -scale$suffix; }")
+            code.appendLine("    if (scale$suffix < 1.0) { scale$suffix = 1.0; }")
+            code.appendLine("    if (diff$suffix > scale$suffix * 1.0e-12) { return $check; }")
+        }
+
+        // 非法输入：固定样例 + 在合法串中注入空格/字母，二者都必须被拒绝。
+        val invalidInts = linkedSetOf(
+            "", " ", " 1", "1 ", "+", "-", "1.0", "0x10", "1e3", "1f",
+            "2147483648", "-2147483649", "123456789012345678901234567890"
+        )
+        val invalidFloats = linkedSetOf(
+            "", " ", " 1", "1 ", "+", "-", "NaN", "Infinity", "-Infinity", "1f",
+            "0x10", "1.", ".", "1e", "1e+", "1.2.3", "1e309"
+        )
+        repeat(10) {
+            val base = validInts.elementAt(random.nextInt(validInts.size))
+            val position = random.nextInt(base.length + 1)
+            val injected = if (random.nextBoolean()) " " else "x"
+            invalidInts.add(base.substring(0, position) + injected + base.substring(position))
+        }
+        repeat(10) {
+            val base = validFloats.elementAt(random.nextInt(validFloats.size))
+            val position = random.nextInt(base.length + 1)
+            val injected = if (random.nextBoolean()) " " else "x"
+            invalidFloats.add(base.substring(0, position) + injected + base.substring(position))
+        }
+
+        fun emitRejection(parser: String, text: String) {
+            check += 1
+            val suffix = check.toString()
+            code.appendLine("    var threw$suffix: bool = false;")
+            code.appendLine("    try { $parser(${jasperStringLiteral(text)}); } catch (e: NumberFormatError) { threw$suffix = true; }")
+            code.appendLine("    if (!threw$suffix) { return $check; }")
+        }
+        for (text in invalidInts) emitRejection("parseInt", text)
+        for (text in invalidFloats) emitRejection("parseFloat", text)
+
+        code.appendLine("    return 0;")
+        code.appendLine("}")
+
+        val (value, _) = runMain("numeric-parser-property", code.toString())
+        assertEquals(
+            0,
+            value,
+            "Generated corpus mismatch at case $value (0 means every case matched the reference)"
+        )
+    }
 }

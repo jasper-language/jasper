@@ -94,6 +94,8 @@ object StdLib {
         "StringBuilder.jas",
         "Error.jas",
         "RecoverableError.jas",
+        "NumberFormatError.jas",
+        "Numbers.jas",
         "FatalError.jas"
     )
 
