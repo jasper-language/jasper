@@ -89,23 +89,33 @@ public class CleanupBudget {
     }
 
     /**
-     * 做什么：派生子预算；局部上限只能收紧当前剩余额度。
+     * 做什么：派生子预算；局部上限只能收紧父区间**当前剩余**额度。
      * 什么时候用：进入嵌套清理区间时。
      * 前置条件：localLimitNanos 非负。
      * 失败模式：负数上限抛 CleanupBudgetError；已过期的父预算会产生已过期子预算。
-     * 为什么用「当前时刻 + 局部上限」再与父截止点取最小：嵌套不重置父时钟，
-     *   同时允许局部配置相对当前剩余时间表达自己的上限。
+     * 为什么先算父剩余再取 min：父截止点是嵌套的硬上限。若父区间已过期，父剩余夹到
+     *   0，子截止点仍回落到父截止点，因此时钟刚跨过父截止点时也不会把预算往后延。
+     *   子预算复用父 startedAtNanos，嵌套不重置计时。
      */
     public function nested(localLimitNanos: int64): CleanupBudget {
         if (java.lang.Long.compare(localLimitNanos, 0) < 0) {
             throw new CleanupBudgetError("nested cleanup budget must be non-negative");
         }
         var now: int64 = java.lang.System.nanoTime();
-        var localDeadline: int64 = now + localLimitNanos;
         // 先把字段读进局部变量：平台静态重载按实参描述符选择，`this.field` 在
         // 检查器里未必保留 int64 描述符，落局部可确保 min(long,long) 被正确选中。
         var parentDeadline: int64 = this.deadlineAtNanos;
-        var tightened: int64 = java.lang.Math.min(parentDeadline, localDeadline);
+        var parentRemaining: int64 = parentDeadline - now;
+        if (java.lang.Long.compare(parentRemaining, 0) < 0) {
+            parentRemaining = 0;
+        }
+        // 有效局部额度 = min(局部显式上限, 父区间当前剩余)；随后再与父截止点取 min，
+        // 防止 now 已越过父截止点时出现「子截止点晚于父截止点」。
+        var effective: int64 = java.lang.Math.min(localLimitNanos, parentRemaining);
+        var tightened: int64 = now + effective;
+        if (java.lang.Long.compare(tightened, parentDeadline) > 0) {
+            tightened = parentDeadline;
+        }
         return new CleanupBudget(this.startedAtNanos, tightened);
     }
 
@@ -148,8 +158,13 @@ public class CleanupBudget {
         return this.deadlineAtNanos;
     }
 
-    /** 做什么：返回默认全局清理上限（5 秒）。前置条件：无；失败模式：不会失败。 */
+    /**
+     * 做什么：返回默认全局清理上限（5 秒）。
+     * 前置条件：无；失败模式：不会失败。
+     * 为什么字面量必须带 L：Jasper 的裸整数字面量默认 int32，5000000000 会先按
+     *   int32 截断成 705032704 再拓宽回 int64；带 L 才表示真正的 5 秒。
+     */
     public static function defaultGlobalNanos(): int64 {
-        return 5000000000;
+        return 5000000000L;
     }
 }
