@@ -96,7 +96,17 @@ object StdLib {
         "RecoverableError.jas",
         "NumberFormatError.jas",
         "Numbers.jas",
-        "FatalError.jas"
+        "FatalError.jas",
+        // S4-B(J)：Jasper 自举协程运行时骨架。Future 文件同时定义 Failure 快照与
+        // Future 状态机，因此必须排在 TaskGroup 之前；执行器接口先于 JVM 适配器。
+        "Runnable.jas",
+        "Executor.jas",
+        "Future.jas",
+        "CancellationToken.jas",
+        "TaskGroup.jas",
+        "Context.jas",
+        "CleanupBudget.jas",
+        "JvmExecutor.jas"
     )
 
     /**

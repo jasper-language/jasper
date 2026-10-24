@@ -1,0 +1,183 @@
+package std;
+
+// ============================================================================
+// CancellationToken.jas —— 只触发一次的协作式取消令牌
+// ============================================================================
+// 职责：
+//   保存一个布尔取消状态和一组取消回调；取消是请求，不是线程终止。重复 cancel()
+//   幂等；onCancel 与 cancel 的竞争由同一把互斥锁线性化，注册时若已取消则立即回调。
+//
+// 父子关系：
+//   createChild() 建立根令牌到子令牌的单向链接：父取消传播到子，子取消不反传。
+//   子令牌自己仍可独立取消；父令牌不知道子的存在。
+//
+// 设计边界（变化点）：
+//   「取消如何被观察」集中在 isCancelled/onCancel；Future、TaskGroup 和未来的阻塞
+//   I/O 端口都只依赖这两个查询，不直接持有内部列表。
+//
+// 为什么用 Action<CancellationToken>：
+//   纯 Jasper 单方法接口可以接受 lambda，避免为了回调再引入继承平台 Runnable 的
+//   额外适配类；回调收到令牌本身，便于诊断是谁触发的取消。
+// ============================================================================
+
+/**
+ * 取消通道使用的结构化异常。
+ *
+ * 做什么：让「任务主动观察取消」与「业务失败」走不同 catch 分支。
+ * 什么时候用：任务体调用 throwIfCancelled，或在协作检查点决定终止时。
+ * 前置条件：令牌已取消。
+ * 失败模式：不会失败。
+ * 为什么独立类型：TaskGroup 的聚合必须把取消原因与业务 primary 分开。
+ */
+public class CancellationException extends Error {
+    /** 做什么：构造取消异常。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * 协作式取消令牌。
+ *
+ * 做什么：记录是否已请求取消，并在首次取消时同步触发全部已注册回调。
+ * 什么时候用：TaskGroup 为每个子任务派生一个令牌；任务体在安全点查询它。
+ * 前置条件：无。
+ * 失败模式：回调异常会向 cancel()/onCancel() 的调用者传播；取消状态已经置位，
+ *   不会因回调失败而回滚。
+ * 为什么只触发一次：取消原因是稳定的；重复触发会让清理逻辑执行多次。
+ */
+public class CancellationToken {
+    private var mutex: java.util.concurrent.Semaphore;
+    private var cancelled: bool;
+    private var handlers: MutableList<Action<CancellationToken>>;
+
+    /**
+     * 做什么：创建一个未取消的根令牌。
+     * 什么时候用：TaskGroup 构造时建立根令牌，再由 createChild 派生子令牌。
+     * 前置条件：无。
+     * 失败模式：信号量分配失败时以平台异常出现。
+     * 为什么在构造器创建原语：避免懒初始化竞争。
+     */
+    public constructor() {
+        this.mutex = new java.util.concurrent.Semaphore(1);
+        this.cancelled = false;
+        this.handlers = new MutableList<Action<CancellationToken>>();
+    }
+
+    /**
+     * 做什么：查询是否已请求取消。
+     * 什么时候用：任务体循环中的协作检查点。
+     * 前置条件：无。
+     * 失败模式：不会失败；返回的是稳定布尔值。
+     */
+    public function isCancelled(): bool {
+        this.mutex.acquireUninterruptibly();
+        var result: bool = this.cancelled;
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：请求取消并触发全部回调；只有第一次返回 true。
+     * 什么时候用：TaskGroup 首个失败取消兄弟、父令牌取消传播、或调用方主动取消。
+     * 前置条件：无。
+     * 失败模式：回调异常向调用者传播；重复调用返回 false 且不再触发回调。
+     * 为什么先置位再回调：保证回调里调用 isCancelled() 一定能观察到已取消，
+     *   也保证注册与取消的竞争有确定结果。
+     */
+    public function cancel(): bool {
+        this.mutex.acquireUninterruptibly();
+        if (this.cancelled) {
+            this.mutex.release();
+            return false;
+        }
+        this.cancelled = true;
+        var pending: MutableList<Action<CancellationToken>> = new MutableList<Action<CancellationToken>>();
+        for (handler in this.handlers) {
+            pending.add(handler);
+        }
+        this.handlers = new MutableList<Action<CancellationToken>>();
+        this.mutex.release();
+        for (handler in pending) {
+            handler.accept(this);
+        }
+        return true;
+    }
+
+    /**
+     * 做什么：注册取消回调；若注册时已经取消，立即回调一次。
+     * 什么时候用：任务体需要在取消时释放资源或唤醒可取消等待时。
+     * 前置条件：handler 非 null。
+     * 失败模式：立即回调时 handler 异常会向本方法传播；取消状态不会回滚。
+     * 为什么注册与检查同锁：消除「看到未取消、注册前父令牌刚好取消」的丢失通知窗口。
+     */
+    public function onCancel(handler: Action<CancellationToken>): void {
+        this.mutex.acquireUninterruptibly();
+        var invokeNow: bool = false;
+        if (this.cancelled) {
+            invokeNow = true;
+        } else {
+            this.handlers.add(handler);
+        }
+        this.mutex.release();
+        if (invokeNow) {
+            handler.accept(this);
+        }
+    }
+
+    /**
+     * 做什么：派生子令牌，并建立父到子的单向取消传播。
+     * 什么时候用：TaskGroup 为每个子任务创建独立令牌时。
+     * 前置条件：无。
+     * 失败模式：若父已取消，子会立即取消并返回；否则注册传播回调，注册本身不会失败。
+     * 为什么单向：子取消不应把父作用域整体取消，否则普通失败会变成全局停机。
+     */
+    public function createChild(): CancellationToken {
+        var child: CancellationToken = new CancellationToken();
+        // onCancel 自带「已取消立即回调」语义，因此这里不需要在父锁内做双重检查；
+        // 竞争窗口由 onCancel 的同一把锁消除。
+        this.onCancel(new ChildCancellation(child));
+        return child;
+    }
+
+    /**
+     * 做什么：在协作检查点观察取消并抛出 CancellationException。
+     * 什么时候用：任务体准备继续业务计算前。
+     * 前置条件：无。
+     * 失败模式：已取消时抛 CancellationException；未取消时直接返回。
+     * 为什么单独提供：让业务代码用统一 catch 通道处理取消，而不是散落 if 判断。
+     */
+    public function throwIfCancelled(): void {
+        if (this.isCancelled()) {
+            throw new CancellationException("operation cancelled");
+        }
+    }
+}
+
+/**
+ * 父令牌到子令牌的传播动作。
+ *
+ * 做什么：作为 Action<CancellationToken> 注册到父令牌，在父取消时取消子令牌。
+ * 什么时候用：CancellationToken.createChild 内部使用。
+ * 前置条件：child 非 null。
+ * 失败模式：不会失败；child.cancel 幂等。
+ * 为什么用具体类：回调只需要一个动作，具体类比在令牌里内嵌匿名逻辑更易审计。
+ */
+public class ChildCancellation implements Action<CancellationToken> {
+    private var child: CancellationToken;
+
+    /** 做什么：绑定要传播的子令牌。前置条件：child 非 null；失败模式：不会失败。 */
+    public constructor(child: CancellationToken) {
+        this.child = child;
+    }
+
+    /**
+     * 做什么：父令牌取消时取消子令牌。
+     * 什么时候用：由父令牌 cancel 触发。
+     * 前置条件：child 已构造。
+     * 失败模式：不会失败；子令牌已取消时 cancel 返回 false。
+     */
+    public function accept(parent: CancellationToken): void {
+        this.child.cancel();
+    }
+}

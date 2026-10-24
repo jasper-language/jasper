@@ -56,6 +56,7 @@ import org.jetbrains.kotlin.ir.declarations.IrFile
 import org.jetbrains.kotlin.ir.symbols.IrConstructorSymbol
 import org.jetbrains.kotlin.ir.symbols.IrFieldSymbol
 import org.jetbrains.kotlin.ir.symbols.IrSimpleFunctionSymbol
+import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -282,6 +283,12 @@ class JasperCompiler {
             val mergedInterfaces = mutableMapOf<String, List<String>>()
             val mergedIfaceDeclNames = mutableSetOf<String>()
             val mergedStaticFields = mutableSetOf<IrFieldSymbol>()
+            val mergedStaticFunctions = mutableSetOf<IrSimpleFunctionSymbol>()
+            val mergedSyntheticStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
+            // 函数/形参描述符与静态函数符号必须一起合并：translateAll 产出的符号身份
+            // 跨文件共享，任一集合漏并都会让后端把 `A.f()` 的声明或调用降级成实例形态。
+            val mergedFunctionDescriptors = mutableMapOf<IrSimpleFunctionSymbol, String>()
+            val mergedParameterDescriptors = mutableMapOf<IrValueSymbol, String>()
             val mergedMemberSignatures = mutableMapOf<String, Map<String, MemberMethodSignature>>()
             val mergedMemberCallKeys = mutableMapOf<IrSimpleFunctionSymbol, String>()
             val mergedPlatformStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
@@ -298,6 +305,10 @@ class JasperCompiler {
                 // 集合类索引用 addAll（去重并集，不涉及覆盖语义）。
                 mergedIfaceDeclNames.addAll(tr.interfaceDeclNames)
                 mergedStaticFields.addAll(tr.staticFieldSymbols)
+                mergedStaticFunctions.addAll(tr.staticFunctionSymbols)
+                mergedFunctionDescriptors.putAll(tr.functionDescriptors)
+                mergedParameterDescriptors.putAll(tr.parameterDescriptors)
+                mergedSyntheticStaticCallOwners.putAll(tr.syntheticStaticCallOwners)
                 mergedMemberSignatures.putAll(tr.memberSignaturesByType)
                 mergedMemberCallKeys.putAll(tr.memberCallKeys)
                 mergedPlatformStaticCallOwners.putAll(tr.platformStaticCallOwners)
@@ -313,6 +324,10 @@ class JasperCompiler {
                 classInterfaceNames = mergedInterfaces,
                 interfaceDeclNames = mergedIfaceDeclNames,
                 staticFieldSymbols = mergedStaticFields,
+                staticFunctionSymbols = mergedStaticFunctions,
+                syntheticStaticCallOwners = mergedSyntheticStaticCallOwners,
+                functionDescriptors = mergedFunctionDescriptors,
+                parameterDescriptors = mergedParameterDescriptors,
                 memberSignaturesByType = mergedMemberSignatures,
                 memberCallKeys = mergedMemberCallKeys,
                 platformStaticCallOwners = mergedPlatformStaticCallOwners
@@ -482,6 +497,8 @@ class JasperCompiler {
                 classInterfaceNames = translated.classInterfaceNames,
                 interfaceDeclNames = translated.interfaceDeclNames,
                 staticFieldSymbols = translated.staticFieldSymbols,
+                staticFunctionSymbols = translated.staticFunctionSymbols,
+                syntheticStaticCallOwners = translated.syntheticStaticCallOwners,
                 memberSignaturesByType = translated.memberSignaturesByType,
                 memberCallKeys = translated.memberCallKeys,
                 platformStaticCallOwners = translated.platformStaticCallOwners

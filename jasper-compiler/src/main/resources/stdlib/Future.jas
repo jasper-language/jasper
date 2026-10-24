@@ -1,0 +1,476 @@
+package std;
+
+// ============================================================================
+// Future.jas —— Jasper 侧的异步结果状态机
+// ============================================================================
+// 职责：
+//   实现 Future<T> 的 Pending / Completed(value) / Failed(failure) / Cancelled
+//   四态状态机，并提供完成回调、阻塞取值和取消。状态迁移全部在本文件用 Jasper
+//   编写；平台只提供互斥信号量与唤醒信号（JDK 原语，不包含任何业务状态机）。
+//
+// 关键不变量：
+//   1) 终态恰好发布一次：complete/fail/cancel 只有第一个成功，其余返回 false；
+//   2) 回调永不在持有互斥锁时执行，避免用户在回调里再次调用本 Future 造成死锁；
+//   3) get() 先注册等待者再检查终态，终态发布时按等待者数量精确唤醒，不丢通知；
+//   4) 失败以 Failure（业务数据）保存，不保存 Error 对象——语言裁决「错误不是值」。
+//
+// 变化点隔离：
+//   - 状态迁移集中在 finish()，以后新增终态或调整回调顺序只改这一处；
+//   - 平台唤醒只用 Semaphore，未来 Jasper OS 适配器可替换为事件源而不改上层 API。
+//
+// 已知边界：
+//   - 本文件不实现挂起点变换（await 语法属于 S4-C）；get() 是阻塞等待，供测试与
+//     平台边界使用，协程调度器应通过 onComplete 注册继续执行；
+//   - 回调抛出的异常会向发布者传播；运行时内部回调不抛异常，用户回调需自行负责。
+// ============================================================================
+
+/**
+ * Future 的四种稳定状态。
+ *
+ * 做什么：给上层提供可比较的状态值，避免用魔法整数。
+ * 什么时候用：诊断、测试与 TaskGroup 聚合时读取。
+ * 失败模式：纯枚举，无失败路径。
+ * 为什么单独定义：状态集合是 Future 与 TaskGroup 的共享词汇，放在同一文件避免
+ *   让调用方依赖内部字段。
+ */
+public enum FutureStatus {
+    Pending,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/**
+ * 一次失败的不可变业务快照。
+ *
+ * 做什么：把异常的可观察信息（消息、分类）保存为普通值，使 Future 能在不违反
+ *   「错误不是值」裁决的前提下记录失败。
+ * 什么时候用：Future.fail、TaskGroup 聚合与 FutureOutcome 读取。
+ * 前置条件：message 非 null；kind 用于区分业务异常与平台异常。
+ * 失败模式：构造本身不会失败；空消息由调用方负责给出可读默认值。
+ * 为什么不用 Error：语言禁止 Error 出现在字段、参数和返回类型中；Failure 是
+ *   专门用于「失败已经是正常数据」这一边界的快照类型。
+ */
+public class Failure {
+    private var messageText: string;
+    private var kindText: string;
+
+    /**
+     * 做什么：构造一个失败快照。
+     * 什么时候用：TaskRunner 捕获异常后、或用户主动让 Future 失败时。
+     * 前置条件：messageText 与 kindText 非 null。
+     * 失败模式：不会失败。
+     * 为什么这样设计：不可变字段让快照可以安全跨线程、跨作用域读取。
+     */
+    public constructor(messageText: string, kindText: string) {
+        this.messageText = messageText;
+        this.kindText = kindText;
+    }
+
+    /** 做什么：返回人类可读的失败消息。前置条件：无；失败模式：不会失败。 */
+    public function message(): string {
+        return this.messageText;
+    }
+
+    /** 做什么：返回失败分类（如 error / platform / schedule）。前置条件：无；失败模式：不会失败。 */
+    public function kind(): string {
+        return this.kindText;
+    }
+}
+
+/**
+ * Future 完成时交给回调的不可变结果视图。
+ *
+ * 做什么：用一次快照统一表达成功值、失败快照与取消，避免回调在锁外重新读取状态。
+ * 什么时候用：onComplete 注册的 Action 接收它。
+ * 前置条件：由 Future 在终态发布时构造；用户不应自行伪造。
+ * 失败模式：访问与当前状态不匹配的字段会返回 null 或空值，调用方应先看 status()。
+ * 为什么值字段是 any：当前泛型类若含 T 类型字段会触发后端已知缺陷；对外仍由
+ *   Future<T>.get() 提供类型化读取，快照只在回调边界弱化一次。
+ */
+public class FutureOutcome {
+    private var statusValue: FutureStatus;
+    private var valueValue: any;
+    private var failureValue: Failure?;
+
+    /**
+     * 做什么：构造一次终态快照。
+     * 什么时候用：仅供 Future 内部发布终态时调用。
+     * 前置条件：statusValue 不是 Pending；Completed 带 value，Failed 带 failure。
+     * 失败模式：不会失败。
+     * 为什么这样设计：不可变视图让回调看到的永远是发布瞬间的结果。
+     */
+    public constructor(statusValue: FutureStatus, valueValue: any, failureValue: Failure?) {
+        this.statusValue = statusValue;
+        this.valueValue = valueValue;
+        this.failureValue = failureValue;
+    }
+
+    /** 做什么：返回终态类别。前置条件：无；失败模式：不会失败。 */
+    public function status(): FutureStatus {
+        return this.statusValue;
+    }
+
+    /** 做什么：判断是否成功完成。前置条件：无；失败模式：不会失败。 */
+    public function isSuccess(): bool {
+        return this.statusValue == FutureStatus.Completed;
+    }
+
+    /** 做什么：判断是否已取消。前置条件：无；失败模式：不会失败。 */
+    public function isCancelled(): bool {
+        return this.statusValue == FutureStatus.Cancelled;
+    }
+
+    /** 做什么：判断是否业务失败。前置条件：无；失败模式：不会失败。 */
+    public function isFailed(): bool {
+        return this.statusValue == FutureStatus.Failed;
+    }
+
+    /** 做什么：返回成功值（弱类型）。前置条件：仅 Completed 有意义；失败模式：其他状态为 null。 */
+    public function value(): any {
+        return this.valueValue;
+    }
+
+    /** 做什么：返回失败快照。前置条件：仅 Failed 非空；失败模式：其他状态返回 null。 */
+    public function failure(): Failure? {
+        return this.failureValue;
+    }
+}
+
+/**
+ * Future 失败时 get() 抛出的结构化错误。
+ *
+ * 做什么：把 Failure 快照转换成可被 try/catch 识别的 Jasper 错误载体。
+ * 什么时候用：调用 get() 且状态为 Failed 时。
+ * 前置条件：message 来自 Failure。
+ * 失败模式：不会失败；取消使用独立的 FutureCancelledError。
+ * 为什么独立类型：让调用方可以只捕获业务失败而不误捕取消，符合 S4 对取消通道的裁决。
+ */
+public class FutureFailureError extends Error {
+    /** 做什么：构造失败错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * Future 被取消时 get() 抛出的结构化错误。
+ *
+ * 做什么：把取消与业务失败分开报告。
+ * 什么时候用：get() 观察到 Cancelled 状态时。
+ * 前置条件：Future 已进入 Cancelled 终态。
+ * 失败模式：不会失败。
+ * 为什么独立类型：取消不是业务异常，也不应被 TaskGroup 当作 primary 业务失败聚合。
+ */
+public class FutureCancelledError extends Error {
+    /** 做什么：构造取消错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * 异步结果句柄。
+ *
+ * 做什么：保存一次异步计算的终态，提供阻塞取值、完成回调、取消与完成确认。
+ * 什么时候用：TaskGroup.spawn 的返回值；平台边界需要等待结果时。
+ * 前置条件：构造后由生产者调用 complete/fail/cancel 之一发布终态；重复发布被拒绝。
+ * 失败模式：get() 在 Failed 时抛 FutureFailureError，在 Cancelled 时抛
+ *   FutureCancelledError；不会返回伪造的成功值。
+ * 为什么这样设计：状态机与唤醒协议全部用 Jasper 实现，Kotlin 侧只做测试与 JVM
+ *   执行器适配；阻塞等待仅作为平台边界能力，不冒充协程挂起。
+ */
+public class Future<T> {
+    // 互斥信号量保护四个状态字段与两个等待者计数；Semaphore 只是平台原语，
+    // 所有「谁先进入终态」的判断仍在本类中完成。
+    private var mutex: java.util.concurrent.Semaphore;
+    // 终态唤醒信号：按 get() 等待者数量释放许可，保证不丢通知、不无限累积。
+    private var terminalSignal: java.util.concurrent.Semaphore;
+    // 任务体真正结束的独立信号：取消可以先发布终态，但 TaskGroup.close 必须等
+    // 执行体退出，不能把「Future 已取消」误当成「线程已回收」。
+    private var settledSignal: java.util.concurrent.Semaphore;
+    private var statusValue: FutureStatus;
+    private var valueValue: any;
+    private var failureValue: Failure?;
+    private var acknowledged: bool;
+    private var handlers: MutableList<Action<FutureOutcome>>;
+    private var waiters: int32;
+    private var settleWaiters: int32;
+    private var settled: bool;
+
+    /**
+     * 做什么：创建一个 Pending 状态的 Future。
+     * 什么时候用：TaskGroup.spawn 或平台边界需要手动发布结果时。
+     * 前置条件：无。
+     * 失败模式：底层信号量分配失败时以平台异常形式出现。
+     * 为什么在构造器里建全部原语：避免第一次使用时的懒初始化竞争。
+     */
+    public constructor() {
+        this.mutex = new java.util.concurrent.Semaphore(1);
+        this.terminalSignal = new java.util.concurrent.Semaphore(0);
+        this.settledSignal = new java.util.concurrent.Semaphore(0);
+        this.statusValue = FutureStatus.Pending;
+        this.valueValue = 0;
+        this.failureValue = null;
+        this.acknowledged = false;
+        this.handlers = new MutableList<Action<FutureOutcome>>();
+        this.waiters = 0;
+        this.settleWaiters = 0;
+        this.settled = false;
+    }
+
+    /**
+     * 做什么：注册终态回调；若注册时已经终态，则立即用快照回调一次。
+     * 什么时候用：调用方不想阻塞、希望在结果就绪时继续工作时。
+     * 前置条件：handler 非 null；同一个 handler 可以被注册多次，每次各触发一次。
+     * 失败模式：handler.accept 抛出的异常会向本方法的调用者传播；状态机已先发布
+     *   终态，不会因回调异常回滚。
+     * 为什么不在锁内回调：避免回调重入 Future 造成自死锁，也避免用户代码拖长临界区。
+     */
+    public function onComplete(handler: Action<FutureOutcome>): void {
+        this.mutex.acquireUninterruptibly();
+        var invokeNow: bool = false;
+        if (this.statusValue == FutureStatus.Pending) {
+            this.handlers.add(handler);
+        } else {
+            invokeNow = true;
+        }
+        this.mutex.release();
+        if (invokeNow) {
+            handler.accept(this.outcome());
+        }
+    }
+
+    /**
+     * 做什么：阻塞等待终态并返回成功值。
+     * 什么时候用：测试或平台阻塞边界；协程内部应使用 onComplete，避免占用工作线程。
+     * 前置条件：调用方接受阻塞等待，且最终会有生产者发布终态。
+     * 失败模式：Failed 抛 FutureFailureError；Cancelled 抛 FutureCancelledError。
+     * 为什么用等待者计数：终态只在发布瞬间释放与当时等待者数量相等的许可，既不会
+     *   丢唤醒，也不会让后续重复 get 消耗已完成的许可。
+     */
+    public function get(): T {
+        this.awaitTerminal();
+        this.mutex.acquireUninterruptibly();
+        var observedStatus: FutureStatus = this.statusValue;
+        var observedValue: any = this.valueValue;
+        var observedFailure: Failure? = this.failureValue;
+        this.mutex.release();
+        if (observedStatus == FutureStatus.Completed) {
+            return cast observedValue as T;
+        }
+        if (observedStatus == FutureStatus.Failed) {
+            if (observedFailure == null) {
+                throw new FutureFailureError("future failed without a failure snapshot");
+            }
+            throw new FutureFailureError(observedFailure.message());
+        }
+        throw new FutureCancelledError("future was cancelled");
+    }
+
+    /**
+     * 做什么：判断是否已经进入任一终态。
+     * 什么时候用：轮询诊断或决定是否还需要注册回调。
+     * 前置条件：无。
+     * 失败模式：不会失败。
+     * 为什么加锁：状态字段由多个线程写入，必须通过同一互斥原语读取。
+     */
+    public function isDone(): bool {
+        this.mutex.acquireUninterruptibly();
+        var done: bool = this.statusValue != FutureStatus.Pending;
+        this.mutex.release();
+        return done;
+    }
+
+    /** 做什么：返回当前状态。前置条件：无；失败模式：不会失败。 */
+    public function status(): FutureStatus {
+        this.mutex.acquireUninterruptibly();
+        var current: FutureStatus = this.statusValue;
+        this.mutex.release();
+        return current;
+    }
+
+    /**
+     * 做什么：尝试发布成功终态。
+     * 什么时候用：生产者在计算成功后调用。
+     * 前置条件：值类型与 T 兼容。
+     * 失败模式：Future 已终态时返回 false，不覆盖已有结果；这是双重完成的固定拒绝方式。
+     */
+    public function complete(value: T): bool {
+        return this.finish(FutureStatus.Completed, value, null);
+    }
+
+    /**
+     * 做什么：尝试发布失败终态。
+     * 什么时候用：生产者捕获业务异常或平台异常后调用。
+     * 前置条件：failure 非 null。
+     * 失败模式：Future 已终态时返回 false；不会把取消改写成失败。
+     */
+    public function fail(failure: Failure): bool {
+        // failure 作为业务数据参数传入；这里显式判空以拒绝不合法的发布请求。
+        if (failure == null) {
+            return false;
+        }
+        return this.finish(FutureStatus.Failed, 0, failure);
+    }
+
+    /**
+     * 做什么：尝试请求取消。
+     * 什么时候用：调用方不再需要结果时；运行中的任务需通过 CancellationToken 协作退出。
+     * 前置条件：无。
+     * 失败模式：已终态返回 false；取消不会强制终止线程，也不会撤销已经发布的完成结果。
+     */
+    public function cancel(): bool {
+        return this.finish(FutureStatus.Cancelled, 0, null);
+    }
+
+    /**
+     * 做什么：确认这个 Future 的业务失败已经由调用方处理。
+     * 什么时候用：监督作用域按 B 策略排除「已确认失败」时；必须针对该 Future 的
+     *   已完成失败执行。
+     * 前置条件：无；只有 Failed 且尚未确认时返回 true。
+     * 失败模式：重复确认、成功或取消状态返回 false；读取异常本身不算确认。
+     * 为什么独立于 get：单纯捕获异常或读取 isDone 不代表调用方处理了失败。
+     */
+    public function acknowledgeFailure(): bool {
+        this.mutex.acquireUninterruptibly();
+        var accepted: bool = false;
+        if (this.statusValue == FutureStatus.Failed && !this.acknowledged) {
+            this.acknowledged = true;
+            accepted = true;
+        }
+        this.mutex.release();
+        return accepted;
+    }
+
+    /** 做什么：判断失败是否已被确认。前置条件：无；失败模式：不会失败。 */
+    public function isFailureAcknowledged(): bool {
+        this.mutex.acquireUninterruptibly();
+        var result: bool = this.acknowledged;
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：返回失败快照；非 Failed 状态返回 null。
+     * 什么时候用：TaskGroup 在全部子任务终止后聚合失败。
+     * 前置条件：无。
+     * 失败模式：不会失败；成功和取消都返回 null。
+     */
+    public function failureOrNull(): Failure? {
+        this.mutex.acquireUninterruptibly();
+        var result: Failure? = null;
+        if (this.statusValue == FutureStatus.Failed) {
+            result = this.failureValue;
+        }
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：标记任务体已经退出（无论 Future 之前是否被取消）。
+     * 什么时候用：TaskRunner 的 finally 中调用，供 TaskGroup.close 精确 join。
+     * 前置条件：每个任务体只应由其执行者调用；重复调用幂等。
+     * 失败模式：不会失败；不会改变 Future 的终态。
+     * 为什么需要独立信号：取消是终态，但执行体可能还在清理资源，作用域关闭必须等它退出。
+     */
+    public function markTaskSettled(): void {
+        this.mutex.acquireUninterruptibly();
+        if (this.settled) {
+            this.mutex.release();
+            return;
+        }
+        this.settled = true;
+        var count: int32 = this.settleWaiters;
+        this.settleWaiters = 0;
+        this.mutex.release();
+        if (count > 0) {
+            this.settledSignal.release(count);
+        }
+    }
+
+    /**
+     * 做什么：等待任务体真正退出。
+     * 什么时候用：TaskGroup.close 等待全部子任务回收时。
+     * 前置条件：生产者最终调用 markTaskSettled；否则调用会一直阻塞。
+     * 失败模式：不会抛异常；调用方必须接受「无法强制中断外部阻塞」的边界。
+     */
+    public function awaitTaskSettled(): void {
+        this.mutex.acquireUninterruptibly();
+        if (this.settled) {
+            this.mutex.release();
+            return;
+        }
+        this.settleWaiters = this.settleWaiters + 1;
+        this.mutex.release();
+        this.settledSignal.acquireUninterruptibly();
+    }
+
+    /**
+     * 做什么：把 Future 推入指定终态，并唤醒等待者、复制并执行回调。
+     * 什么时候用：complete/fail/cancel 的唯一实现路径。
+     * 前置条件：nextStatus 不是 Pending。
+     * 失败模式：已有终态时返回 false，不产生任何副作用。
+     * 为什么把迁移集中到一处：终态互斥、恰好一次发布、通知顺序都是同一变化点；
+     *   分散实现会让双重完成或漏唤醒在某条路径上复发。
+     */
+    private function finish(nextStatus: FutureStatus, nextValue: any, nextFailure: Failure?): bool {
+        this.mutex.acquireUninterruptibly();
+        if (this.statusValue != FutureStatus.Pending) {
+            this.mutex.release();
+            return false;
+        }
+        this.statusValue = nextStatus;
+        this.valueValue = nextValue;
+        this.failureValue = nextFailure;
+        var pendingHandlers: MutableList<Action<FutureOutcome>> = new MutableList<Action<FutureOutcome>>();
+        for (handler in this.handlers) {
+            pendingHandlers.add(handler);
+        }
+        this.handlers = new MutableList<Action<FutureOutcome>>();
+        var waiterCount: int32 = this.waiters;
+        this.waiters = 0;
+        this.mutex.release();
+        if (waiterCount > 0) {
+            this.terminalSignal.release(waiterCount);
+        }
+        var snapshot: FutureOutcome = new FutureOutcome(nextStatus, nextValue, nextFailure);
+        // 回调在锁外按注册顺序执行；内部回调不抛异常，用户回调异常向发布者传播。
+        for (handler in pendingHandlers) {
+            handler.accept(snapshot);
+        }
+        return true;
+    }
+
+    /**
+     * 做什么：构造当前终态快照。
+     * 什么时候用：onComplete 在注册时已终态，需要立即回调。
+     * 前置条件：调用时状态不是 Pending（调用方已检查）。
+     * 失败模式：不会失败；读取过程中状态不会回退。
+     */
+    private function outcome(): FutureOutcome {
+        this.mutex.acquireUninterruptibly();
+        var snapshot: FutureOutcome = new FutureOutcome(this.statusValue, this.valueValue, this.failureValue);
+        this.mutex.release();
+        return snapshot;
+    }
+
+    /**
+     * 做什么：等待终态发布；已终态立即返回。
+     * 什么时候用：get() 与需要阻塞等待终态的内部逻辑。
+     * 前置条件：无。
+     * 失败模式：不会抛异常；无生产者时永久阻塞，由调用方负责超时/取消策略。
+     * 为什么先注册后检查：与 finish() 使用同一把互斥锁，消除「检查完 Pending、
+     *   发布者已经唤醒完、才进入等待」的丢失通知窗口。
+     */
+    private function awaitTerminal(): void {
+        this.mutex.acquireUninterruptibly();
+        if (this.statusValue != FutureStatus.Pending) {
+            this.mutex.release();
+            return;
+        }
+        this.waiters = this.waiters + 1;
+        this.mutex.release();
+        this.terminalSignal.acquireUninterruptibly();
+    }
+}

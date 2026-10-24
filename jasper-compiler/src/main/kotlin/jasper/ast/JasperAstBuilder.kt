@@ -1585,37 +1585,55 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     // 鈹€鈹€ Literals 鈹€鈹€
 
     /**
-     * literal 的 Decimal 标签：去掉下划线后转 Long，产出 JasIntLiteral（原始文本保留）。
+     * literal 的 Decimal 标签：去掉下划线与整数后缀 L/l 后转 Long，产出 JasIntLiteral（原始文本保留）。
      *
-     * 边界：溢出/非法时数值回退为 0。
+     * 边界：词法规则把类型后缀计入 token 文本，若不去后缀 `1000L` 会被当成非法并回退为 0；
+     * 溢出/非法时数值仍回退为 0（与既有行为一致）。
      */
     override fun visitDecimalLiteral(ctx: JasperParser.DecimalLiteralContext): JasNode? {
-        return JasIntLiteral(ctx.text.replace("_", "").toLongOrNull() ?: 0L, ctx.text).at(ctx)
+        val cleaned = stripIntegerSuffix(ctx.text.replace("_", ""))
+        return JasIntLiteral(cleaned.toLongOrNull() ?: 0L, ctx.text).at(ctx)
     }
 
     /**
-     * literal 的 Hex 标签：剥离 0x/0X 与下划线后按 16 进制转 Long，产出 JasIntLiteral。
+     * literal 的 Hex 标签：剥离 0x/0X、下划线与整数后缀后按 16 进制转 Long，产出 JasIntLiteral。
      */
     override fun visitHexadecimalLiteral(ctx: JasperParser.HexadecimalLiteralContext): JasNode? {
-        val cleaned = ctx.text.replace("_", "").removePrefix("0x").removePrefix("0X")
+        val cleaned = stripIntegerSuffix(
+            ctx.text.replace("_", "").removePrefix("0x").removePrefix("0X"),
+        )
         return JasIntLiteral(cleaned.toLongOrNull(16) ?: 0L, ctx.text).at(ctx)
     }
 
     /**
-     * literal 的 Octal 标签：剥离 0o/0O 与下划线后按 8 进制转 Long，产出 JasIntLiteral。
+     * literal 的 Octal 标签：剥离 0o/0O、下划线与整数后缀后按 8 进制转 Long，产出 JasIntLiteral。
      */
     override fun visitOctalLiteral(ctx: JasperParser.OctalLiteralContext): JasNode? {
-        val cleaned = ctx.text.replace("_", "").removePrefix("0o").removePrefix("0O")
+        val cleaned = stripIntegerSuffix(
+            ctx.text.replace("_", "").removePrefix("0o").removePrefix("0O"),
+        )
         return JasIntLiteral(cleaned.toLongOrNull(8) ?: 0L, ctx.text).at(ctx)
     }
 
     /**
-     * literal 的 Binary 标签：剥离 0b/0B 与下划线后按 2 进制转 Long，产出 JasIntLiteral。
+     * literal 的 Binary 标签：剥离 0b/0B、下划线与整数后缀后按 2 进制转 Long，产出 JasIntLiteral。
      */
     override fun visitBinaryLiteral(ctx: JasperParser.BinaryLiteralContext): JasNode? {
-        val cleaned = ctx.text.replace("_", "").removePrefix("0b").removePrefix("0B")
+        val cleaned = stripIntegerSuffix(
+            ctx.text.replace("_", "").removePrefix("0b").removePrefix("0B"),
+        )
         return JasIntLiteral(cleaned.toLongOrNull(2) ?: 0L, ctx.text).at(ctx)
     }
+
+    /**
+     * 去掉整数 token 末尾的 L/l 类型后缀。
+     *
+     * 为什么需要：Jasper 词法规则 `INTEGER_TYPE_SUFFIX` 把后缀并入 token 文本，
+     * 而数值解析只接受纯数字，导致带后缀字面量被静默解析为 0。此处统一剥离，
+     * 保持 AST 原始文本（第二个参数）不变以便错误定位。
+     */
+    private fun stripIntegerSuffix(text: String): String =
+        if (text.isNotEmpty() && (text.last() == 'l' || text.last() == 'L')) text.dropLast(1) else text
 
     /**
      * literal 的 Float 标签：去除下划线后转 Double，产出 JasFloatLiteral。

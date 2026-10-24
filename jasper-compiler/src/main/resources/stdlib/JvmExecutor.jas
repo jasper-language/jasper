@@ -1,0 +1,102 @@
+package std;
+
+// ============================================================================
+// JvmExecutor.jas —— Executor 端口的 JVM Java 8 适配器
+// ============================================================================
+// 职责：
+//   唯一允许直接绑定 java.util.concurrent.Executors 的平台适配文件。它把 Jasper
+//   的 Runnable 桥接到 JDK ExecutorService，并把 shutdown/isTerminated 暴露成
+//   与平台无关的布尔查询。
+//
+// 为什么单独成文件：
+//   调度是整条运行时里唯一必须知道宿主线程池形状的变化点；Future/TaskGroup/Context
+//   全部只依赖 Executor 接口。未来 Jasper OS 适配器可以替换本文件，而不改状态机。
+//
+// Java 8 边界：
+//   只使用 Java 8 已有的 Executors.newFixedThreadPool / ExecutorService / shutdown /
+//   isTerminated / awaitTermination，不依赖虚拟线程或 StructuredTaskScope。
+//
+// 线程安全：
+//   字段 pool 在构造后不再改绑；ExecutorService 自身负责并发提交与关闭。本类不保存
+//   任何任务状态，也不实现 Future/TaskGroup 的状态迁移。
+// ============================================================================
+
+/**
+ * 基于 JVM 固定线程池的 Executor 实现。
+ *
+ * 做什么：把 Runnable 提交给 java.util.concurrent.ExecutorService。
+ * 什么时候用：JVM 第一版的测试与平台边界需要真实线程池时。
+ * 前置条件：线程数大于 0；调用方负责在结束时 shutdown。
+ * 失败模式：线程池拒绝任务时抛平台 RejectedExecutionException；TaskGroup 会把它
+ *   转换成 Future 失败。关闭后再 schedule 也会被底层拒绝。
+ * 为什么用固定线程池：数量可控、行为确定，符合 S4-B「有界资源 + 显式背压」的方向；
+ *   无界缓存线程池会掩盖配额问题。
+ */
+public class JvmExecutor implements Executor {
+    private var pool: java.util.concurrent.ExecutorService;
+
+    /**
+     * 做什么：创建指定线程数的固定线程池。
+     * 什么时候用：测试或单机 JVM 运行时启动时。
+     * 前置条件：threads > 0。
+     * 失败模式：非法线程数由 JDK 抛 IllegalArgumentException；资源不足时抛平台异常。
+     * 为什么不在构造器里自动 shutdown：生命周期由调用方拥有，适配器不替业务决定。
+     */
+    public constructor(threads: int32) {
+        this.pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+    }
+
+    /**
+     * 做什么：把 Jasper Runnable 交给 JDK 线程池。
+     * 什么时候用：TaskGroup.spawn 内部。
+     * 前置条件：task 非 null 且线程池尚未关闭。
+     * 失败模式：池关闭或饱和时抛平台异常；本方法不吞异常。
+     * 为什么先赋给 java.lang.Runnable 局部变量：显式把描述符落到平台接口，
+     *   避免调用点误用 Jasper 接口的擦除描述符。
+     */
+    public function schedule(task: Runnable): void {
+        var platformTask: java.lang.Runnable = task;
+        this.pool.execute(platformTask);
+    }
+
+    /**
+     * 做什么：请求线程池停止接收新任务。
+     * 什么时候用：调用方不再需要提交任务时。
+     * 前置条件：无。
+     * 失败模式：重复调用幂等；不会抛业务异常。
+     * 为什么用 shutdown 而不是 shutdownNow：取消语义由 CancellationToken 负责，
+     *   这里不应偷偷中断正在清理的任务。
+     */
+    public function shutdown(): void {
+        this.pool.shutdown();
+    }
+
+    /**
+     * 做什么：判断线程池是否已经终止。
+     * 什么时候用：测试收尾或调用方等待资源释放时。
+     * 前置条件：通常先调用 shutdown。
+     * 失败模式：不会失败。
+     * 为什么提供：TaskGroup.close 只等任务体退出，不等线程池销毁；线程池生命周期
+     *   属于 Executor 自己，需要可观察的查询。
+     */
+    public function isTerminated(): bool {
+        return this.pool.isTerminated();
+    }
+
+    /**
+     * 做什么：最多等待 millis 毫秒让线程池终止。
+     * 什么时候用：测试收尾，避免线程泄漏影响后续用例。
+     * 前置条件：已经调用 shutdown；millis 非负。
+     * 失败模式：超时返回 false；中断时返回 false（本适配器不把中断转成业务错误）。
+     * 为什么不用 TimeUnit 静态字段：当前平台调用只支持静态方法，不支持静态字段访问；
+     *   用 valueOf("MILLISECONDS") 得到同一个枚举值，保持 Java 8 兼容。
+     */
+    public function awaitTermination(millis: int64): bool {
+        var unit: java.util.concurrent.TimeUnit = java.util.concurrent.TimeUnit.valueOf("MILLISECONDS");
+        try {
+            return this.pool.awaitTermination(millis, unit);
+        } catch (interrupted: java.lang.InterruptedException) {
+            return false;
+        }
+    }
+}
