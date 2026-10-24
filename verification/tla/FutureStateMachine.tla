@@ -14,7 +14,6 @@
 \*   - acknowledged 只对 Failed 有意义，对应 Future.acknowledgeFailure()。
 \*
 \* 状态数由 TLC 在 FutureStateMachine.cfg 下穷举得到，见交付报告。
-------------------------------------------------------------------------------
 
 EXTENDS Naturals, TLC
 
