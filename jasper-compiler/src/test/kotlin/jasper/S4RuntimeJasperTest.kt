@@ -764,6 +764,78 @@ class S4RuntimeJasperTest {
     }
 
     /**
+     * 做什么：用固定种子在 Jasper 层循环生成 64 组键/策略，验证白名单传播只保留
+     *   定义处声明可传播的键，且未授权键不会因循环偶然命中而泄漏。
+     * 什么时候用：修改 Context.with/derive 的传播判定或键权限来源时。
+     * 前置条件：无；种子与轮次固定，失败可复现。
+     * 失败模式：派生快照键数不符、未授权键出现、授权键缺失或读回值错位。
+     * 为什么用循环生成：单点用例容易只覆盖手写组合；固定种子在 Jasper 内生成
+     *   多组键名、布尔权限与共享策略，能更早暴露传播分支的漏判。
+     */
+    @Test
+    fun `context whitelist property holds for seeded keys`() {
+        assertOk(
+            "context-whitelist-property",
+            """
+            package std;
+
+            public class SeedValue implements ContextValue {
+                private var policyValue: ContextSharePolicy;
+                private var numberValue: int32;
+                public constructor(policyValue: ContextSharePolicy, numberValue: int32) {
+                    this.policyValue = policyValue;
+                    this.numberValue = numberValue;
+                }
+                public function sharePolicy(): ContextSharePolicy { return this.policyValue; }
+                public function copyForChild(): ContextValue {
+                    return new SeedValue(this.policyValue, this.numberValue);
+                }
+                public function number(): int32 { return this.numberValue; }
+            }
+
+            public function main(): int32 {
+                var state: int32 = 20261024;
+                var keys: MutableList<ContextKey<SeedValue>> =
+                    new MutableList<ContextKey<SeedValue>>();
+                var bound: Context = new Context();
+                var allowed: int32 = 0;
+                var i: int32 = 0;
+                while (i < 64) {
+                    state = state * 1103515245 + 12345;
+                    var bucket: int32 = state % 17;
+                    if (bucket < 0) { bucket = 0 - bucket; }
+                    var propagates: bool = bucket != 0;
+                    var policy: ContextSharePolicy = ContextSharePolicy.Immutable;
+                    if (bucket == 3) { policy = ContextSharePolicy.SnapshotCopy; }
+                    var key: ContextKey<SeedValue> =
+                        new ContextKey<SeedValue>("k" + i, propagates);
+                    var value: SeedValue = new SeedValue(policy, i);
+                    keys.add(key);
+                    bound = bound.with(key, value);
+                    if (propagates) { allowed = allowed + 1; }
+                    i = i + 1;
+                }
+                if (bound.size() != 64) { return 1; }
+                var child: Context = bound.derive();
+                if (child.size() != allowed) { return 2; }
+                i = 0;
+                while (i < 64) {
+                    var lookupKey: ContextKey<SeedValue> = keys.get(i);
+                    if (child.has(lookupKey) != lookupKey.propagates()) { return 3; }
+                    if (lookupKey.propagates()) {
+                        var readBack: SeedValue? = child.get(lookupKey);
+                        if (readBack == null) { return 4; }
+                        if (readBack.number() != i) { return 5; }
+                    }
+                    i = i + 1;
+                }
+                return 0;
+            }
+            """.trimIndent()
+        )
+    }
+
+    /**
      * 做什么：验证清理预算取全局/局部较小值、嵌套只能收紧、负数配置被拒绝。
      * 什么时候用：修改 CleanupBudget.start/nested/remainingNanos 时。
      * 前置条件：JVM 单调时钟可用。
@@ -810,6 +882,71 @@ class S4RuntimeJasperTest {
                 }
                 if (!nestedRejected) { return 8; }
                 if (CleanupBudget.defaultGlobalNanos() != fiveSeconds) { return 9; }
+                return 0;
+            }
+            """.trimIndent()
+        )
+    }
+
+    /**
+     * 做什么：用固定种子在 Jasper 层循环生成 64 组全局/局部/嵌套上限，验证
+     *   根 deadline 恰为 min(全局, 局部)、子 deadline 不晚于父、也不突破子局部上限。
+     * 什么时候用：修改 CleanupBudget.start/nested 的 deadline 公式时。
+     * 前置条件：JVM 单调时钟可用；种子与轮次固定，失败可复现。
+     * 失败模式：根上限没有取最小、嵌套延长父截止点、嵌套突破自身上限。
+     * 为什么用循环生成：时间类边界若只测 0/1s/5s 容易漏掉“父剩余小于子局部上限”
+     *   的组合；固定种子覆盖两者大小关系交替出现的分支。
+     */
+    @Test
+    fun `cleanup budget property holds for seeded limits`() {
+        assertOk(
+            "cleanup-budget-property",
+            """
+            package std;
+            public function main(): int32 {
+                var state: int32 = 424242;
+                var i: int32 = 0;
+                while (i < 64) {
+                    state = state * 1103515245 + 12345;
+                    var globalSeed: int32 = state % 101;
+                    if (globalSeed < 0) { globalSeed = 0 - globalSeed; }
+                    state = state * 1103515245 + 12345;
+                    var localSeed: int32 = state % 101;
+                    if (localSeed < 0) { localSeed = 0 - localSeed; }
+
+                    var global: int64 = globalSeed;
+                    global = (global + 1L) * 1000000L;
+                    var local: int64 = localSeed;
+                    local = (local + 1L) * 1000000L;
+
+                    var budget: CleanupBudget = CleanupBudget.start(global, local);
+                    var expected: int64 = java.lang.Math.min(global, local);
+                    var span: int64 =
+                        budget.deadlineNanos() - budget.startedAtNanos();
+                    if (java.lang.Long.compare(span, expected) != 0) { return 1; }
+                    if (java.lang.Long.compare(span, global) > 0) { return 2; }
+                    if (java.lang.Long.compare(span, local) > 0) { return 3; }
+
+                    state = state * 1103515245 + 12345;
+                    var nestedSeed: int32 = state % 53;
+                    if (nestedSeed < 0) { nestedSeed = 0 - nestedSeed; }
+                    var nestedLimit: int64 = nestedSeed;
+                    nestedLimit = (nestedLimit + 1L) * 1000L;
+                    var child: CleanupBudget = budget.nested(nestedLimit);
+                    var afterNested: int64 = java.lang.System.nanoTime();
+                    var childDeadline: int64 = child.deadlineNanos();
+                    var parentDeadline: int64 = budget.deadlineNanos();
+                    var latestDeadline: int64 = afterNested + nestedLimit;
+                    var childSpan: int64 =
+                        childDeadline - child.startedAtNanos();
+                    if (java.lang.Long.compare(childSpan, span) > 0) { return 4; }
+                    if (java.lang.Long.compare(childDeadline, parentDeadline) > 0) { return 5; }
+                    if (java.lang.Long.compare(childDeadline, latestDeadline) > 0) { return 6; }
+
+                    var zeroChild: CleanupBudget = budget.nested(0L);
+                    if (!zeroChild.isExpired()) { return 7; }
+                    i = i + 1;
+                }
                 return 0;
             }
             """.trimIndent()
