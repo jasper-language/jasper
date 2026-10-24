@@ -133,6 +133,10 @@ class DocExamplesParseTest {
             "name: Type",
             // 04: explicitly illegal multi-binding.
             "var (name, age) = userInfo();",
+            // 05 §5.7: intentionally illegal — error types used as values (rejected by the checker).
+            "function read(): (int32, Error) { ... }\nfunction read(): Error { ... }\nvar lastError: Error;\nfunction handle(e: Error): void { ... }\nvar box: Result<int32, Error>;",
+            // 05 §5.7: anti-pattern fragment plus the throw/catch alternative; not a compilable unit.
+            "var value, err = parse(text);\nif (err != null) { ... }\ntry {\n    var value = parse(text);\n} catch (e: RecoverableError) {\n    ...\n}",
             // 06: annotation fragment.
             "@A(1, 2, name = \"x\", ...args)",
             // 08: switch-case fragment.

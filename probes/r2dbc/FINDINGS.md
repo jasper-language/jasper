@@ -18,7 +18,7 @@
 | --- | --- |
 | `Connection.jas` | `Connection`/`Statement`/`ResultSet` 三条契约（事务返回 `Mono`、查询返回 `Flux`） |
 | `Publisher.jas` | `Publisher`；`Mono extends Publisher`（单值流 + `block()`）；`Flux extends Publisher`（多值流 + 接口常量 `FETCH_SIZE`、`collect()`） |
-| `Subscriber.jas` | `Subscriber` 四段式协议（`onNext(Row)`，`onError(R2dbcException)` 跨包形参） |
+| `Subscriber.jas` | `Subscriber` 四段式协议（`onNext(Row)`，`onError(string)` 只传业务消息——错误类型不是值） |
 | `Subscription.jas` | `Subscription`：`cancel()`/`isCancelled()`/`isReleased()`（取消即释放） |
 | `Row.jas` | 行载荷具体类型（`id()`/`name()` 取值方法，代替泛型 `Row<T>`） |
 | `MemoryResultSet.jas` | `ResultSet` 内存实现（独立文件，跨文件接口实现回归守门） |
@@ -130,7 +130,8 @@ Flux.declaredFields=[FETCH_SIZE]
    （**#5 已修复（Q25 / C6+C16）**：该规避现已不再必要；探针源保留原写法以保留历史证据，
    未在本轮改写。）
 4. **继承来的方法用声明该方法的类型作接收者**（#6）：
-   `var error: R2dbcException = new R2dbcException(...); return error.sqlState();`。
+   `catch (e: R2dbcException) { return e.sqlState(); }`——catch 形参的静态类型就是
+   声明 `sqlState()` 的类。（2026-10-24「错误不是值」裁决后，错误对象不再存进局部变量。）
 5. **多态一律走接口，不做「子类赋给基类变量」**（#9）：`MemoryConnection` 先赋给
    `Connection` 接口再使用；`Task` 等不依赖类层次赋值。
 6. **订阅者不保存可空的接口字段**（#10）：取消需要的 `Subscription` 句柄通过参数即取即用。

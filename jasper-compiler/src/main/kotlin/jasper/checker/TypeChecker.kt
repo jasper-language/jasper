@@ -42,6 +42,21 @@ import jasper.compiler.SymbolTable
 data class TypeError(val message: String, val node: JasNode? = null)
 
 /**
+ * 错误类型被当作普通值使用时的统一诊断前缀。
+ *
+ * 为什么集中成常量：测试与文档都依赖 `error is not a value` 这一稳定措辞；
+ *   把它收敛到唯一位置，避免各分支自行拼字符串后逐渐漂移。
+ */
+private const val ERROR_IS_NOT_A_VALUE_MESSAGE =
+    "error is not a value: return it with throw, or use Result<T, E> where E is business data"
+
+/** 错误层次根类的限定名；继承图按「包 + 简单名」建键，故这里用 `std.Error`。 */
+private const val ERROR_BASE_QUALIFIED_NAME = "std.Error"
+
+/** 语言约定中承载业务失败数据的 `Result<T, E>` 简单名。 */
+private const val RESULT_TYPE_SIMPLE_NAME = "Result"
+
+/**
  * 类型检查器：对单个源文件做声明/语句/表达式检查并返回诊断列表。
  *
  * 做什么：check() 先收集类-接口实现/继承关系，再逐声明做类型检查与推断。
@@ -421,14 +436,15 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
      */
     private fun checkMemberTypeReferences(member: JasDeclaration, env: TypeEnvironment) {
         when (member) {
-            is JasProperty -> checkTypeReferences(member.type, env)
+            // 接口/枚举/注解成员的声明类型都是「值位置」，错误类型不得在此出现。
+            is JasProperty -> checkDeclaredType(member.type, env)
             is JasFunction -> {
                 val memberEnv = env.copy()
                 checkTypeParameters(member.typeParameters, memberEnv, "method '${member.name}'")
-                member.parameters.forEach { checkTypeReferences(it.type, memberEnv) }
-                checkTypeReferences(member.returnType, memberEnv)
+                member.parameters.forEach { checkDeclaredType(it.type, memberEnv) }
+                checkDeclaredType(member.returnType, memberEnv)
             }
-            is JasAnnotationMember -> checkTypeReferences(member.type, env)
+            is JasAnnotationMember -> checkDeclaredType(member.type, env)
             else -> {}
         }
     }
@@ -449,7 +465,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             env.addTypeParameter(tp)
             // 上界也是「显式类型引用」，同样需要名字可见性校验（在登记本类型参数之后，
             // 以便自引用/F-约束（如 T extends Comparable<T>）中的 T 已被识别）。
-            checkTypeReferences(tp.bound, env)
+            // 上界同样是值位置：`T is Error` 会把错误类型引入泛型 API，必须拒绝。
+            checkDeclaredType(tp.bound, env)
         }
     }
 
@@ -463,7 +480,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 error("Where constraint bound '${typeDisplayName(wc.bound)}' is not a valid type in $context", null)
             }
             // 约束上界同样是显式类型引用，需做名字可见性校验。
-            checkTypeReferences(wc.bound, env)
+            checkDeclaredType(wc.bound, env)
         }
     }
 
@@ -523,6 +540,147 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             else -> {}
         }
     }
+
+    /**
+     * 校验一个**声明位置**上的类型：先做类型引用可见性检查，再拒绝「错误类型当值」。
+     *
+     * 做什么：把两类独立的约束组合起来——
+     *   1) [checkTypeReferences]：名字可见性、泛型实参个数、嵌套结构合法性；
+     *   2) [rejectErrorTypeAsValue]：`Error` / `RecoverableError` / `FatalError`
+     *      及其子类只能被 `throw` / `catch`，不能充当返回值、字段、参数、局部变量
+     *      或泛型实参等值位置类型。
+     *
+     * 什么时候用：函数返回类型、形参类型、字段/属性类型、局部变量显式类型、
+     *   lambda 形参类型、解构绑定类型、类型参数上界与 where 约束上界。
+     *   注意：`catch (e: X)` 与 `new X(...)` **不**走本方法——前者是异常绑定的
+     *   唯一合法类型位置，后者是构造错误对象以便 `throw` 的必要表达。
+     *
+     * 前置条件：env 已登记当前作用域的类型参数；symbolTable 可为 null（此时只做
+     *   可见性检查，不做错误类型判定）。
+     * 失败模式：不抛异常；两类问题都以 [TypeError] 追加到诊断列表，可能各报一条。
+     * 为什么单独成方法：把「声明类型 = 值位置」这一语言裁决收敛到一个入口，避免
+     *   在每个声明分支里各写一遍检查；同时让 `catch`/`new` 的例外保持显式、可审计。
+     */
+    private fun checkDeclaredType(type: JasType?, env: TypeEnvironment) {
+        checkTypeReferences(type, env)
+        rejectErrorTypeAsValue(type, env)
+    }
+
+    /**
+     * 拒绝把错误类型用作值位置的类型（`Error` 及其子类）。
+     *
+     * 做什么：递归检查一个已写出的类型树；命中错误类型时产生编译期诊断
+     *   `error is not a value: ...`。对 `Result<T, E>` 额外给出专用提示：错误应
+     *   通过 `throw` 传播，而不是塞进 `Result` 的 `E` 位置。
+     *
+     * 什么时候用：仅由 [checkDeclaredType] 在声明类型位置调用；不要用于
+     *   `catch` 形参（那是合法的错误类型位置）或 `new Error(...)` 的构造目标。
+     *
+     * 前置条件：先执行 [checkTypeReferences]，确保名字已可解析；本方法只对
+     *   「当前作用域可见且解析到 std.Error 派生类」的名字判定为错误类型，未解析
+     *   的名字交给可见性诊断，避免同一条源码报出两种互相矛盾的原因。
+     * 失败模式：不抛异常；每个错误类型根只报一条诊断。
+     * 为什么这样设计：错误类型在 Jasper 中不是普通值，而是控制流载体；把判定放在
+     *   「声明类型」这一层，既覆盖所有值位置，又不影响 `throw` / `catch` 的既有语义。
+     */
+    private fun rejectErrorTypeAsValue(type: JasType?, env: TypeEnvironment) {
+        if (type == null) return
+        when (type) {
+            is JasNamedType -> {
+                // Result<T, E> 的 E 必须是业务数据；若 E 含错误类型，给出专用提示。
+                if (isResultTypeName(type.name) &&
+                    type.typeArguments.size >= 2 &&
+                    containsErrorType(type.typeArguments[1], env)
+                ) {
+                    error(
+                        "error is not a value: Result<T, E> requires E to be business data, " +
+                            "not an error type; throw the error instead",
+                        type
+                    )
+                    // E 的错误已由上面的专用诊断覆盖；继续检查其它泛型实参，
+                    // 但不再对 E 重复报通用消息。
+                    type.typeArguments.forEachIndexed { index, argument ->
+                        if (index != 1) rejectErrorTypeAsValue(argument, env)
+                    }
+                    return
+                }
+                if (isErrorType(type, env)) {
+                    error(ERROR_IS_NOT_A_VALUE_MESSAGE, type)
+                    return
+                }
+                // 非错误类型本身仍可能是容器（List<Error>、dict<string, Error>），递归检查实参。
+                type.typeArguments.forEach { rejectErrorTypeAsValue(it, env) }
+            }
+            is JasArrayType -> rejectErrorTypeAsValue(type.inner, env)
+            is JasNullableType -> rejectErrorTypeAsValue(type.inner, env)
+            is JasNonNullType -> rejectErrorTypeAsValue(type.inner, env)
+            is JasFunctionType -> {
+                type.paramTypes.forEach { rejectErrorTypeAsValue(it, env) }
+                rejectErrorTypeAsValue(type.returnType, env)
+            }
+            is JasTupleType -> type.types.forEach { rejectErrorTypeAsValue(it, env) }
+            is JasWildcardType -> type.bound?.let { rejectErrorTypeAsValue(it, env) }
+            is JasPointerType -> rejectErrorTypeAsValue(type.inner, env)
+            is JasReferenceType -> rejectErrorTypeAsValue(type.inner, env)
+            else -> {}
+        }
+    }
+
+    /**
+     * 判断一个已写出的类型树是否**包含**错误类型。
+     *
+     * 什么时候用：[rejectErrorTypeAsValue] 判定 `Result<T, E>` 的 `E` 是否含错误类型。
+     * 前置条件：类型名字已通过可见性检查；symbolTable 可为 null。
+     * 失败模式：不抛异常；无法解析的名字返回 false（交由可见性诊断处理）。
+     * 为什么与 [rejectErrorTypeAsValue] 分开：这里只回答布尔问题，不产生诊断，
+     *   使「Result 专用提示」与「通用提示」两个变化点彼此独立。
+     */
+    private fun containsErrorType(type: JasType?, env: TypeEnvironment): Boolean {
+        if (type == null) return false
+        return when (type) {
+            is JasNamedType -> isErrorType(type, env) || type.typeArguments.any { containsErrorType(it, env) }
+            is JasArrayType -> containsErrorType(type.inner, env)
+            is JasNullableType -> containsErrorType(type.inner, env)
+            is JasNonNullType -> containsErrorType(type.inner, env)
+            is JasFunctionType ->
+                type.paramTypes.any { containsErrorType(it, env) } || containsErrorType(type.returnType, env)
+            is JasTupleType -> type.types.any { containsErrorType(it, env) }
+            is JasWildcardType -> containsErrorType(type.bound, env)
+            is JasPointerType -> containsErrorType(type.inner, env)
+            is JasReferenceType -> containsErrorType(type.inner, env)
+            else -> false
+        }
+    }
+
+    /**
+     * 判断一个具名类型是否就是 `Error` 或其子类（含类型参数上界链）。
+     *
+     * 做什么：先排除不可见名字（它们已由可见性检查报错），再沿符号表的类继承图
+     *   判断该类型是否为 `std.Error` 的后代。
+     * 什么时候用：错误类型值位置拒绝逻辑的内部判定。
+     * 前置条件：调用前已执行可见性检查；symbolTable 可为 null。
+     * 失败模式：不抛异常；外部/JDK 类型、接口、枚举与未解析名字一律返回 false。
+     * 为什么沿继承图而不是比较名字：用户可声明 `class MyError extends Error`，
+     *   按名字硬编码会漏掉子类；继承图是唯一事实来源。
+     */
+    private fun isErrorType(type: JasType, env: TypeEnvironment): Boolean {
+        if (type !is JasNamedType) return false
+        // 类型参数本身不是错误类型；若其上界是错误类型，则由上界这一显式类型位置
+        // 的检查负责拒绝，避免在每次使用 T 时重复报错。
+        if (env.hasTypeParameter(type.name)) return false
+        val table = symbolTable ?: return false
+        // 不可见名字（例如未 import 的 std.Error）已由 unknown-type 诊断覆盖，
+        // 这里不再追加「error is not a value」，以免同一条源码出现两种原因。
+        if (!isVisibleTypeName(type.name, env)) return false
+        val key = table.resolveTypeKey(type.name) ?: return false
+        // 错误类型必须是类（Error 层级都是 class）；接口/枚举不参与该判定。
+        if (table.findClass(key) == null) return false
+        return isSubtype(key.qualifiedName, ERROR_BASE_QUALIFIED_NAME)
+    }
+
+    /** 判断具名类型是否是语言约定的 `Result<T, E>`（允许限定名写法）。 */
+    private fun isResultTypeName(name: String): Boolean =
+        name.substringAfterLast('.') == RESULT_TYPE_SIMPLE_NAME
 
     /**
      * 校验一个**显式写出的具名类型引用**是否可解析；不可解析则报错（带位置与名字）。
@@ -637,10 +795,10 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             if (!params.add(param.name)) {
                 error("Duplicate parameter '${param.name}' in function '${func.name}'", param)
             }
-            checkTypeReferences(param.type, funcEnv)
+            checkDeclaredType(param.type, funcEnv)
             funcEnv.set(param.name, param.type)
         }
-        checkTypeReferences(func.returnType, funcEnv)
+        checkDeclaredType(func.returnType, funcEnv)
         if (func.body != null) {
             // body=null 表示只有签名（内置/外部函数），无需检查语句。
             for (stmt in func.body!!.statements) {
@@ -672,7 +830,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                     if (!memberNames.add(member.name)) {
                         error("Duplicate member '${member.name}' in class '${cls.name}'", member)
                     }
-                    checkTypeReferences(member.type, clsEnv)
+                    checkDeclaredType(member.type, clsEnv)
                     clsEnv.set(member.name, member.type)
                 }
                 is JasFunction -> {
@@ -702,7 +860,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 if (!params.add(param.name)) {
                     error("Duplicate constructor parameter '${param.name}' in class '${cls.name}'", param)
                 }
-                checkTypeReferences(param.type, ctorEnv)
+                checkDeclaredType(param.type, ctorEnv)
                 ctorEnv.set(param.name, param.type)
             }
             if (ctor.body != null) {
@@ -870,21 +1028,29 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 if (stmt.type == null && stmt.initializer == null) {
                     error("Variable '${stmt.name}' requires an explicit type or an initializer", stmt)
                 }
-                // 变量声明的显式类型必须先校验可见性（未知类型不得静默通过）。
-                checkTypeReferences(stmt.type, env)
-                if (stmt.initializer != null) {
+                // 变量声明的显式类型必须先校验可见性（未知类型不得静默通过），
+                // 并拒绝错误类型（错误不是值，只能 throw/catch）。
+                checkDeclaredType(stmt.type, env)
+                // 初始化表达式只推断一次：推断会顺带检查 lambda 形参等子结构，
+                // 重复推断会让同一条源码产生重复诊断（并浪费工作）。
+                val initType = stmt.initializer?.let { inferExpression(it, env, stmt.type) }
+                if (stmt.initializer != null && stmt.type != null && initType != null) {
                     // 声明类型显式给出时，要求初始化表达式可赋给它。
                     // 把声明类型作为「期望类型」传入：数组字面量据此直接采用目标元素类型，
                     // 既避免公共父类型推断的歧义，也保证翻译器拿到正确的数组描述符。
-                    val initType = inferExpression(stmt.initializer, env, stmt.type)
-                    if (stmt.type != null && initType != null) {
-                        if (!typesCompatible(initType, stmt.type!!)) {
-                            error("Type mismatch: cannot assign ${typeDisplayName(initType)} to variable of type ${typeDisplayName(stmt.type!!)}", stmt)
-                        }
+                    if (!typesCompatible(initType, stmt.type!!)) {
+                        error("Type mismatch: cannot assign ${typeDisplayName(initType)} to variable of type ${typeDisplayName(stmt.type!!)}", stmt)
                     }
                 }
-                // 变量类型：优先用显式声明类型；否则用初始化表达式的推断结果（可能为 null）。
-                env.set(stmt.name, stmt.type ?: stmt.initializer?.let { inferExpression(it, env) })
+                if (stmt.type == null && stmt.initializer !is JasLambdaExpr) {
+                    // 省略显式类型时，推断出的类型同样是一个局部变量类型；
+                    // `var e = new Error(...)` 不能把错误类型固化成普通值变量。
+                    // lambda 的形参类型已在 lambda 表达式检查中按声明位置检查过，
+                    // 这里跳过其函数类型，避免同一条 lambda 形参被重复报告。
+                    rejectErrorTypeAsValue(initType, env)
+                }
+                // 变量类型：优先用显式声明类型；否则复用上面的推断结果（可能为 null）。
+                env.set(stmt.name, stmt.type ?: initType)
             }
             is JasExpressionStatement -> checkExpression(stmt.expression, env)
             is JasReturn -> {
@@ -1027,8 +1193,8 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 // 因此带显式类型的绑定以自身类型为准，其余绑定沿用整体类型。
                 val initType = inferExpression(stmt.initializer, env)
                 for (binding in stmt.bindings) {
-                    // 解构绑定的显式类型同样是类型引用，先校验可见性。
-                    checkTypeReferences(binding.type, env)
+                    // 解构绑定的显式类型同样是类型引用，先校验可见性并拒绝错误类型。
+                    checkDeclaredType(binding.type, env)
                     env.set(binding.name, binding.type ?: initType)
                 }
             }
@@ -1477,7 +1643,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 // lambda 在子环境中检查：形参注入其中；返回类型由 body 的首个 return 推断。
                 val lambdaEnv = env.copy()
                 for (param in expr.parameters) {
-                    checkTypeReferences(param.type, lambdaEnv)
+                    checkDeclaredType(param.type, lambdaEnv)
                     lambdaEnv.set(param.name, param.type)
                 }
                 for (stmt in expr.body.statements) {

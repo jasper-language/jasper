@@ -13,6 +13,19 @@ This document records the current source-of-truth decisions that supersede older
 5. **W-2 删除**：容器统一使用 `remove`；`delete`、`clear`、`drop` 按各自语义使用。已落到 `docs/jucs.md` §2。
 6. **同日另两条**：不允许用户自定义运算符重载（运算符行为由语言规范统一定义），已落到 `docs/03-类型系统.md` §3.9.1；`.jaso` 采用独立规范，见 `docs/jaso.md` 与本文 `.jaso` Module Loading 一节。
 
+## 2026-10-24 错误不是值裁决
+
+在 W-18「异常为主、`Result` 为辅」之上，进一步取消 Go 式「返回错误值 + `if` 判断」：
+
+1. `Error` / `RecoverableError` / `FatalError` 及其子类是 **throw-only** 类型，只能出现在
+   `throw new X(...)` 与 `catch (e: X)` 中。
+2. 错误类型不得出现在函数/方法返回类型（含元组元素）、字段类型、参数类型、局部变量类型、
+   泛型实参中；违反时编译期报
+   `error is not a value: return it with throw, or use Result<T, E> where E is business data`。
+3. `Result<T, E>` 的 `E` 不得是错误类型；若是，同样编译期报错并提示改用 `throw`。
+4. 多值返回保留：`(int32, int32)`、`(string, bool)` 等业务数据元组不受影响。
+5. 已落到 `docs/05-函数.md` §5.7；机械性质见 `verification/PROPERTIES.md` 的 `LANG-ERR-01`。
+
 ## Soft Keywords
 
 The true soft keywords are `get`, `set`, `from`, `onComplete`, `onBreak`,

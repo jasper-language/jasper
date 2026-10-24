@@ -13,16 +13,16 @@
 //   `Ljava/lang/Object;`，调用点会 NoSuchMethodError（见 FINDINGS 第 3 条）。
 //   故可运行形状把元素类型固定为 Row；理想泛型形状保留在 ReactiveStreams.jas。
 //
-// 为什么 onError 收的是 R2dbcException（import 自 probes.r2dbc）：
-//   验证跨包类型可以作为接口方法形参被引用与链接。
+// 为什么 onError 收的是 string 消息而不是 R2dbcException：
+//   错误类型（Error / RecoverableError / FatalError 及其子类）是控制流载体，
+//   不能作为接口方法形参（2026-10-24「错误不是值」裁决）。错误对象只经
+//   `throw` / `catch` 传播；跨协议边界时传递可展示的业务数据（这里是消息文本）。
 // =============================================================================
 package std;
-
-import probes.r2dbc.R2dbcException;
 
 public interface Subscriber {
     public function onSubscribe(subscription: Subscription): void;
     public function onNext(row: Row): void;
-    public function onError(error: R2dbcException): void;
+    public function onError(message: string): void;
     public function onComplete(): void;
 }

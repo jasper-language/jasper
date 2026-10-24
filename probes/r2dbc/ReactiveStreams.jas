@@ -1,7 +1,5 @@
 package probes.r2dbc.rx;
 
-import probes.r2dbc.R2dbcException;
-
 // =============================================================================
 // ReactiveStreams.jas —— 「理想形状」：泛型响应式协议（只声明，不参与运行）
 // =============================================================================
@@ -34,7 +32,8 @@ public interface RxPublisher<T> {
 public interface RxSubscriber<T> {
     public function onSubscribe(subscription: RxSubscription): void;
     public function onNext(item: T): void;
-    public function onError(error: R2dbcException): void;
+    // 错误类型不是值：跨协议边界只传业务消息，错误对象留给 throw/catch。
+    public function onError(message: string): void;
     public function onComplete(): void;
 }
 

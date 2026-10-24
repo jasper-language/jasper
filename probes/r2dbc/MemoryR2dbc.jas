@@ -31,7 +31,7 @@ import probes.r2dbc.TransientR2dbcException;
 //   * 跨文件读取**字段**需声明文件的翻译顺序在前，否则描述符退化成 "field"/V
 //     （FINDINGS #5）；本文件改用 Row 的 id()/name() 取值方法绕开。
 //   * 在子类类型接收者上调用**继承来的**方法，返回描述符会退化为 void
-//     （FINDINGS #6）；errorState 用 R2dbcException 声明类型接收者。
+//     （FINDINGS #6）；errorState 在 catch 形参上调用 sqlState()，接收者即声明类型。
 //   * 子类实例不能赋给基类类型变量（FINDINGS #9）；本探针不做类层次多态赋值，
 //     多态一律走接口。
 //   * 订阅者不保存可空的 Subscription 字段（可空引用字段描述符错误，FINDINGS #10），
@@ -192,8 +192,8 @@ public class GatedSubscriber implements Subscriber {
         this.downstream.onNext(row);
     }
 
-    public function onError(error: R2dbcException): void {
-        this.downstream.onError(error);
+    public function onError(message: string): void {
+        this.downstream.onError(message);
     }
 
     public function onComplete(): void {
@@ -326,8 +326,8 @@ public class CollectingSubscriber implements Subscriber {
         this.count = this.count + 1;
     }
 
-    public function onError(error: R2dbcException): void {
-        this.errorMessage = error.message();
+    public function onError(message: string): void {
+        this.errorMessage = message;
     }
 
     public function onComplete(): void {
@@ -355,7 +355,7 @@ public class CancellingSubscriber implements Subscriber {
         this.seen = this.seen + 1;
     }
 
-    public function onError(error: R2dbcException): void { }
+    public function onError(message: string): void { }
 
     public function onComplete(): void { }
 }
@@ -372,8 +372,8 @@ public class FailingPublisher implements Publisher {
         var resource: Resource = new Resource();
         var sub: Subscription = new MemorySubscription(resource);
         subscriber.onSubscribe(sub);
-        var error: R2dbcException = new R2dbcException("40001", this.message);
-        subscriber.onError(error);
+        // 错误对象不是值：协议边界只传消息文本，错误类型本身只在 throw/catch 中出现。
+        subscriber.onError(this.message);
     }
 }
 
@@ -419,21 +419,29 @@ public function taskValue(): int32 {
     return 0;
 }
 
-// 错误层次 + 跨包链接的观测点：构造错误并读取 SQLSTATE。
-// 接收者静态类型取**声明该方法的类** R2dbcException：在子类类型接收者上调用从基类
-// 继承的方法，返回描述符会退化成 void（见 FINDINGS #6「继承来的方法：返回描述符退化为 void」），
-// 且「子类赋给基类变量」当前被类型检查器拒绝（见 FINDINGS #9「类继承不参与赋值子类型」），
-// 故此处直接构造基类实例。
+// 错误层次 + 跨包链接的观测点：抛出错误并在 catch 中读取 SQLSTATE。
+// 错误对象不是值（2026-10-24 裁决），因此这里不再把它存进局部变量：
+//   * `throw new R2dbcException(...)` 是构造并传播错误对象的唯一入口；
+//   * `catch (e: R2dbcException)` 是接收错误对象的唯一入口，接收者静态类型就是
+//     声明 sqlState() 的类，避开 FINDINGS #6「继承来的方法返回描述符退化为 void」。
 public function errorState(): string {
-    var error: R2dbcException = new R2dbcException("40001", "deadlock");
-    return error.sqlState();
+    try {
+        throw new R2dbcException("40001", "deadlock");
+    } catch (e: R2dbcException) {
+        return e.sqlState();
+    }
+    return "";
 }
 
-// 二级错误层次的实例化观测点：构造瞬时错误子类并调用继承自 std.Error 的 message()，
-// 证明子类可实例化、可跨包链接（返回消息文本由测试断言）。
+// 二级错误层次的实例化观测点：抛出瞬时错误子类，再按基类 Error 捕获并读取 message()，
+// 证明「子类可实例化、可跨包链接、可按基类捕获」三条路径都工作（消息文本由测试断言）。
 public function transientMessage(): string {
-    var error: TransientR2dbcException = new TransientR2dbcException("40001", "deadlock");
-    return error.message();
+    try {
+        throw new TransientR2dbcException("40001", "deadlock");
+    } catch (e: Error) {
+        return e.message();
+    }
+    return "";
 }
 
 // 证明嵌套泛型「类型」可解析（`>>` 需以空格收尾），与 JDBC 探针同款；
@@ -489,7 +497,7 @@ public function main(): int32 {
     var cancelPublisher: Publisher = flux;
     cancelPublisher.subscribe(cancellingSubscriber);
 
-    // (5) 错误传播：onError 通道带回 R2dbcException。
+    // (5) 错误传播：onError 通道带回错误消息（错误类型不是值）。
     var failing: FailingPublisher = new FailingPublisher("deadlock");
     var failingPublisher: Publisher = failing;
     var errorCollector: CollectingSubscriber = new CollectingSubscriber();
