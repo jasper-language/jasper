@@ -536,7 +536,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             when (s) {
                 is JasperParser.TypeSuffixDotContext -> {
                     if (result is JasNamedType) {
-                        result = JasNamedType(result.name + "." + s.Identifier().text, result.typeArguments)
+                        // 限定类型末段也可带泛型实参（如 std.Future<int32>）。
+                        // 不能只保留原子 std 的空实参，否则后续 await 会把结果擦除为 any。
+                        val arguments = s.typeArguments()?.typeArgument()?.mapNotNull {
+                            visit(it) as? JasType
+                        } ?: result.typeArguments
+                        result = JasNamedType(result.name + "." + s.Identifier().text, arguments)
                     }
                 }
                 is JasperParser.TypeSuffixArrayContext -> result = JasArrayType(result)

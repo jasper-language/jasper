@@ -1309,10 +1309,23 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasUnaryOp -> {
-                inferExpression(expr.operand, env)
+                val operandType = inferExpression(expr.operand, env)
                 when (expr.op) {
                     "!" -> JasPrimitiveType("bool")
-                    else -> inferExpression(expr.operand, env) ?: JasPrimitiveType("int32")
+                    "await" -> {
+                        val named = operandType as? JasNamedType
+                        val identity = named?.let { symbolTable?.resolveTypeKey(it.name) }
+                        if (identity == jasper.compiler.TypeKey("std", "Future")) {
+                            // S4-C 前端先识别真实 Future 身份与结果类型；后端尚未接通时
+                            // 必须失败关闭，不能把 Future 透传或阻塞 get 冒充挂起。
+                            error("non-blocking await lowering is not implemented yet", expr)
+                            named?.typeArguments?.singleOrNull() ?: JasAnyType
+                        } else {
+                            // 用户裁决：普通值 await 保留同步兼容；同名用户类型不是 std.Future。
+                            operandType ?: JasPrimitiveType("int32")
+                        }
+                    }
+                    else -> operandType ?: JasPrimitiveType("int32")
                 }
             }
             is JasCall -> {

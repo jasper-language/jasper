@@ -22,6 +22,8 @@
 
 | `LANG-S4BJ-04` | 协作检查点抛出的 CancellationException 发布 Cancelled 而非业务 Failure，不触发普通组兄弟失败级联；关闭快照中无未处理失败而存在取消时 close 抛 CancellationException，重复 close 保持同一取消结果，业务失败优先于取消。 | `TaskGroup.jas` 的 `TaskRunner.run`、`close`；`S4RuntimeJasperTest.cooperative cancellation is not a business failure`；`TaskGroupAggregation.tla` 的 `Cancel`、`Close`、`CancellationOutcomeMatchesSnapshot` | 真实编译运行契约测试 + TLA+ 有限模型 | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*S4RuntimeJasperTest' --no-daemon`；虚拟机内 `TLA2TOOLS_JAR=/tmp/jasper-s4-tla2tools.jar bash verification/run-s4-models.sh` | 运行测试覆盖主动取消的普通组任务、未取消兄弟、重复关闭和无子任务的监督组取消；模型仍固定两个任务槽，未抽象根令牌单独取消，未建模取消原因/Deadline、清理失败、阻塞和 JVM 同步。取消错误消息当前固定，尚未保存具体取消原因。 |
 
+| `LANG-AWAIT-01` | 非可空直接 std.Future<T> 的 await 在前端仅解包一层 T，按真实包身份识别；限定名末段泛型实参保留；continuation 降级未接通前明确诊断且不写 class。普通值和用户同名 Future 保持同步兼容。 | `TypeChecker.inferExpression` 的 JasUnaryOp 分支；`JasperAstBuilder.visitTypeExpression` 的 TypeSuffixDot；`AwaitFrontendTest`、`R2dbcDefectRegressionTest` | 端到端编译诊断 + 固定种子类型属性测试（20261025，12 例，每例单函数即最小反例） | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*AwaitFrontendTest' --tests '*R2dbcDefectRegressionTest' --no-daemon` | 只证明当前前端与明确拒绝路径，不表示实现挂起；不覆盖 Future 子类、可空 Future、可等待协议、挂起能力传播或跨模块 ABI。泛型类型整体兼容性仍受既有检查器限制。 |
+
 ## 可信基与未覆盖范围
 
 - **可信基（不在本表验证范围内、被假设正确）**：ANTLR 运行时与其生成的解析器、ASM 字节码库、执行测试的 JVM 与其类加载器、Gradle / JUnit 测试运行器、构建所用 JDK 的标准库。
