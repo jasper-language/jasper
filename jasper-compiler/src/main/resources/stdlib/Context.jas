@@ -1,0 +1,284 @@
+package std;
+
+// ============================================================================
+// Context.jas —— 不可变上下文快照与类型化白名单传播
+// ============================================================================
+// 职责：
+//   保存「类型化键 -> 值」的不可变快照；派生时为每个键做白名单判定。未知键、
+//   未声明可传播的键不进入子快照；可变值若未声明并发安全策略则在写入时拒绝。
+//
+// 已裁决规则（S4-A 策略 A）：
+//   - 传播权限由键定义处声明，调用方不能为别人的键临时开绿灯；
+//   - 获准传播的值必须声明 Immutable / SharedSafe / SnapshotCopy；
+//   - 声明 Unsafe 的值在 with() 阶段就被拒绝，而不是悄悄共享引用。
+//
+// 变化点隔离：
+//   - 新传播策略只需扩展 ContextSharePolicy 并让 ContextValue 实现对应分支；
+//   - Context 不依赖 TaskGroup/Future，避免运行时状态机之间产生环。
+//
+// 已知边界：
+//   - 本文件只实现通用键白名单，不实现 S4-A 表中的 JobId/Trace/Identity 等保留元素；
+//   - 当前值必须是对象并实现 ContextValue；基本类型若要进入上下文需先有明确包装类型。
+// ============================================================================
+
+/**
+ * 上下文值的并发共享声明。
+ *
+ * 做什么：把「这个对象能否被多个子任务安全共享」变成显式、可审计的声明。
+ * 什么时候用：实现 ContextValue.sharePolicy 时。
+ * 失败模式：纯枚举，无失败路径。
+ * 为什么不用运行时反射猜可变性：反射无法证明线程安全；显式声明才能拒绝含糊共享。
+ */
+public enum ContextSharePolicy {
+    Immutable,
+    SharedSafe,
+    SnapshotCopy,
+    Unsafe,
+}
+
+/**
+ * 可进入上下文的值的协议。
+ *
+ * 做什么：同时声明共享策略与派生副本策略。
+ * 什么时候用：任何希望经过 Context.with 传播的对象。
+ * 前置条件：sharePolicy 返回除 Unsafe 以外的值；SnapshotCopy 时 copyForChild 必须
+ *   返回独立副本，不能返回 this。
+ * 失败模式：返回 Unsafe 会在写入时被 Context.with 拒绝；copyForChild 返回 null
+ *   会触发 ContextError。
+ * 为什么要求两个方法：只声明「安全」不够，SnapshotCopy 需要真正可执行的复制能力。
+ */
+public interface ContextValue {
+    /**
+     * 做什么：声明该值跨任务共享的策略。
+     * 什么时候用：Context.with 与 Context.derive 校验时。
+     * 前置条件：无。
+     * 失败模式：不会失败；返回 Unsafe 表示拒绝进入上下文。
+     */
+    public function sharePolicy(): ContextSharePolicy;
+
+    /**
+     * 做什么：为子快照生成独立值。
+     * 什么时候用：策略为 SnapshotCopy 且发生派生时。
+     * 前置条件：已有合法状态；实现不得返回 null。
+     * 失败模式：返回 null 时 Context.derive 抛 ContextError。
+     */
+    public function copyForChild(): ContextValue;
+}
+
+/**
+ * 类型化上下文键。
+ *
+ * 做什么：用稳定的字符串 id 关联一个泛型类型，并携带「是否允许自动传播」的
+ *   定义处声明。
+ * 什么时候用：模块定义自己的上下文键时；同一 id 的键才能命中同一个值。
+ * 前置条件：id 非空；传播权限只能在本键创建时声明。
+ * 失败模式：不会失败；同 id 的不同键会共享存储位置，调用方应使用唯一前缀。
+ * 为什么把权限放在键上：调用方无法替其他模块的键临时开启传播，符合策略 A。
+ */
+public class ContextKey<T> {
+    private var name: string;
+    private var propagatesToChildren: bool;
+
+    /**
+     * 做什么：定义一个键并固定其传播权限。
+     * 什么时候用：模块初始化的受信任位置。
+     * 前置条件：name 非空。
+     * 失败模式：不会失败。
+     * 为什么构造器即声明：之后没有任何 setter 能打开传播，权限不可被调用方篡改。
+     */
+    public constructor(name: string, propagatesToChildren: bool) {
+        this.name = name;
+        this.propagatesToChildren = propagatesToChildren;
+    }
+
+    /** 做什么：返回稳定 id。前置条件：无；失败模式：不会失败。 */
+    public function id(): string {
+        return this.name;
+    }
+
+    /** 做什么：返回是否允许自动传播。前置条件：无；失败模式：不会失败。 */
+    public function propagates(): bool {
+        return this.propagatesToChildren;
+    }
+}
+
+/**
+ * 上下文中的一条键值绑定。
+ *
+ * 做什么：把值与其键的传播声明打包，避免 derive 时重新查键表。
+ * 什么时候用：Context.with 创建、Context.derive 复制。
+ * 前置条件：id/value 非 null。
+ * 失败模式：不会失败。
+ * 为什么单独成类：快照复制与值策略校验都需要同一份绑定数据，避免平行映射漂移。
+ */
+public class ContextEntry {
+    private var name: string;
+    private var propagatesToChildren: bool;
+    private var storedValue: ContextValue;
+
+    /**
+     * 做什么：构造一条不可变绑定。
+     * 什么时候用：Context.with/derive 内部。
+     * 前置条件：name/storedValue 非 null。
+     * 失败模式：不会失败。
+     * 为什么保存 propagates 副本：派生只需要绑定自身，不需要再访问键对象。
+     */
+    public constructor(name: string, propagatesToChildren: bool, storedValue: ContextValue) {
+        this.name = name;
+        this.propagatesToChildren = propagatesToChildren;
+        this.storedValue = storedValue;
+    }
+
+    /** 做什么：返回键 id。前置条件：无；失败模式：不会失败。 */
+    public function id(): string {
+        return this.name;
+    }
+
+    /** 做什么：返回是否允许传播。前置条件：无；失败模式：不会失败。 */
+    public function propagates(): bool {
+        return this.propagatesToChildren;
+    }
+
+    /** 做什么：返回绑定值。前置条件：无；失败模式：不会失败。 */
+    public function value(): ContextValue {
+        return this.storedValue;
+    }
+}
+
+/**
+ * 上下文白名单校验失败。
+ *
+ * 做什么：把「值不可传播」「值不是 ContextValue」「快照复制失败」报告为可捕获的
+ *   Jasper 错误。
+ * 什么时候用：Context.with/derive 拒绝不安全传播时。
+ * 前置条件：调用方在构造子任务前触发了校验。
+ * 失败模式：不会失败。
+ * 为什么独立类型：调用方需要区分上下文配置错误与业务错误。
+ */
+public class ContextError extends Error {
+    /** 做什么：构造上下文错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * 不可变上下文快照。
+ *
+ * 做什么：按键保存 ContextEntry；with 返回新快照，derive 按白名单生成子快照。
+ * 什么时候用：创建子任务前冻结父上下文；查询时只读。
+ * 前置条件：值实现 ContextValue 且策略不是 Unsafe。
+ * 失败模式：with 遇到非 ContextValue 或 Unsafe 值时抛 ContextError；
+ *   derive 遇到 SnapshotCopy 返回 null 时抛 ContextError。
+ * 为什么不在原对象上修改：不可变快照让已创建子任务不会看到父级后续替换，符合 S4-A。
+ */
+public class Context {
+    private var entries: Map<string, ContextEntry>;
+
+    /**
+     * 做什么：创建空上下文。
+     * 什么时候用：根作用域或测试起点。
+     * 前置条件：无。
+     * 失败模式：底层 HashMap 分配失败时以平台异常出现。
+     * 为什么允许空构造：空快照是所有派生链的明确基线。
+     */
+    public constructor() {
+        this.entries = new Map<string, ContextEntry>();
+    }
+
+    /**
+     * 做什么：返回替换/新增一个键后的新快照；当前快照保持不变。
+     * 什么时候用：作用域建立时绑定自己的类型化值。
+     * 前置条件：key 非 null；value 必须实现 ContextValue；策略不能是 Unsafe。
+     * 失败模式：值不是 ContextValue 或策略 Unsafe 时抛 ContextError；不静默共享引用。
+     * 为什么先校验再复制：不安全的父值不应先进入任何快照，否则后续派发都要重复防御。
+     */
+    public function with<T>(key: ContextKey<T>, value: T): Context {
+        var contextValue: ContextValue;
+        try {
+            contextValue = cast value as ContextValue;
+        } catch (castFailure: java.lang.ClassCastException) {
+            throw new ContextError("context value must implement ContextValue");
+        }
+        if (contextValue.sharePolicy() == ContextSharePolicy.Unsafe) {
+            throw new ContextError("context value declares Unsafe sharing policy");
+        }
+        var next: Context = new Context();
+        for (entry in this.entries) {
+            var existing: ContextEntry = this.entries.get(entry);
+            next.putEntry(existing);
+        }
+        next.putEntry(new ContextEntry(key.id(), key.propagates(), contextValue));
+        return next;
+    }
+
+    /**
+     * 做什么：按类型化键读取值；键不存在或未传播到本快照时返回 null。
+     * 什么时候用：子任务读取继承来的上下文值。
+     * 前置条件：key 非 null。
+     * 失败模式：不会失败；缺失与显式值 null 在类型层由 T? 统一表达。
+     * 为什么用 id 查找：跨包同名简单类型可能不同，稳定 id 才是绑定身份。
+     */
+    public function get<T>(key: ContextKey<T>): T? {
+        var entry: ContextEntry = this.entries.get(key.id());
+        if (entry == null) {
+            return null;
+        }
+        // 先落到局部变量再 cast：预处理器会把「函数调用 + as 类型」再包一层 cast，
+        // 形成非法的 `cast cast f() as T`；两步写法同时让转换点更易读。
+        var rawValue: ContextValue = entry.value();
+        return cast rawValue as T;
+    }
+
+    /** 做什么：判断键是否在当前快照中。前置条件：key 非 null；失败模式：不会失败。 */
+    public function has<T>(key: ContextKey<T>): bool {
+        return this.entries.containsKey(key.id());
+    }
+
+    /** 做什么：返回当前快照的键数量。前置条件：无；失败模式：不会失败。 */
+    public function size(): int32 {
+        return this.entries.size();
+    }
+
+    /**
+     * 做什么：生成子快照，只复制声明可传播的键。
+     * 什么时候用：TaskGroup 创建子任务前冻结上下文时。
+     * 前置条件：父快照中的值在 with 阶段已通过安全检查。
+     * 失败模式：SnapshotCopy 的 copyForChild 返回 null 时抛 ContextError。
+     * 为什么在这里复制：快照安全是传播的一部分；让父对象后续可变状态不会穿透子作用域。
+     */
+    public function derive(): Context {
+        var child: Context = new Context();
+        for (entryId in this.entries) {
+            var entry: ContextEntry = this.entries.get(entryId);
+            if (!entry.propagates()) {
+                // 未知/未授权键默认拒绝传播；这里不猜测、不临时开绿灯。
+                continue;
+            }
+            var value: ContextValue = entry.value();
+            if (value.sharePolicy() == ContextSharePolicy.Unsafe) {
+                throw new ContextError("refusing to propagate Unsafe context value");
+            }
+            var propagated: ContextValue = value;
+            if (value.sharePolicy() == ContextSharePolicy.SnapshotCopy) {
+                propagated = value.copyForChild();
+                if (propagated == null) {
+                    throw new ContextError("context value copyForChild returned null");
+                }
+            }
+            child.putEntry(new ContextEntry(entry.id(), entry.propagates(), propagated));
+        }
+        return child;
+    }
+
+    /**
+     * 做什么：把绑定写入内部映射。
+     * 什么时候用：with/derive 构造新快照内部。
+     * 前置条件：entry 非 null。
+     * 失败模式：不会失败。
+     * 为什么需要这个私有入口：公开 API 只暴露创建新快照，不暴露原地修改。
+     */
+    private function putEntry(entry: ContextEntry): void {
+        this.entries.put(entry.id(), entry);
+    }
+}

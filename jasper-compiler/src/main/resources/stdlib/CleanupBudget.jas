@@ -1,0 +1,170 @@
+package std;
+
+// ============================================================================
+// CleanupBudget.jas —— 不可取消清理区间的预算
+// ============================================================================
+// 职责：
+//   用单调时钟表示一次清理允许使用的时间额度；全局上限与局部上限取最小值，
+//   嵌套区间共享同一截止点，不能通过嵌套重置或延长外层预算。
+//
+// 已裁决规则（S4-A 策略 A）：
+//   - 有效上限 = min(全局运行时上限, 局部显式上限)；
+//   - 嵌套不得重置计时；子区间只能收紧剩余额度；
+//   - 预算耗尽后运行时应恢复协作取消检查并报告清理未完成，而不是虚称强制终止。
+//
+// 变化点隔离：
+//   - 时钟源只在 start/remainingNanos 两处出现；未来 Jasper OS 适配器可替换为
+//     内核单调时钟，而不改预算的对外语义；
+//   - 全局默认值集中在 defaultGlobalNanos，便于运行时统一调整。
+//
+// 为什么用 System.nanoTime：
+//   墙钟会被校时与夏令时改变，无法表达「最多还能清理多少纳秒」；nanoTime 是
+//   单调时钟，适合测量相对时长。它不承诺与进程启动时间对应，因此本类只保存
+//   绝对纳秒截点，不把数值暴露成日期。
+//
+// 已知边界：
+//   - compute remaining 时会读取一次新时钟值；调用方若需要严格的一次性预留，
+//     应在自己的资源管理器里再串行化；
+//   - 预算耗尽只表示时间到，不保证能中断外部阻塞调用。
+// ============================================================================
+
+/**
+ * 清理预算参数非法。
+ *
+ * 做什么：拒绝负的全局/局部上限，避免「负预算」被误解释成立即完成。
+ * 什么时候用：CleanupBudget.start/nested 收到负数时。
+ * 前置条件：调用方传入了错误的时钟数值。
+ * 失败模式：不会失败。
+ * 为什么抛错而不是夹到 0：静默夹取会掩盖配置错误，使清理逻辑看起来成功。
+ */
+public class CleanupBudgetError extends Error {
+    /** 做什么：构造预算错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * 单调时钟清理预算（不可变）。
+ *
+ * 做什么：保存起点与绝对截止点，提供剩余额度、过期判断和嵌套收紧。
+ * 什么时候用：进入不可取消清理区间前创建；嵌套清理通过 nested 派生。
+ * 前置条件：所有上限以纳秒表示且非负。
+ * 失败模式：负数上限抛 CleanupBudgetError；读取剩余额度不会失败。
+ * 为什么不可变：预算一旦进入清理区间就不应被调用方随意延长；嵌套只能产生更严格的新值。
+ */
+public class CleanupBudget {
+    private var startedAtNanos: int64;
+    private var deadlineAtNanos: int64;
+
+    /**
+     * 做什么：直接以绝对截点构造预算。
+     * 什么时候用：start/nested 内部使用；调用方通常不用。
+     * 前置条件：deadlineAtNanos 不早于 startedAtNanos。
+     * 失败模式：不会校验反向区间；公开入口保证正确，直接构造属于内部约定。
+     * 为什么公开：Jasper 当前没有包内可见性；用注释明确它只服务本文件。
+     */
+    public constructor(startedAtNanos: int64, deadlineAtNanos: int64) {
+        this.startedAtNanos = startedAtNanos;
+        this.deadlineAtNanos = deadlineAtNanos;
+    }
+
+    /**
+     * 做什么：从当前单调时钟启动预算，全局与局部上限取较小者。
+     * 什么时候用：进入一次全新的不可取消清理区间时。
+     * 前置条件：globalLimitNanos 与 localLimitNanos 均非负。
+     * 失败模式：任一上限为负时抛 CleanupBudgetError。
+     * 为什么在入口取最小：局部配置只能收紧全局运行时上限，不能突破安全边界。
+     */
+    public static function start(globalLimitNanos: int64, localLimitNanos: int64): CleanupBudget {
+        if (java.lang.Long.compare(globalLimitNanos, 0) < 0) {
+            throw new CleanupBudgetError("global cleanup budget must be non-negative");
+        }
+        if (java.lang.Long.compare(localLimitNanos, 0) < 0) {
+            throw new CleanupBudgetError("local cleanup budget must be non-negative");
+        }
+        var started: int64 = java.lang.System.nanoTime();
+        var effective: int64 = java.lang.Math.min(globalLimitNanos, localLimitNanos);
+        return new CleanupBudget(started, started + effective);
+    }
+
+    /**
+     * 做什么：派生子预算；局部上限只能收紧父区间**当前剩余**额度。
+     * 什么时候用：进入嵌套清理区间时。
+     * 前置条件：localLimitNanos 非负。
+     * 失败模式：负数上限抛 CleanupBudgetError；已过期的父预算会产生已过期子预算。
+     * 为什么先算父剩余再取 min：父截止点是嵌套的硬上限。若父区间已过期，父剩余夹到
+     *   0，子截止点仍回落到父截止点，因此时钟刚跨过父截止点时也不会把预算往后延。
+     *   子预算复用父 startedAtNanos，嵌套不重置计时。
+     */
+    public function nested(localLimitNanos: int64): CleanupBudget {
+        if (java.lang.Long.compare(localLimitNanos, 0) < 0) {
+            throw new CleanupBudgetError("nested cleanup budget must be non-negative");
+        }
+        var now: int64 = java.lang.System.nanoTime();
+        // 先把字段读进局部变量：平台静态重载按实参描述符选择，`this.field` 在
+        // 检查器里未必保留 int64 描述符，落局部可确保 min(long,long) 被正确选中。
+        var parentDeadline: int64 = this.deadlineAtNanos;
+        var parentRemaining: int64 = parentDeadline - now;
+        if (java.lang.Long.compare(parentRemaining, 0) < 0) {
+            parentRemaining = 0;
+        }
+        // 有效局部额度 = min(局部显式上限, 父区间当前剩余)；随后再与父截止点取 min，
+        // 防止 now 已越过父截止点时出现「子截止点晚于父截止点」。
+        var effective: int64 = java.lang.Math.min(localLimitNanos, parentRemaining);
+        var tightened: int64 = now + effective;
+        if (java.lang.Long.compare(tightened, parentDeadline) > 0) {
+            tightened = parentDeadline;
+        }
+        return new CleanupBudget(this.startedAtNanos, tightened);
+    }
+
+    /**
+     * 做什么：返回剩余纳秒数；已过期时返回 0。
+     * 什么时候用：清理循环决定还能尝试多久，或测试预算边界时。
+     * 前置条件：无。
+     * 失败模式：不会失败；数值在调用瞬间有效。
+     * 为什么夹到 0：负剩余时间对调用方没有额外含义，0 明确表示预算耗尽。
+     */
+    public function remainingNanos(): int64 {
+        var now: int64 = java.lang.System.nanoTime();
+        var remaining: int64 = this.deadlineAtNanos - now;
+        if (java.lang.Long.compare(remaining, 0) < 0) {
+            return 0;
+        }
+        return remaining;
+    }
+
+    /** 做什么：判断预算是否已耗尽。前置条件：无；失败模式：不会失败。 */
+    public function isExpired(): bool {
+        // 同 nested：先落局部变量，避免方法调用结果在平台重载匹配时丢失 int64 描述符。
+        var remaining: int64 = this.remainingNanos();
+        return java.lang.Long.compare(remaining, 0) <= 0;
+    }
+
+    /** 做什么：判断是否仍有正剩余额度。前置条件：无；失败模式：不会失败。 */
+    public function hasRemaining(): bool {
+        var remaining: int64 = this.remainingNanos();
+        return java.lang.Long.compare(remaining, 0) > 0;
+    }
+
+    /** 做什么：返回创建时的单调时钟起点。前置条件：无；失败模式：不会失败。 */
+    public function startedAtNanos(): int64 {
+        return this.startedAtNanos;
+    }
+
+    /** 做什么：返回绝对截止截点。前置条件：无；失败模式：不会失败。 */
+    public function deadlineNanos(): int64 {
+        return this.deadlineAtNanos;
+    }
+
+    /**
+     * 做什么：返回默认全局清理上限（5 秒）。
+     * 前置条件：无；失败模式：不会失败。
+     * 为什么字面量必须带 L：Jasper 的裸整数字面量默认 int32，5000000000 会先按
+     *   int32 截断成 705032704 再拓宽回 int64；带 L 才表示真正的 5 秒。
+     */
+    public static function defaultGlobalNanos(): int64 {
+        return 5000000000L;
+    }
+}

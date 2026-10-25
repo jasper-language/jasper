@@ -1,0 +1,354 @@
+package std;
+
+// ============================================================================
+// TaskGroup.jas —— 单层结构化并发作用域
+// ============================================================================
+// 职责：
+//   持有同一作用域内创建的全部子任务，提供 spawn/close、普通组失败级联取消与
+//   监督组的 B 策略失败聚合。子任务的生命周期只有一层：不在此文件实现嵌套作用域，
+//   以免把父子注册表扩张成难以审计的树。
+//
+// 失败传播（已裁决语义）：
+//   - 普通组：首个业务失败立即取消其余未终止子任务，close 仍等待全部执行体退出；
+//   - 监督组：子失败不取消兄弟；
+//   - B 策略：supervisor 作用域退出时，已由调用方 acknowledgeFailure 确认的失败
+//     不进入聚合；未确认失败必须聚合。普通组不受确认影响，仍以最早创建的失败为
+//     primary 并保留其余为 suppressed 计数。
+//
+// 依赖方向：
+//   TaskGroup -> Executor / Future / CancellationToken；这些下层不知道 TaskGroup，
+//   因此运行时模块之间没有环。
+//
+// 关键不变量：
+//   1) close 先封闭新增入口，再等待所有已登记任务体 markTaskSettled；
+//   2) 聚合结果在第一次 close 时冻结，之后确认失败不会反向修改这次聚合；
+//   3) 调度拒绝必须转换成 Future 失败并完成 settled 标记，不能留下永远 Pending 的任务。
+//
+// 变化点隔离：
+//   - 普通/监督差异集中在 onChildFailure 与 aggregate 两个方法；
+//   - 具体线程池由 Executor 端口隔离，本文件不出现 Executors 等平台类型。
+// ============================================================================
+
+/**
+ * 子任务执行体。
+ *
+ * 做什么：把「业务计算」与「任务包装/状态机」分开，执行体只接收取消令牌并返回 T。
+ * 什么时候用：TaskGroup.spawn 的第二个参数。
+ * 前置条件：实现应在长循环/阻塞前检查 token.isCancelled()。
+ * 失败模式：抛出的业务异常会被包装成 Future 失败；平台异常也会被记录。
+ * 为什么接收令牌：取消是协作式的，执行体没有令牌就无法在安全点退出。
+ */
+public interface TaskBody<T> {
+    /**
+     * 做什么：执行一次子任务并返回结果。
+     * 什么时候用：TaskRunner 在调度线程上调用。
+     * 前置条件：token 由作用域派生，调用方不应替换。
+     * 失败模式：抛 Error 表示业务失败，抛其他 Throwable 表示平台失败。
+     */
+    public function run(token: CancellationToken): T;
+}
+
+/**
+ * 作用域因未处理失败退出时抛出的聚合错误。
+ *
+ * 做什么：携带 primary 失败消息与 suppressed 数量，保证多个失败不会静默丢失。
+ * 什么时候用：TaskGroup.close 发现需要聚合的失败时。
+ * 前置条件：至少一个失败未被排除。
+ * 失败模式：不会失败。
+ * 为什么是 Error 子类：错误是控制流载体，不进入普通返回值。
+ */
+public class TaskGroupFailure extends Error {
+    private var suppressedTotal: int32;
+
+    /**
+     * 做什么：构造聚合错误。
+     * 什么时候用：close 计算完 primary 与 suppressed 后。
+     * 前置条件：message 非 null，suppressedTotal 非负。
+     * 失败模式：不会失败。
+     * 为什么保存数量：完整 Failure 列表若作为 Error 字段会违反「错误不是值」，
+     *   数量加 primary 消息足以让调用方定位并保留可观察的聚合规模。
+     */
+    public constructor(message: string, suppressedTotal: int32) {
+        super(message);
+        this.suppressedTotal = suppressedTotal;
+    }
+
+    /** 做什么：返回被压制的失败数量。前置条件：无；失败模式：不会失败。 */
+    public function suppressedCount(): int32 {
+        return this.suppressedTotal;
+    }
+}
+
+/**
+ * 关闭后继续 spawn 时抛出的结构化错误。
+ *
+ * 做什么：明确拒绝「作用域关闭后新增子任务」，而不是静默返回一个不会被 join 的 Future。
+ * 什么时候用：TaskGroup.isClosed 为真时调用 spawn。
+ * 前置条件：作用域已进入关闭流程。
+ * 失败模式：不会失败。
+ * 为什么直接抛错：创建失败不能留下无法回收的活动子任务。
+ */
+public class TaskGroupClosedError extends Error {
+    /** 做什么：构造关闭错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * 单层结构化并发作用域。
+ *
+ * 做什么：登记子任务、传递取消、在 close 时 join 并聚合未处理失败。
+ * 什么时候用：需要把一组子任务绑定到同一生命周期时；测试与平台边界也用它。
+ * 前置条件：执行器由调用方提供并负责最终 shutdown；同一个 TaskGroup 只应被一个
+ *   协调线程驱动 spawn/close（内部锁只保证登记原子性，不承诺并发 spawn 的公平顺序）。
+ * 失败模式：close 抛出 TaskGroupFailure 表示存在未处理失败；spawn 在关闭后抛
+ *   TaskGroupClosedError；执行器拒绝调度时返回失败的 Future 而不遗留活动任务。
+ * 为什么这样设计：Future 管单任务状态，TaskGroup 只管父子关系与聚合，职责分开后
+ *   两者都不需要知道对方内部状态机的细节。
+ */
+public class TaskGroup {
+    private var supervisorScope: bool;
+    private var closed: bool;
+    private var mutex: java.util.concurrent.Semaphore;
+    private var rootToken: CancellationToken;
+    private var children: MutableList<Future<any>>;
+    private var aggregationDone: bool;
+    private var aggregatePrimary: Failure?;
+    private var aggregateSuppressed: int32;
+
+    /**
+     * 做什么：创建普通组或监督组。
+     * 什么时候用：进入结构化并发作用域时。
+     * 前置条件：supervisorScope 为 true 表示 B 策略监督组。
+     * 失败模式：信号量分配失败时以平台异常出现。
+     * 为什么用布尔而不是两个类：两种作用域只差失败传播两处，合并可避免复制 join 逻辑。
+     */
+    public constructor(supervisorScope: bool) {
+        this.supervisorScope = supervisorScope;
+        this.closed = false;
+        this.mutex = new java.util.concurrent.Semaphore(1);
+        this.rootToken = new CancellationToken();
+        this.children = new MutableList<Future<any>>();
+        this.aggregationDone = false;
+        this.aggregatePrimary = null;
+        this.aggregateSuppressed = 0;
+    }
+
+    /** 做什么：判断是否监督组。前置条件：无；失败模式：不会失败。 */
+    public function isSupervisor(): bool {
+        return this.supervisorScope;
+    }
+
+    /** 做什么：判断是否已关闭新增入口。前置条件：无；失败模式：不会失败。 */
+    public function isClosed(): bool {
+        this.mutex.acquireUninterruptibly();
+        var result: bool = this.closed;
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：创建并调度一个子任务。
+     * 什么时候用：作用域尚未关闭时。
+     * 前置条件：executor 与 body 非 null。
+     * 失败模式：关闭后抛 TaskGroupClosedError；调度异常转成失败 Future 并立即标记
+     *   执行体已结束，避免 close 永久等待。
+     * 为什么先登记再调度：close 可能并发发生；先登记能让 close 看到这个 Future 并
+     *   等待它，随后调度一定会为它发布终态或失败。
+     */
+    public function spawn<T>(executor: Executor, body: TaskBody<T>): Future<T> {
+        this.mutex.acquireUninterruptibly();
+        if (this.closed) {
+            this.mutex.release();
+            throw new TaskGroupClosedError("cannot spawn after TaskGroup.close");
+        }
+        var future: Future<T> = new Future<T>();
+        var erased: Future<any> = cast future as Future<any>;
+        // children 的追加顺序就是子任务创建顺序；close 按同一顺序聚合 primary，
+        // 因此这里不再另存一份序列号，避免两份顺序来源漂移。
+        this.children.add(erased);
+        var token: CancellationToken = this.rootToken.createChild();
+        this.mutex.release();
+
+        var runner: TaskRunner<T> = new TaskRunner<T>(this, body, future, token);
+        try {
+            executor.schedule(runner);
+        } catch (rejected: java.lang.Throwable) {
+            // 调度拒绝是「任务从未开始」的失败：Future 必须先进入终态，再标记 settled，
+            // 否则 close 会等待一个永远不会运行的执行体。
+            var failure: Failure = new Failure(rejected.toString(), "schedule");
+            if (future.fail(failure)) {
+                this.onChildFailure();
+            }
+            future.markTaskSettled();
+        }
+        return future;
+    }
+
+    /**
+     * 做什么：关闭作用域、等待全部子任务执行体退出，并按策略聚合失败。
+     * 什么时候用：作用域正常结束或异常退出前的 finally 中。
+     * 前置条件：调用方接受等待已经启动的子任务；不可中断的外部阻塞可能让 close 阻塞。
+     * 失败模式：存在未处理失败时抛 TaskGroupFailure；第一次 close 后聚合结果冻结。
+     * 为什么先复制子任务列表：等待期间不持锁，允许任务完成回调正常推进，也避免
+     *   把长阻塞放进临界区。
+     */
+    public function close(): void {
+        this.mutex.acquireUninterruptibly();
+        this.closed = true;
+        var snapshot: MutableList<Future<any>> = new MutableList<Future<any>>();
+        for (child in this.children) {
+            snapshot.add(child);
+        }
+        this.mutex.release();
+
+        for (child in snapshot) {
+            child.awaitTaskSettled();
+        }
+
+        this.mutex.acquireUninterruptibly();
+        if (!this.aggregationDone) {
+            this.aggregationDone = true;
+            var primary: Failure? = null;
+            var suppressed: int32 = 0;
+            for (child in snapshot) {
+                var failure: Failure? = child.failureOrNull();
+                if (failure == null) {
+                    continue;
+                }
+                // 只有监督组承认「已确认」；普通组的子失败仍进入聚合，
+                // 因为普通组的兄弟取消策略不因确认而改变。
+                if (this.supervisorScope && child.isFailureAcknowledged()) {
+                    continue;
+                }
+                if (primary == null) {
+                    primary = failure;
+                } else {
+                    suppressed = suppressed + 1;
+                }
+            }
+            this.aggregatePrimary = primary;
+            this.aggregateSuppressed = suppressed;
+        }
+        var decided: Failure? = this.aggregatePrimary;
+        var decidedSuppressed: int32 = this.aggregateSuppressed;
+        this.mutex.release();
+
+        if (decided == null) {
+            return;
+        }
+        var message: string = decided.message();
+        if (decidedSuppressed > 0) {
+            message = message + " (+" + decidedSuppressed + " suppressed)";
+        }
+        throw new TaskGroupFailure(message, decidedSuppressed);
+    }
+
+    /**
+     * 做什么：主动取消根令牌与全部未终态子任务。
+     * 什么时候用：父作用域异常或调用方提前放弃时；普通组首个失败内部也调用它。
+     * 前置条件：无。
+     * 失败模式：不会抛异常；取消不代表执行体已退出，仍应 close join。
+     * 为什么同时取消根令牌与 Future：令牌负责协作检查，Future 负责让等待者立即
+     *   观察到取消；两者都由同一取消请求驱动，不互相替代。
+     */
+    public function cancel(): void {
+        this.rootToken.cancel();
+        var snapshot: MutableList<Future<any>> = new MutableList<Future<any>>();
+        this.mutex.acquireUninterruptibly();
+        for (child in this.children) {
+            snapshot.add(child);
+        }
+        this.mutex.release();
+        for (child in snapshot) {
+            child.cancel();
+        }
+    }
+
+    /**
+     * 做什么：普通组子任务首次失败后的级联反应。
+     * 什么时候用：TaskRunner 成功发布失败终态且当前不是监督组时。
+     * 前置条件：失败已经写入对应 Future。
+     * 失败模式：不会失败。
+     * 为什么只对普通组生效：监督组按裁决不因一个子失败取消兄弟。
+     */
+    public function onChildFailure(): void {
+        // 公开原因：Jasper 当前没有包内可见性，TaskRunner 需要调用本方法。它仍只服务
+        // 运行时内部，文档明确调用方不应直接使用。
+        if (this.supervisorScope) {
+            return;
+        }
+        this.cancel();
+    }
+}
+
+/**
+ * 子任务执行体包装器。
+ *
+ * 做什么：把 TaskBody 适配为 Executor 需要的 Runnable，并把返回值/失败/取消统一
+ *   发布到 Future，最后无条件标记任务体已退出。
+ * 什么时候用：TaskGroup.spawn 内部创建，每次 spawn 一个新实例。
+ * 前置条件：owner/future/token 由同一个 TaskGroup.spawn 创建并配对。
+ * 失败模式：执行体异常被转换为 Failure；Future 已取消时 fail/complete 返回 false
+ *   且不会二次发布终态。
+ * 为什么用具体类而不是 lambda：Runnable 继承平台接口，当前编译器只为纯 Jasper
+ *   单方法接口生成 lambda 目标；具体类还能把「finally 必标记 settled」集中到一处。
+ */
+public class TaskRunner<T> implements Runnable {
+    private var owner: TaskGroup;
+    private var body: TaskBody<T>;
+    private var future: Future<T>;
+    private var token: CancellationToken;
+
+    /**
+     * 做什么：绑定一次子任务执行所需的全部引用。
+     * 什么时候用：TaskGroup.spawn 内。
+     * 前置条件：四个引用非 null。
+     * 失败模式：不会失败。
+     * 为什么全部用构造器注入：执行期间不再改绑，避免读到另一个任务的状态。
+     */
+    public constructor(owner: TaskGroup, body: TaskBody<T>, future: Future<T>, token: CancellationToken) {
+        this.owner = owner;
+        this.body = body;
+        this.future = future;
+        this.token = token;
+    }
+
+    /**
+     * 做什么：执行任务体并发布终态。
+     * 什么时候用：执行器线程调用一次。
+     * 前置条件：Future 初始为 Pending。
+     * 失败模式：业务 Error 与平台 Throwable 分别转成 Failure；无论路径如何 finally
+     *   都会标记 settled，保证作用域关闭不会漏 join。
+     * 为什么先看令牌再看返回值：执行体可能在取消后仍正常返回一个值，此时可观察语义
+     *   必须是 Cancelled，而不是把迟到结果伪装成成功。
+     * 为什么用嵌套 try 而不是并列 catch：当前编译器只为「每个 try 的第一个 catch」
+     *   生成异常表项，并列写 Error + Throwable 会让第二个 catch 从空栈执行 ASTORE 而
+     *   在字节码帧合并阶段失败；外层 try 覆盖内层 catch 体，语义等价且只用一个处理器。
+     */
+    public function run(): void {
+        try {
+            try {
+                var value: T = this.body.run(this.token);
+                if (this.token.isCancelled()) {
+                    this.future.cancel();
+                } else {
+                    this.future.complete(value);
+                }
+            } catch (error: Error) {
+                var failure: Failure = new Failure(error.message(), "error");
+                if (this.future.fail(failure)) {
+                    this.owner.onChildFailure();
+                }
+            }
+        } catch (throwable: java.lang.Throwable) {
+            var failure: Failure = new Failure(throwable.toString(), "platform");
+            if (this.future.fail(failure)) {
+                this.owner.onChildFailure();
+            }
+        } finally {
+            this.future.markTaskSettled();
+        }
+    }
+}
