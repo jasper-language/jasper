@@ -1,0 +1,96 @@
+package std;
+
+// S4-C 内部调度门：编译器生成的执行段负责业务状态与 Future，本类仅串行化恢复。
+// Executor 必须入队执行，不能同步递归调用 run；JvmExecutor 满足此约束。
+/**
+ * 同一 continuation 最多一个执行段正在运行。运行中的唤醒合并为一次后续入队，
+ * 空闲时的唤醒合并为一次调度；finish 后不再执行。锁外调用执行器与业务段。
+ * 这是内部实现接口，不声明新的源语言标记，也不实现 await 状态机变换。
+ */
+public class ContinuationDispatch implements Runnable {
+    private var executor: Executor;
+    private var segment: Runnable;
+    private var mutex: java.util.concurrent.Semaphore;
+    private var queued: bool;
+    private var running: bool;
+    private var wakePending: bool;
+    private var finished: bool;
+
+    /** 绑定调度器与单步执行段；两者非 null，执行段自行保存程序位置与局部变量。 */
+    public constructor(executor: Executor, segment: Runnable) {
+        this.executor = executor;
+        this.segment = segment;
+        this.mutex = new java.util.concurrent.Semaphore(1);
+        this.queued = false;
+        this.running = false;
+        this.wakePending = false;
+        this.finished = false;
+    }
+
+    /** 请求恢复；已终止返回 false，否则合并请求并在必要时入队，拒绝调度原样抛出。 */
+    public function resume(): bool {
+        this.mutex.acquireUninterruptibly();
+        if (this.finished) {
+            this.mutex.release();
+            return false;
+        }
+        if (this.running) {
+            this.wakePending = true;
+            this.mutex.release();
+            return true;
+        }
+        if (this.queued) {
+            this.mutex.release();
+            return true;
+        }
+        this.queued = true;
+        this.mutex.release();
+        this.enqueue();
+        return true;
+    }
+
+    /** 标记执行状态终止；已入队的陈旧恢复请求只会空返回，不强制停止正在执行的段。 */
+    public function finish(): void {
+        this.mutex.acquireUninterruptibly();
+        this.finished = true;
+        this.wakePending = false;
+        this.queued = false;
+        this.mutex.release();
+    }
+
+    /** 执行一个就绪段；通知回调只调用 resume，不直接执行此段。段抛错后禁止重放。 */
+    public function run(): void {
+        this.mutex.acquireUninterruptibly();
+        if (this.finished || this.running || !this.queued) {
+            this.mutex.release();
+            return;
+        }
+        this.queued = false;
+        this.running = true;
+        this.mutex.release();
+        try {
+            this.segment.run();
+        } catch (error: java.lang.Throwable) {
+            this.finish();
+            throw error;
+        } finally {
+            this.mutex.acquireUninterruptibly();
+            this.running = false;
+            var scheduleAgain: bool = this.wakePending && !this.finished;
+            this.wakePending = false;
+            if (scheduleAgain) { this.queued = true; }
+            this.mutex.release();
+            if (scheduleAgain) { this.enqueue(); }
+        }
+    }
+
+    /** 锁外提交；拒绝后关闭调度门并抛原异常，由生成的任务桥发布失败、完成回收。 */
+    private function enqueue(): void {
+        try {
+            this.executor.schedule(this);
+        } catch (error: java.lang.Throwable) {
+            this.finish();
+            throw error;
+        }
+    }
+}

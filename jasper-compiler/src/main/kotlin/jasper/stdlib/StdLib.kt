@@ -107,7 +107,8 @@ object StdLib {
         "TaskGroup.jas",
         "Context.jas",
         "CleanupBudget.jas",
-        "JvmExecutor.jas"
+        "JvmExecutor.jas",
+        "ContinuationDispatch.jas"
     )
 
     /**
