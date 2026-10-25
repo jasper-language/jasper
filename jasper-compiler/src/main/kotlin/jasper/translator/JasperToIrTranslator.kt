@@ -2955,17 +2955,17 @@ class JasperToIrTranslator {
     }
 
     private fun translateUnaryOp(expr: JasUnaryOp, ctx: TranslationContext): IrExpression {
-        // await / go 是异步地基原语，语义特殊，先于通用一元运算分派。（FINDINGS #1/#2）
+        // await 的兼容占位路径先于通用一元运算分派；它尚未实现协程挂起。
         when (expr.op) {
             // await：当前没有真实的挂起运行时，等待语义按「操作数同步求值完成」实现——
             // 直接返回操作数的求值结果，其 IR 类型即操作数类型。
             // 旧实现把 await 当成未知一元运算，降级为对名为 "unknown" 的调用，
             // 生成的描述符/宿主都不对（运行期 NoSuchMethodError: ...unknown(...)）。
-            // 变化点被隔离在此：将来引入真正的 async/Task 运行时，只需在这里改成
-            // 「按目标类型调用阻塞式取值」，不影响其它一元运算。
+            // S4-C 必须在函数级生成 continuation/状态机，并把完成通知接回调度队列。
+            // 不可只在此调用 Future.get()：阻塞工作线程不满足非阻塞挂起契约。
             "await" -> return translateExpression(expr.operand, ctx)
             // 注意：`go` 前缀运算符已于 2026-10-17 从语言中移除（用户裁决 A）。
-            // 启动任务改由标准库 `Task.run(...)` 提供，返回 Task 句柄，配合 `await` 取值。
+            // 当前任务创建由标准库 TaskGroup.spawn 提供并返回 Future；await 挂起仍待 S4-C。
             // 这样任务有句柄 ⇒ 可取消、可跟踪模块归属（.jaso 卸载依赖活跃引用）。
         }
         val operand = translateExpression(expr.operand, ctx)
