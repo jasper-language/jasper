@@ -178,10 +178,15 @@ public class TaskGroup {
             // 调度拒绝是「任务从未开始」的失败：Future 必须先进入终态，再标记 settled，
             // 否则 close 会等待一个永远不会运行的执行体。
             var failure: Failure = new Failure(rejected.toString(), "schedule");
-            if (future.fail(failure)) {
-                this.onChildFailure();
+            try {
+                future.fail(failure);
+            } finally {
+                try {
+                    this.onChildFailure();
+                } finally {
+                    future.markTaskSettled();
+                }
             }
-            future.markTaskSettled();
         }
         return future;
     }
@@ -249,12 +254,19 @@ public class TaskGroup {
      * 做什么：主动取消根令牌与全部未终态子任务。
      * 什么时候用：父作用域异常或调用方提前放弃时；普通组首个失败内部也调用它。
      * 前置条件：无。
-     * 失败模式：不会抛异常；取消不代表执行体已退出，仍应 close join。
+     * 失败模式：通知全部尝试后汇总回调错误；取消不代表执行体已退出，仍应 close join。
      * 为什么同时取消根令牌与 Future：令牌负责协作检查，Future 负责让等待者立即
      *   观察到取消；两者都由同一取消请求驱动，不互相替代。
      */
     public function cancel(): void {
-        this.rootToken.cancel();
+        var callbackFailures: int32 = 0;
+        var firstFailure: string = "";
+        try {
+            this.rootToken.cancel();
+        } catch (error: java.lang.Throwable) {
+            firstFailure = error.toString();
+            callbackFailures = callbackFailures + 1;
+        }
         var snapshot: MutableList<Future<any>> = new MutableList<Future<any>>();
         this.mutex.acquireUninterruptibly();
         for (child in this.children) {
@@ -262,7 +274,15 @@ public class TaskGroup {
         }
         this.mutex.release();
         for (child in snapshot) {
-            child.cancel();
+            try {
+                child.cancel();
+            } catch (error: java.lang.Throwable) {
+                if (callbackFailures == 0) { firstFailure = error.toString(); }
+                callbackFailures = callbackFailures + 1;
+            }
+        }
+        if (callbackFailures > 0) {
+            throw new CallbackDispatchError(firstFailure, callbackFailures);
         }
     }
 
@@ -270,7 +290,7 @@ public class TaskGroup {
      * 做什么：普通组子任务首次失败后的级联反应。
      * 什么时候用：TaskRunner 成功发布失败终态且当前不是监督组时。
      * 前置条件：失败已经写入对应 Future。
-     * 失败模式：不会失败。
+     * 失败模式：取消回调失败时抛 CallbackDispatchError，全部兄弟仍会收到取消。
      * 为什么只对普通组生效：监督组按裁决不因一个子失败取消兄弟。
      */
     public function onChildFailure(): void {
@@ -338,17 +358,19 @@ public class TaskRunner<T> implements Runnable {
                 }
             } catch (error: Error) {
                 var failure: Failure = new Failure(error.message(), "error");
-                if (this.future.fail(failure)) {
-                    this.owner.onChildFailure();
-                }
+                this.future.fail(failure);
             }
         } catch (throwable: java.lang.Throwable) {
             var failure: Failure = new Failure(throwable.toString(), "platform");
-            if (this.future.fail(failure)) {
-                this.owner.onChildFailure();
-            }
+            this.future.fail(failure);
         } finally {
-            this.future.markTaskSettled();
+            try {
+                if (this.future.status() == FutureStatus.Failed) {
+                    this.owner.onChildFailure();
+                }
+            } finally {
+                this.future.markTaskSettled();
+            }
         }
     }
 }

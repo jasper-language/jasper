@@ -81,7 +81,7 @@ public class CancellationToken {
      * 做什么：请求取消并触发全部回调；只有第一次返回 true。
      * 什么时候用：TaskGroup 首个失败取消兄弟、父令牌取消传播、或调用方主动取消。
      * 前置条件：无。
-     * 失败模式：回调异常向调用者传播；重复调用返回 false 且不再触发回调。
+     * 失败模式：全部回调尝试后以 CallbackDispatchError 汇总失败；重复调用返回 false。
      * 为什么先置位再回调：保证回调里调用 isCancelled() 一定能观察到已取消，
      *   也保证注册与取消的竞争有确定结果。
      */
@@ -98,8 +98,18 @@ public class CancellationToken {
         }
         this.handlers = new MutableList<Action<CancellationToken>>();
         this.mutex.release();
+        var callbackFailures: int32 = 0;
+        var firstFailure: string = "";
         for (handler in pending) {
-            handler.accept(this);
+            try {
+                handler.accept(this);
+            } catch (error: java.lang.Throwable) {
+                if (callbackFailures == 0) { firstFailure = error.toString(); }
+                callbackFailures = callbackFailures + 1;
+            }
+        }
+        if (callbackFailures > 0) {
+            throw new CallbackDispatchError(firstFailure, callbackFailures);
         }
         return true;
     }
@@ -160,7 +170,7 @@ public class CancellationToken {
  * 做什么：作为 Action<CancellationToken> 注册到父令牌，在父取消时取消子令牌。
  * 什么时候用：CancellationToken.createChild 内部使用。
  * 前置条件：child 非 null。
- * 失败模式：不会失败；child.cancel 幂等。
+ * 失败模式：child.cancel 幂等；子回调失败由父取消批次汇总。
  * 为什么用具体类：回调只需要一个动作，具体类比在令牌里内嵌匿名逻辑更易审计。
  */
 public class ChildCancellation implements Action<CancellationToken> {
@@ -175,7 +185,7 @@ public class ChildCancellation implements Action<CancellationToken> {
      * 做什么：父令牌取消时取消子令牌。
      * 什么时候用：由父令牌 cancel 触发。
      * 前置条件：child 已构造。
-     * 失败模式：不会失败；子令牌已取消时 cancel 返回 false。
+     * 失败模式：子令牌已取消时返回；子回调失败向父批次传播但不阻断其他子令牌。
      */
     public function accept(parent: CancellationToken): void {
         this.child.cancel();

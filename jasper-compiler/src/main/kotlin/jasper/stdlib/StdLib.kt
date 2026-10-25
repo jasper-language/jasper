@@ -103,6 +103,7 @@ object StdLib {
         "Executor.jas",
         "Future.jas",
         "CancellationToken.jas",
+        "CallbackDispatchError.jas",
         "TaskGroup.jas",
         "Context.jas",
         "CleanupBudget.jas",

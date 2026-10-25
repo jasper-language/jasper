@@ -217,6 +217,175 @@ class S4RuntimeJasperTest {
         )
     }
 
+    /** 调度拒绝后的级联通知失败仍须给从未运行的子任务标记 settled。 */
+    @Test
+    fun `rejected task settles even when sibling cancellation callback throws`() {
+        assertOk(
+            "task-group-rejection-callback-failure",
+            """
+            package std;
+            public class RejectSecond implements Executor {
+                private var task: Runnable?;
+                private var count: int32;
+                public constructor() { this.task = null; this.count = 0; }
+                public function schedule(task: Runnable): void {
+                    this.count = this.count + 1;
+                    if (this.count > 1) { throw new Error("schedule rejected"); }
+                    this.task = task;
+                }
+                public function shutdown(): void { }
+                public function drain(): void {
+                    var queued: Runnable = cast this.task as Runnable;
+                    queued.run();
+                }
+            }
+            public class RejectedSiblingHandler implements Action<FutureOutcome> {
+                public function accept(value: FutureOutcome): void { throw new Error("notification failed"); }
+            }
+            public class EmptyBody implements TaskBody<int32> {
+                public function run(token: CancellationToken): int32 { return 7; }
+            }
+            public function main(): int32 {
+                var executor: RejectSecond = new RejectSecond();
+                var group: TaskGroup = new TaskGroup(false);
+                var first: Future<int32> = group.spawn(executor, new EmptyBody());
+                first.onComplete(new RejectedSiblingHandler());
+                try {
+                    group.spawn(executor, new EmptyBody());
+                    return 1;
+                } catch (error: CallbackDispatchError) {
+                    if (first.status() != FutureStatus.Cancelled) { return 2; }
+                }
+                executor.drain();
+                try {
+                    group.close();
+                    return 3;
+                } catch (error: TaskGroupFailure) {
+                    if (error.suppressedCount() != 0) { return 4; }
+                }
+                return 0;
+            }
+            """.trimIndent()
+        )
+    }
+
+    /** 失败通知抛错仍须取消兄弟，并在最终标记 settled 后允许 close 返回。 */
+    @Test
+    fun `task group settles and cancels siblings despite callback failures`() {
+        assertOk(
+            "task-group-callback-failure",
+            """
+            package std;
+            public class ManualExecutor implements Executor {
+                private var tasks: MutableList<Runnable>;
+                public constructor() { this.tasks = new MutableList<Runnable>(); }
+                public function schedule(task: Runnable): void { this.tasks.add(task); }
+                public function shutdown(): void { }
+                public function runAt(index: int32): void { this.tasks.get(index).run(); }
+            }
+            public class BadOutcome implements Action<FutureOutcome> {
+                public function accept(value: FutureOutcome): void { throw new Error("bad outcome"); }
+            }
+            public class BadCancellation implements Action<CancellationToken> {
+                public function accept(value: CancellationToken): void { throw new Error("bad cancellation"); }
+            }
+            public class FailWithCancellationHook implements TaskBody<int32> {
+                public function run(token: CancellationToken): int32 {
+                    token.onCancel(new BadCancellation());
+                    throw new Error("business failure");
+                }
+            }
+            public class ObserveCancelled implements TaskBody<int32> {
+                public function run(token: CancellationToken): int32 {
+                    if (!token.isCancelled()) { throw new Error("sibling missed cancellation"); }
+                    return 7;
+                }
+            }
+            public function main(): int32 {
+                var executor: ManualExecutor = new ManualExecutor();
+                var group: TaskGroup = new TaskGroup(false);
+                var first: Future<int32> = group.spawn(executor, new FailWithCancellationHook());
+                var second: Future<int32> = group.spawn(executor, new ObserveCancelled());
+                if (first.isDone()) { return 6; }
+                if (second.isDone()) { return 7; }
+                first.onComplete(new BadOutcome());
+                second.onComplete(new BadOutcome());
+                try {
+                    executor.runAt(0);
+                    return 1;
+                } catch (error: CallbackDispatchError) {
+                    if (first.status() != FutureStatus.Failed) { return 2; }
+                    if (second.status() != FutureStatus.Cancelled) { return 3; }
+                }
+                executor.runAt(1);
+                try {
+                    group.close();
+                    return 4;
+                } catch (error: TaskGroupFailure) {
+                    if (error.message() != "business failure") { return 5; }
+                }
+                return 0;
+            }
+            """.trimIndent()
+        )
+    }
+
+    /** 回调失败不能中断同批后续通知，也不能阻断父子取消传播。 */
+    @Test
+    fun `throwing callbacks do not drop completion or cancellation notifications`() {
+        assertOk(
+            "callback-failure-isolation",
+            """
+            package std;
+            public class OutcomeCounter implements Action<FutureOutcome> {
+                public var count: int32 = 0;
+                public function accept(value: FutureOutcome): void { this.count = this.count + 1; }
+            }
+            public class ThrowOutcome implements Action<FutureOutcome> {
+                public function accept(value: FutureOutcome): void {
+                    throw new Error("completion callback failed");
+                }
+            }
+            public class ThrowCancel implements Action<CancellationToken> {
+                public function accept(value: CancellationToken): void {
+                    throw new Error("cancellation callback failed");
+                }
+            }
+            public function main(): int32 {
+                var f: Future<int32> = new Future<int32>();
+                var counter: OutcomeCounter = new OutcomeCounter();
+                f.onComplete(new ThrowOutcome());
+                f.onComplete(counter);
+                f.onComplete(new ThrowOutcome());
+                try {
+                    f.complete(42);
+                    return 1;
+                } catch (error: CallbackDispatchError) {
+                    if (counter.count != 1) { return 2; }
+                    if (error.failureCount() != 2) { return 10; }
+                }
+                if (f.get() != 42) { return 3; }
+                if (f.complete(99)) { return 4; }
+                if (counter.count != 1) { return 5; }
+                var parent: CancellationToken = new CancellationToken();
+                parent.onCancel(new ThrowCancel());
+                var child: CancellationToken = parent.createChild();
+                parent.onCancel(new ThrowCancel());
+                try {
+                    parent.cancel();
+                    return 6;
+                } catch (error: CallbackDispatchError) {
+                    if (error.failureCount() != 2) { return 11; }
+                    if (!parent.isCancelled()) { return 7; }
+                    if (!child.isCancelled()) { return 8; }
+                }
+                if (parent.cancel()) { return 9; }
+                return 0;
+            }
+            """.trimIndent()
+        )
+    }
+
     /**
      * 做什么：验证并发 complete 竞争下恰好一个生产者成功、终态唯一。
      * 什么时候用：修改 Future 的互斥/终态判定时。

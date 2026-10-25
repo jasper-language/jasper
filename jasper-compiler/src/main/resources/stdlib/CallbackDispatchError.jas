@@ -1,0 +1,22 @@
+package std;
+
+// 回调批次失败报告：先尝试全部通知，再向发布者报告；不把 Error 当作值保存。
+/**
+ * 回调批次中至少一个注册者失败。保存首个失败的文本与失败注册者数，
+ * 不撤销已经发布的 Future 终态或取消状态，不保留 Throwable 对象。
+ * count 是本批失败注册者数，不展开子批次中的失败数量。
+ */
+public class CallbackDispatchError extends Error {
+    private var countValue: int32;
+
+    /** 构造回调失败报告；前置条件 count > 0，message 为首个失败文本。 */
+    public constructor(message: string, count: int32) {
+        super(message);
+        this.countValue = count;
+    }
+
+    /** 返回本批失败注册者数；读取不会失败。 */
+    public function failureCount(): int32 {
+        return this.countValue;
+    }
+}

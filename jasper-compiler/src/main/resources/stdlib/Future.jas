@@ -294,7 +294,7 @@ public class Future<T> {
      * 做什么：尝试发布成功终态。
      * 什么时候用：生产者在计算成功后调用。
      * 前置条件：值类型与 T 兼容。
-     * 失败模式：Future 已终态时返回 false，不覆盖已有结果；这是双重完成的固定拒绝方式。
+     * 失败模式：已终态返回 false；发布成功后回调全部尝试，有失败则抛 CallbackDispatchError。
      */
     public function complete(value: T): bool {
         return this.finish(FutureStatus.Completed, value, null);
@@ -304,7 +304,7 @@ public class Future<T> {
      * 做什么：尝试发布失败终态。
      * 什么时候用：生产者捕获业务异常或平台异常后调用。
      * 前置条件：failure 非 null。
-     * 失败模式：Future 已终态时返回 false；不会把取消改写成失败。
+     * 失败模式：已终态返回 false；回调失败在发布后汇总抛出，不改写终态。
      */
     public function fail(failure: Failure): bool {
         // failure 作为业务数据参数传入；这里显式判空以拒绝不合法的发布请求。
@@ -318,7 +318,7 @@ public class Future<T> {
      * 做什么：尝试请求取消。
      * 什么时候用：调用方不再需要结果时；运行中的任务需通过 CancellationToken 协作退出。
      * 前置条件：无。
-     * 失败模式：已终态返回 false；取消不会强制终止线程，也不会撤销已经发布的完成结果。
+     * 失败模式：已终态返回 false；通知失败在取消后汇总抛出，不强制终止线程。
      */
     public function cancel(): bool {
         return this.finish(FutureStatus.Cancelled, 0, null);
@@ -410,7 +410,7 @@ public class Future<T> {
      * 做什么：把 Future 推入指定终态，并唤醒等待者、复制并执行回调。
      * 什么时候用：complete/fail/cancel 的唯一实现路径。
      * 前置条件：nextStatus 不是 Pending。
-     * 失败模式：已有终态时返回 false，不产生任何副作用。
+     * 失败模式：已有终态时返回 false；回调全部尝试后以 CallbackDispatchError 汇总失败。
      * 为什么把迁移集中到一处：终态互斥、恰好一次发布、通知顺序都是同一变化点；
      *   分散实现会让双重完成或漏唤醒在某条路径上复发。
      */
@@ -435,9 +435,19 @@ public class Future<T> {
             this.terminalSignal.release(waiterCount);
         }
         var snapshot: FutureOutcome = new FutureOutcome(nextStatus, nextValue, nextFailure);
-        // 回调在锁外按注册顺序执行；内部回调不抛异常，用户回调异常向发布者传播。
+        // 回调在锁外按注册顺序执行；单个失败不能丢弃后续通知。
+        var callbackFailures: int32 = 0;
+        var firstFailure: string = "";
         for (handler in pendingHandlers) {
-            handler.accept(snapshot);
+            try {
+                handler.accept(snapshot);
+            } catch (error: java.lang.Throwable) {
+                if (callbackFailures == 0) { firstFailure = error.toString(); }
+                callbackFailures = callbackFailures + 1;
+            }
+        }
+        if (callbackFailures > 0) {
+            throw new CallbackDispatchError(firstFailure, callbackFailures);
         }
         return true;
     }

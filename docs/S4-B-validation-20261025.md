@@ -64,3 +64,23 @@ TLA+ 只验证有限抽象模型，未证明 JVM 内存模型、实际信号量�
 无法中断的外部阻塞仍可能阻止 TaskGroup.close 返回。
 
 改动保留在 `oc/Q79`，没有合入 main 或推送远端。
+
+
+## 接续二：回调异常隔离
+
+已修复首个回调抛错就中断后续通知的问题。新增回归在修改前真实执行失败
+（callback-failure-isolation 返回 2：后续完成回调未执行），修改后通过。
+Future 与 CancellationToken 先完成全部通知再抛 CallbackDispatchError；TaskGroup
+继续尝试全部取消，TaskRunner 和调度拒绝路径用嵌套 finally 保证 settled。
+详细公开契约见 `S4-coroutine-context.md` 的回调异常条目。
+
+构建虚拟机 `./gradlew test --no-daemon` 通过（1 分 21 秒），JUnit XML 汇总
+740 项 / 0 failures / 0 errors / 1 skipped；739 项实际执行。其中运行时专项
+20/20，新增 3 项覆盖回调失败隔离、失败通知后的兄弟取消/close、调度拒绝后的
+settled。其他模块为缓存或受影响任务按 Gradle 正常判定执行，未声称本次全部强制重跑。
+
+五组 TLA+ 配置均重新运行通过，新增 CallbackDispatch 模型 23 个可达状态。
+新增性质 LANG-S4BJ-03 为 tested；模型中的顺序、失败计数和全部尝试后才报告成立，
+不表示 JVM 实现被形式证明。语法文件未改，代码规范与 FV 产物检查通过。
+
+后续仍需推进 S4-C 挂起/恢复降级；当前回调协议不能中断阻塞回调。
