@@ -32,6 +32,8 @@
 
 | `LANG-CONT-EFFECT-01` | 沿检查器实际解析的直接调用声明传播挂起能力，支持前向引用与递归不动点；普通值 await 不构成种子；动态/外部/未覆盖调用保留 UNKNOWN，不假装同步；多文件编译共享效果快照。 | `JasCall.resolvedFunction`；`TypeChecker` 已选函数回填；`SuspensionEffectAnalysis`；`CompilePipeline.suspensionEffects`；`SuspensionEffectAnalysisTest` 与 `SuspensionPlanningIntegrationTest` | 实际编译管线契约测试 + 固定种子 20261025 的 64 个八节点图，独立逐根可达性 oracle | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*SuspensionEffectAnalysisTest' --tests '*SuspensionPlanningIntegrationTest' --no-daemon` | 只覆盖已解析直接调用；实例虚分派、函数值、外部函数、未覆盖 AST 结构保守 UNKNOWN；遵循既有重载解析结果，不修复其限制。尚未对外公开挂起 ABI 或实现显式标记，不发射协程字节码。 |
 
+| `LANG-CONT-RESULT-01` | 内部调度门的结果只可在首次恢复前绑定一次；当前段退出后重入队拒绝或段异常应关闭门并发布可观察失败，不能遗留 Pending；通知抛异常仍通过 finally 标记 settled。 | `ContinuationDispatch.bindResult/publishFailure/enqueue/run`；`ContinuationDispatchTest` 的绑定与失败用例；`verification/tla/ContinuationResultBinding.tla` | 真实 Jasper 编译执行契约测试 + TLA+ 有限状态模型（21 个可达状态） | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*ContinuationDispatchTest' --tests '*ContinuationThreadPoolTest' --no-daemon`；虚拟机内 `TLA2TOOLS_JAR=/tmp/jasper-s4-tla2tools.jar bash verification/run-s4-models.sh` | 可选内部任务桥接口，未绑定时保留原异常传播；成功和主动取消仍由生成段发布。模型把同步原语与失败快照发布抽象为原子动作，不证明 JVM 内存模型或不返回的用户回调；不是自动生成 await 状态机。 |
+
 ## 可信基与未覆盖范围
 
 - **可信基（不在本表验证范围内、被假设正确）**：ANTLR 运行时与其生成的解析器、ASM 字节码库、执行测试的 JVM 与其类加载器、Gradle / JUnit 测试运行器、构建所用 JDK 的标准库。

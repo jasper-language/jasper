@@ -1,6 +1,6 @@
 package std;
 
-// S4-C 内部调度门：编译器生成的执行段负责业务状态与 Future，本类仅串行化恢复。
+// S4-C 内部调度门：生成段负责业务成功/取消，本类串行恢复并补充调度和段异常结果。
 // Executor 必须入队执行，不能同步递归调用 run；JvmExecutor 满足此约束。
 /**
  * 同一 continuation 最多一个执行段正在运行。运行中的唤醒合并为一次后续入队，
@@ -15,6 +15,8 @@ public class ContinuationDispatch implements Runnable {
     private var running: bool;
     private var wakePending: bool;
     private var finished: bool;
+    private var everStarted: bool;
+    private var result: Future<any>?;
 
     /** 绑定调度器与单步执行段；两者非 null，执行段自行保存程序位置与局部变量。 */
     public constructor(executor: Executor, segment: Runnable) {
@@ -25,6 +27,19 @@ public class ContinuationDispatch implements Runnable {
         this.running = false;
         this.wakePending = false;
         this.finished = false;
+        this.everStarted = false;
+        this.result = null;
+    }
+
+    /** 生成任务桥可在首次 resume 前绑定结果；重复绑定或启动后绑定均明确拒绝。 */
+    public function bindResult<T>(result: Future<T>): void {
+        this.mutex.acquireUninterruptibly();
+        if (this.everStarted || this.finished || this.result != null) {
+            this.mutex.release();
+            throw new Error("continuation result must be bound once before start");
+        }
+        this.result = cast result as Future<any>;
+        this.mutex.release();
     }
 
     /** 请求恢复；已终止返回 false，否则合并请求并在必要时入队，拒绝调度原样抛出。 */
@@ -34,6 +49,7 @@ public class ContinuationDispatch implements Runnable {
             this.mutex.release();
             return false;
         }
+        this.everStarted = true;
         if (this.running) {
             this.wakePending = true;
             this.mutex.release();
@@ -72,6 +88,7 @@ public class ContinuationDispatch implements Runnable {
             this.segment.run();
         } catch (error: java.lang.Throwable) {
             this.finish();
+            this.publishFailure(new Failure(error.toString(), "platform"));
             throw error;
         } finally {
             this.mutex.acquireUninterruptibly();
@@ -84,13 +101,27 @@ public class ContinuationDispatch implements Runnable {
         }
     }
 
-    /** 锁外提交；拒绝后关闭调度门并抛原异常，由生成的任务桥发布失败、完成回收。 */
+    /** 锁外提交；拒绝后关闭调度门，已绑定结果补充失败与回收，然后传播异常。 */
     private function enqueue(): void {
         try {
             this.executor.schedule(this);
         } catch (error: java.lang.Throwable) {
             this.finish();
+            this.publishFailure(new Failure(error.toString(), "schedule"));
             throw error;
+        }
+    }
+
+    /** 调度或执行失败不能遗留 Pending 结果；通知异常也不得跳过 settled。 */
+    private function publishFailure(failure: Failure): void {
+        var bound: Future<any>? = this.result;
+        if (bound != null) {
+            var target: Future<any> = cast bound as Future<any>;
+            try {
+                target.fail(failure);
+            } finally {
+                target.markTaskSettled();
+            }
         }
     }
 }
