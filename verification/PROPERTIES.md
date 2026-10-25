@@ -26,6 +26,8 @@
 
 | `LANG-CONT-DISPATCH-01` | 恢复请求在 queued/running 阶段合并，运行中唤醒保留到退出后重新入队；同一执行段不并发运行，finish 后陈旧队列项不执行；调度拒绝与段异常关闭调度门并向调用方传播。 | `ContinuationDispatch.jas` 的 resume/run/finish/enqueue；`ContinuationDispatchTest`、`ContinuationThreadPoolTest`；`verification/tla/ContinuationDispatch.tla` | 真实编译执行的确定性队列与实际 JVM 线程池契约测试 + TLA+ 有限状态模型（6 个可达状态） | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*ContinuationDispatchTest' --no-daemon`；虚拟机内 `TLA2TOOLS_JAR=/tmp/jasper-s4-tla2tools.jar bash verification/run-s4-models.sh` | 内部执行接口，要求 Executor 异步入队而非同步内联；模型把互斥临界区抽象为原子转换，不证明 JVM 锁/公平性/活性。测试使用手写执行段，不是编译器生成 await；实际池覆盖单线程进展，以及首段运行时八个生产者的 800 次并发唤醒合并，不能据此声称证明 JVM 内存模型或任意调度交错；取消、结果 Future、任务回收由后续生成桥负责。 |
 
+| `LANG-CONT-FRAME-01` | 直线体规划对检查器确认的直接挂起划分边界，保守保存挂起前已存在且恢复后仍被引用的绑定，不提前保存 await 结果；保留节点身份与位置；不支持的控制流或嵌套挂起返回明确节点且不返回部分计划。 | `LinearSuspensionPlanner.plan/collect`；`LinearSuspensionPlannerTest` | 单元契约测试 + 固定种子 20261025 的 64 组跨边界引用集合，失败时优先收缩为单引用 | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*LinearSuspensionPlannerTest' --no-daemon` | 输入须经过类型/作用域检查，真正挂起由外部谓词提供；当前未接入编译器主流程或生成代码。只支持直线体与列出的表达式，未做赋值杀死分析，可能多保存；不覆盖循环/分支/闭包/清理、字段布局类型与恢复调度。 |
+
 ## 可信基与未覆盖范围
 
 - **可信基（不在本表验证范围内、被假设正确）**：ANTLR 运行时与其生成的解析器、ASM 字节码库、执行测试的 JVM 与其类加载器、Gradle / JUnit 测试运行器、构建所用 JDK 的标准库。
