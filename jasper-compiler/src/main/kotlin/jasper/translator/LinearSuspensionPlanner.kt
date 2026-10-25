@@ -8,7 +8,8 @@ data class LinearSuspensionPoint(
     val statementIndex: Int,
     val expression: JasUnaryOp,
     val resultBinding: String?,
-    val liveLocals: Set<String>
+    val liveLocals: Set<String>,
+    val resultType: JasType? = expression.awaitResultType
 )
 
 /** 分段结果或首个不支持的节点；失败时不返回部分计划，以免调用者漏掉控制流。 */
@@ -25,7 +26,10 @@ data class LinearSuspensionPlan(
  */
 object LinearSuspensionPlanner {
     /** 规划直线体；先完整验证支持范围，再收集跨挂起活跃绑定，保持源码节点身份与位置。 */
-    fun plan(function: JasFunction, isSuspending: (JasUnaryOp) -> Boolean): LinearSuspensionPlan {
+    fun plan(
+        function: JasFunction,
+        isSuspending: (JasUnaryOp) -> Boolean = { it.awaitResultType != null }
+    ): LinearSuspensionPlan {
         val statements = function.body?.statements ?: return LinearSuspensionPlan(emptyList())
         val references = mutableListOf<Set<String>>()
         val awaits = mutableListOf<Pair<JasUnaryOp, String?>?>()

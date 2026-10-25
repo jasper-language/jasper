@@ -28,6 +28,8 @@
 
 | `LANG-CONT-FRAME-01` | 直线体规划对检查器确认的直接挂起划分边界，保守保存挂起前已存在且恢复后仍被引用的绑定，不提前保存 await 结果；保留节点身份与位置；不支持的控制流或嵌套挂起返回明确节点且不返回部分计划。 | `LinearSuspensionPlanner.plan/collect`；`LinearSuspensionPlannerTest` | 单元契约测试 + 固定种子 20261025 的 64 组跨边界引用集合，失败时优先收缩为单引用 | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*LinearSuspensionPlannerTest' --no-daemon` | 输入须经过类型/作用域检查，真正挂起由外部谓词提供；当前未接入编译器主流程或生成代码。只支持直线体与列出的表达式，未做赋值杀死分析，可能多保存；不覆盖循环/分支/闭包/清理、字段布局类型与恢复调度。 |
 
+| `LANG-CONT-TYPED-01` | 解析后的真实 std.Future await 由检查器标记结果类型并供直线分段规划器直接消费，普通值不切段；同一 AST 重查为普通值后清除旧挂起事实。 | `JasUnaryOp.awaitResultType`、`TypeChecker.inferExpression`、`LinearSuspensionPlanner.plan` 默认谓词；`SuspensionPlanningIntegrationTest` | 权威 ANTLR 解析 -> 真实类型检查 -> 分段布局的集成契约测试 | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*SuspensionPlanningIntegrationTest' --tests '*AwaitFrontendTest' --tests '*LinearSuspensionPlannerTest' --no-daemon` | 类型身份夹具仅声明 std.Future 泛型签名；运行时另有真实标准库测试。只接通前端事实与规划器，不发射状态机字节码，不改变公开函数 ABI；未来 await 仍保留未实现诊断。 |
+
 ## 可信基与未覆盖范围
 
 - **可信基（不在本表验证范围内、被假设正确）**：ANTLR 运行时与其生成的解析器、ASM 字节码库、执行测试的 JVM 与其类加载器、Gradle / JUnit 测试运行器、构建所用 JDK 的标准库。

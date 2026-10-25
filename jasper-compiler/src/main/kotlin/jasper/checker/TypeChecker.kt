@@ -17,7 +17,7 @@
 //
 // 对外契约：
 //   - check(sourceFile): List<TypeError>：入口，清空内部状态后做一次完整检查；
-//   - 只回写推断结果 expr.inferredTypeArgs（供下游生成代码使用），不改动 AST 语义；
+//   - 回写调用推断与真实 await 结果类型事实供下游使用，不重写源 AST 结构；
 //   - 只做检查与推断，**不生成代码**。
 //
 // 扩展点与已知限制：
@@ -1309,6 +1309,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasUnaryOp -> {
+                expr.awaitResultType = null
                 val operandType = inferExpression(expr.operand, env)
                 when (expr.op) {
                     "!" -> JasPrimitiveType("bool")
@@ -1319,7 +1320,9 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                             // S4-C 前端先识别真实 Future 身份与结果类型；后端尚未接通时
                             // 必须失败关闭，不能把 Future 透传或阻塞 get 冒充挂起。
                             error("non-blocking await lowering is not implemented yet", expr)
-                            named?.typeArguments?.singleOrNull() ?: JasAnyType
+                            val resultType = named?.typeArguments?.singleOrNull() ?: JasAnyType
+                            expr.awaitResultType = resultType
+                            resultType
                         } else {
                             // 用户裁决：普通值 await 保留同步兼容；同名用户类型不是 std.Future。
                             operandType ?: JasPrimitiveType("int32")

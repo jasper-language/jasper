@@ -2,15 +2,15 @@
 // JasperAst.kt —— Jasper 语言无关的抽象语法树（AST）数据模型
 // ============================================================================
 // 职责：用 sealed class / data class / object 描述 Jasper 源码的纯结构，不含任何逻辑
-//       （不涉及 LLVM IR、不做类型检查），只声明数据形状，字段均为 val 只读。
+//       （不涉及 LLVM IR、不做类型检查），声明数据形状及阶段间语义事实。
 // 所属层次：ast 层（最低层），被 annotations/checker/translator/backend/compiler 等
 //       所有上层依赖；本文件不 import 任何 jasper.* 分层，故永不产生下层→上层依赖。
 // 与谁协作：上游 JasperAstBuilder 将 ANTLR 语法树转换为这里的节点；下游注解处理、
 //       检查器、翻译器、后端消费这些节点。本层只被调用，不主动调用任何下游。
 // 对外契约：所有语言构造建模为 JasNode 子类型——JasDeclaration（声明）、
 //       JasStatement（语句）、JasExpression（表达式）、JasType（类型）、
-//       JasPattern（模式）等 sealed/open 根；仅 JasNode.sourceLine/sourceColumn 与
-//       JasCall.inferredTypeArgs 为可变状态，其余字段全部只读。
+//       JasPattern（模式）等 sealed/open 根；结构字段只读，源码位置和检查器确认的
+//       调用/挂起信息可回写，具体字段见各节点说明。
 // 扩展点与限制：新增语法构造 = 新增节点子类并补齐各下游 when 分支；sealed 层次隔离
 //       「穷举分派」变化点，但 Kotlin when 未穷举时不报错，新增节点须人工排查消费点。
 // ============================================================================
@@ -515,7 +515,14 @@ data class JasBinaryOp(val left: JasExpression, val op: String, val right: JasEx
  * 一元运算：op 运算符文本（如 "-"、"!"）；operand 操作数；
  * prefix=true 表示前缀（如 -x），false 表示后缀形式。
  */
-data class JasUnaryOp(val op: String, val operand: JasExpression, val prefix: Boolean = true) : JasExpression()
+data class JasUnaryOp(val op: String, val operand: JasExpression, val prefix: Boolean = true) : JasExpression() {
+    /**
+     * 检查器确认的真正挂起结果类型；null 表示未确认挂起（包括兼容 await 普通值）。
+     * 仅作为编译器阶段间事实传递，不声明显式挂起标记、不改变函数公开签名。
+     * 每次推断前清除，禁止复查 AST 时沿用过时的类型身份。
+     */
+    var awaitResultType: JasType? = null
+}
 
 /**
  * 后置自增/自减表达式：target 被操作表达式；op 运算符（"++" 或 "--"）。
