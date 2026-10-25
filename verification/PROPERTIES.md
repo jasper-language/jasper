@@ -20,6 +20,8 @@
 
 | `LANG-S4BJ-03` | 批次通知按注册顺序全部尝试，单个回调抛错不丢弃后续 Future 回调、子令牌取消或兄弟 Future 取消；失败数汇总为 CallbackDispatchError，已发布终态不回滚。任务失败通知抛错仍执行普通组取消与最终 settled。 | `Future.finish`、`CancellationToken.cancel`、`TaskGroup.cancel`、`TaskRunner.run`、`CallbackDispatchError.jas`；`S4RuntimeJasperTest` 三项回调失败/调度拒绝测试；`verification/tla/CallbackDispatch.tla` | 真实编译运行契约测试 + 有限 TLA+ 模型（23 个可达状态） | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*S4RuntimeJasperTest' --no-daemon`；虚拟机内 `TLA2TOOLS_JAR=/tmp/jasper-s4-tla2tools.jar bash verification/run-s4-models.sh` | 模型固定三项通知，回调成功/抛错均穷举；只证明批次顺序与计数，不证明 JVM 同步、阻塞回调的进展、重入注册或内存耗尽。失败汇总保存首个失败文本和本批失败项数，不保留 Throwable 对象、原异常身份或完整栈；嵌套批次按一个失败项计。终态后注册的单项立即通知继续直接传播原异常。 |
 
+| `LANG-S4BJ-04` | 协作检查点抛出的 CancellationException 发布 Cancelled 而非业务 Failure，不触发普通组兄弟失败级联；关闭快照中无未处理失败而存在取消时 close 抛 CancellationException，重复 close 保持同一取消结果，业务失败优先于取消。 | `TaskGroup.jas` 的 `TaskRunner.run`、`close`；`S4RuntimeJasperTest.cooperative cancellation is not a business failure`；`TaskGroupAggregation.tla` 的 `Cancel`、`Close`、`CancellationOutcomeMatchesSnapshot` | 真实编译运行契约测试 + TLA+ 有限模型 | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*S4RuntimeJasperTest' --no-daemon`；虚拟机内 `TLA2TOOLS_JAR=/tmp/jasper-s4-tla2tools.jar bash verification/run-s4-models.sh` | 运行测试覆盖主动取消的普通组任务、未取消兄弟、重复关闭和无子任务的监督组取消；模型仍固定两个任务槽，未抽象根令牌单独取消，未建模取消原因/Deadline、清理失败、阻塞和 JVM 同步。取消错误消息当前固定，尚未保存具体取消原因。 |
+
 ## 可信基与未覆盖范围
 
 - **可信基（不在本表验证范围内、被假设正确）**：ANTLR 运行时与其生成的解析器、ASM 字节码库、执行测试的 JVM 与其类加载器、Gradle / JUnit 测试运行器、构建所用 JDK 的标准库。

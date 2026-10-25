@@ -26,7 +26,7 @@ ASSUME Tasks = {1, 2}
 ASSUME Supervisor \in BOOLEAN
 
 Statuses == {"Absent", "Pending", "Completed", "Failed", "Cancelled"}
-Outcomes == {"Ok", "Failure"}
+Outcomes == {"Ok", "Failure", "Cancelled"}
 
 VARIABLES
     childStatus,      \* 每个任务槽位的状态
@@ -122,7 +122,9 @@ Close ==
     /\ closedSpawnCount' = IF closed THEN closedSpawnCount ELSE spawnedCount
     /\ outcome' =
          IF frozen THEN outcome
-         ELSE IF Eligible(acknowledged) = {} THEN "Ok" ELSE "Failure"
+         ELSE IF Eligible(acknowledged) # {} THEN "Failure"
+              ELSE IF \E t \in Tasks: childStatus[t] = "Cancelled"
+                   THEN "Cancelled" ELSE "Ok"
     /\ primary' =
          IF frozen THEN primary
          ELSE IF Eligible(acknowledged) = {} THEN 0
@@ -205,5 +207,12 @@ SuppressedMatchesSnapshot ==
 \* 确认只可能发生在 Failed 任务上。
 AcknowledgedOnlyAfterFailure ==
     \A t \in Tasks: acknowledged[t] => childStatus[t] = "Failed"
+
+\* 仅有取消时不能作为成功或业务失败退出；已有业务失败优先级更高。
+CancellationOutcomeMatchesSnapshot ==
+    frozen =>
+        ((outcome = "Cancelled") <=>
+            (Eligible(frozenAck) = {} /\
+                (\E t \in Tasks: childStatus[t] = "Cancelled")))
 
 =============================================================================

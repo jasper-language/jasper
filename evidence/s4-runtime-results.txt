@@ -2,6 +2,7 @@ cleanup-budget-property => 0
 future-completion-race => 0
 context-whitelist-property => 0
 task-group-rejection-callback-failure => 0
+task-cooperative-cancellation => 0
 future-cancel-complete-race => 0
 future-failure-cancel => 0
 callback-failure-isolation => 0

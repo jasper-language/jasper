@@ -84,3 +84,21 @@ settled。其他模块为缓存或受影响任务按 Gradle 正常判定执行�
 不表示 JVM 实现被形式证明。语法文件未改，代码规范与 FV 产物检查通过。
 
 后续仍需推进 S4-C 挂起/恢复降级；当前回调协议不能中断阻塞回调。
+
+
+## 接续三：协作取消的独立通道
+
+发现并复现 `token.cancel(); token.throwIfCancelled()` 被 TaskRunner 的通用 Error
+处理器转换为业务 Failure（新增回归修改前返回 1）。已在业务错误捕获前单独处理
+CancellationException，发布 Cancelled，不触发普通组的兄弟业务失败级联。
+close 冻结取消快照：无未处理失败但存在取消时报告 CancellationException，重复 close
+维持结果；存在业务失败时仍优先报告 TaskGroupFailure。覆盖无子任务的监督组主动取消。
+
+虚拟机运行时专项 21/21，全量 Gradle test 成功（1 分 12 秒）；JUnit XML 总计
+741 / failures 0 / errors 0 / skipped 1，740 项实际执行。更新 TaskGroup TLA+ 模型的
+Cancelled 退出结果及 CancellationOutcomeMatchesSnapshot 不变量，五组模型重跑全部
+通过（32 / 115 / 72 / 8425 / 23 个可达状态）。首次模型命令因虚拟机临时工具 jar
+不存在而未运行；复制已有 jar 后重跑完成，没有下载依赖。FV/代码规范检查通过。
+
+取消原因与 Deadline 尚未保存/传播，错误消息目前固定；S4-C 的 await 挂起点变换、
+continuation 状态机和恢复调度尚未实现。当前能力仍为回调式运行时，而非完整协程。

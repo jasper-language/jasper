@@ -102,7 +102,7 @@ public class TaskGroupClosedError extends Error {
  * 什么时候用：需要把一组子任务绑定到同一生命周期时；测试与平台边界也用它。
  * 前置条件：执行器由调用方提供并负责最终 shutdown；同一个 TaskGroup 只应被一个
  *   协调线程驱动 spawn/close（内部锁只保证登记原子性，不承诺并发 spawn 的公平顺序）。
- * 失败模式：close 抛出 TaskGroupFailure 表示存在未处理失败；spawn 在关闭后抛
+ * 失败模式：close 抛 TaskGroupFailure 表示未处理失败，仅有取消则抛 CancellationException；spawn 在关闭后抛
  *   TaskGroupClosedError；执行器拒绝调度时返回失败的 Future 而不遗留活动任务。
  * 为什么这样设计：Future 管单任务状态，TaskGroup 只管父子关系与聚合，职责分开后
  *   两者都不需要知道对方内部状态机的细节。
@@ -116,6 +116,7 @@ public class TaskGroup {
     private var aggregationDone: bool;
     private var aggregatePrimary: Failure?;
     private var aggregateSuppressed: int32;
+    private var aggregateCancelled: bool;
 
     /**
      * 做什么：创建普通组或监督组。
@@ -133,6 +134,7 @@ public class TaskGroup {
         this.aggregationDone = false;
         this.aggregatePrimary = null;
         this.aggregateSuppressed = 0;
+        this.aggregateCancelled = false;
     }
 
     /** 做什么：判断是否监督组。前置条件：无；失败模式：不会失败。 */
@@ -195,7 +197,7 @@ public class TaskGroup {
      * 做什么：关闭作用域、等待全部子任务执行体退出，并按策略聚合失败。
      * 什么时候用：作用域正常结束或异常退出前的 finally 中。
      * 前置条件：调用方接受等待已经启动的子任务；不可中断的外部阻塞可能让 close 阻塞。
-     * 失败模式：存在未处理失败时抛 TaskGroupFailure；第一次 close 后聚合结果冻结。
+     * 失败模式：未处理失败抛 TaskGroupFailure，仅有取消抛 CancellationException；首次聚合冻结。
      * 为什么先复制子任务列表：等待期间不持锁，允许任务完成回调正常推进，也避免
      *   把长阻塞放进临界区。
      */
@@ -217,7 +219,9 @@ public class TaskGroup {
             this.aggregationDone = true;
             var primary: Failure? = null;
             var suppressed: int32 = 0;
+            var cancelled: bool = this.rootToken.isCancelled();
             for (child in snapshot) {
+                if (child.status() == FutureStatus.Cancelled) { cancelled = true; }
                 var failure: Failure? = child.failureOrNull();
                 if (failure == null) {
                     continue;
@@ -235,12 +239,17 @@ public class TaskGroup {
             }
             this.aggregatePrimary = primary;
             this.aggregateSuppressed = suppressed;
+            this.aggregateCancelled = cancelled;
         }
         var decided: Failure? = this.aggregatePrimary;
         var decidedSuppressed: int32 = this.aggregateSuppressed;
+        var decidedCancelled: bool = this.aggregateCancelled;
         this.mutex.release();
 
         if (decided == null) {
+            if (decidedCancelled) {
+                throw new CancellationException("TaskGroup cancelled");
+            }
             return;
         }
         var message: string = decided.message();
@@ -339,7 +348,7 @@ public class TaskRunner<T> implements Runnable {
      * 做什么：执行任务体并发布终态。
      * 什么时候用：执行器线程调用一次。
      * 前置条件：Future 初始为 Pending。
-     * 失败模式：业务 Error 与平台 Throwable 分别转成 Failure；无论路径如何 finally
+     * 失败模式：CancellationException 发布 Cancelled；业务 Error 与平台 Throwable 转成 Failure；finally
      *   都会标记 settled，保证作用域关闭不会漏 join。
      * 为什么先看令牌再看返回值：执行体可能在取消后仍正常返回一个值，此时可观察语义
      *   必须是 Cancelled，而不是把迟到结果伪装成成功。
@@ -350,11 +359,16 @@ public class TaskRunner<T> implements Runnable {
     public function run(): void {
         try {
             try {
-                var value: T = this.body.run(this.token);
-                if (this.token.isCancelled()) {
+                try {
+                    var value: T = this.body.run(this.token);
+                    if (this.token.isCancelled()) {
+                        this.future.cancel();
+                    } else {
+                        this.future.complete(value);
+                    }
+                } catch (cancelled: CancellationException) {
+                    // 取消是独立终态，不写业务 Failure，也不触发兄弟失败级联。
                     this.future.cancel();
-                } else {
-                    this.future.complete(value);
                 }
             } catch (error: Error) {
                 var failure: Failure = new Failure(error.message(), "error");

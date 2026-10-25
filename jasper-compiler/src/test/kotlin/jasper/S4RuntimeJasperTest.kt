@@ -217,6 +217,61 @@ class S4RuntimeJasperTest {
         )
     }
 
+    /** 协作检查点的取消必须走 Cancelled 通道，不能伪装成业务失败或取消兄弟。 */
+    @Test
+    fun `cooperative cancellation is not a business failure`() {
+        assertOk(
+            "task-cooperative-cancellation",
+            """
+            package std;
+            public class InlineCancelExecutor implements Executor {
+                public function schedule(task: Runnable): void { task.run(); }
+                public function shutdown(): void { }
+            }
+            public class SelfCancelledBody implements TaskBody<int32> {
+                public function run(token: CancellationToken): int32 {
+                    token.cancel();
+                    token.throwIfCancelled();
+                    return 1;
+                }
+            }
+            public class AfterCancelledBody implements TaskBody<int32> {
+                public function run(token: CancellationToken): int32 {
+                    token.throwIfCancelled();
+                    return 42;
+                }
+            }
+            public function main(): int32 {
+                var executor: InlineCancelExecutor = new InlineCancelExecutor();
+                var group: TaskGroup = new TaskGroup(false);
+                var cancelled: Future<int32> = group.spawn(executor, new SelfCancelledBody());
+                if (cancelled.status() != FutureStatus.Cancelled) { return 1; }
+                if (cancelled.failureOrNull() != null) { return 2; }
+                if (cancelled.acknowledgeFailure()) { return 3; }
+                var sibling: Future<int32> = group.spawn(executor, new AfterCancelledBody());
+                if (sibling.status() != FutureStatus.Completed) { return 4; }
+                if (sibling.get() != 42) { return 5; }
+                var cancellationReports: int32 = 0;
+                while (cancellationReports < 2) {
+                    try {
+                        group.close();
+                        return 6;
+                    } catch (error: CancellationException) {
+                        cancellationReports = cancellationReports + 1;
+                    }
+                }
+                var empty: TaskGroup = new TaskGroup(true);
+                empty.cancel();
+                try {
+                    empty.close();
+                    return 7;
+                } catch (error: CancellationException) { }
+                return 0;
+            }
+            """.trimIndent()
+        )
+    }
+
     /** 调度拒绝后的级联通知失败仍须给从未运行的子任务标记 settled。 */
     @Test
     fun `rejected task settles even when sibling cancellation callback throws`() {
