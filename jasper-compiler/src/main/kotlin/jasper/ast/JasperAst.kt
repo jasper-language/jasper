@@ -542,6 +542,8 @@ class JasCall(
     val args: List<JasExpression>,
     val isSafe: Boolean = false
 ) : JasExpression() {
+    /** 检查器实际选中的源码函数声明；未解析、平台调用或复查失配时为 null。 */
+    var resolvedFunction: JasFunction? = null
     var inferredTypeArgs: Map<String, JasType>? = null
 
     /**

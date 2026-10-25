@@ -1332,6 +1332,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 }
             }
             is JasCall -> {
+                expr.resolvedFunction = null
                 // 先推断所有实参类型，再按 callee 形态走两条路：具名函数（重载解析）或函数值。
                 val argTypes = expr.args.map { inferExpression(it, env) }
                 // 类名静态方法调用（`A.f()` / 枚举合成方法 `Types.values()`）必须在「按函数值
@@ -1388,6 +1389,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                                 error("Function '$name' argument types do not match expected $signature", expr)
                                 byArity.first().returnType ?: JasAnyType
                             } else {
+                                expr.resolvedFunction = compatible
                                 if (compatible.typeParameters.isNotEmpty()) {
                                     // 泛型函数：用实参类型推断类型参数（unify 收集约束到 inferred）。
                                     val typeParamNames = compatible.typeParameters.map { it.name }.toSet()
@@ -1771,6 +1773,11 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
             if (!arityOk) {
                 error("Function '$memberName' expects ${fn.parameters.size} argument(s), got ${expr.args.size}", expr)
             }
+            // 当前静态重载路径仍有首候选限制；存在多个同名静态声明时，效果推导
+            // 保守保持未知，不能把尚未唯一确认的声明当成可靠调用边。
+            val staticCandidates = symbolTable?.findMemberFunctions(typeName, memberName)
+                ?.filter { candidate -> candidate.modifiers.contains("static") }
+            if (arityOk && staticCandidates?.size == 1) expr.resolvedFunction = fn
             return fn.returnType ?: JasUnitType
         }
         // 不是静态方法：给出比「未解析」更精确的诊断，帮助用户区分「忘写 static」与「名字写错」。
@@ -2075,6 +2082,7 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                 candidates.first().returnType ?: JasUnitType
             }
             is MemberOverloadResolution.Selected -> {
+                call.resolvedFunction = resolution.function
                 call.varargCall = resolution.vararg
                 validateMemberArguments(call, target.property, resolution.function, resolution.parameterTypes, argTypes)
                 memberReturnType(resolution.function, receiverType)

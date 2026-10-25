@@ -3,7 +3,10 @@ package jasper
 
 import jasper.ast.*
 import jasper.checker.TypeChecker
+import jasper.checker.SuspensionEffect
+import jasper.checker.SuspensionEffectAnalysis
 import jasper.compiler.SymbolTable
+import jasper.compiler.JasperCompiler
 import jasper.parser.JasperLexer
 import jasper.parser.JasperParser
 import jasper.translator.LinearSuspensionPlanner
@@ -13,6 +16,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.test.assertSame
 
 /** 不再由测试谓词猜测挂起点，而消费检查器按真实类型身份标注的结果。 */
 class SuspensionPlanningIntegrationTest {
@@ -78,5 +82,56 @@ class SuspensionPlanningIntegrationTest {
         val errors = checker.check(changed)
         assertTrue(errors.isEmpty(), errors.toString())
         assertTrue(LinearSuspensionPlanner.plan(changedFunction).points.isEmpty())
+    }
+
+    /** 真实解析与检查器选中的静态调用边用于能力传播，调用者不必直接出现 await。 */
+    @Test
+    fun `typed static call graph propagates suspension through caller`() {
+        val file = parse("""
+            package demo;
+            import std.Future;
+            public class Program {
+                public static function caller(input: Future<int32>): int32 { return Program.leaf(input); }
+                public static function leaf(input: Future<int32>): int32 { return await input; }
+                public static function ordinary(): int32 { return await 42; }
+            }
+        """.trimIndent())
+        val errors = TypeChecker(symbols(file)).check(file)
+        assertTrue(errors.all { it.message.contains("non-blocking await lowering") }, errors.toString())
+        val functions = (file.declarations.single() as JasClass).members.filterIsInstance<JasFunction>()
+        val effects = SuspensionEffectAnalysis.analyze(functions)
+        assertEquals(SuspensionEffect.SUSPENDING, effects[functions.first { it.name == "caller" }])
+        assertEquals(SuspensionEffect.SYNCHRONOUS, effects[functions.first { it.name == "ordinary" }])
+    }
+
+    /** 实际多文件编译管线共享完整效果快照，不把另一个文件里的已知函数当外部未知。 */
+    @Test
+    fun `compiler pipelines share cross-file suspension analysis`() {
+        val pipelines = JasperCompiler().compileAll(mapOf(
+            "A.jas" to "package p; public class A { public static function first(): int32 { return B.second(); } }",
+            "B.jas" to "package p; public class B { public static function second(): int32 { return 42; } }"
+        ))
+        val a = pipelines.getValue("A.jas")
+        val b = pipelines.getValue("B.jas")
+        assertSame(a.suspensionEffects, b.suspensionEffects)
+        val first = (a.ast.declarations.single() as JasClass).members.filterIsInstance<JasFunction>().single()
+        assertEquals(SuspensionEffect.SYNCHRONOUS, a.suspensionEffects[first])
+    }
+
+    /** 现有静态重载决议未唯一确认时，不把首候选的效果冒充完整分派结果。 */
+    @Test
+    fun `static overload uncertainty stays unknown`() {
+        val file = parse("""
+            package demo;
+            public class Program {
+                public static function same(x: int32): int32 { return x; }
+                public static function same(x: string): int32 { return 1; }
+                public static function caller(): int32 { return Program.same(1); }
+            }
+        """.trimIndent())
+        TypeChecker(symbols(file)).check(file)
+        val functions = (file.declarations.single() as JasClass).members.filterIsInstance<JasFunction>()
+        val effects = SuspensionEffectAnalysis.analyze(functions)
+        assertEquals(SuspensionEffect.UNKNOWN, effects[functions.first { it.name == "caller" }])
     }
 }

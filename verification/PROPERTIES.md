@@ -30,6 +30,8 @@
 
 | `LANG-CONT-TYPED-01` | 解析后的真实 std.Future await 由检查器标记结果类型并供直线分段规划器直接消费，普通值不切段；同一 AST 重查为普通值后清除旧挂起事实。 | `JasUnaryOp.awaitResultType`、`TypeChecker.inferExpression`、`LinearSuspensionPlanner.plan` 默认谓词；`SuspensionPlanningIntegrationTest` | 权威 ANTLR 解析 -> 真实类型检查 -> 分段布局的集成契约测试 | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*SuspensionPlanningIntegrationTest' --tests '*AwaitFrontendTest' --tests '*LinearSuspensionPlannerTest' --no-daemon` | 类型身份夹具仅声明 std.Future 泛型签名；运行时另有真实标准库测试。只接通前端事实与规划器，不发射状态机字节码，不改变公开函数 ABI；未来 await 仍保留未实现诊断。 |
 
+| `LANG-CONT-EFFECT-01` | 沿检查器实际解析的直接调用声明传播挂起能力，支持前向引用与递归不动点；普通值 await 不构成种子；动态/外部/未覆盖调用保留 UNKNOWN，不假装同步；多文件编译共享效果快照。 | `JasCall.resolvedFunction`；`TypeChecker` 已选函数回填；`SuspensionEffectAnalysis`；`CompilePipeline.suspensionEffects`；`SuspensionEffectAnalysisTest` 与 `SuspensionPlanningIntegrationTest` | 实际编译管线契约测试 + 固定种子 20261025 的 64 个八节点图，独立逐根可达性 oracle | `tested` | `bash /home/auth/Documents/jasper/jasper-os-build/vm-run.sh jasper ./gradlew :jasper-compiler:test --tests '*SuspensionEffectAnalysisTest' --tests '*SuspensionPlanningIntegrationTest' --no-daemon` | 只覆盖已解析直接调用；实例虚分派、函数值、外部函数、未覆盖 AST 结构保守 UNKNOWN；遵循既有重载解析结果，不修复其限制。尚未对外公开挂起 ABI 或实现显式标记，不发射协程字节码。 |
+
 ## 可信基与未覆盖范围
 
 - **可信基（不在本表验证范围内、被假设正确）**：ANTLR 运行时与其生成的解析器、ASM 字节码库、执行测试的 JVM 与其类加载器、Gradle / JUnit 测试运行器、构建所用 JDK 的标准库。

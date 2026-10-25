@@ -142,7 +142,9 @@ class JasperCompiler {
         val source: String,
         val ast: jasper.ast.JasSourceFile,
         val ir: jasper.translator.TranslationResult,
-        val annotationIndex: AnnotationIndex = AnnotationIndex.EMPTY
+        val annotationIndex: AnnotationIndex = AnnotationIndex.EMPTY,
+        val suspensionEffects: jasper.checker.SuspensionEffects =
+            jasper.checker.SuspensionEffectAnalysis.analyzeSources(listOf(ast))
     )
 
     /**
@@ -478,6 +480,7 @@ class JasperCompiler {
         }
 
         // 第三轮：一次性翻译全部文件，再把结果按文件切回各自的 TranslationResult。
+        val suspensionEffects = jasper.checker.SuspensionEffectAnalysis.analyzeSources(parsed.values)
         val translator = JasperToIrTranslator()
         val translated = translator.translateAll(parsed.values.toList(), symbolTable)
         val pipelines = mutableMapOf<String, CompilePipeline>()
@@ -503,7 +506,8 @@ class JasperCompiler {
                 memberCallKeys = translated.memberCallKeys,
                 platformStaticCallOwners = translated.platformStaticCallOwners
             )
-            pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir, annotationIndexes[filename] ?: AnnotationIndex.EMPTY)
+            pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir,
+                annotationIndexes[filename] ?: AnnotationIndex.EMPTY, suspensionEffects)
         }
         return pipelines
     }
