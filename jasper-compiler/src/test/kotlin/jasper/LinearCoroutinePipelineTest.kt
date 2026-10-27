@@ -335,25 +335,62 @@ class LinearCoroutinePipelineTest {
                     public static function f(input: Future<int32>): int32 { return await input; }
                 }
             """.trimIndent(),
-            "two-awaits" to """
+            // 第十片起多 await 与 if/else 内 await 已支持（见 BranchingCoroutinePipelineTest）；
+            // 这里改锁仍未支持的循环 / try / 条件与子表达式中的 await。
+            "loop-await" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function f(first: Future<int32>, second: Future<int32>): int32 {
-                        var a: int32 = await first;
-                        var b: int32 = await second;
-                        return a + b;
+                    public static function f(input: Future<int32>, count: int32): int32 {
+                        var total: int32 = 0;
+                        while (total < count) { total = await input; }
+                        return total;
                     }
                 }
             """.trimIndent(),
-            "branching-await" to """
+            "try-await" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function f(input: Future<int32>, flag: bool): int32 {
+                    public static function f(input: Future<int32>): int32 {
                         var value: int32 = 0;
-                        if (flag) { value = await input; }
+                        try { value = await input; } finally { value = value + 1; }
                         return value;
+                    }
+                }
+            """.trimIndent(),
+            "await-in-condition" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function f(input: Future<int32>): int32 {
+                        if ((await input) > 0) { return 1; }
+                        return 0;
+                    }
+                }
+            """.trimIndent(),
+            "await-in-subexpression" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function f(input: Future<int32>): int32 {
+                        var value: int32 = (await input) + 1;
+                        return value;
+                    }
+                }
+            """.trimIndent(),
+            "synchronous-call-in-branch" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function leaf(input: Future<int32>): int32 {
+                        var value: int32 = await input;
+                        return value;
+                    }
+                    public static function caller(input: Future<int32>, flag: bool): int32 {
+                        var first: int32 = await input;
+                        if (flag) { first = P.leaf(input); }
+                        return first;
                     }
                 }
             """.trimIndent(),

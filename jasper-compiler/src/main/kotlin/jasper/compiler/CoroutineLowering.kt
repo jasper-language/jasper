@@ -1,9 +1,9 @@
 // ============================================================================
-// CoroutineLowering.kt —— S4-C 第八片的编译期协程降级编排
+// CoroutineLowering.kt —— S4-C 编译期协程降级编排（第八片起，第十片扩展分支）
 // ============================================================================
 // 职责：
-//   在类型检查与挂起效果分析完成之后、AST -> IR 之前，挑选属于「单挂起点直线
-//   int32 函数」的挂起函数，交给 LinearCoroutineEmitter 生成内部状态机类；其余
+//   在类型检查与挂起效果分析完成之后、AST -> IR 之前，挑选属于「多挂起点、条件
+//   分支（无循环）int32 函数」的挂起函数，交给 LinearCoroutineEmitter 生成内部状态机类；其余
 //   真实挂起形态统一产生明确诊断，禁止把 Future 同步透传给后端。
 //
 // 所属层次：
@@ -22,9 +22,9 @@
 //   - 生成类只放在原文件同包顶层，不嵌套、不改变原函数公开签名，也不引入新语法。
 //
 // 设计边界：
-//   - 本片只支持「变量初始化 await + 最后 return」的直线体；`return await`、多个
-//     await、分支/循环/异常/defer、对其它挂起函数的同步调用等全部诊断，而不是
-//     退化为同步求值；
+//   - 支持范围以 LinearCoroutineEmitter / CoroutineBlockPlanner 为准：局部声明、
+//     局部赋值、if/else、return，await 是局部写入的整个右侧；`return await`、
+//     循环/异常/defer、对其它挂起函数的同步调用等全部诊断，而不是退化为同步求值；
 //   - 函数被发射后，其原声明从生成 AST 中移除：生成帧需要 executor 与输出 Future，
 //     还不是公开源码调用 ABI；任何调用方都会因自身也变为 SUSPENDING 而得到诊断；
 //   - 本层不生成字节码、不选择显式挂起标记名称、不改公开 ABI/文法。
@@ -134,7 +134,7 @@ object CoroutineLowering {
                 if (reportedAwaits.containsKey(await)) continue
                 errors += CompileError.Type(
                     "$UNSUPPORTED_PREFIX: await at this position is outside a supported " +
-                        "straight-line int32 function",
+                        "int32 coroutine function",
                     line = await.sourceLine,
                     column = await.sourceColumn
                 )
@@ -238,7 +238,7 @@ object CoroutineLowering {
     /**
      * 查找函数体中对 SUSPENDING 函数的同步调用。
      *
-     * 做什么：形态已通过发射器检查后，再遍历局部初始化器与返回值中的调用；若被调函数
+     * 做什么：形态已通过发射器检查后，再遍历局部写入、分支条件与返回值中的调用；若被调函数
      *   本身是 SUSPENDING，返回拒绝原因。
      * 为什么必须拒绝：被发射的挂起函数原声明会被生成帧替代，同步调用既没有可链接目标，
      *   也会把挂起语义退化为同步求值；本片没有「调用挂起函数」的帧间协议，只能诊断。
@@ -258,13 +258,19 @@ object CoroutineLowering {
             is JasCastExpr -> find(expression.expression)
             else -> null
         }
-        val call = function.body?.statements.orEmpty().firstNotNullOfOrNull { statement ->
-            when (statement) {
-                is JasVariableStatement -> find(statement.initializer)
-                is JasReturn -> find(statement.value)
-                else -> null
-            }
-        } ?: return null
+        /** 按语句递归查找；分支条件与两条分支体都要覆盖（第十片起支持 if/else）。 */
+        fun search(statement: JasStatement): JasCall? = when (statement) {
+            is JasVariableStatement -> find(statement.initializer)
+            is JasExpressionStatement -> (statement.expression as? JasAssignment)?.let { find(it.value) }
+                ?: find(statement.expression)
+            is JasReturn -> find(statement.value)
+            is JasIf -> find(statement.condition)
+                ?: statement.thenBody.statements.firstNotNullOfOrNull(::search)
+                ?: statement.elseBody?.statements?.firstNotNullOfOrNull(::search)
+            is JasBlock -> statement.statements.firstNotNullOfOrNull(::search)
+            else -> null
+        }
+        val call = function.body?.statements.orEmpty().firstNotNullOfOrNull(::search) ?: return null
         val name = call.resolvedFunction?.name ?: "<unknown>"
         return "synchronous call to suspending function '$name' is not supported"
     }

@@ -343,3 +343,65 @@ JVM 反射驱动执行（秒级，所有阻塞调用在有界线程中）：
 公开源码层「调用挂起函数」语法 / ABI 与显式挂起标记名称仍待裁决；测试经反射构造生成帧并
 调用 `TaskGroup.launch`，源码层无法直接写出这一调用。多 await、分支、循环、try/清理后继、
 实例分派、取消原因与 Deadline 仍不支持（实现次序第 5、6 条）。
+
+
+## S4-C 第十片：多 await 与 if/else 分支内挂起
+
+本片推进「实现次序」第 5 条的第一步（条件）：协程降级不再限于「恰好一个 await 的直线体」，
+支持多个挂起点与 if/else 分支内挂起。循环仍不支持。
+
+### 块规划与生成帧
+
+- 新增 `CoroutineBlockPlanner`：把函数体切成前向基本块。每个 await 结束当前块并开启一个
+  恢复块；if/else 结束当前块并开启两个分支块，未 return 的分支出口汇合到新块；return
+  结束一条路径。块编号按分配顺序递增，出口目标严格大于所在块（规划器返回前自检）。
+- 生成帧的 `__phase` 表示下一块编号，`run()` 中各段按编号顺序排列：一次运行从当前块开始
+  顺序走到下一个挂起点或 return，已执行的块不会重放，await 操作数与挂起前表达式只求值一次。
+- 恢复块入口消费完成快照：取消发布 Cancelled、失败原样发布 Failure、成功值写入绑定局部。
+  挂起块先求值操作数，再检查结果是否已被外部终结（作用域取消），未终结才写下一块编号并
+  注册回调；入口终态检查、调度门与 settled 回收沿用第八、九片。
+- 分支内声明的局部同样成为帧字段（可能跨越分支内的挂起点），因此全函数局部名必须唯一。
+
+### 已支持形态
+
+- 类/枚举静态函数或顶层函数，非泛型、非重载，返回 `int32`；
+- 参数为 `int32`、`bool` 或 `std.Future<int32>`；局部为显式 `int32` / `bool`（await 绑定可省略类型）；
+- 语句：带初始化的局部声明、对局部的 `=` 赋值、if/else（含 else-if 链与嵌套）、return；
+- 至少一个 await，每个 await 是局部初始化或局部赋值的整个右侧，结果为 `int32`；
+- 表达式范围与第八片相同（局部/参数、字面量、纯算术/比较/逻辑、属性访问、调用、cast）。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- 循环、try/catch/finally、defer、throw、match、break/continue 中或旁的挂起；
+- await 出现在条件、return 值（`return await`）或任何子表达式中；
+- 存在不以 return 结束的路径、return 之后的不可达语句；
+- 参数与局部重名（含两条分支各自声明同名局部）、未写类型的非 await 局部；
+- 分支条件或分支体内对另一挂起函数的同步调用；
+- 第八片已有的其余拒绝（传播挂起、非 int32、泛型/非静态/重载、生成名冲突、函数外 await）。
+
+### 验收结果
+
+- `CoroutineBlockPlannerTest` 3 项：else 全部 return 时不接汇合边（实现过程中由编译器
+  「条件恒假」警告发现的真实缺陷：`elseBody?.let { … } ?: whenFalse` 会把「else 全部
+  return」误当成「没有 else」）；10 种不支持形态给出原因且不返回部分计划；固定种子
+  20261029 的 400 个随机程序 × 4 组输入，AST 直接解释与块状态机解释比对返回值与经过的
+  挂起点数，并检查编号稠密、出口前向、全部可达。
+- `BranchingCoroutinePipelineTest` 4 项，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM
+  执行：then 分支单工作线程两次挂起后汇合得 40（挂起前表达式只执行一次，class major 52）；
+  else 分支输入注册前完成得 9、else-if 提前 return 不挂起得 1202；第二挂起点失败 / 取消
+  走各自通道，挂起中的帧被作用域取消后回收且晚到输入不复活；固定种子 20261029 的 48 轮
+  （随机分支、输入值、输入在启动前或后完成）与 Kotlin oracle 一致。
+- `LinearCoroutinePipelineTest` 的不支持形态清单：「两个 await」「分支内 await」现为支持
+  形态，改由上面两组测试正向覆盖；清单新增循环内、try 内、条件中、子表达式中的 await 与
+  分支内同步调用挂起函数五例，均诊断且不写 class。
+- 变异检查：恢复 else 汇合缺陷后 6 个新用例失败。
+- `BranchingCoroutineFrame.tla`：按端到端测试函数的 11 块控制流图建模入口检查、块原子执行、
+  挂起块的终态检查与注册、共享 `__outcome` 字段上的输入回调与自身结果回调、调度门与回收；
+  不变量 AtMostOnce / ResumeAfterDelivery / NoOverlap / SettledIsFinal，动作性质
+  ForwardOnly / ResultStable，活性 EventuallySettled（弱公平）。1560 个可达状态无错；去掉
+  入口终态检查的变异模型违反 ResumeAfterDelivery。`run-s4-models.sh` 十一组配置全部通过。
+
+### 仍未支持
+
+循环（需要回边与重入检查，下一片单独建模）、try/catch/finally/defer 的清理后继、await 出现在
+条件或子表达式、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称。
