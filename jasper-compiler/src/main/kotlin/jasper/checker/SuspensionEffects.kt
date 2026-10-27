@@ -89,6 +89,12 @@ object SuspensionEffectAnalysis {
                 scan(node.condition, facts); scan(node.thenBody, facts)
                 node.elseBody?.let { scan(it, facts) }
             }
+            is JasWhile -> {
+                scan(node.condition, facts); scan(node.body, facts)
+                // 循环后置块尚未覆盖：不猜测其中无挂起。
+                if (node.suffix != null) facts.unknown = true
+            }
+            is JasBreakStatement, is JasContinueStatement -> Unit
             is JasCall -> {
                 val selected = node.resolvedFunction
                 val direct = node.target is JasIdentifier || selected?.modifiers?.contains("static") == true

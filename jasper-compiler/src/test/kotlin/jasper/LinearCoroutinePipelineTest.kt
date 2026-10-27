@@ -335,15 +335,42 @@ class LinearCoroutinePipelineTest {
                     public static function f(input: Future<int32>): int32 { return await input; }
                 }
             """.trimIndent(),
-            // 第十片起多 await 与 if/else 内 await 已支持（见 BranchingCoroutinePipelineTest）；
-            // 这里改锁仍未支持的循环 / try / 条件与子表达式中的 await。
-            "loop-await" to """
+            // 第十片起多 await 与 if/else 内 await 已支持（见 BranchingCoroutinePipelineTest），
+            // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest）；这里改锁仍未
+            // 支持的 do-while / try / 条件与子表达式中的 await。
+            "do-while-await" to """
                 package demo;
                 import std.Future;
                 public class P {
                     public static function f(input: Future<int32>, count: int32): int32 {
                         var total: int32 = 0;
-                        while (total < count) { total = await input; }
+                        do { total = await input; } while (total < count);
+                        return total;
+                    }
+                }
+            """.trimIndent(),
+            "while-condition-await" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function f(input: Future<int32>): int32 {
+                        var total: int32 = 0;
+                        while ((await input) > total) { total = total + 1; }
+                        return total;
+                    }
+                }
+            """.trimIndent(),
+            "synchronous-call-in-loop" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function leaf(input: Future<int32>): int32 {
+                        var value: int32 = await input;
+                        return value;
+                    }
+                    public static function caller(input: Future<int32>, count: int32): int32 {
+                        var total: int32 = await input;
+                        while (total < count) { total = total + P.leaf(input); }
                         return total;
                     }
                 }

@@ -1,0 +1,223 @@
+TLC2 Version 2.16 of 31 December 2020 (rev: cdddf55)
+Warning: Please run the Java VM which executes TLC with a throughput optimized garbage collector by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 51 and seed -2904925409355575349 with 1 worker on 8 cores with 1984MB heap and 64MB offheap memory [pid: 339359] (Linux 7.0.0-38-generic amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file verification/tla/LoopingCoroutineFrame.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module LoopingCoroutineFrame
+Starting... (2026-10-28 00:05:00)
+Implied-temporal checking--satisfiability problem has 2 branches.
+Computing initial states...
+Finished computing initial states: 2 distinct states generated at 2026-10-28 00:05:00.
+Progress(33) at 2026-10-28 00:05:02: 10,327 states generated, 3,814 distinct states found, 0 states left on queue.
+Checking 2 branches of temporal properties for the complete state space with 7628 total distinct states at (2026-10-28 00:05:02)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ input = [input |-> "Pending", gate |-> "Pending"]
+/\ result = "Pending"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = TRUE
+/\ closed = FALSE
+/\ outcome = "None"
+/\ running = FALSE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = FALSE
+/\ settled = FALSE
+/\ resultNotified = FALSE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 2: <CompleteInput line 56, col 21 to line 58, col 113 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Pending", gate |-> "Cancelled"]
+/\ result = "Pending"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = TRUE
+/\ closed = FALSE
+/\ outcome = "None"
+/\ running = FALSE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = FALSE
+/\ settled = FALSE
+/\ resultNotified = FALSE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 3: <Begin line 78, col 10 to line 81, col 76 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Pending", gate |-> "Cancelled"]
+/\ result = "Pending"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "None"
+/\ running = TRUE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = FALSE
+/\ settled = FALSE
+/\ resultNotified = FALSE
+/\ iter = 0
+/\ entry = TRUE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 4: <CompleteInput line 56, col 21 to line 58, col 113 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Pending"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "None"
+/\ running = TRUE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = FALSE
+/\ settled = FALSE
+/\ resultNotified = FALSE
+/\ iter = 0
+/\ entry = TRUE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 5: <PassStart line 84, col 14 to line 89, col 55 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Pending"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "None"
+/\ running = TRUE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = FALSE
+/\ settled = FALSE
+/\ resultNotified = FALSE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 6: <ExternalCancel line 60, col 19 to line 62, col 110 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Cancelled"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "None"
+/\ running = TRUE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = FALSE
+/\ settled = FALSE
+/\ resultNotified = FALSE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 7: <ResultCallback line 72, col 19 to line 76, col 84 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Cancelled"
+/\ preludeRuns = 0
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "Cancelled"
+/\ running = TRUE
+/\ phase = 0
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = TRUE
+/\ settled = FALSE
+/\ resultNotified = TRUE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 8: <Step line 117, col 9 to line 129, col 61 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Cancelled"
+/\ preludeRuns = 1
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "Cancelled"
+/\ running = TRUE
+/\ phase = 1
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = TRUE
+/\ settled = FALSE
+/\ resultNotified = TRUE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 9: <Step line 117, col 9 to line 129, col 61 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Cancelled"
+/\ preludeRuns = 1
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "Cancelled"
+/\ running = TRUE
+/\ phase = 2
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = TRUE
+/\ settled = FALSE
+/\ resultNotified = TRUE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+State 10: <Step line 117, col 9 to line 129, col 61 of module LoopingCoroutineFrame>
+/\ input = [input |-> "Failed", gate |-> "Cancelled"]
+/\ result = "Cancelled"
+/\ preludeRuns = 1
+/\ spin = TRUE
+/\ returning = FALSE
+/\ bad = FALSE
+/\ queued = FALSE
+/\ closed = FALSE
+/\ outcome = "Cancelled"
+/\ running = TRUE
+/\ phase = 1
+/\ armed = [input |-> FALSE, gate |-> FALSE]
+/\ wake = TRUE
+/\ settled = FALSE
+/\ resultNotified = TRUE
+/\ iter = 0
+/\ entry = FALSE
+/\ delivered = [input |-> FALSE, gate |-> FALSE]
+
+Back to state 9: <Step line 117, col 9 to line 129, col 61 of module LoopingCoroutineFrame>
+
+Finished checking temporal properties in 00s at 2026-10-28 00:05:02
+10327 states generated, 3814 distinct states found, 0 states left on queue.
+Finished in 01s at (2026-10-28 00:05:02)

@@ -1,5 +1,5 @@
 // ============================================================================
-// LinearCoroutineEmitter.kt —— 多挂起点、条件分支 int32 函数的内部状态机发射器
+// LinearCoroutineEmitter.kt —— 多挂起点、条件分支与 while 循环 int32 函数的内部状态机发射器
 // ============================================================================
 // 职责：
 //   把已经通过类型检查、且已被直接调用图判定为「可能挂起」的窄范围函数，翻译成
@@ -14,7 +14,7 @@
 //   compiler 层在类型检查之后接入。
 //
 // 与谁协作：
-//   - CoroutineBlockPlanner：把函数体切成前向基本块，给出挂起点、分支与局部布局；
+//   - CoroutineBlockPlanner：把函数体切成基本块，给出挂起点、分支、循环回边与局部布局；
 //   - 生成代码运行期依赖 std.ContinuationDispatch / std.Future / std.FutureOutcome /
 //     std.CoroutineTask；
 //   - compiler 层的协程降级阶段负责挑选函数、命名生成类并处理不支持形态的诊断。
@@ -26,9 +26,10 @@
 //     IllegalArgumentException，绝不返回半边生成结果。
 //
 // 边界（本片刻意不做）：
-//   - 函数体只由 int32/bool 局部声明、对局部的 `=` 赋值、if/else 与 return 组成；
-//     至少一个 await，且每个 await 是局部写入的整个右侧；不接受循环、try、defer、
-//     throw、嵌套 await、条件中的 await 或 return await（第十片起支持多 await 与分支）；
+//   - 函数体只由 int32/bool 局部声明、对局部的 `=` 赋值、if/else、while、无标签
+//     break/continue 与 return 组成；至少一个 await，且每个 await 是局部写入的整个
+//     右侧；不接受 do-while/for/for-in、try、defer、throw、嵌套 await、条件中的 await
+//     或 return await（第十片起支持多 await 与分支，第十一片起支持 while）；
 //   - 不定义显式挂起标记，不改变公开函数 ABI，也不把生成帧冒充为可同步调用的
 //     普通函数；
 //   - 不实现 Future.get 阻塞等待；恢复只经 onComplete -> ContinuationDispatch。
@@ -39,12 +40,12 @@ package jasper.translator
 import jasper.ast.*
 
 /**
- * 多挂起点、条件分支 int32 函数的内部 AST 发射器。
+ * 多挂起点、条件分支与 while 循环 int32 函数的内部 AST 发射器。
  *
  * 做什么：把一个受限函数改写成显式状态机类；原函数参数/局部变量成为帧字段，
  *   程序位置由 `__phase`（下一个基本块编号）表示，awaited Future 的回调只请求恢复，
- *   恢复段在调度门分配的工作线程上执行。基本块只向前跳转，按编号顺序排列的段在
- *   一次运行中顺序执行到下一个挂起点或 return。
+ *   恢复段在调度门分配的工作线程上执行。按编号顺序排列的段包在分派循环里：前向
+ *   跳转在同一趟内继续，回边（循环头）开启新一趟，直到下一个挂起点或 return。
  * 什么时候用：compiler 的协程降级阶段确认函数为 SUSPENDING，且
  *   [unsupportedReason] 返回 null 时。
  * 前置条件：输入已通过类型检查；真实 std.Future await 的 `awaitResultType` 已由
@@ -282,13 +283,18 @@ object LinearCoroutineEmitter {
             JasBlock(constructorBody)
         )
 
-        // 段按块编号顺序排列且只向前跳转：一次运行从 `__phase` 指向的块开始，顺序走到
-        // 下一个挂起点或 return，已执行的块不会在同一次或后续运行中重放，操作数只求值一次。
-        // 入口先看结果是否已被外部终结（作用域取消）：此时不再执行任何业务段，
+        // 段按块编号顺序排列：前向跳转在同一趟内顺序走到目标段；回边把 `__phase` 设为
+        // 更小的循环头编号，本趟其余段都不匹配，分派循环开启新一趟。恢复不会重放挂起点
+        // 之前的块，挂起点的操作数每次经过只求值一次。
+        // 每趟开头先看结果是否已被外部终结（作用域取消）：第一趟即入口检查，之后的每趟
+        // 对应一次回边，不挂起的循环因此也能在回边处响应取消；终结时不再执行业务段，
         // 直接落到 finally 关闭调度门并标记 settled，等待中的帧因此能被回收。
-        val runBody = JasBlock(
-            listOf(JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasReturn(null))), null)) + segments
-        )
+        val runBody = JasBlock(listOf(JasWhile(
+            JasBoolLiteral(true),
+            JasBlock(
+                listOf(JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasReturn(null))), null)) + segments
+            )
+        )))
         val caught = JasIdentifier("__error")
         // 段内任何未捕获异常都必须变成结果 Future 的失败，并在 finally 中结束调度门、
         // 标记 settled；否则等待者会永远看到 Pending，TaskGroup.close 也无法回收。

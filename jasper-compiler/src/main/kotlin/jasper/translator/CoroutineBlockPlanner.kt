@@ -1,12 +1,13 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的前向基本块规划（S4-C 第十片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十、十一片）
 // ============================================================================
 // 职责：
-//   把一个已通过类型检查的受限函数体切成「只向前跳转」的基本块序列：每个真实
-//   await（局部初始化或对局部 `=` 赋值的整个右侧）结束当前块并开启一个恢复块；
-//   if/else 结束当前块并开启两个分支块，分支未 return 的出口汇合到新块；return
+//   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
+//   或对局部 `=` 赋值的整个右侧）结束当前块并开启一个恢复块；if/else 结束当前块
+//   并开启两个分支块，分支未终止的出口汇合到新块；while 开启循环头块（求值条件），
+//   循环体末尾与 continue 回到循环头，break 与条件为假前进到循环出口块；return
 //   结束一条路径。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
-//   即可在一次运行中顺序走完不挂起的部分。
+//   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
 // 所属层次：
 //   translator 层（AST -> 规划数据）。只依赖 ast；不依赖 checker / compiler /
@@ -15,14 +16,17 @@
 // 对外契约：
 //   - plan(...) 是纯函数，不修改输入 AST；成功时返回完整块表，失败时只返回首个
 //     拒绝原因，绝不返回半边计划；
-//   - 块编号按分配顺序递增，且每个出口目标编号严格大于所在块编号（前向不变量），
-//     规划器在返回前自检，违反即抛 IllegalStateException（编译器内部错误）。
+//   - 块编号按分配顺序递增；出口目标编号要么严格大于所在块（前向边），要么是某个
+//     循环头（回边），规划器在返回前自检，违反即抛 IllegalStateException（编译器
+//     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - 循环、try/catch/finally、defer、throw、match、break/continue 一律拒绝；
+//   - do-while、三段式 for、for-in、循环后置块、带标签的 break/continue、
+//     try/catch/finally、defer、throw、match 一律拒绝；
 //   - await 只能是局部初始化或局部赋值的整个右侧，不能出现在条件、return 值或
 //     任何子表达式中；
-//   - 每条路径必须以 return 结束；return 之后的语句视为不可达并拒绝。
+//   - 每条路径必须以 return 结束；return / break / continue 之后的语句视为不可达
+//     并拒绝。
 // ============================================================================
 
 package jasper.translator
@@ -36,7 +40,7 @@ import jasper.ast.*
  * 为什么是 sealed：发射器必须穷举每种出口；新增出口种类时编译期即可发现漏处理。
  */
 sealed class CoroutineBlockExit {
-    /** 无条件前进到 [target] 块（分支汇合）。 */
+    /** 无条件跳到 [target] 块（分支汇合、进入循环头、循环体末尾 / continue 回边、break）。 */
     data class Goto(val target: Int) : CoroutineBlockExit()
 
     /** 按 [condition] 前进到 [whenTrue] 或 [whenFalse] 块。 */
@@ -67,27 +71,30 @@ data class CoroutineBlock(
  * 规划结果。
  *
  * [blocks] 按编号排列（编号即下标）；[locals] 是函数体内声明的局部名与类型，
- * 按源码出现顺序；[reason] 非空表示不支持，此时其余字段为空。
+ * 按源码出现顺序；[loopHeaders] 是 while 循环头块编号，回边只能指向它们；
+ * [reason] 非空表示不支持，此时其余字段为空。
  */
 data class CoroutineBlockPlan(
     val blocks: List<CoroutineBlock>,
     val locals: List<Pair<String, JasType>>,
-    val reason: String? = null
+    val reason: String? = null,
+    val loopHeaders: Set<Int> = emptySet()
 ) {
     /** 挂起点数量；发射器要求至少一个，否则函数不是由直接 await 挂起。 */
     val suspensionCount: Int get() = blocks.count { it.exit is CoroutineBlockExit.Suspend }
 }
 
 /**
- * 前向基本块规划器（无状态单例）。
+ * 基本块规划器（无状态单例）。
  *
  * 做什么：按上文契约切块；同时收集局部声明、校验类型与 await 位置。
  * 什么时候用：LinearCoroutineEmitter.unsupportedReason / emit。
  * 前置条件：函数已完成类型检查，真实 std.Future await 的 awaitResultType 已回填；
  *   兼容模式的普通值 await（awaitResultType 为 null）不视为挂起点。
  * 失败模式：不支持形态返回带原因的计划；内部不变量破坏抛 IllegalStateException。
- * 为什么只做前向跳转：没有循环时控制流图天然无环，按分配顺序编号即可让顺序排列
- *   的段在一次运行中走完；循环需要回边与重入检查，留给下一片单独建模验证。
+ * 为什么回边只能指向循环头：除循环外控制流图无环，按分配顺序编号即可让顺序排列
+ *   的段在一趟内走完；回边集中到循环头，发射器只需在分派循环每趟开头做一次终态
+ *   检查，就能让不挂起的循环在回边处响应作用域取消。
  */
 object CoroutineBlockPlanner {
     /** 本片允许的局部 / 参数值类型；帧字段直接使用该类型。 */
@@ -100,6 +107,11 @@ object CoroutineBlockPlanner {
     /** 正在构造、尚未确定出口的块。 */
     private class OpenBlock(val id: Int, val resumeBinding: String?) {
         val assignments = mutableListOf<Pair<String, JasExpression>>()
+    }
+
+    /** 正在降级的 while：continue 回到 [header]；break 的块等出口块分配后再封闭。 */
+    private class LoopContext(val header: Int) {
+        val breaks = mutableListOf<OpenBlock>()
     }
 
     /**
@@ -119,10 +131,12 @@ object CoroutineBlockPlanner {
             check(blocks.map { it.id } == blocks.indices.toList()) { "coroutine block ids are not dense" }
             blocks.forEach { block ->
                 targets(block.exit).forEach { target ->
-                    check(target > block.id) { "coroutine block ${block.id} jumps backwards to $target" }
+                    check(target > block.id || target in state.headers) {
+                        "coroutine block ${block.id} jumps backwards to non-header $target"
+                    }
                 }
             }
-            CoroutineBlockPlan(blocks, state.locals.toList())
+            CoroutineBlockPlan(blocks, state.locals.toList(), loopHeaders = state.headers.toSet())
         } catch (rejected: Rejected) {
             CoroutineBlockPlan(emptyList(), emptyList(), rejected.message)
         }
@@ -141,6 +155,8 @@ object CoroutineBlockPlanner {
         val types = LinkedHashMap(parameters)
         val locals = LinkedHashMap<String, JasType>()
         val closed = LinkedHashMap<Int, CoroutineBlock>()
+        val headers = linkedSetOf<Int>()
+        private val loops = ArrayDeque<LoopContext>()
         private var nextId = 0
 
         /** 分配新块；编号按分配顺序递增，是前向不变量的来源。 */
@@ -151,11 +167,14 @@ object CoroutineBlockPlanner {
             closed[block.id] = CoroutineBlock(block.id, block.resumeBinding, block.assignments.toList(), exit)
         }
 
-        /** 降级语句序列；返回序列结束时仍开放的块，所有路径都已 return 时返回 null。 */
+        /**
+         * 降级语句序列；返回序列结束时仍开放的块，所有路径都已终止（return / break /
+         * continue）时返回 null。
+         */
         fun lowerSequence(statements: List<JasStatement>, start: OpenBlock): OpenBlock? {
             var current: OpenBlock? = start
             for (statement in statements) {
-                val block = current ?: throw Rejected("unreachable statement after return")
+                val block = current ?: throw Rejected("unreachable statement after return, break or continue")
                 current = lowerStatement(statement, block)
             }
             return current
@@ -193,6 +212,16 @@ object CoroutineBlockPlanner {
                 write(block, target.name, assignment.value, await)
             }
             is JasIf -> lowerIf(statement, block)
+            is JasWhile -> lowerWhile(statement, block)
+            is JasBreakStatement -> {
+                val loop = innermostLoop(statement.label)
+                loop.breaks += block
+                null
+            }
+            is JasContinueStatement -> {
+                close(block, CoroutineBlockExit.Goto(innermostLoop(statement.label).header))
+                null
+            }
             is JasReturn -> {
                 val value = statement.value ?: throw Rejected("return must carry an int32 value")
                 if (directAwait(value) != null) throw Rejected("return await is not supported")
@@ -234,6 +263,38 @@ object CoroutineBlockPlanner {
             trueEnd?.let { close(it, CoroutineBlockExit.Goto(join.id)) }
             falseEnd?.let { close(it, CoroutineBlockExit.Goto(join.id)) }
             return join
+        }
+
+        /**
+         * while：当前块前进到新开的循环头；循环头求值条件，为真进入循环体，为假前进到
+         * 出口块。循环体末尾与 continue 是回边（回到循环头），break 前进到出口块。出口块
+         * 在循环体之后分配，所以除回边外的所有边仍是前向的。
+         */
+        private fun lowerWhile(statement: JasWhile, block: OpenBlock): OpenBlock {
+            if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
+            rejectNestedAwait(statement.condition)
+            val header = open(null)
+            headers += header.id
+            close(block, CoroutineBlockExit.Goto(header.id))
+            val body = open(null)
+            val loop = LoopContext(header.id)
+            loops.addLast(loop)
+            val bodyEnd = try {
+                lowerSequence(statement.body.statements, body)
+            } finally {
+                loops.removeLast()
+            }
+            bodyEnd?.let { close(it, CoroutineBlockExit.Goto(header.id)) }
+            val exit = open(null)
+            close(header, CoroutineBlockExit.Branch(statement.condition, body.id, exit.id))
+            loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
+            return exit
+        }
+
+        /** break/continue 的目标循环；带标签或不在循环内时拒绝。 */
+        private fun innermostLoop(label: String?): LoopContext {
+            if (label != null) throw Rejected("labeled break/continue is not supported")
+            return loops.lastOrNull() ?: throw Rejected("break/continue outside a loop")
         }
     }
 

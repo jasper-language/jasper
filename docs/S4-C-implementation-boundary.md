@@ -405,3 +405,74 @@ JVM 反射驱动执行（秒级，所有阻塞调用在有界线程中）：
 
 循环（需要回边与重入检查，下一片单独建模）、try/catch/finally/defer 的清理后继、await 出现在
 条件或子表达式、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称。
+（第十一片起 while 循环已支持，见下节。）
+
+## S4-C 第十一片：while 循环内挂起
+
+本片继续「实现次序」第 5 条（循环）：协程降级支持 `while` 循环，循环体内可以挂起，并支持
+不带标签的 `break` / `continue`。其他循环形式仍诊断。
+
+### 块规划与生成帧
+
+- `CoroutineBlockPlanner` 为每个 while 开一个循环头块：进入循环的块前进到循环头，循环头只
+  求值条件（为真进入循环体，为假前进到出口块），循环体末尾与 `continue` 跳回循环头（回边），
+  `break` 前进到出口块。出口块在循环体之后分配，因此除回边以外的边仍是前向的；规划器返回前
+  自检「每条出口要么前向、要么回到已登记的循环头」，计划里带出循环头集合。
+- 生成帧的 `run()` 把按编号排列的段包进分派循环 `while (true)`：前向跳转在同一趟内顺序走到
+  目标段；回边把 `__phase` 设为更小的循环头编号，本趟其余段都不匹配，于是开启新一趟。
+- 每趟开头检查结果是否已被外部终结（作用域取消）：第一趟就是原来的入口检查，之后每趟对应
+  一次回边。因此不挂起的循环也会在回边处响应作用域取消，帧返回后由 finally 关闭调度门并标记
+  settled，不会一直占住工作线程。
+- 循环内的 await 每次经过都重新求值操作数并注册一次回调；同一个已完成的 Future 在注册时同步
+  回调，恢复请求由调度门合并到本段结束之后，恢复块入口消费的总是本次注册送达的快照。
+- 循环体内声明的局部和分支内局部一样成为帧字段，每趟由其初始化重新写入；名字仍须全函数唯一。
+- 挂起效果分析与「同步调用挂起函数」检查都覆盖了 while 条件与循环体；带后置块的 while
+  视为效果未知。
+
+### 已支持形态
+
+在第十片的基础上增加：
+
+- `while (条件) { ... }`，可嵌套，可与 if/else 互相嵌套；循环体内可以有 await（局部初始化或
+  局部赋值的整个右侧）；
+- 不带标签的 `break` / `continue`（作用于最内层 while）。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- `do { } while (...)`、三段式 `for`、`for-in`；
+- 带 `onComplete` / `onBreak` / `onZeroRuns` 后置块的 while；
+- 带标签的 `break` / `continue`，以及循环外的 `break` / `continue`；
+- await 出现在循环条件中；return / break / continue 之后的不可达语句；
+- 循环条件或循环体内对另一挂起函数的同步调用；
+- 第十片已有的其余拒绝（try/catch/finally、defer、throw、match、条件与子表达式中的 await 等）。
+
+### 验收结果
+
+- `CoroutineBlockPlannerTest` 4 项：新增 while 块形状检查（循环头 Branch、回边只指向循环头、
+  break 前进到循环体之后分配的出口块）；拒绝清单换为 do-while、for、后置块、循环条件中的 await、
+  带标签 break、循环外 break/continue、break 之后的不可达语句等 17 种形态；固定种子 20261029 的
+  400 个随机程序（含有界 while、随机 break/continue、循环内挂起）× 4 组输入，AST 直接解释与
+  块状态机解释比对返回值与经过的挂起点数，结构检查改为「前向或回到循环头」并要求全部可达。
+- `LoopingCoroutinePipelineTest` 5 项，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM 执行：
+  单工作线程跨多趟回边逐个挂起、恢复得 36，循环之前的表达式只执行一次（class major 52）；
+  输入已完成时 200 趟循环每趟同步恢复、break 提前离开、零趟循环不挂起；不挂起的自旋循环被
+  作用域取消后在回边处结束并回收，工作线程随后可运行下一个帧；循环内 if 里挂起点的失败原样
+  发布、循环内挂起中的帧被作用域取消后回收且晚到输入不复活；固定种子 20261030 的 64 轮
+  （随机趟数、输入量级、输入在启动前或后完成）与 Kotlin oracle 一致。
+- `LinearCoroutinePipelineTest` 的不支持形态清单：「循环内 await」现为支持形态，改为
+  do-while 内 await、循环条件中的 await、循环体内同步调用挂起函数三例，均诊断且不写 class。
+- 变异检查：分派循环只在入口做终态检查时，自旋循环取消测试失败；break 接到循环头时
+  4 个用例失败（规划器形状、随机比对、端到端 break 与种子比对）。
+- `LoopingCoroutineFrame.tla`：按端到端测试函数的 21 块控制流图建模（两个循环头、三条回边、
+  break、循环内两个挂起点），主循环趟数上限 3，自旋循环由常量决定；每次经过挂起块重新注册
+  回调，回调消耗注册并记下送达。不变量 PreludeOnce（回边不重放循环前的块）/
+  ResumeAfterDelivery（恢复块消费本次送达；同一 Future 不会同时挂两个回调）/ NoOverlap /
+  SettledIsFinal，动作性质 BackEdgesToHeaders / ResultStable，活性 TerminatesUnlessSpinning、
+  CancelLeadsToSettled（弱公平）。4170 个可达状态无错；只在入口做终态检查的变异配置得到
+  「自旋 + 已取消 + 永远在两个块之间循环」的反例。`run-s4-models.sh` 十二组配置全部通过。
+
+### 仍未支持
+
+do-while / for / for-in 与循环后置块、带标签的 break/continue、try/catch/finally/defer 的清理
+后继、await 出现在条件或子表达式、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与
+显式挂起标记名称。
