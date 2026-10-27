@@ -368,6 +368,23 @@ class LinearCoroutinePipelineTest {
                     public static function caller(input: Future<int32>): int32 { return P.leaf(input); }
                 }
             """.trimIndent(),
+            // 调用者自身形态合法（恰好一个 await），但又在非 await 位置同步调用另一个挂起函数：
+            // 不能因被调函数已被生成帧替代而退化成内部错误或同步求值。
+            "synchronous-call-to-suspending" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function leaf(input: Future<int32>): int32 {
+                        var value: int32 = await input;
+                        return value;
+                    }
+                    public static function caller(input: Future<int32>): int32 {
+                        var first: int32 = await input;
+                        var second: int32 = P.leaf(input);
+                        return first + second;
+                    }
+                }
+            """.trimIndent(),
             "non-int32" to """
                 package demo;
                 import std.Future;

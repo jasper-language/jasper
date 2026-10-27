@@ -247,6 +247,8 @@ awaitTaskSettled 验证回收，执行测试有超时隔离。延迟拒绝用例
 
 - `return await`、多于一个 await、分支/循环/try/defer 中挂起、嵌套 await；
 - 仅通过调用传播挂起而没有直接 await 的调用者；
+- 自身形态合法、但在非 await 位置同步调用另一个挂起函数的函数（被调函数已由生成帧
+  替代，同步调用既无链接目标也会退化为同步求值；验收时由独立探针发现并补拒绝规则）；
 - 非 `int32` 结果、泛型/非静态/重载函数、生成类名冲突；
 - await 操作数或返回值出现发射器未支持的表达式；
 - 字段初始化器、构造器、lambda 等函数外位置的真实 await（`SuspendingAwaitScanner`
@@ -264,7 +266,7 @@ awaitTaskSettled 验证回收，执行测试有超时隔离。延迟拒绝用例
 3. await 操作数与挂起前表达式各只执行一次（固定种子 20261027 的 8 组布局 oracle）；
 4. 失败快照原样发布到结果 Future 的 Failed 通道，取消发布 Cancelled，二者均通过
    `awaitTaskSettled` 验证回收；
-5. 五类不支持形态均产生明确诊断且输出目录没有 `.class`。
+5. 六类不支持形态（含同步调用挂起函数）均产生明确诊断且输出目录没有 `.class`。
 
 生成类单独断言 major version 52。`LinearCoroutineFrame.tla` 有限模型检查 47 个生成状态、
 32 个可达状态、0 错误，覆盖“保存局部 → 注册 → 注册前/后回调 → 挂起返回 → 恢复”的

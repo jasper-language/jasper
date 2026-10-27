@@ -23,7 +23,8 @@
 //
 // 设计边界：
 //   - 本片只支持「变量初始化 await + 最后 return」的直线体；`return await`、多个
-//     await、分支/循环/异常/defer 等全部诊断，而不是退化为同步求值；
+//     await、分支/循环/异常/defer、对其它挂起函数的同步调用等全部诊断，而不是
+//     退化为同步求值；
 //   - 函数被发射后，其原声明从生成 AST 中移除：生成帧需要 executor 与输出 Future，
 //     还不是公开源码调用 ABI；任何调用方都会因自身也变为 SUSPENDING 而得到诊断；
 //   - 本层不生成字节码、不选择显式挂起标记名称、不改公开 ABI/文法。
@@ -200,6 +201,7 @@ object CoroutineLowering {
         val reason = when {
             (overloads[key] ?: 0) > 1 -> "overloaded suspending functions are not supported"
             else -> LinearCoroutineEmitter.unsupportedReason(function, requireStatic)
+                ?: synchronousSuspendingCall(function, effects)
         }
         if (reason != null) {
             reportFunctionError(errors, source, ownerName, function, reason)
@@ -231,6 +233,40 @@ object CoroutineLowering {
         frames += GeneratedCoroutineFrame(source.packageName, ownerName, function.name, className, generated)
         localFrames += generated
         return null
+    }
+
+    /**
+     * 查找函数体中对 SUSPENDING 函数的同步调用。
+     *
+     * 做什么：形态已通过发射器检查后，再遍历局部初始化器与返回值中的调用；若被调函数
+     *   本身是 SUSPENDING，返回拒绝原因。
+     * 为什么必须拒绝：被发射的挂起函数原声明会被生成帧替代，同步调用既没有可链接目标，
+     *   也会把挂起语义退化为同步求值；本片没有「调用挂起函数」的帧间协议，只能诊断。
+     * 失败模式：纯检查；发射器不支持的表达式不在此深入，由发射器自身拒绝。
+     */
+    private fun synchronousSuspendingCall(function: JasFunction, effects: SuspensionEffects): String? {
+        /** 深度优先返回首个被调函数为 SUSPENDING 的调用；无则 null。 */
+        fun find(expression: JasExpression?): JasCall? = when (expression) {
+            is JasCall -> {
+                val callee = expression.resolvedFunction
+                if (callee != null && effects[callee] == SuspensionEffect.SUSPENDING) expression
+                else find(expression.target) ?: expression.args.firstNotNullOfOrNull(::find)
+            }
+            is JasBinaryOp -> find(expression.left) ?: find(expression.right)
+            is JasUnaryOp -> find(expression.operand)
+            is JasPropertyAccess -> find(expression.target)
+            is JasCastExpr -> find(expression.expression)
+            else -> null
+        }
+        val call = function.body?.statements.orEmpty().firstNotNullOfOrNull { statement ->
+            when (statement) {
+                is JasVariableStatement -> find(statement.initializer)
+                is JasReturn -> find(statement.value)
+                else -> null
+            }
+        } ?: return null
+        val name = call.resolvedFunction?.name ?: "<unknown>"
+        return "synchronous call to suspending function '$name' is not supported"
     }
 
     /** 生成类名把来源写进名字，便于证据和反射驱动稳定定位；不使用随机/动态名称。 */
