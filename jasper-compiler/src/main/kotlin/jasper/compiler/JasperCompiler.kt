@@ -370,6 +370,43 @@ class JasperCompiler {
     }
 
     /**
+     * 登记并复查协程降级生成的帧类。
+     *
+     * 做什么：把 CoroutineLowering 已发射的帧登记进共享符号表，再用与普通源码相同的
+     *   TypeChecker 检查生成 AST。
+     * 什么时候用：compileToPipeline 与 compileAll 在降级诊断为空后、IR 翻译前。
+     * 前置条件：result.errors 为空；sources 的 awaitResultType / resolvedFunction 已回填。
+     * 失败模式：生成类检查失败时抛 CompileException；不返回部分结果。
+     * 为什么必须二次检查：生成类也是 Jasper AST，字段类型、调用描述符或作用域错误
+     *   不能等到字节码阶段才由后端内部异常暴露。
+     */
+    private fun finalizeCoroutineLowering(
+        result: CoroutineLoweringResult,
+        symbolTable: SymbolTable
+    ): List<jasper.ast.JasSourceFile> {
+        check(result.errors.isEmpty()) { "coroutine lowering diagnostics must be handled first" }
+
+        // 只登记生成声明，不能把已检查过的原始声明整份重新 collect（会制造重复声明）。
+        val symbolErrorsBefore = symbolTable.errors.size
+        val frameFiles = result.frames.map { frame ->
+            jasper.ast.JasSourceFile(frame.packageName, listOf(frame.declaration), emptyList())
+        }
+        frameFiles.forEach(symbolTable::collectDeclarations)
+        val errors: MutableList<CompileError> = symbolTable.errors.drop(symbolErrorsBefore).map { se ->
+            CompileError.Symbol(se.message, se.name, se.line, se.column)
+        }.toMutableList()
+
+        for (file in frameFiles) {
+            val typeErrors = TypeChecker(symbolTable, rejectUnloweredAwait = false).check(file)
+            errors += typeErrors.map { te ->
+                CompileError.Type(te.message, line = te.node?.sourceLine ?: 0, column = te.node?.sourceColumn ?: 0)
+            }
+        }
+        if (errors.isNotEmpty()) throw CompileException(errors)
+        return result.sources
+    }
+
+    /**
      * 单源码的完整流水线：预处理 → 解析 → 注解处理 → 符号表 → 类型检查 → IR 翻译。
      * 什么时候用：需要拿到中间产物 [CompilePipeline]（AST/IR/注解索引）而非只判断
      * 成功失败时；也是 [compile]/[compileScript] 的底层实现。
@@ -409,21 +446,31 @@ class JasperCompiler {
         })
 
         // 阶段五：类型检查；类型错误可能不带节点位置，故 line/column 以 0 兜底。
-        val typeErrors = TypeChecker(symbolTable).check(ast)
+        // 这里关闭「await 未实现」单项拒绝：支持范围统一由协程降级层判断，避免两处
+        // 规则漂移；不支持形态仍会在下面的降级阶段产生同样的明确诊断。
+        val typeErrors = TypeChecker(symbolTable, rejectUnloweredAwait = false).check(ast)
         allErrors.addAll(typeErrors.map { te ->
             CompileError.Type(te.message, line = te.node?.sourceLine ?: 0, column = te.node?.sourceColumn ?: 0)
         })
+
+        // 阶段六：协程降级。即使前面已有类型错误，也要运行一次「只收集诊断」的降级，
+        // 让不支持的真实挂起始终保留既有明确措辞；但 errors 非空时不会继续生成类。
+        val suspensionEffects = jasper.checker.SuspensionEffectAnalysis.analyzeSources(listOf(ast))
+        val lowering = CoroutineLowering.lower(listOf(ast), suspensionEffects)
+        allErrors.addAll(lowering.errors)
 
         // 聚合后再抛：让调用方一次性看到全部阶段的错误，而不是在第一个错误处中断。
         if (allErrors.isNotEmpty()) {
             throw CompileException(allErrors)
         }
 
-        // 阶段六：AST → IR 翻译（仅在无错误时执行）。
-        val translator = JasperToIrTranslator()
-        val ir = translator.translate(ast)
+        val loweredAst = finalizeCoroutineLowering(lowering, symbolTable).single()
 
-        return CompilePipeline(parsed.parsedText, ast, ir, annotated.index)
+        // 阶段七：AST → IR 翻译（仅在无错误时执行）。
+        val translator = JasperToIrTranslator()
+        val ir = translator.translate(loweredAst)
+
+        return CompilePipeline(parsed.parsedText, loweredAst, ir, annotated.index, suspensionEffects)
     }
 
     /**
@@ -468,19 +515,31 @@ class JasperCompiler {
         })
 
         // 第二轮：所有声明就位后，逐文件做类型检查（复用同一符号表）。
+        // 与单文件入口相同，真正的 await 支持范围交由协程降级层统一裁决。
         for ((filename, ast) in parsed) {
-            val typeErrors = TypeChecker(symbolTable).check(ast)
+            val typeErrors = TypeChecker(symbolTable, rejectUnloweredAwait = false).check(ast)
             allErrors.addAll(typeErrors.map { te ->
                 CompileError.Type(te.message, line = te.node?.sourceLine ?: 0, column = te.node?.sourceColumn ?: 0)
             })
         }
 
+        // 第三轮：共享挂起效果快照并运行协程降级。即使已有错误也收集降级诊断，
+        // 但不支持/类型错误并存时仍会在这里整体失败，不进入生成与注册。
+        val suspensionEffects = jasper.checker.SuspensionEffectAnalysis.analyzeSources(parsed.values)
+        val lowering = CoroutineLowering.lower(parsed.values.toList(), suspensionEffects)
+        allErrors.addAll(lowering.errors)
+
         if (allErrors.isNotEmpty()) {
             throw CompileException(allErrors)
         }
 
-        // 第三轮：一次性翻译全部文件，再把结果按文件切回各自的 TranslationResult。
-        val suspensionEffects = jasper.checker.SuspensionEffectAnalysis.analyzeSources(parsed.values)
+        // 生成类先注册再二次类型检查，最后把新源文件按原文件名对回 parsed。
+        val loweredSources = finalizeCoroutineLowering(lowering, symbolTable)
+        parsed.keys.forEachIndexed { index, filename ->
+            parsed[filename] = loweredSources[index]
+        }
+
+        // 第四轮：一次性翻译全部文件（含生成帧类），再把结果按文件切回各自的 TranslationResult。
         val translator = JasperToIrTranslator()
         val translated = translator.translateAll(parsed.values.toList(), symbolTable)
         val pipelines = mutableMapOf<String, CompilePipeline>()
@@ -610,6 +669,9 @@ class JasperCompiler {
             CompileError.Symbol(se.message, se.name, se.line, se.column)
         })
 
+        // 本重载只看到当前文件，拿不到跨文件直接调用图，无法可靠判定 SUSPENDING；
+        // 因此保持检查器的默认失败关闭行为，真实 await 仍得到明确诊断，不会同步透传。
+        // 需要自动发射请使用会跑完整挂起效果分析与降级的 compileToPipeline / compileAll。
         val typeErrors = TypeChecker(symbolTable).check(ast)
         allErrors.addAll(typeErrors.map { te ->
             CompileError.Type(te.message, line = te.node?.sourceLine ?: 0, column = te.node?.sourceColumn ?: 0)

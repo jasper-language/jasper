@@ -220,3 +220,65 @@ awaitTaskSettled 验证回收，执行测试有超时隔离。延迟拒绝用例
 
 后续仍需实际发射并运行生成状态机。本轮补齐的是该生成桥必须依赖的异常结果路径，
 不能把内部 bindResult 接口或手写测试执行段称为自动 await 已完成。
+
+
+## S4-C 第八片：编译器真实发射单挂起点直线 int32 状态机
+
+本片把 `LinearCoroutineEmitter` 接入 `JasperCompiler` 的真实编译路径，而不再只由测试
+直接调用发射器。类型检查通过后，`CoroutineLowering` 使用与第六片相同的共享挂起效果
+快照挑选函数：只有直接调用图判定为 `SUSPENDING`、且形态落在下述支持集内的函数会生成
+`<Owner>_<函数名>_Coroutine`（顶层为 `<函数名>_Coroutine`）内部帧类。生成帧复用既有
+`ContinuationDispatch.bindResult` 桥、`Future.onComplete` 与 JVM 执行器；生成 AST 先登记
+符号并用同一个 `TypeChecker` 复查，再交给既有 IR/JVM 后端，class 版本仍为 52，不使用
+动态代码生成。原函数声明在降级结果中由生成类替代；这仍不是公开源码挂起调用 ABI。
+
+### 已支持形态
+
+- 类/枚举静态函数或顶层函数，非泛型、非重载；
+- 返回 `int32`；参数为 `int32` 或 `std.Future<int32>`；
+- 函数体是直线控制流：恰好一个 `await`，且只出现在一个局部变量初始化中；其余语句是
+  带初始化器的 `int32` 局部声明；最后一句为 `return`；
+- await 操作数与返回值可使用局部/参数、字面量、纯算术/比较/逻辑运算、属性访问、调用和
+  显式 cast；自由标识符按类型名/静态函数名保留；含 `this` 的实例接收者明确拒绝；
+- 生成帧构造参数为 `(Executor, Future<int32>, 原参数...)`，`start()` 只请求第一次恢复；
+  输出 Future 由调用方提供，构造时经 `bindResult` 绑定。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- `return await`、多于一个 await、分支/循环/try/defer 中挂起、嵌套 await；
+- 仅通过调用传播挂起而没有直接 await 的调用者；
+- 非 `int32` 结果、泛型/非静态/重载函数、生成类名冲突；
+- await 操作数或返回值出现发射器未支持的表达式；
+- 字段初始化器、构造器、lambda 等函数外位置的真实 await（`SuspendingAwaitScanner`
+  作为降级后的残留安全网）；普通值 await 的兼容语义不变。
+  以上诊断统一包含 `non-blocking await lowering is not implemented yet`，便于沿用既有
+  前端断言，同时给出具体函数与原因。
+
+### 验收结果
+
+新增 `LinearCoroutinePipelineTest` 5 项，全部经真实 ANTLR 解析、标准库 + 用户源码编译、
+生成 class 写出与 JVM 反射驱动执行：
+
+1. 单工作线程：生成帧注册回调后返回，生产者任务完成输入，随后恢复并得到 26；
+2. 输入在注册前已完成仍恢复，结果 26；
+3. await 操作数与挂起前表达式各只执行一次（固定种子 20261027 的 8 组布局 oracle）；
+4. 失败快照原样发布到结果 Future 的 Failed 通道，取消发布 Cancelled，二者均通过
+   `awaitTaskSettled` 验证回收；
+5. 五类不支持形态均产生明确诊断且输出目录没有 `.class`。
+
+生成类单独断言 major version 52。`LinearCoroutineFrame.tla` 有限模型检查 47 个生成状态、
+32 个可达状态、0 错误，覆盖“保存局部 → 注册 → 注册前/后回调 → 挂起返回 → 恢复”的
+顺序及“运行中不重叠执行段”不变量；模型抽象掉锁、线程调度与 JVM 内存模型。
+
+构建虚拟机内 `verification/run-s4-models.sh` 八组配置全部通过，日志写入
+`evidence/s4-models/`；新增模型日志为 `evidence/s4-models/LinearCoroutineFrame.log`。
+构建虚拟机全量 `./gradlew test --no-daemon` 成功（1 分 50 秒），JUnit XML 为
+777 tests / failures 0 / errors 0 / skipped 1，776 实际执行。
+
+复用外部 `SymbolTable` 的单文件 `compileToPipeline` 重载只看到当前文件，拿不到完整直接
+调用图，因此仍保持失败关闭：真实 await 继续得到同一明确诊断，不会同步透传；需要自动发射
+时应使用会运行共享挂起效果分析与降级的 `compileToPipeline` / `compileAll` 入口。
+
+本片仍不提供公开挂起调用 ABI、显式挂起标记、多 await/分支/循环/清理后继、结构化作用域
+自动登记、取消原因或 Deadline。Kotlin 编译器实现按 FV-B 交付：效果/降级链有真实端到端
+契约测试、固定种子布局 oracle 与 TLA+ 模型；性质登记见 `LANG-CONT-LOWER-01`。

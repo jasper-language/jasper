@@ -67,8 +67,15 @@ private const val RESULT_TYPE_SIMPLE_NAME = "Result"
  *
  * 设计说明：errors / classImplements / interfaceExtends 是复用的实例字段，
  * 每次 check() 会先清空。因此同一实例不保证线程安全，也不适合并发检查不同文件。
+ *
+ * rejectUnloweredAwait 是编译阶段的内部开关：默认 true 保持前端单元测试与旧的
+ * 「未实现即拒绝」行为；JasperCompiler 会以 false 运行检查，让协程降级阶段统一
+ * 判断哪些真实 await 能发射、哪些必须明确诊断，避免检查器与降级器各自维护支持范围。
  */
-class TypeChecker(private val symbolTable: SymbolTable? = null) {
+class TypeChecker(
+    private val symbolTable: SymbolTable? = null,
+    private val rejectUnloweredAwait: Boolean = true
+) {
     private val errors = mutableListOf<TypeError>()
     private val classImplements = mutableMapOf<String, List<String>>() // className -> interfaceNames
     private val interfaceExtends = mutableMapOf<String, List<String>>() // interfaceName -> parentInterfaceNames
@@ -1317,9 +1324,12 @@ class TypeChecker(private val symbolTable: SymbolTable? = null) {
                         val named = operandType as? JasNamedType
                         val identity = named?.let { symbolTable?.resolveTypeKey(it.name) }
                         if (identity == jasper.compiler.TypeKey("std", "Future")) {
-                            // S4-C 前端先识别真实 Future 身份与结果类型；后端尚未接通时
-                            // 必须失败关闭，不能把 Future 透传或阻塞 get 冒充挂起。
-                            error("non-blocking await lowering is not implemented yet", expr)
+                            // S4-C 前端先识别真实 Future 身份与结果类型；是否可降级由
+                            // 编译器的协程降级阶段统一裁决。直接调用 TypeChecker 的旧入口
+                            // 默认仍失败关闭，不能把 Future 透传或阻塞 get 冒充挂起。
+                            if (rejectUnloweredAwait) {
+                                error("non-blocking await lowering is not implemented yet", expr)
+                            }
                             val resultType = named?.typeArguments?.singleOrNull() ?: JasAnyType
                             expr.awaitResultType = resultType
                             resultType
