@@ -194,6 +194,52 @@ public class TaskGroup {
     }
 
     /**
+     * 做什么：把编译器生成的协程帧作为子任务登记并启动。
+     * 什么时候用：S4-C 生成帧需要随作用域一起 join、级联取消与聚合失败时。
+     * 前置条件：task 尚未 start，其结果 Future 只属于这一个帧且仍为 Pending；
+     *   帧负责在结果终态后（含被作用域取消）调用 markTaskSettled。
+     * 失败模式：关闭后抛 TaskGroupClosedError，帧不会启动；执行器拒绝首次恢复时
+     *   返回已失败且已 settled 的 Future，并按普通组语义取消兄弟。
+     * 为什么先登记再挂接再启动：close 必须能看到每个已启动帧；失败级联回调必须在
+     *   帧可能发布失败之前注册，否则早到的失败会漏掉兄弟取消。
+     * 为什么用结果 Future 的回调做级联：帧的失败在恢复段内发布，不存在 TaskRunner
+     *   那样包住整个执行体的 finally；Future 终态回调恰好覆盖所有失败发布路径。
+     */
+    public function launch<T>(task: CoroutineTask<T>): Future<T> {
+        var future: Future<T> = task.resultFuture();
+        var erased: Future<any> = cast future as Future<any>;
+        this.mutex.acquireUninterruptibly();
+        if (this.closed) {
+            this.mutex.release();
+            throw new TaskGroupClosedError("cannot launch after TaskGroup.close");
+        }
+        this.children.add(erased);
+        // 登记之后再读根令牌：cancel 先取消根令牌、再在锁内快照子任务，因此并发取消
+        // 要么在快照里看到本帧，要么在这里被本帧看到，不会两边都漏掉。
+        var scopeCancelled: bool = this.rootToken.isCancelled();
+        this.mutex.release();
+
+        erased.onComplete(new ChildFailureRelay(this));
+        if (scopeCancelled) {
+            // 已取消（显式取消或普通组失败级联）的作用域里新帧不执行任何业务段：
+            // 先发布 Cancelled，start 后帧在入口检查处直接回收，与 spawn 的令牌语义一致。
+            future.cancel();
+        }
+        try {
+            task.start();
+        } catch (rejected: java.lang.Throwable) {
+            // 生成帧的调度门已为绑定结果发布失败并标记 settled；这里再兜底一次，
+            // 保证任何 CoroutineTask 实现都不会留下 close 永远等待的子任务。
+            try {
+                future.fail(new Failure(rejected.toString(), "schedule"));
+            } finally {
+                future.markTaskSettled();
+            }
+        }
+        return future;
+    }
+
+    /**
      * 做什么：关闭作用域、等待全部子任务执行体退出，并按策略聚合失败。
      * 什么时候用：作用域正常结束或异常退出前的 finally 中。
      * 前置条件：调用方接受等待已经启动的子任务；不可中断的外部阻塞可能让 close 阻塞。
@@ -309,6 +355,32 @@ public class TaskGroup {
             return;
         }
         this.cancel();
+    }
+}
+
+/**
+ * 协程子任务的失败级联回调。
+ *
+ * 做什么：结果 Future 进入 Failed 时通知所属作用域；成功与取消不触发级联。
+ * 什么时候用：TaskGroup.launch 在启动帧之前注册到结果 Future。
+ * 前置条件：owner 非 null。
+ * 失败模式：兄弟取消回调失败时抛 CallbackDispatchError，由 Future 的批次通知汇总。
+ * 为什么取消不级联：取消是独立终态（见 TaskRunner.run），由作用域取消自身发起时
+ *   再级联只会重复取消；业务失败才需要普通组取消兄弟。
+ */
+public class ChildFailureRelay implements Action<FutureOutcome> {
+    private var owner: TaskGroup;
+
+    /** 做什么：绑定所属作用域。前置条件：owner 非 null；失败模式：不会失败。 */
+    public constructor(owner: TaskGroup) {
+        this.owner = owner;
+    }
+
+    /** 做什么：失败终态时触发 onChildFailure。前置条件：snapshot 为终态快照。 */
+    public function accept(snapshot: FutureOutcome): void {
+        if (snapshot.isFailed()) {
+            this.owner.onChildFailure();
+        }
     }
 }
 

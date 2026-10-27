@@ -3,9 +3,10 @@
 // ============================================================================
 // 职责：
 //   把已经通过类型检查、且已被直接调用图判定为「可能挂起」的窄范围函数，翻译成
-//   一个实现 Runnable + Action<FutureOutcome> 的生成帧类。生成类保存源码函数的
-//   参数与跨挂起局部，使用 Future.onComplete 注册恢复，并通过 ContinuationDispatch
-//   的串行恢复门与结果绑定桥运行。
+//   一个实现 Runnable + Action<FutureOutcome> + CoroutineTask<int32> 的生成帧类。
+//   生成类保存源码函数的参数与跨挂起局部，使用 Future.onComplete 注册恢复，并通过
+//   ContinuationDispatch 的串行恢复门与结果绑定桥运行；CoroutineTask 协议让
+//   TaskGroup.launch 把帧作为结构化作用域的子任务登记、取消与回收。
 //
 // 所属层次：
 //   translator 层（AST -> AST 的变换）。只依赖 ast 与同层分段规划器；不依赖
@@ -14,7 +15,8 @@
 //
 // 与谁协作：
 //   - LinearSuspensionPlanner：给出唯一挂起点、结果绑定与跨段活跃局部；
-//   - 生成代码运行期依赖 std.ContinuationDispatch / std.Future / std.FutureOutcome；
+//   - 生成代码运行期依赖 std.ContinuationDispatch / std.Future / std.FutureOutcome /
+//     std.CoroutineTask；
 //   - compiler 层的协程降级阶段负责挑选函数、命名生成类并处理不支持形态的诊断。
 //
 // 对外契约：
@@ -61,6 +63,7 @@ object LinearCoroutineEmitter {
     private const val EXECUTOR = "std.Executor"
     private const val RUNNABLE = "std.Runnable"
     private const val ACTION = "std.Action"
+    private const val COROUTINE_TASK = "std.CoroutineTask"
 
     /** 仅 int32 结果；更宽类型需要重新审视字段布局与描述符，不能静默复用。 */
     private val INT = JasPrimitiveType("int32")
@@ -129,8 +132,9 @@ object LinearCoroutineEmitter {
     /**
      * 生成完整的帧类 AST。
      *
-     * 做什么：把支持范围内的函数改写为字段 + 构造器 + `run` + `accept` + `start`；
-     *   构造器把结果 Future 绑定到 ContinuationDispatch，`start` 只请求第一次恢复。
+     * 做什么：把支持范围内的函数改写为字段 + 构造器 + `run` + `accept` +
+     *   `resultFuture` + `start`；构造器把结果 Future 绑定到 ContinuationDispatch，
+     *   `start` 订阅自身结果 Future 后只请求第一次恢复。
      * 什么时候用：compiler 已确认 [unsupportedReason] 返回 null 后调用。
      * 前置条件：className 是合法 Java 标识符；function 未脱离原 AST 上下文完成类型检查。
      * 失败模式：形态不支持或表达式无法安全改写时抛 IllegalArgumentException；
@@ -285,7 +289,10 @@ object LinearCoroutineEmitter {
         second += JasReturn(null)
 
         // `__phase` 在每段入口判断；两段互斥，恢复段不会重放第一段，操作数只求值一次。
+        // 入口先看结果是否已被外部终结（作用域取消）：此时不再执行任何业务段，
+        // 直接落到 finally 关闭调度门并标记 settled，等待中的帧因此能被回收。
         val runBody = JasBlock(listOf(
+            JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasReturn(null))), null),
             JasIf(JasBinaryOp(field("__phase"), "==", JasIntLiteral(0, "0")), JasBlock(first), null),
             JasIf(JasBinaryOp(field("__phase"), "==", JasIntLiteral(1, "1")), JasBlock(second), null)
         ))
@@ -323,8 +330,18 @@ object LinearCoroutineEmitter {
             listOf("public")
         )
         properties += JasFunction(
+            "resultFuture", emptyList(), resultFuture,
+            JasBlock(listOf(JasReturn(field("__result")))),
+            listOf("public")
+        )
+        // start 先订阅自身结果：作用域取消结果 Future 时经 accept 请求一次恢复，挂起中的
+        // 帧由此进入入口检查并回收；帧自己发布终态时的这次回调只会合并或被已结束的门忽略。
+        properties += JasFunction(
             "start", emptyList(), JasUnitType,
-            JasBlock(listOf(statement(invoke(field("__dispatch"), "resume")))),
+            JasBlock(listOf(
+                statement(invoke(field("__result"), "onComplete", JasIdentifier("this"))),
+                statement(invoke(field("__dispatch"), "resume"))
+            )),
             listOf("public")
         )
 
@@ -333,7 +350,11 @@ object LinearCoroutineEmitter {
             listOf("public"),
             emptyList(),
             null,
-            listOf(JasNamedType(RUNNABLE), JasNamedType(ACTION, listOf(JasNamedType(FUTURE_OUTCOME)))),
+            listOf(
+                JasNamedType(RUNNABLE),
+                JasNamedType(ACTION, listOf(JasNamedType(FUTURE_OUTCOME))),
+                JasNamedType(COROUTINE_TASK, listOf(INT))
+            ),
             properties,
             listOf(constructor)
         ).also {

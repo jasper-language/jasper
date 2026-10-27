@@ -104,6 +104,8 @@ object StdLib {
         "Future.jas",
         "CancellationToken.jas",
         "CallbackDispatchError.jas",
+        // S4-C 第九片：生成帧进入作用域的协议须先于使用它的 TaskGroup.launch。
+        "CoroutineTask.jas",
         "TaskGroup.jas",
         "Context.jas",
         "CleanupBudget.jas",

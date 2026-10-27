@@ -26,12 +26,17 @@ dependencies {
     testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.10.2")
     // 既有部分测试直接 import org.junit.Test / org.junit.Assume，必须继续提供 JUnit 4 API。
     testImplementation("junit:junit:4.13.2")
+    // S4-C 运行时源码验证链：Lincheck（并发交错模型检查）与 Jazzer（覆盖引导 fuzz）。
+    testImplementation("org.jetbrains.kotlinx:lincheck:2.39")
+    testImplementation("com.code-intelligence:jazzer-junit:0.30.0")
     add(antlrTool.name, "org.antlr:antlr4:4.13.2")
 }
 
 tasks.test {
     // 同时运行 JUnit Jupiter（动态一致性测试）与 Vintage（既有 JUnit 4 测试）。
     useJUnitPlatform()
+    // Lincheck 与 Jazzer 在测试 JVM 内动态挂载插桩代理；JDK 21 需显式允许。
+    jvmArgs("-XX:+EnableDynamicAgentLoading")
 }
 
 application {

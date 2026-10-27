@@ -284,3 +284,62 @@ awaitTaskSettled 验证回收，执行测试有超时隔离。延迟拒绝用例
 本片仍不提供公开挂起调用 ABI、显式挂起标记、多 await/分支/循环/清理后继、结构化作用域
 自动登记、取消原因或 Deadline。Kotlin 编译器实现按 FV-B 交付：效果/降级链有真实端到端
 契约测试、固定种子布局 oracle 与 TLA+ 模型；性质登记见 `LANG-CONT-LOWER-01`。
+
+
+## S4-C 第九片：生成帧接入结构化作用域
+
+本片完成「实现次序」第 4 条：编译器生成帧可作为 Jasper 运行时 `TaskGroup` 的子任务
+启动，登记、终态发布、失败级联、取消唤醒与 settled 回收全部由 Jasper 代码完成，
+Kotlin 侧没有运行时状态机。
+
+### 运行时入口（Jasper）
+
+- 新增内部协议 `std.CoroutineTask<T>`：`resultFuture()` 返回帧构造时已绑定的结果
+  Future，`start()` 只请求首次恢复。它不是公开源码挂起调用 ABI。
+- `TaskGroup.launch<T>(task)`：关闭后抛 `TaskGroupClosedError` 且不启动帧；否则先登记
+  结果 Future，再在结果上挂 `ChildFailureRelay`（Failed 时调用 `onChildFailure`，普通组
+  据此取消兄弟；成功与取消不级联），最后 `start()`。执行器拒绝首次恢复时返回已失败
+  （kind=schedule）且已 settled 的结果，并照普通组语义级联。
+- 登记时若作用域根令牌已取消（显式 `cancel` 或普通组失败级联之后），先把结果发布为
+  Cancelled，帧不执行任何业务段，与 `spawn` 的令牌继承语义一致。该规则由新模型的
+  `NormalCascade` 反例发现：缺少检查时，已失败普通组里新 launch 的帧会照常运行。
+
+### 生成帧协议（编译器）
+
+- 生成帧额外实现 `std.CoroutineTask<int32>`，新增 `resultFuture()`；
+- `start()` 先订阅自身结果 Future 再请求恢复：作用域取消结果时帧被唤醒；
+- `run()` 入口先检查结果是否已终结：是则不执行任何业务段，直接在 finally 中关闭调度门
+  并标记 settled。挂起中的帧因此在被取消后无需输入完成也能回收；晚到输入只会命中已
+  结束的调度门，不会复活帧。帧自己发布终态时引起的那次回调只会合并或被忽略。
+
+### 验收结果
+
+新增 `LinearCoroutineScopeTest` 8 项，全部经真实 ANTLR 解析、标准库 + 用户源码编译、
+JVM 反射驱动执行（秒级，所有阻塞调用在有界线程中）：
+
+1. 单工作线程作用域内两帧都挂起、逆序完成输入后各自恢复，close 正常返回且全部 settled；
+2. 普通组一帧失败，挂起兄弟发布 Cancelled 并回收，晚到输入不复活，close 抛 TaskGroupFailure；
+3. 监督组不级联，兄弟正常完成；确认失败后 close 正常返回，未确认时聚合（B 策略）；
+4. 作用域取消唤醒两个挂起帧，结果 Cancelled 并回收，close 抛 CancellationException；
+5. 已取消作用域（显式取消 / 失败级联后）中 launch 的帧直接 Cancelled，不进入任何段；
+6. 关闭后 launch 被拒且帧不启动；执行器已关闭时 launch 返回 schedule 失败并已回收；
+7. 固定种子 20261028 的 64 轮事件序列（3 帧、普通/监督、输入完成/失败/取消、随机作用域
+   取消）与独立 Kotlin oracle 比对每帧终态、成功值与 close 结果；
+8. 独立子 JVM 以 `-Xverify:all -Xcheck:jni` 加载并初始化本次输出的全部 class，生成帧与
+   作用域运行时 class 版本均为 52。
+
+另有 `LinearCoroutineScopeLincheckTest`（Lincheck 2.39 模型检查：2 线程 × 3 操作，
+40 迭代 × 400 次调用，枚举 launch / 输入失败与完成 / 作用域取消 / 执行队列段的交错，
+无死锁、无意外异常、@Validate 不变量成立）与 `LinearCoroutineScopeFuzzTest`（Jazzer
+0.30.0：两次各 60 秒覆盖引导 fuzz，共 867,357 次执行无发现，139 条语料入库作为回归输入）。
+二者使用确定性队列执行器（JDK 动态代理实现 `std.Executor`），不变量与新模型同名。
+
+`CoroutineScopeLaunch.tla` 普通组 / 监督组两份配置均通过（1308 / 1342 个可达状态），
+含 `TerminalEventuallySettled` 活性（弱公平）；模型把失败级联与作用域取消视为同一回调
+批次内的原子动作，抽象掉锁、线程调度与 JVM 内存模型。
+
+### 仍未支持
+
+公开源码层「调用挂起函数」语法 / ABI 与显式挂起标记名称仍待裁决；测试经反射构造生成帧并
+调用 `TaskGroup.launch`，源码层无法直接写出这一调用。多 await、分支、循环、try/清理后继、
+实例分派、取消原因与 Deadline 仍不支持（实现次序第 5、6 条）。
