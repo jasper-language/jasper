@@ -1117,7 +1117,7 @@ class S4RuntimeJasperTest {
      *   根 deadline 恰为 min(全局, 局部)、子 deadline 不晚于父、也不突破子局部上限。
      * 什么时候用：修改 CleanupBudget.start/nested 的 deadline 公式时。
      * 前置条件：JVM 单调时钟可用；种子与轮次固定，失败可复现。
-     * 失败模式：根上限没有取最小、嵌套延长父截止点、嵌套突破自身上限。
+     * 失败模式：根上限没有取最小、嵌套重置父起点、嵌套延长父截止点、嵌套突破自身上限。
      * 为什么用循环生成：时间类边界若只测 0/1s/5s 容易漏掉“父剩余小于子局部上限”
      *   的组合；固定种子覆盖两者大小关系交替出现的分支。
      */
@@ -1157,6 +1157,8 @@ class S4RuntimeJasperTest {
                     var nestedLimit: int64 = nestedSeed;
                     nestedLimit = (nestedLimit + 1L) * 1000L;
                     var child: CleanupBudget = budget.nested(nestedLimit);
+                    // 嵌套不得重置计时起点：子预算必须复用父预算的 startedAtNanos。
+                    if (child.startedAtNanos() != budget.startedAtNanos()) { return 8; }
                     var afterNested: int64 = java.lang.System.nanoTime();
                     var childDeadline: int64 = child.deadlineNanos();
                     var parentDeadline: int64 = budget.deadlineNanos();
