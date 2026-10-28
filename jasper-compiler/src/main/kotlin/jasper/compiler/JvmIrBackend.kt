@@ -1332,22 +1332,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // 旧实现只支持 ①（且异常/return 路径完全不执行 finally），是 FINDINGS #4 的根因。
                 val finallyExpr = stmt.finallyExpression
                 val hasFinally = finallyExpr != null
-                val hasCatches = stmt.catches.isNotEmpty()
                 // 本 try 体的受保护区间；外层 finally 内联进来的代码会在这里留下空隙。
                 val tryRange = ProtectedRange()
                 val fctx = if (hasFinally) FinallyContext(finallyExpr!!, ctx.openRanges.size) else null
 
                 val tryStart = Label()
                 val tryEnd = Label()
-                val catchStart = Label()
-                val catchEnd = Label()
                 val finallyHandler = Label()
                 val endLabel = Label()
+                // 每个 catch 子句一个处理器入口：异常表按子句书写顺序逐一登记各自的捕获类型，
+                // JVM 按登记顺序匹配，于是只有第一个类型匹配的子句执行（LANG-SYNC-CATCH-01）。
+                val catchHandlers = stmt.catches.map { Label() }
 
-                // 异常表顺序即匹配优先级：具体 catch 类型在前，finally 兜底（type=null）在后。
-                val catchTypeInternal = if (hasCatches) {
-                    typeMapper.jvmInternalNameFromIrType(stmt.catches.first().catchParameter.type)
-                } else null
                 // 注意：本 try 的异常表项**延迟到生成完 try 体之后**才登记（见下）。
                 // JVM 按登记顺序匹配异常表项，嵌套 try 的内层处理器必须先于外层登记，
                 // 否则外层 catch 会「抢先」吞掉本该由内层 finally 处理的异常。
@@ -1369,9 +1365,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitLabel(tryEnd)
                 if (fctx != null) ctx.finallyStack.removeLast()
                 ctx.openRanges.removeLast()
-                // 生成完 try 体后登记本 try 范围的处理器：内层（体里嵌套 try）已先登记。
-                if (hasCatches) {
-                    registerProtectedRange(mv, tryStart, tryEnd, tryRange, catchStart, catchTypeInternal)
+                // 生成完 try 体后登记本 try 范围的处理器：内层（体里嵌套 try）已先登记；
+                // 各 catch 子句按书写顺序在前，finally 兜底（type=null）在后。
+                stmt.catches.forEachIndexed { i, catchClause ->
+                    val catchTypeInternal = typeMapper.jvmInternalNameFromIrType(catchClause.catchParameter.type)
+                    registerProtectedRange(mv, tryStart, tryEnd, tryRange, catchHandlers[i], catchTypeInternal)
                 }
                 if (hasFinally) {
                     // try 体内未被 catch 命中的异常 → finallyHandler（兜底，type=null）。
@@ -1381,47 +1379,47 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 if (hasFinally) generateFinallyBody(mv, finallyExpr!!, ctx, owner)
                 mv.visitJumpInsn(Opcodes.GOTO, endLabel)
 
-                // ---- ② catch 分支 ----
-                if (hasCatches) {
+                // ---- ② catch 分支：每个子句一段独立处理器 ----
+                // 子句的受保护区间只覆盖它自己的体：体内抛出的异常只交给本 try 的 finally（及外层），
+                // 不会被同一 try 的兄弟子句截获；体末尾内联的 finally 与 GOTO 在区间之外。
+                stmt.catches.forEachIndexed { i, catchClause ->
+                    val catchStart = catchHandlers[i]
+                    val catchEnd = Label()
                     mv.visitLabel(catchStart)
                     // catch 体是另一段受 finally 兜底保护的区间，内联其 finally 时从这里挖空隙。
                     val catchRange = ProtectedRange()
                     val catchFctx = if (hasFinally) FinallyContext(finallyExpr!!, ctx.openRanges.size) else null
+                    // 进入处理器时操作数栈顶恰是抛出的异常对象：存入本子句的参数槽。
+                    // 异常表已按声明类型匹配，栈顶静态类型即该类型，CHECKCAST 只为让校验器按声明类型取值。
+                    val param = catchClause.catchParameter
+                    val pName = param.name.toString()
+                    val paramDesc = typeMapper.jvmDescriptorFromIrType(param.type)
+                    val paramInternal = typeMapper.jvmInternalNameFromIrType(param.type)
+                    val catchSlot = ctx.nextSlot
+                    // 异常对象是引用，占 1 个槽。
+                    ctx.nextSlot += 1
+                    if (paramInternal != "java/lang/Throwable" && paramInternal != "throwable") {
+                        mv.visitTypeInsn(Opcodes.CHECKCAST, paramInternal)
+                        storeLocal(mv, paramDesc, catchSlot)
+                    } else {
+                        storeLocal(mv, "Ljava/lang/Throwable;", catchSlot)
+                    }
+                    ctx.variables[pName] = catchSlot
+                    ctx.locals.add(LocalInfo(pName, param.type, catchSlot))
+                    ctx.symbolToName[param.symbol] = pName
                     if (catchFctx != null) ctx.finallyStack.add(catchFctx)
                     ctx.openRanges.add(catchRange)
-                    // 进入 catch 时操作数栈顶是抛出的异常对象；每个 catch 参数都必须从它取值。
-                    // 下面为每个 catch 子句分配一个槽并 ASTORE（先按 Throwable 存，
-                    // 具体类型不足时再 CHECKCAST 回写），最后按 catch 顺序生成体。
-                    for (catchClause in stmt.catches) {
-                        val param = catchClause.catchParameter
-                        val pName = param.name.toString()
-                        val paramDesc = typeMapper.jvmDescriptorFromIrType(param.type)
-                        val paramInternal = typeMapper.jvmInternalNameFromIrType(param.type)
-                        val catchSlot = ctx.nextSlot
-                        // 异常对象是引用，占 1 个槽（即便类型是 long/double 也不会出现在这里）。
-                        ctx.nextSlot += 1
-                        storeLocal(mv, "Ljava/lang/Throwable;", catchSlot)
-                        // 声明的异常类型比 Throwable 更具体时，需 checkcast 后按真实类型
-                        // 重存，后续 loadLocal 才能用正确的描述符取值。
-                        if (paramInternal != "java/lang/Throwable" && paramInternal != "throwable") {
-                            loadLocal(mv, "Ljava/lang/Throwable;", catchSlot)
-                            mv.visitTypeInsn(Opcodes.CHECKCAST, paramInternal)
-                            storeLocal(mv, paramDesc, catchSlot)
-                        }
-                        ctx.variables[pName] = catchSlot
-                        ctx.locals.add(LocalInfo(pName, param.type, catchSlot))
-                        ctx.symbolToName[param.symbol] = pName
-                        val catchBody = catchClause.result
-                        if (catchBody is IrBlock) {
-                            for (s in catchBody.statements) generateIrStatement(mv, s, ctx, owner)
-                        } else {
-                            generateIrStatement(mv, catchBody as IrStatement, ctx, owner)
-                        }
+                    val catchBody = catchClause.result
+                    if (catchBody is IrBlock) {
+                        for (s in catchBody.statements) generateIrStatement(mv, s, ctx, owner)
+                    } else {
+                        generateIrStatement(mv, catchBody as IrStatement, ctx, owner)
                     }
                     mv.visitLabel(catchEnd)
                     if (catchFctx != null) ctx.finallyStack.removeLast()
                     ctx.openRanges.removeLast()
                     // catch 体自身抛出的异常同样要跑 finally；登记时机同样晚于 catch 体内层处理器。
+                    // 区间以存参数槽的指令开头，因而非空。
                     if (hasFinally) {
                         registerProtectedRange(mv, catchStart, catchEnd, catchRange, finallyHandler, null)
                     }
