@@ -23,9 +23,10 @@
 //
 // 设计边界：
 //   - 支持范围以 LinearCoroutineEmitter / CoroutineBlockPlanner 为准：局部声明、
-//     局部赋值、if/else、while、无标签 break/continue、return，await 是局部写入的
-//     整个右侧；`return await`、其它循环形式/异常/defer、对其它挂起函数的同步调用等
-//     全部诊断，而不是退化为同步求值；
+//     局部赋值、if/else、while / do-while / 三段式 for、无标签 break/continue、return，
+//     await 可在局部写入右侧、条件与 return 值中（按求值顺序提升为临时局部）；for-in、
+//     异常/defer、调用实参与短路右操作数中的 await、对其它挂起函数的同步调用等全部
+//     诊断，而不是退化为同步求值；
 //   - 函数被发射后，其原声明从生成 AST 中移除：生成帧需要 executor 与输出 Future，
 //     还不是公开源码调用 ABI；任何调用方都会因自身也变为 SUSPENDING 而得到诊断；
 //   - 本层不生成字节码、不选择显式挂起标记名称、不改公开 ABI/文法。

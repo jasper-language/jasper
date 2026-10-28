@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十二片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十三片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -8,7 +8,8 @@
 //   循环体末尾与 continue 回到循环头，break 与条件为假前进到循环出口块；do-while
 //   的循环头是不带工作的空块（直接进入循环体），条件块在循环体之后；三段式 for
 //   先在当前块做初始化，continue 与循环体末尾前进到步进块，步进块回到循环头；
-//   return 结束一条路径。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
+//   return 结束一条路径。出现在条件、return 值或算术子表达式中的 await 按求值顺序
+//   提升为合成临时局部（每个各占一个挂起点），原位置改读该临时局部。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
 // 所属层次：
@@ -26,8 +27,10 @@
 //   - for-in、循环后置块、带标签的 break/continue、try/catch/finally、defer、
 //     throw、match 一律拒绝；
 //   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 局部的 `++` / `--`；
-//   - await 只能是局部初始化或局部赋值的整个右侧，不能出现在条件、return 值或
-//     任何子表达式中；
+//   - 子表达式中的 await 只允许出现在一元 `+ - !` 与二元运算之下（`&&` / `||` 只许左
+//     操作数），先于它求值、未被提升的部分只能是字面量、局部读取与不会抛出的运算
+//     （否则提升会改变副作用或异常与挂起的先后，拒绝）；调用实参、属性、下标、
+//     转换等位置中的 await 一律拒绝；await 操作数内不能再有 await 或局部写入；
 //   - 每条路径必须以 return 结束；return / break / continue 之后的语句视为不可达
 //     并拒绝。
 // ============================================================================
@@ -107,6 +110,9 @@ object CoroutineBlockPlanner {
     /** 规划期间的拒绝；只在本对象内部抛出并收敛为 [CoroutineBlockPlan.reason]。 */
     private class Rejected(message: String) : RuntimeException(message)
 
+    /** 合成临时局部的名字前缀；含 `$`，不会与源码标识符冲突。 */
+    const val TEMP_PREFIX = "\$await"
+
     /** 正在构造、尚未确定出口的块。 */
     private class OpenBlock(val id: Int, val resumeBinding: String?) {
         val assignments = mutableListOf<Pair<String, JasExpression>>()
@@ -168,6 +174,7 @@ object CoroutineBlockPlanner {
         val headers = linkedSetOf<Int>()
         private val loops = ArrayDeque<LoopContext>()
         private var nextId = 0
+        private var nextTemp = 0
 
         /** 分配新块；编号按分配顺序递增，是前向不变量的来源。 */
         fun open(resumeBinding: String?) = OpenBlock(nextId++, resumeBinding)
@@ -229,9 +236,8 @@ object CoroutineBlockPlanner {
             }
             is JasReturn -> {
                 val value = statement.value ?: throw Rejected("return must carry an int32 value")
-                if (directAwait(value) != null) throw Rejected("return await is not supported")
-                rejectNestedAwait(value)
-                close(block, CoroutineBlockExit.Finish(value))
+                val (end, rewritten) = hoist(value, block)
+                close(end, CoroutineBlockExit.Finish(rewritten))
                 null
             }
             is JasBlock -> lowerSequence(statement.statements, block)
@@ -270,9 +276,9 @@ object CoroutineBlockPlanner {
         /** 局部写入：直接 await 时挂起并开启恢复块，否则追加普通赋值。 */
         private fun write(block: OpenBlock, name: String, value: JasExpression, await: JasUnaryOp?): OpenBlock {
             if (await == null) {
-                rejectNestedAwait(value)
-                block.assignments += name to value
-                return block
+                val (end, rewritten) = hoist(value, block)
+                end.assignments += name to rewritten
+                return end
             }
             if (await.awaitResultType != INT) throw Rejected("await result type must be int32")
             rejectNestedAwait(await.operand)
@@ -283,7 +289,8 @@ object CoroutineBlockPlanner {
 
         /** if/else：条件在当前块求值；两条分支各自成块，未 return 的出口汇合到新块。 */
         private fun lowerIf(statement: JasIf, block: OpenBlock): OpenBlock? {
-            rejectNestedAwait(statement.condition)
+            // 条件中的 await 先于两条分支的块分配挂起，分支编号仍大于条件所在块。
+            val (conditionEnd, condition) = hoist(statement.condition, block)
             val whenTrue = open(null)
             val trueEnd = lowerSequence(statement.thenBody.statements, whenTrue)
             val whenFalse = open(null)
@@ -291,7 +298,7 @@ object CoroutineBlockPlanner {
             // elvis 会把它误当成「没有 else」而接上汇合边。
             val elseBody = statement.elseBody
             val falseEnd = if (elseBody == null) whenFalse else lowerSequence(elseBody.statements, whenFalse)
-            close(block, CoroutineBlockExit.Branch(statement.condition, whenTrue.id, whenFalse.id))
+            close(conditionEnd, CoroutineBlockExit.Branch(condition, whenTrue.id, whenFalse.id))
             if (trueEnd == null && falseEnd == null) return null
             val join = open(null)
             trueEnd?.let { close(it, CoroutineBlockExit.Goto(join.id)) }
@@ -306,16 +313,17 @@ object CoroutineBlockPlanner {
          */
         private fun lowerWhile(statement: JasWhile, block: OpenBlock): OpenBlock {
             if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
-            rejectNestedAwait(statement.condition)
             val header = open(null)
             headers += header.id
             close(block, CoroutineBlockExit.Goto(header.id))
+            // 条件中的 await 每趟都从循环头重新挂起；恢复块在循环体之前分配。
+            val (conditionEnd, condition) = hoist(statement.condition, header)
             val body = open(null)
             val loop = LoopContext(header.id)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             bodyEnd?.let { close(it, CoroutineBlockExit.Goto(header.id)) }
             val exit = open(null)
-            close(header, CoroutineBlockExit.Branch(statement.condition, body.id, exit.id))
+            close(conditionEnd, CoroutineBlockExit.Branch(condition, body.id, exit.id))
             loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
             return exit
         }
@@ -328,7 +336,6 @@ object CoroutineBlockPlanner {
          * break 时整个循环不会正常结束，返回 null，其后的语句按不可达拒绝。
          */
         private fun lowerDoWhile(statement: JasDoWhile, block: OpenBlock): OpenBlock? {
-            rejectNestedAwait(statement.condition)
             val header = open(null)
             headers += header.id
             close(block, CoroutineBlockExit.Goto(header.id))
@@ -339,12 +346,16 @@ object CoroutineBlockPlanner {
             val exitNeeded = bodyEnd != null || loop.continues.isNotEmpty() || loop.breaks.isNotEmpty()
             if (!exitNeeded) return null
             val conditionBlock = if (bodyEnd != null || loop.continues.isNotEmpty()) open(null) else null
+            // 条件中的 await 在条件块挂起，恢复块在出口块之前分配；最后一个恢复块回到循环头。
+            // 没有路径到达条件块时（循环体只经 break / return 离开）源码也从不求值条件，
+            // 条件不切块、不生成代码，其中的 await 不构成挂起点。
+            val hoisted = conditionBlock?.let { hoist(statement.condition, it) }
             if (conditionBlock != null) {
                 bodyEnd?.let { close(it, CoroutineBlockExit.Goto(conditionBlock.id)) }
                 loop.continues.forEach { close(it, CoroutineBlockExit.Goto(conditionBlock.id)) }
             }
             val exit = open(null)
-            conditionBlock?.let { close(it, CoroutineBlockExit.Branch(statement.condition, header.id, exit.id)) }
+            hoisted?.let { (end, condition) -> close(end, CoroutineBlockExit.Branch(condition, header.id, exit.id)) }
             loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
             return exit
         }
@@ -369,11 +380,10 @@ object CoroutineBlockPlanner {
                 }
                 else -> throw Rejected("unsupported for initializer ${init.javaClass.simpleName}")
             } ?: throw Rejected("for initializer must not end the path")
-            val condition = statement.condition ?: JasBoolLiteral(true)
-            rejectNestedAwait(condition)
             val header = open(null)
             headers += header.id
             close(afterInit, CoroutineBlockExit.Goto(header.id))
+            val (conditionEnd, condition) = hoist(statement.condition ?: JasBoolLiteral(true), header)
             val body = open(null)
             val loop = LoopContext(null)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
@@ -387,9 +397,69 @@ object CoroutineBlockPlanner {
                 close(stepEnd, CoroutineBlockExit.Goto(header.id))
             }
             val exit = open(null)
-            close(header, CoroutineBlockExit.Branch(condition, body.id, exit.id))
+            close(conditionEnd, CoroutineBlockExit.Branch(condition, body.id, exit.id))
             loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
             return exit
+        }
+
+        /**
+         * 把 [expression] 中的真实 await 按求值顺序提升为合成临时局部：每个 await 在当前块
+         * 挂起、恢复块绑定临时局部，原位置改读它。返回最后一个块与改写后的表达式（无 await
+         * 时原样返回 [block] 与 [expression]）。
+         *
+         * 为什么要求先于 await 求值的部分无副作用、不会抛出：提升后它们在挂起恢复之后才
+         * 求值。局部与参数只由本帧写入（await 操作数内的局部写入被拒绝），读取推迟不改变
+         * 值；调用、除法 / 取余、属性与下标访问则可能有副作用或抛出，推迟会改变它们与挂起
+         * （及操作数求值）的先后，因此拒绝。await 之后求值的部分保持原位，顺序不变。
+         */
+        fun hoist(expression: JasExpression, block: OpenBlock): Pair<OpenBlock, JasExpression> {
+            if (!containsAwait(expression)) return block to expression
+            var current = block
+            var effectPending = false
+
+            fun visit(node: JasExpression): JasExpression {
+                val await = directAwait(node)
+                if (await != null) {
+                    if (effectPending) {
+                        throw Rejected("await after an operation that may fail or have side effects in the same expression")
+                    }
+                    if (await.awaitResultType != INT) throw Rejected("await result type must be int32")
+                    rejectNestedAwait(await.operand)
+                    if (containsLocalWrite(await.operand)) throw Rejected("await operand must not write locals")
+                    var name: String
+                    do { name = "$TEMP_PREFIX${nextTemp++}" } while (name in types)
+                    types[name] = INT
+                    locals[name] = INT
+                    val resume = open(name)
+                    close(current, CoroutineBlockExit.Suspend(await, name, resume.id))
+                    current = resume
+                    return JasIdentifier(name)
+                }
+                if (!containsAwait(node)) {
+                    if (!isSilent(node)) effectPending = true
+                    return node
+                }
+                return when (node) {
+                    is JasBinaryOp -> {
+                        if (node.op in SHORT_CIRCUIT && containsAwait(node.right)) {
+                            throw Rejected("await in the right operand of '${node.op}' is not supported")
+                        }
+                        val left = visit(node.left)
+                        val right = visit(node.right)
+                        // 运算本身在两侧求值之后执行；可能抛出的运算对其后的 await 构成前序副作用。
+                        if (node.op !in SILENT_BINARY) effectPending = true
+                        node.copy(left = left, right = right)
+                    }
+                    is JasUnaryOp -> {
+                        if (node.op !in SILENT_UNARY) throw Rejected("await under unary '${node.op}' is not supported")
+                        JasUnaryOp(node.op, visit(node.operand), node.prefix)
+                    }
+                    else -> throw Rejected("await inside ${node.javaClass.simpleName} is not supported")
+                }
+            }
+
+            val rewritten = visit(expression)
+            return current to rewritten
         }
 
         /** 在 [loop] 作用域内降级循环体；无论成败都弹出循环上下文。 */
@@ -413,12 +483,47 @@ object CoroutineBlockPlanner {
     private fun directAwait(expression: JasExpression): JasUnaryOp? =
         (expression as? JasUnaryOp)?.takeIf { it.op == "await" && it.awaitResultType != null }
 
-    /** 子表达式中出现真实 await 一律拒绝：当前只在语句边界切块。 */
+    /** 不会抛出、没有副作用的二元运算（int32 回绕算术、比较与布尔运算）。 */
+    private val SILENT_BINARY = setOf("+", "-", "*", "==", "!=", "<", "<=", ">", ">=", "&&", "||")
+    private val SILENT_UNARY = setOf("+", "-", "!")
+    private val SHORT_CIRCUIT = setOf("&&", "||")
+
+    /** 表达式求值是否既无副作用也不会抛出：只含字面量、局部读取与 [SILENT_BINARY] / [SILENT_UNARY]。 */
+    private fun isSilent(expression: JasExpression): Boolean = when (expression) {
+        is JasIntLiteral, is JasBoolLiteral, is JasIdentifier -> true
+        is JasUnaryOp -> directAwait(expression) == null && expression.op in SILENT_UNARY && isSilent(expression.operand)
+        is JasBinaryOp -> expression.op in SILENT_BINARY && isSilent(expression.left) && isSilent(expression.right)
+        else -> false
+    }
+
+    /** 子树中是否有真实 await。 */
+    private fun containsAwait(expression: JasExpression?): Boolean = try {
+        rejectNestedAwait(expression)
+        false
+    } catch (_: Rejected) {
+        true
+    }
+
+    /** 子树中是否有局部写入（赋值或自增 / 自减）。 */
+    private fun containsLocalWrite(expression: JasExpression?): Boolean = when (expression) {
+        null -> false
+        is JasAssignment, is JasAssignmentIncrement, is JasPostfixIncDec -> true
+        is JasUnaryOp -> containsLocalWrite(expression.operand)
+        is JasBinaryOp -> containsLocalWrite(expression.left) || containsLocalWrite(expression.right)
+        is JasCall -> containsLocalWrite(expression.target) || expression.args.any(::containsLocalWrite)
+        is JasPropertyAccess -> containsLocalWrite(expression.target)
+        is JasCastExpr -> containsLocalWrite(expression.expression)
+        is JasArrayAccess -> containsLocalWrite(expression.target) || containsLocalWrite(expression.index)
+        is JasNew -> expression.args.any(::containsLocalWrite)
+        else -> false
+    }
+
+    /** 子树中出现真实 await 即拒绝；用于 await 操作数等不允许再挂起的位置。 */
     private fun rejectNestedAwait(expression: JasExpression?) {
         val children: List<JasExpression?> = when (expression) {
             null -> return
             is JasUnaryOp -> {
-                if (directAwait(expression) != null) throw Rejected("await must be the whole value of a local write")
+                if (directAwait(expression) != null) throw Rejected("await is not supported at this position")
                 listOf(expression.operand)
             }
             is JasBinaryOp -> listOf(expression.left, expression.right)

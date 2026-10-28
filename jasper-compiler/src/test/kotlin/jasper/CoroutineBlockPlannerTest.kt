@@ -66,10 +66,12 @@ class CoroutineBlockPlannerTest {
             }
         }
         plan.loopHeaders.forEach { header ->
-            // while / for 的循环头求值条件；do-while 的循环头是空块，直接进入紧随其后的循环体。
+            // while / for 的循环头求值条件（条件含 await 时先在循环头挂起，恢复块里再分支）；
+            // do-while 的循环头是空块，直接进入紧随其后的循环体。
             val exit = plan.blocks[header].exit
-            assertTrue(exit is CoroutineBlockExit.Branch || exit == CoroutineBlockExit.Goto(header + 1),
-                "$context: header $header is neither a branch nor an empty do-while entry: $exit")
+            assertTrue(exit is CoroutineBlockExit.Branch || exit is CoroutineBlockExit.Suspend ||
+                exit == CoroutineBlockExit.Goto(header + 1),
+                "$context: header $header is neither a branch, a condition suspension nor an empty do-while entry: $exit")
             assertTrue(plan.blocks[header].resumeBinding == null && plan.blocks[header].assignments.isEmpty(),
                 "$context: header $header carries work")
         }
@@ -195,8 +197,10 @@ class CoroutineBlockPlannerTest {
 
     /**
      * 做什么：仍未支持的形态必须给出具体原因，而不是返回部分计划。
-     * 失败模式：for-in / 循环后置块 / 步进段非局部写入 / do-while 条件中的 await / 非 int32 自增 / 带标签或循环外的 break、continue /
-     *   return await / 子表达式与循环条件中的 await / return 或 break 之后的不可达语句 /
+     * 失败模式：for-in / 循环后置块 / 步进段非局部写入 / 非 int32 自增 / 带标签或循环外的 break、continue /
+     *   短路右操作数、调用实参、转换中的 await / 可能抛出或有副作用的运算之后的 await /
+     *   await 操作数内的 await 或局部写入 /
+     *   return 或 break 之后的不可达语句 /
      *   缺 return 路径 / 重名 / 未写类型的非 await 局部被静默接受。
      */
     @Test
@@ -207,24 +211,28 @@ class CoroutineBlockPlannerTest {
                 JasForStatement(null, id("flag"), null, block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
             "for-call-update" to function(decl("v", lit(0)),
                 JasForStatement(null, id("flag"), JasCall(id("g"), emptyList()), block(set("v", await("input")))), JasReturn(id("v"))),
-            "for-update-await-nested" to function(decl("v", lit(0)),
-                JasForStatement(null, id("flag"), JasAssignment(id("v"), JasBinaryOp(await("input"), "+", lit(1))), block()), JasReturn(id("v"))),
-            "do-while-condition-await" to function(decl("v", lit(0)),
-                JasDoWhile(block(set("v", lit(1))), JasBinaryOp(await("input"), ">", lit(0))), JasReturn(id("v"))),
             "increment-bool" to function(decl("b", JasBoolLiteral(true), bool), JasExpressionStatement(JasPostfixIncDec(id("b"), "++")),
                 JasReturn(lit(0))),
             "loop-suffix" to function(decl("v", lit(0)),
                 JasWhile(id("flag"), block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
-            "loop-condition-await" to function(decl("v", lit(0)),
-                JasWhile(JasBinaryOp(await("input"), ">", lit(0)), block(set("v", lit(1)))), JasReturn(id("v"))),
+            "short-circuit-right-await" to function(JasIf(JasBinaryOp(id("flag"), "&&", JasBinaryOp(await("input"), ">", lit(0))),
+                block(JasReturn(lit(1))), null), JasReturn(lit(0))),
+            "call-argument-await" to function(JasReturn(JasCall(id("g"), listOf(await("input"))))),
+            "cast-await" to function(JasReturn(JasCastExpr(await("input"), int))),
+            "await-after-call" to function(JasReturn(JasBinaryOp(JasCall(id("g"), emptyList()), "+", await("input")))),
+            "await-after-division" to function(JasReturn(JasBinaryOp(JasBinaryOp(id("base"), "/", lit(2)), "+", await("input")))),
+            "await-after-awaited-division" to function(
+                JasReturn(JasBinaryOp(JasBinaryOp(await("input"), "%", id("base")), "+", await("input")))),
+            "await-in-await-operand" to function(
+                JasReturn(JasUnaryOp("await", JasCall(id("g"), listOf(await("input")))).also { it.awaitResultType = int })),
+            "await-operand-writes-local" to function(decl("v", lit(0)),
+                JasReturn(JasBinaryOp(id("v"), "+", JasUnaryOp("await", JasCall(id("g"), listOf(JasAssignment(id("v"), lit(1)))))
+                    .also { it.awaitResultType = int }))),
             "labeled-break" to function(decl("v", await("input")), JasWhile(id("flag"), block(JasBreakStatement("outer"))), JasReturn(id("v"))),
             "break-outside-loop" to function(decl("v", await("input")), JasBreakStatement(null), JasReturn(id("v"))),
             "continue-outside-loop" to function(decl("v", await("input")), JasContinueStatement(null), JasReturn(id("v"))),
             "after-break" to function(decl("v", await("input")),
                 JasWhile(id("flag"), block(JasBreakStatement(null), set("v", lit(1)))), JasReturn(id("v"))),
-            "return-await" to function(JasReturn(await("input"))),
-            "nested-await" to function(decl("v", JasBinaryOp(await("input"), "+", lit(1))), JasReturn(id("v"))),
-            "condition-await" to function(JasIf(JasBinaryOp(await("input"), ">", lit(0)), block(JasReturn(lit(1))), null), JasReturn(lit(0))),
             "unreachable" to function(JasReturn(lit(1)), decl("v", lit(0))),
             "missing-return" to function(decl("v", await("input")), JasIf(id("flag"), block(JasReturn(id("v"))), null)),
             "duplicate" to function(decl("base", await("input")), JasReturn(id("base"))),
@@ -257,6 +265,7 @@ class CoroutineBlockPlannerTest {
             is JasUnaryOp -> { consumed++; inputs.next() }
             is JasBinaryOp -> when (expression.op) {
                 "+" -> eval(expression.left) + eval(expression.right)
+                "-" -> eval(expression.left) - eval(expression.right)
                 ">" -> if (eval(expression.left) > eval(expression.right)) 1 else 0
                 else -> error(expression.op)
             }
@@ -354,13 +363,20 @@ class CoroutineBlockPlannerTest {
      * `var cN: int32 = 0; while (cN < k) { cN = cN + 1; ... }`，计数器不作为随机赋值目标，
      * 因此每个循环至多 k 趟，continue 也不会跳过自增。
      */
-    private class Generator(val random: Random, val extendedLoops: Boolean = false) {
+    private class Generator(val random: Random, val extendedLoops: Boolean = false, val nestedAwaits: Boolean = false) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
 
+        /** nestedAwaits 时叶子有 1/4 是 await，可落在条件、return 值与 `+` / `>` 的任一侧。 */
         fun expression(scope: List<String>): JasExpression {
-            val leaf = { if (scope.isNotEmpty() && random.nextBoolean()) JasIdentifier(scope.random(random)) else JasIntLiteral(random.nextLong(-5, 6), "") }
-            return if (random.nextInt(3) == 0) JasBinaryOp(leaf(), "+", leaf()) else leaf()
+            val leaf = {
+                if (nestedAwaits && random.nextInt(4) == 0) awaitNode()
+                else if (scope.isNotEmpty() && random.nextBoolean()) JasIdentifier(scope.random(random))
+                else JasIntLiteral(random.nextLong(-5, 6), "")
+            }
+            // nestedAwaits 时也用不可交换的 `-`：两侧各有 await 时，提升若颠倒先后，消费的输入随之错位。
+            val op = if (nestedAwaits && random.nextBoolean()) "-" else "+"
+            return if (random.nextInt(3) == 0) JasBinaryOp(leaf(), op, leaf()) else leaf()
         }
 
         fun awaitNode() = JasUnaryOp("await", JasIdentifier("input")).also { it.awaitResultType = JasPrimitiveType("int32") }
@@ -402,7 +418,9 @@ class CoroutineBlockPlannerTest {
                         }
                         val (body, bodyTerminates) = sequence(depth - 1, bodyScope, random.nextInt(5) == 0, inLoop = true)
                         val limit = JasIntLiteral(random.nextLong(0, 4), "")
-                        val condition = JasBinaryOp(limit, ">", JasIdentifier(loopCounter))
+                        // 循环条件里的 await 每趟都重新挂起；输入在 [-6, 6]，计数器每趟自增，仍至多 10 趟。
+                        val bound = if (nestedAwaits && random.nextInt(3) == 0) JasBinaryOp(limit, "+", awaitNode()) else limit
+                        val condition = JasBinaryOp(bound, ">", JasIdentifier(loopCounter))
                         statements += when (if (extendedLoops) random.nextInt(3) else 0) {
                             0 -> JasWhile(condition, JasBlock(head + body))
                             // do-while：计数器在循环体首句自增，continue 前进到条件块也不会死循环。
@@ -427,7 +445,8 @@ class CoroutineBlockPlannerTest {
                         }
                     }
                     else -> {
-                        val condition = JasBinaryOp(expression(scope), ">", JasIntLiteral(random.nextLong(-3, 4), ""))
+                        val condition = JasBinaryOp(expression(scope), ">",
+                            if (nestedAwaits && random.nextBoolean()) expression(scope) else JasIntLiteral(random.nextLong(-3, 4), ""))
                         val (thenBody, thenReturns) = sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop)
                         val withElse = random.nextBoolean()
                         val (elseBody, elseReturns) =
@@ -551,5 +570,83 @@ class CoroutineBlockPlannerTest {
         assertTrue(suspendingPrograms > 100, "generator too weak: only $suspendingPrograms suspending programs")
         assertTrue(loopPrograms > 100, "generator too weak: only $loopPrograms programs with loops")
         assertTrue(suspendingLoops > 50, "generator too weak: only $suspendingLoops programs suspend inside a loop")
+    }
+
+    /**
+     * 做什么：条件中的 await 在条件所在块挂起，恢复块再分支；while 的循环头直接挂起，
+     *   回边回到循环头后再次挂起；return 值中的 await 先求值再 Finish 读临时局部；
+     *   `base + await` 的 base 读取留在 await 之后（无副作用、局部只由本帧写入）。
+     * 失败模式：分支在挂起前求值、回边跳过条件挂起、临时局部未登记为帧局部。
+     */
+    @Test
+    fun `awaits in conditions and return values are hoisted into temporaries`() {
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("v", lit(0)),
+            JasWhile(JasBinaryOp(await("input"), ">", id("v")), block(set("v", JasBinaryOp(id("v"), "+", lit(1))))),
+            JasIf(JasUnaryOp("!", JasBinaryOp(await("input"), ">", lit(3))), block(JasReturn(lit(-1))), null),
+            JasReturn(JasBinaryOp(id("base"), "+", await("input")))
+        ), parameters)
+        assertWellFormed(plan, "hoisted")
+        val temps = plan.locals.map { it.first }.filter { it.startsWith(CoroutineBlockPlanner.TEMP_PREFIX) }
+        assertEquals(3, temps.size, "every await gets its own temporary: ${plan.locals}")
+        assertTrue(plan.locals.filter { it.first in temps }.all { it.second == int })
+        val header = plan.loopHeaders.single()
+        val headerExit = plan.blocks[header].exit as CoroutineBlockExit.Suspend
+        val resume = plan.blocks[headerExit.resume]
+        assertEquals(headerExit.binding, resume.resumeBinding)
+        val branch = resume.exit as CoroutineBlockExit.Branch
+        assertEquals(JasBinaryOp(id(headerExit.binding), ">", id("v")), branch.condition)
+        // 循环体末尾回到挂起的循环头，而不是恢复块。
+        assertTrue(plan.blocks.any { it.exit == CoroutineBlockExit.Goto(header) && it.id > header })
+        val finish = plan.blocks.map { it.exit }.filterIsInstance<CoroutineBlockExit.Finish>()
+            .single { it.value is JasBinaryOp }
+        assertEquals(JasBinaryOp(id("base"), "+", id(temps.last())), finish.value)
+        assertEquals(3, plan.suspensionCount)
+
+        // 循环体只经 break 离开的 do-while 从不求值条件：条件中的 await 不构成挂起点。
+        val dead = CoroutineBlockPlanner.plan(function(
+            decl("v", await("input")),
+            JasDoWhile(block(JasBreakStatement(null)), JasBinaryOp(await("input"), ">", lit(0))),
+            JasReturn(id("v"))
+        ), parameters)
+        assertWellFormed(dead, "dead do-while condition")
+        assertEquals(1, dead.suspensionCount)
+    }
+
+    /**
+     * 做什么：固定种子 20261101 生成 400 个随机程序，await 可出现在局部写入的子表达式、
+     *   if 条件、return 值与 while / do-while / for 条件中；同样比对 AST 直接解释与块状态机
+     *   的返回值和经过的挂起点数（AST 解释器按求值顺序从左到右消费输入，提升若改变了 await
+     *   的先后即会失配）。另要求条件挂起与表达式内挂起都出现足够多次。
+     * 失败模式：打印种子、用例与程序 AST。
+     */
+    @Test
+    fun `seeded hoisted awaits match direct AST semantics`() {
+        val seed = 20261101
+        val random = Random(seed)
+        var conditionSuspends = 0
+        var temporaries = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, nestedAwaits = true)
+                .sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (plan.loopHeaders.any { plan.blocks[it].exit is CoroutineBlockExit.Suspend }) conditionSuspends++
+            if (plan.locals.any { it.first.startsWith(CoroutineBlockPlanner.TEMP_PREFIX) }) temporaries++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) { random.nextInt(-6, 7) }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                val (actual, suspensions) = runBlocks(plan, inputs.iterator(), base)
+                assertEquals(expected, actual, "$context round=$round base=$base inputs=$inputs")
+                assertEquals(direct.consumed, suspensions, "$context round=$round suspension count")
+            }
+        }
+        assertTrue(conditionSuspends > 40, "generator too weak: only $conditionSuspends programs suspend in a loop header")
+        assertTrue(temporaries > 150, "generator too weak: only $temporaries programs hoist an await")
     }
 }

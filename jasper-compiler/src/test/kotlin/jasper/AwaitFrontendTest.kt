@@ -19,6 +19,11 @@ class AwaitFrontendTest {
         val types = listOf("int32", "int64", "bool", "string", "float64", "Future<int32>")
         repeat(12) { index ->
             val type = types[random.nextInt(types.size)]
+            // 第十三片起 `return await` 的 int32 形态可降级：成功编译即证明结果类型解包为 int32。
+            if (type == "int32") {
+                assertLowered("seed-$index", "seed=$seed case=$index")
+                return@repeat
+            }
             val message = compile("seed-$index", type, "Future<$type>")
             assertTrue(message.contains("non-blocking await lowering is not implemented yet"),
                 "seed=$seed case=$index type=$type: $message")
@@ -27,8 +32,8 @@ class AwaitFrontendTest {
         }
     }
 
-    /** 在模块 build 下编译并返回诊断与产物路径，确保负例没有生成字节码。 */
-    private fun compile(name: String, returnType: String, operandType: String): String {
+    /** 在模块 build 下编译 `return await f`；返回编译结果与输出目录。 */
+    private fun compileResult(name: String, returnType: String, operandType: String): Pair<JasperCompiler.CompileResult, java.nio.file.Path> {
         val output = Paths.get("build", "tmp", "await-frontend", name)
         output.toFile().deleteRecursively()
         Files.createDirectories(output)
@@ -38,6 +43,21 @@ class AwaitFrontendTest {
                 return await f;
             }
         """.trimIndent()), output)
+        return result to output
+    }
+
+    /** int32 结果的 `return await` 必须编译成功并写出生成帧的 class，不能因类型识别错误失配。 */
+    private fun assertLowered(name: String, context: String) {
+        val (result, output) = compileResult(name, "int32", "Future<int32>")
+        assertTrue(result is JasperCompiler.CompileResult.Success, "$context: $result")
+        Files.walk(output).use { paths ->
+            assertTrue(paths.anyMatch { it.toString().endsWith("_Coroutine.class") }, "$context: no generated frame")
+        }
+    }
+
+    /** 在模块 build 下编译并返回诊断与产物路径，确保负例没有生成字节码。 */
+    private fun compile(name: String, returnType: String, operandType: String): String {
+        val (result, output) = compileResult(name, returnType, operandType)
         assertTrue(result is JasperCompiler.CompileResult.Error, result.toString())
         Files.walk(output).use { paths ->
             assertFalse(paths.anyMatch { it.toString().endsWith(".class") })
@@ -45,10 +65,14 @@ class AwaitFrontendTest {
         return (result as JasperCompiler.CompileResult.Error).message
     }
 
-    /** Future<int32> 的等待结果是 int32；暂时拒绝代码生成，而非透传 Future。 */
+    /**
+     * Future<int32> 的等待结果是 int32：第十三片起 `return await` 降级为生成帧（类型失配
+     * 会编译失败）；非 int32 结果仍拒绝代码生成，而非透传 Future。
+     */
     @Test
-    fun `future await identifies result type and rejects unavailable lowering`() {
-        val message = compile("int", "int32", "Future<int32>")
+    fun `future await identifies result type and lowers int32 returns`() {
+        assertLowered("int", "int32")
+        val message = compile("int64", "int64", "Future<int64>")
         assertTrue(message.contains("non-blocking await lowering is not implemented yet"), message)
         assertFalse(message.contains("Return type mismatch"), message)
     }

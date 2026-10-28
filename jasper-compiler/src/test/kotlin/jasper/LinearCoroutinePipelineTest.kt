@@ -328,37 +328,42 @@ class LinearCoroutinePipelineTest {
     @Test
     fun `unsupported suspension shapes stay explicit diagnostics`() {
         val cases = mapOf(
-            "return-await" to """
-                package demo;
-                import std.Future;
-                public class P {
-                    public static function f(input: Future<int32>): int32 { return await input; }
-                }
-            """.trimIndent(),
             // 第十片起多 await 与 if/else 内 await 已支持（见 BranchingCoroutinePipelineTest），
             // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest），第十二片起
-            // do-while 与三段式 for 内 await 已支持（见 ForLoopCoroutinePipelineTest）；这里改锁
-            // 仍未支持的 try / 条件与子表达式中的 await。
-            "for-condition-await" to """
+            // do-while 与三段式 for 内 await 已支持（见 ForLoopCoroutinePipelineTest），第十三片起
+            // 条件、return 值与算术子表达式中的 await 已支持（见 ExpressionAwaitCoroutinePipelineTest）；
+            // 这里改锁仍未支持的 try、短路右操作数 / 调用实参中的 await 与有副作用运算之后的 await。
+            "await-in-short-circuit-right" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function f(input: Future<int32>): int32 {
-                        var total: int32 = 0;
-                        for (var i: int32 = 0; (await input) > i; i++) { total = total + 1; }
-                        return total;
+                    public static function f(input: Future<int32>, flag: bool): int32 {
+                        if (flag && (await input) > 0) { return 1; }
+                        return 0;
                     }
                 }
             """.trimIndent(),
-            "while-condition-await" to """
+            "await-in-call-argument" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function f(input: Future<int32>): int32 {
-                        var total: int32 = 0;
-                        while ((await input) > total) { total = total + 1; }
-                        return total;
-                    }
+                    public static function id(value: int32): int32 { return value; }
+                    public static function f(input: Future<int32>): int32 { return P.id(await input); }
+                }
+            """.trimIndent(),
+            "await-after-call" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function id(value: int32): int32 { return value; }
+                    public static function f(input: Future<int32>): int32 { return P.id(1) + (await input); }
+                }
+            """.trimIndent(),
+            "await-after-division" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function f(input: Future<int32>, d: int32): int32 { return 10 / d + (await input); }
                 }
             """.trimIndent(),
             "synchronous-call-in-loop" to """
@@ -383,26 +388,6 @@ class LinearCoroutinePipelineTest {
                     public static function f(input: Future<int32>): int32 {
                         var value: int32 = 0;
                         try { value = await input; } finally { value = value + 1; }
-                        return value;
-                    }
-                }
-            """.trimIndent(),
-            "await-in-condition" to """
-                package demo;
-                import std.Future;
-                public class P {
-                    public static function f(input: Future<int32>): int32 {
-                        if ((await input) > 0) { return 1; }
-                        return 0;
-                    }
-                }
-            """.trimIndent(),
-            "await-in-subexpression" to """
-                package demo;
-                import std.Future;
-                public class P {
-                    public static function f(input: Future<int32>): int32 {
-                        var value: int32 = (await input) + 1;
                         return value;
                     }
                 }
