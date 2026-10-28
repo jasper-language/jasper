@@ -1,12 +1,14 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十、十一片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十二片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
 //   或对局部 `=` 赋值的整个右侧）结束当前块并开启一个恢复块；if/else 结束当前块
 //   并开启两个分支块，分支未终止的出口汇合到新块；while 开启循环头块（求值条件），
-//   循环体末尾与 continue 回到循环头，break 与条件为假前进到循环出口块；return
-//   结束一条路径。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
+//   循环体末尾与 continue 回到循环头，break 与条件为假前进到循环出口块；do-while
+//   的循环头是不带工作的空块（直接进入循环体），条件块在循环体之后；三段式 for
+//   先在当前块做初始化，continue 与循环体末尾前进到步进块，步进块回到循环头；
+//   return 结束一条路径。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
 // 所属层次：
@@ -21,8 +23,9 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - do-while、三段式 for、for-in、循环后置块、带标签的 break/continue、
-//     try/catch/finally、defer、throw、match 一律拒绝；
+//   - for-in、循环后置块、带标签的 break/continue、try/catch/finally、defer、
+//     throw、match 一律拒绝；
+//   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 局部的 `++` / `--`；
 //   - await 只能是局部初始化或局部赋值的整个右侧，不能出现在条件、return 值或
 //     任何子表达式中；
 //   - 每条路径必须以 return 结束；return / break / continue 之后的语句视为不可达
@@ -71,7 +74,7 @@ data class CoroutineBlock(
  * 规划结果。
  *
  * [blocks] 按编号排列（编号即下标）；[locals] 是函数体内声明的局部名与类型，
- * 按源码出现顺序；[loopHeaders] 是 while 循环头块编号，回边只能指向它们；
+ * 按源码出现顺序；[loopHeaders] 是 while / do-while / for 的循环头块编号，回边只能指向它们；
  * [reason] 非空表示不支持，此时其余字段为空。
  */
 data class CoroutineBlockPlan(
@@ -109,9 +112,16 @@ object CoroutineBlockPlanner {
         val assignments = mutableListOf<Pair<String, JasExpression>>()
     }
 
-    /** 正在降级的 while：continue 回到 [header]；break 的块等出口块分配后再封闭。 */
-    private class LoopContext(val header: Int) {
+    /**
+     * 正在降级的循环。
+     *
+     * [continueTarget] 非空时 continue 直接跳过去（while 的循环头）；为空时 continue 的
+     * 目标块（do-while 的条件块、for 的步进块）要在循环体之后才分配，先把块记进
+     * [continues]。break 的块同样等出口块分配后再封闭。
+     */
+    private class LoopContext(val continueTarget: Int?) {
         val breaks = mutableListOf<OpenBlock>()
+        val continues = mutableListOf<OpenBlock>()
     }
 
     /**
@@ -198,28 +208,23 @@ object CoroutineBlockPlanner {
                 locals[statement.name] = type
                 write(block, statement.name, initializer, await)
             }
-            is JasExpressionStatement -> {
-                val assignment = statement.expression as? JasAssignment
-                    ?: throw Rejected("only assignments to locals may appear as statements")
-                val target = assignment.target as? JasIdentifier
-                if (assignment.op != "=" || target == null || target.name !in locals) {
-                    throw Rejected("only plain '=' assignments to locals are supported")
-                }
-                val await = directAwait(assignment.value)
-                if (await != null && locals.getValue(target.name) != INT) {
-                    throw Rejected("await binding type must be int32")
-                }
-                write(block, target.name, assignment.value, await)
+            is JasExpressionStatement -> when (val expression = statement.expression) {
+                is JasAssignment -> lowerAssignment(expression, block)
+                else -> lowerIncrement(expression, block)
             }
             is JasIf -> lowerIf(statement, block)
             is JasWhile -> lowerWhile(statement, block)
+            is JasDoWhile -> lowerDoWhile(statement, block)
+            is JasForStatement -> lowerFor(statement, block)
             is JasBreakStatement -> {
                 val loop = innermostLoop(statement.label)
                 loop.breaks += block
                 null
             }
             is JasContinueStatement -> {
-                close(block, CoroutineBlockExit.Goto(innermostLoop(statement.label).header))
+                val loop = innermostLoop(statement.label)
+                val target = loop.continueTarget
+                if (target != null) close(block, CoroutineBlockExit.Goto(target)) else loop.continues += block
                 null
             }
             is JasReturn -> {
@@ -231,6 +236,35 @@ object CoroutineBlockPlanner {
             }
             is JasBlock -> lowerSequence(statement.statements, block)
             else -> throw Rejected("unsupported control flow node ${statement.javaClass.simpleName}")
+        }
+
+        /** 对局部的 `=` 赋值；右侧为直接 await 时挂起。 */
+        private fun lowerAssignment(assignment: JasAssignment, block: OpenBlock): OpenBlock {
+            val target = assignment.target as? JasIdentifier
+            if (assignment.op != "=" || target == null || target.name !in locals) {
+                throw Rejected("only plain '=' assignments to locals are supported")
+            }
+            val await = directAwait(assignment.value)
+            if (await != null && locals.getValue(target.name) != INT) {
+                throw Rejected("await binding type must be int32")
+            }
+            return write(block, target.name, assignment.value, await)
+        }
+
+        /**
+         * `i++` / `i--`：只接受 int32 局部，改写为 `i = i + 1` / `i = i - 1` 的普通赋值；
+         * 生成帧随后经真实类型检查，改写结果与源码自增的 int32 回绕语义一致。
+         */
+        private fun lowerIncrement(expression: JasExpression, block: OpenBlock): OpenBlock {
+            val increment = expression as? JasPostfixIncDec
+                ?: throw Rejected("only assignments to locals may appear as statements")
+            val target = increment.target as? JasIdentifier
+            if (target == null || locals[target.name] != INT || increment.op !in setOf("++", "--")) {
+                throw Rejected("only '++' / '--' on int32 locals are supported")
+            }
+            val op = if (increment.op == "++") "+" else "-"
+            block.assignments += target.name to JasBinaryOp(JasIdentifier(target.name), op, JasIntLiteral(1, "1"))
+            return block
         }
 
         /** 局部写入：直接 await 时挂起并开启恢复块，否则追加普通赋值。 */
@@ -278,17 +312,94 @@ object CoroutineBlockPlanner {
             close(block, CoroutineBlockExit.Goto(header.id))
             val body = open(null)
             val loop = LoopContext(header.id)
-            loops.addLast(loop)
-            val bodyEnd = try {
-                lowerSequence(statement.body.statements, body)
-            } finally {
-                loops.removeLast()
-            }
+            val bodyEnd = lowerLoopBody(statement.body, body, loop)
             bodyEnd?.let { close(it, CoroutineBlockExit.Goto(header.id)) }
             val exit = open(null)
             close(header, CoroutineBlockExit.Branch(statement.condition, body.id, exit.id))
             loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
             return exit
+        }
+
+        /**
+         * do-while：先开一个不带工作的循环头块（条件为真时的回边目标），无条件进入循环体；
+         * 循环头与循环体首块分开，使所有循环头都只负责「每趟开始」这一件事。循环体末尾与
+         * continue 前进到循环体之后分配的条件块，条件块按条件回到循环头或前进到出口块。
+         * 没有任何路径到达条件块时（循环体每条路径都 return / break）不分配条件块；也没有
+         * break 时整个循环不会正常结束，返回 null，其后的语句按不可达拒绝。
+         */
+        private fun lowerDoWhile(statement: JasDoWhile, block: OpenBlock): OpenBlock? {
+            rejectNestedAwait(statement.condition)
+            val header = open(null)
+            headers += header.id
+            close(block, CoroutineBlockExit.Goto(header.id))
+            val body = open(null)
+            close(header, CoroutineBlockExit.Goto(body.id))
+            val loop = LoopContext(null)
+            val bodyEnd = lowerLoopBody(statement.body, body, loop)
+            val exitNeeded = bodyEnd != null || loop.continues.isNotEmpty() || loop.breaks.isNotEmpty()
+            if (!exitNeeded) return null
+            val conditionBlock = if (bodyEnd != null || loop.continues.isNotEmpty()) open(null) else null
+            if (conditionBlock != null) {
+                bodyEnd?.let { close(it, CoroutineBlockExit.Goto(conditionBlock.id)) }
+                loop.continues.forEach { close(it, CoroutineBlockExit.Goto(conditionBlock.id)) }
+            }
+            val exit = open(null)
+            conditionBlock?.let { close(it, CoroutineBlockExit.Branch(statement.condition, header.id, exit.id)) }
+            loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
+            return exit
+        }
+
+        /**
+         * 三段式 for：初始化在当前块按普通局部声明 / 赋值降级（可以含 await，只执行一次）；
+         * 随后开循环头块求值条件（省略条件等价于 true，与 while (true) 一样保留出口块）；
+         * 循环体末尾与 continue 前进到步进块，步进块执行步进段后回到循环头；break 前进到
+         * 出口块。步进块与出口块都在循环体之后分配，除两条回边外所有边仍是前向的。
+         */
+        private fun lowerFor(statement: JasForStatement, block: OpenBlock): OpenBlock {
+            if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
+            // 多个绑定的声明式初始化（`var a = 0, b = 0`）由 AST 构建器包成 JasBlock，逐条降级。
+            val afterInit = when (val init = statement.init) {
+                null -> block
+                is JasVariableStatement, is JasExpressionStatement -> lowerStatement(init, block)
+                is JasBlock -> {
+                    if (init.statements.any { it !is JasVariableStatement }) {
+                        throw Rejected("unsupported for initializer block")
+                    }
+                    lowerSequence(init.statements, block)
+                }
+                else -> throw Rejected("unsupported for initializer ${init.javaClass.simpleName}")
+            } ?: throw Rejected("for initializer must not end the path")
+            val condition = statement.condition ?: JasBoolLiteral(true)
+            rejectNestedAwait(condition)
+            val header = open(null)
+            headers += header.id
+            close(afterInit, CoroutineBlockExit.Goto(header.id))
+            val body = open(null)
+            val loop = LoopContext(null)
+            val bodyEnd = lowerLoopBody(statement.body, body, loop)
+            if (bodyEnd != null || loop.continues.isNotEmpty()) {
+                val step = open(null)
+                bodyEnd?.let { close(it, CoroutineBlockExit.Goto(step.id)) }
+                loop.continues.forEach { close(it, CoroutineBlockExit.Goto(step.id)) }
+                val update = statement.update
+                val stepEnd = if (update == null) step else lowerStatement(JasExpressionStatement(update), step)
+                    ?: throw Rejected("for update must not end the path")
+                close(stepEnd, CoroutineBlockExit.Goto(header.id))
+            }
+            val exit = open(null)
+            close(header, CoroutineBlockExit.Branch(condition, body.id, exit.id))
+            loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
+            return exit
+        }
+
+        /** 在 [loop] 作用域内降级循环体；无论成败都弹出循环上下文。 */
+        private fun lowerLoopBody(body: JasBlock, start: OpenBlock, loop: LoopContext): OpenBlock? {
+            loops.addLast(loop)
+            return try {
+                lowerSequence(body.statements, start)
+            } finally {
+                loops.removeLast()
+            }
         }
 
         /** break/continue 的目标循环；带标签或不在循环内时拒绝。 */

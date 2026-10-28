@@ -94,7 +94,18 @@ object SuspensionEffectAnalysis {
                 // 循环后置块尚未覆盖：不猜测其中无挂起。
                 if (node.suffix != null) facts.unknown = true
             }
+            is JasDoWhile -> { scan(node.body, facts); scan(node.condition, facts) }
+            is JasForStatement -> {
+                // 三段都可省略；省略的段没有子表达式，不能当作未知结构。
+                node.init?.let { scan(it, facts) }
+                node.condition?.let { scan(it, facts) }
+                node.update?.let { scan(it, facts) }
+                scan(node.body, facts)
+                if (node.suffix != null) facts.unknown = true
+            }
             is JasBreakStatement, is JasContinueStatement -> Unit
+            is JasAssignment -> { scan(node.target, facts); scan(node.value, facts) }
+            is JasPostfixIncDec -> scan(node.target, facts)
             is JasCall -> {
                 val selected = node.resolvedFunction
                 val direct = node.target is JasIdentifier || selected?.modifiers?.contains("static") == true

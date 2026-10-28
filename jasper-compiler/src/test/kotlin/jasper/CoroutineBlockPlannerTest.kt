@@ -10,7 +10,8 @@
 // 为什么需要双解释器 oracle：块编号、汇合边与恢复绑定的错误不一定让编译失败，
 //   只有把块状态机的执行结果与源码语义逐例对齐才能发现（例如 else 全部 return 时
 //   误接汇合边）。第十一片起随机程序含 while / break / continue，块状态机解释器
-//   允许回边，但只允许回到规划器登记的循环头。
+//   允许回边，但只允许回到规划器登记的循环头；第十二片另有一组随机程序含 do-while 与三段式 for
+//   （continue 前进到条件块 / 步进块）。
 // ============================================================================
 
 package jasper
@@ -65,7 +66,10 @@ class CoroutineBlockPlannerTest {
             }
         }
         plan.loopHeaders.forEach { header ->
-            assertTrue(plan.blocks[header].exit is CoroutineBlockExit.Branch, "$context: header $header is not a branch")
+            // while / for 的循环头求值条件；do-while 的循环头是空块，直接进入紧随其后的循环体。
+            val exit = plan.blocks[header].exit
+            assertTrue(exit is CoroutineBlockExit.Branch || exit == CoroutineBlockExit.Goto(header + 1),
+                "$context: header $header is neither a branch nor an empty do-while entry: $exit")
             assertTrue(plan.blocks[header].resumeBinding == null && plan.blocks[header].assignments.isEmpty(),
                 "$context: header $header carries work")
         }
@@ -135,16 +139,80 @@ class CoroutineBlockPlannerTest {
     }
 
     /**
+     * 做什么：三段式 for 与 do-while 的块形状。for：多绑定初始化段（AST 构建器包成 JasBlock）
+     *   在入口块执行，continue 与循环体末尾前进到步进块，步进块（`i++` 改写为 `i = i + 1`）回到
+     *   循环头；do-while：循环头是空块直接进入循环体，continue 前进到循环体之后的条件块，条件块
+     *   回到循环头或前进到出口块。
+     * 失败模式：continue 跳过步进 / 条件、初始化段被放进循环头、自增未改写或出口接错。
+     */
+    @Test
+    fun `for and do-while plan step and condition blocks after the body`() {
+        val forPlan = CoroutineBlockPlanner.plan(function(
+            JasForStatement(
+                block(decl("i", lit(0)), decl("total", lit(0))),
+                JasBinaryOp(lit(4), ">", id("i")),
+                JasPostfixIncDec(id("i"), "++"),
+                block(
+                    JasIf(id("flag"), block(JasContinueStatement(null)), null),
+                    set("total", await("input"))
+                )
+            ),
+            JasReturn(lit(0))
+        ), parameters)
+        assertWellFormed(forPlan, "for")
+        assertEquals(listOf("i" to int, "total" to int), forPlan.locals)
+        assertEquals(listOf("i", "total"), forPlan.blocks[0].assignments.map { it.first })
+        val forHeader = forPlan.loopHeaders.single()
+        assertEquals(CoroutineBlockExit.Goto(forHeader), forPlan.blocks[0].exit)
+        val step = forPlan.blocks.single { block ->
+            block.exit == CoroutineBlockExit.Goto(forHeader) && block.id != 0
+        }
+        assertEquals("i", step.assignments.single().first)
+        assertEquals(JasBinaryOp(id("i"), "+", JasIntLiteral(1, "1")), step.assignments.single().second)
+        val intoStep = forPlan.blocks.filter { it.exit == CoroutineBlockExit.Goto(step.id) }
+        assertEquals(2, intoStep.size, "continue and body end must both reach the step block: $intoStep")
+
+        val doPlan = CoroutineBlockPlanner.plan(function(
+            decl("n", lit(0)),
+            JasDoWhile(block(
+                set("n", await("input")),
+                JasIf(id("flag"), block(JasContinueStatement(null)), null),
+                set("n", JasBinaryOp(id("n"), "+", lit(1)))
+            ), JasBinaryOp(lit(3), ">", id("n"))),
+            JasReturn(id("n"))
+        ), parameters)
+        assertWellFormed(doPlan, "do-while")
+        val doHeader = doPlan.loopHeaders.single()
+        assertEquals(CoroutineBlockExit.Goto(doHeader + 1), doPlan.blocks[doHeader].exit)
+        val condition = doPlan.blocks.single { block ->
+            (block.exit as? CoroutineBlockExit.Branch)?.whenTrue == doHeader
+        }
+        assertTrue(condition.id > doHeader + 1, "condition block must follow the body")
+        val exit = doPlan.blocks[(condition.exit as CoroutineBlockExit.Branch).whenFalse]
+        assertTrue(exit.exit is CoroutineBlockExit.Finish, "do-while exit: ${exit.exit}")
+        assertEquals(2, doPlan.blocks.count { it.exit == CoroutineBlockExit.Goto(condition.id) })
+    }
+
+    /**
      * 做什么：仍未支持的形态必须给出具体原因，而不是返回部分计划。
-     * 失败模式：do-while / for / 循环后置块 / 带标签或循环外的 break、continue /
+     * 失败模式：for-in / 循环后置块 / 步进段非局部写入 / do-while 条件中的 await / 非 int32 自增 / 带标签或循环外的 break、continue /
      *   return await / 子表达式与循环条件中的 await / return 或 break 之后的不可达语句 /
      *   缺 return 路径 / 重名 / 未写类型的非 await 局部被静默接受。
      */
     @Test
     fun `unsupported shapes are rejected with reasons`() {
         val cases = mapOf(
-            "do-while" to function(decl("v", lit(0)), JasDoWhile(block(set("v", await("input"))), id("flag")), JasReturn(id("v"))),
-            "for" to function(decl("v", lit(0)), JasForStatement(null, id("flag"), null, block(set("v", await("input")))), JasReturn(id("v"))),
+            "for-in" to function(decl("v", lit(0)), JasForInStatement("x", id("base"), block(set("v", await("input")))), JasReturn(id("v"))),
+            "for-suffix" to function(decl("v", lit(0)),
+                JasForStatement(null, id("flag"), null, block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
+            "for-call-update" to function(decl("v", lit(0)),
+                JasForStatement(null, id("flag"), JasCall(id("g"), emptyList()), block(set("v", await("input")))), JasReturn(id("v"))),
+            "for-update-await-nested" to function(decl("v", lit(0)),
+                JasForStatement(null, id("flag"), JasAssignment(id("v"), JasBinaryOp(await("input"), "+", lit(1))), block()), JasReturn(id("v"))),
+            "do-while-condition-await" to function(decl("v", lit(0)),
+                JasDoWhile(block(set("v", lit(1))), JasBinaryOp(await("input"), ">", lit(0))), JasReturn(id("v"))),
+            "increment-bool" to function(decl("b", JasBoolLiteral(true), bool), JasExpressionStatement(JasPostfixIncDec(id("b"), "++")),
+                JasReturn(lit(0))),
             "loop-suffix" to function(decl("v", lit(0)),
                 JasWhile(id("flag"), block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
             "loop-condition-await" to function(decl("v", lit(0)),
@@ -195,14 +263,43 @@ class CoroutineBlockPlannerTest {
             else -> error(expression.javaClass.simpleName)
         }
 
+        /** 局部写入或 int32 自增 / 自减。 */
+        fun write(expression: JasExpression) {
+            when (expression) {
+                is JasAssignment -> env[(expression.target as JasIdentifier).name] = eval(expression.value)
+                is JasPostfixIncDec -> {
+                    val name = (expression.target as JasIdentifier).name
+                    env[name] = env.getValue(name) + if (expression.op == "++") 1 else -1
+                }
+                else -> error(expression.javaClass.simpleName)
+            }
+        }
+
         /** 返回 null 表示序列正常结束（未 return）。 */
         fun run(statements: List<JasStatement>): Int? {
             for (statement in statements) {
                 when (statement) {
                     is JasVariableStatement -> env[statement.name] = eval(requireNotNull(statement.initializer))
-                    is JasExpressionStatement -> {
-                        val assignment = statement.expression as JasAssignment
-                        env[(assignment.target as JasIdentifier).name] = eval(assignment.value)
+                    is JasExpressionStatement -> write(statement.expression)
+                    is JasDoWhile -> do {
+                        val returned = try {
+                            run(statement.body.statements)
+                        } catch (jump: LoopJump) {
+                            if (jump.isBreak) break else continue
+                        }
+                        if (returned != null) return returned
+                    } while (eval(statement.condition) != 0)
+                    is JasForStatement -> {
+                        statement.init?.let { run(listOf(it)) }
+                        while (statement.condition?.let { eval(it) != 0 } != false) {
+                            val returned = try {
+                                run(statement.body.statements)
+                            } catch (jump: LoopJump) {
+                                if (jump.isBreak) break else null
+                            }
+                            if (returned != null) return returned
+                            statement.update?.let(::write)
+                        }
                     }
                     is JasIf -> {
                         val taken = if (eval(statement.condition) != 0) statement.thenBody else statement.elseBody
@@ -257,7 +354,7 @@ class CoroutineBlockPlannerTest {
      * `var cN: int32 = 0; while (cN < k) { cN = cN + 1; ... }`，计数器不作为随机赋值目标，
      * 因此每个循环至多 k 趟，continue 也不会跳过自增。
      */
-    private class Generator(val random: Random) {
+    private class Generator(val random: Random, val extendedLoops: Boolean = false) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
 
@@ -303,9 +400,31 @@ class CoroutineBlockPlannerTest {
                             head += JasVariableStatement(name, JasPrimitiveType("int32"), awaitNode())
                             bodyScope += name
                         }
-                        val (body, _) = sequence(depth - 1, bodyScope, random.nextInt(5) == 0, inLoop = true)
+                        val (body, bodyTerminates) = sequence(depth - 1, bodyScope, random.nextInt(5) == 0, inLoop = true)
                         val limit = JasIntLiteral(random.nextLong(0, 4), "")
-                        statements += JasWhile(JasBinaryOp(limit, ">", JasIdentifier(loopCounter)), JasBlock(head + body))
+                        val condition = JasBinaryOp(limit, ">", JasIdentifier(loopCounter))
+                        statements += when (if (extendedLoops) random.nextInt(3) else 0) {
+                            0 -> JasWhile(condition, JasBlock(head + body))
+                            // do-while：计数器在循环体首句自增，continue 前进到条件块也不会死循环。
+                            1 -> JasDoWhile(JasBlock(head + body), condition).also {
+                                // 循环体至少执行一趟：所有路径都 return 且没有跳到本循环的 break /
+                                // continue 时循环不会正常结束，其后语句不可达，序列就此结束。
+                                if (bodyTerminates && !jumpsToThisLoop(body)) {
+                                    statements += it
+                                    return statements to true
+                                }
+                            }
+                            // for：计数器改由步进段自增（一半用 `++`，一半用 `=`），continue 前进到
+                            // 步进块；计数器的 0 声明移进初始化段。
+                            else -> {
+                                statements.removeAt(statements.lastIndex)
+                                val init = JasVariableStatement(loopCounter, JasPrimitiveType("int32"), JasIntLiteral(0, "0"))
+                                val update = if (random.nextBoolean()) JasPostfixIncDec(JasIdentifier(loopCounter), "++")
+                                    else JasAssignment(JasIdentifier(loopCounter),
+                                        JasBinaryOp(JasIdentifier(loopCounter), "+", JasIntLiteral(1, "1")))
+                                JasForStatement(init, condition, update, JasBlock(head.drop(1) + body))
+                            }
+                        }
                     }
                     else -> {
                         val condition = JasBinaryOp(expression(scope), ">", JasIntLiteral(random.nextLong(-3, 4), ""))
@@ -327,6 +446,56 @@ class CoroutineBlockPlannerTest {
                 return statements to true
             }
             return statements to false
+        }
+    }
+
+    /**
+     * 做什么：固定种子 20261031 生成 400 个含 while / do-while / 三段式 for 的随机程序，
+     *   与上一测试同样比对两套语义；另要求 do-while 与 for 各自出现足够多次。
+     * 失败模式：打印种子、用例与程序 AST。
+     */
+    @Test
+    fun `seeded do-while and for block machines match direct AST semantics`() {
+        val seed = 20261031
+        val random = Random(seed)
+        var doWhilePrograms = 0
+        var forPrograms = 0
+        var suspendingLoops = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true).sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val text = body.toString()
+            if ("JasDoWhile" in text) doWhilePrograms++
+            if ("JasForStatement" in text) forPrograms++
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (suspendsInsideLoop(plan)) suspendingLoops++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) { random.nextInt(-6, 7) }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                val (actual, suspensions) = runBlocks(plan, inputs.iterator(), base)
+                assertEquals(expected, actual, "$context round=$round base=$base inputs=$inputs")
+                assertEquals(direct.consumed, suspensions, "$context round=$round suspension count")
+            }
+        }
+        assertTrue(doWhilePrograms > 60, "generator too weak: only $doWhilePrograms do-while programs")
+        assertTrue(forPrograms > 60, "generator too weak: only $forPrograms for programs")
+        assertTrue(suspendingLoops > 50, "generator too weak: only $suspendingLoops programs suspend inside a loop")
+    }
+
+    /** 语句序列中是否有以本层循环为目标的 break / continue（穿过 if，不进入内层循环）。 */
+    private companion object {
+        fun jumpsToThisLoop(statements: List<JasStatement>): Boolean = statements.any { statement ->
+            when (statement) {
+                is JasBreakStatement, is JasContinueStatement -> true
+                is JasIf -> jumpsToThisLoop(statement.thenBody.statements) ||
+                    (statement.elseBody?.let { jumpsToThisLoop(it.statements) } ?: false)
+                else -> false
+            }
         }
     }
 

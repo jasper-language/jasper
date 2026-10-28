@@ -336,15 +336,16 @@ class LinearCoroutinePipelineTest {
                 }
             """.trimIndent(),
             // 第十片起多 await 与 if/else 内 await 已支持（见 BranchingCoroutinePipelineTest），
-            // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest）；这里改锁仍未
-            // 支持的 do-while / try / 条件与子表达式中的 await。
-            "do-while-await" to """
+            // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest），第十二片起
+            // do-while 与三段式 for 内 await 已支持（见 ForLoopCoroutinePipelineTest）；这里改锁
+            // 仍未支持的 try / 条件与子表达式中的 await。
+            "for-condition-await" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function f(input: Future<int32>, count: int32): int32 {
+                    public static function f(input: Future<int32>): int32 {
                         var total: int32 = 0;
-                        do { total = await input; } while (total < count);
+                        for (var i: int32 = 0; (await input) > i; i++) { total = total + 1; }
                         return total;
                     }
                 }
