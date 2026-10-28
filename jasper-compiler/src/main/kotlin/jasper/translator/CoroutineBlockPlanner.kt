@@ -454,12 +454,48 @@ object CoroutineBlockPlanner {
                         if (node.op !in SILENT_UNARY) throw Rejected("await under unary '${node.op}' is not supported")
                         JasUnaryOp(node.op, visit(node.operand), node.prefix)
                     }
+                    is JasCall -> {
+                        requireStaticSourceCallee(node)
+                        // 实参自左向右求值，调用本身在全部实参之后执行；它对其后的 await 构成前序副作用。
+                        val args = node.args.map(::visit)
+                        effectPending = true
+                        JasCall(node.target, args, node.isSafe).also {
+                            it.resolvedFunction = node.resolvedFunction
+                            it.inferredTypeArgs = node.inferredTypeArgs
+                        }
+                    }
                     else -> throw Rejected("await inside ${node.javaClass.simpleName} is not supported")
                 }
             }
 
             val rewritten = visit(expression)
             return current to rewritten
+        }
+
+        /**
+         * 实参含 await 的调用只接受检查器已解析的源码静态函数：被调目标是函数名本身
+         * （`g(...)`）或类型名限定（`T.g(...)`）。为什么：目标表达式先于实参求值，提升后推迟到
+         * 恢复之后；函数名 / 类型名的求值不读可变状态，推迟不改变语义。局部 / 参数接收者、
+         * 字段接收者、安全调用、平台调用与 varargs 打包都可能读取可变状态或另有降级路径，拒绝。
+         */
+        private fun requireStaticSourceCallee(call: JasCall) {
+            val callee = call.resolvedFunction
+                ?: throw Rejected("await in arguments of an unresolved or platform call is not supported")
+            if (call.isSafe || call.platformStaticOwner != null || call.varargCall != null) {
+                throw Rejected("await in arguments of a safe, platform or varargs call is not supported")
+            }
+            val qualifier = when (val target = call.target) {
+                is JasIdentifier -> target.name
+                is JasPropertyAccess -> {
+                    val type = target.target as? JasIdentifier
+                    if (target.isSafe || type == null || "static" !in callee.modifiers) null else type.name
+                }
+                else -> null
+            }
+            if (qualifier == null || qualifier in types) {
+                throw Rejected("await in arguments is only supported for static source function calls")
+            }
+            if (call.args.any(::containsLocalWrite)) throw Rejected("call arguments with awaits must not write locals")
         }
 
         /** 在 [loop] 作用域内降级循环体；无论成败都弹出循环上下文。 */

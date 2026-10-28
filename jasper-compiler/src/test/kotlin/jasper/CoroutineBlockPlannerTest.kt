@@ -27,6 +27,19 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+/** 被调函数 `mix(a: int32, b: int32): int32` 的声明；只用于回填 resolvedFunction，模拟检查器的解析结果。 */
+private val MIX = JasFunction(
+    "mix",
+    listOf(JasParameter("a", JasPrimitiveType("int32")), JasParameter("b", JasPrimitiveType("int32"))),
+    JasPrimitiveType("int32"),
+    JasBlock(emptyList()),
+    listOf("public", "static")
+)
+
+/** 检查器已解析的源码静态调用 `mix(a, b)`。 */
+private fun mixCall(a: JasExpression, b: JasExpression, target: JasExpression = JasIdentifier("mix")) =
+    JasCall(target, listOf(a, b)).also { it.resolvedFunction = MIX }
+
 /** 块规划器测试；所有 AST 都由下方小工具直接构造。 */
 class CoroutineBlockPlannerTest {
     private val int = JasPrimitiveType("int32")
@@ -198,7 +211,8 @@ class CoroutineBlockPlannerTest {
     /**
      * 做什么：仍未支持的形态必须给出具体原因，而不是返回部分计划。
      * 失败模式：for-in / 循环后置块 / 步进段非局部写入 / 非 int32 自增 / 带标签或循环外的 break、continue /
-     *   短路右操作数、调用实参、转换中的 await / 可能抛出或有副作用的运算之后的 await /
+     *   短路右操作数、转换中的 await / 未解析调用、局部接收者调用、安全调用的实参中的 await /
+     *   可能抛出或有副作用的运算（含先于 await 的调用实参）之后的 await /
      *   await 操作数内的 await 或局部写入 /
      *   return 或 break 之后的不可达语句 /
      *   缺 return 路径 / 重名 / 未写类型的非 await 局部被静默接受。
@@ -217,7 +231,15 @@ class CoroutineBlockPlannerTest {
                 JasWhile(id("flag"), block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
             "short-circuit-right-await" to function(JasIf(JasBinaryOp(id("flag"), "&&", JasBinaryOp(await("input"), ">", lit(0))),
                 block(JasReturn(lit(1))), null), JasReturn(lit(0))),
-            "call-argument-await" to function(JasReturn(JasCall(id("g"), listOf(await("input"))))),
+            "unresolved-call-argument-await" to function(JasReturn(JasCall(id("g"), listOf(await("input"))))),
+            "local-receiver-call-argument-await" to function(
+                JasReturn(mixCall(await("input"), lit(0), JasPropertyAccess(id("base"), "mix")))),
+            "safe-call-argument-await" to function(JasReturn(
+                JasCall(JasPropertyAccess(id("Owner"), "mix"), listOf(await("input"), lit(0)), isSafe = true)
+                    .also { it.resolvedFunction = MIX })),
+            "await-after-earlier-call-argument" to function(JasReturn(mixCall(mixCall(lit(1), lit(2)), await("input")))),
+            "await-after-call-with-awaited-argument" to function(
+                JasReturn(JasBinaryOp(mixCall(await("input"), lit(1)), "+", await("input")))),
             "cast-await" to function(JasReturn(JasCastExpr(await("input"), int))),
             "await-after-call" to function(JasReturn(JasBinaryOp(JasCall(id("g"), emptyList()), "+", await("input")))),
             "await-after-division" to function(JasReturn(JasBinaryOp(JasBinaryOp(id("base"), "/", lit(2)), "+", await("input")))),
@@ -263,6 +285,8 @@ class CoroutineBlockPlannerTest {
             is JasIntLiteral -> expression.value.toInt()
             is JasIdentifier -> env.getValue(expression.name)
             is JasUnaryOp -> { consumed++; inputs.next() }
+            // 生成器里唯一的被调函数 mix(a, b) = 3a - b：实参自左向右求值，不可交换，顺序错位即失配。
+            is JasCall -> expression.args.map(::eval).let { (a, b) -> 3 * a - b }
             is JasBinaryOp -> when (expression.op) {
                 "+" -> eval(expression.left) + eval(expression.right)
                 "-" -> eval(expression.left) - eval(expression.right)
@@ -363,12 +387,17 @@ class CoroutineBlockPlannerTest {
      * `var cN: int32 = 0; while (cN < k) { cN = cN + 1; ... }`，计数器不作为随机赋值目标，
      * 因此每个循环至多 k 趟，continue 也不会跳过自增。
      */
-    private class Generator(val random: Random, val extendedLoops: Boolean = false, val nestedAwaits: Boolean = false) {
+    private class Generator(
+        val random: Random,
+        val extendedLoops: Boolean = false,
+        val nestedAwaits: Boolean = false,
+        val callAwaits: Boolean = false
+    ) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
 
         /** nestedAwaits 时叶子有 1/4 是 await，可落在条件、return 值与 `+` / `>` 的任一侧。 */
-        fun expression(scope: List<String>): JasExpression {
+        fun expression(scope: List<String>, allowCall: Boolean = true): JasExpression {
             val leaf = {
                 if (nestedAwaits && random.nextInt(4) == 0) awaitNode()
                 else if (scope.isNotEmpty() && random.nextBoolean()) JasIdentifier(scope.random(random))
@@ -376,6 +405,12 @@ class CoroutineBlockPlannerTest {
             }
             // nestedAwaits 时也用不可交换的 `-`：两侧各有 await 时，提升若颠倒先后，消费的输入随之错位。
             val op = if (nestedAwaits && random.nextBoolean()) "-" else "+"
+            // callAwaits 时调用只放在表达式最后求值的位置（整个表达式或右操作数，嵌套调用作最后一个
+            // 实参），使每个随机程序都落在支持集内：调用之后同一表达式里不再有 await。
+            if (callAwaits && allowCall && random.nextInt(3) == 0) {
+                fun call(depth: Int): JasExpression = mixCall(leaf(), if (depth > 0 && random.nextBoolean()) call(depth - 1) else leaf())
+                return if (random.nextBoolean()) call(1) else JasBinaryOp(leaf(), op, call(1))
+            }
             return if (random.nextInt(3) == 0) JasBinaryOp(leaf(), op, leaf()) else leaf()
         }
 
@@ -445,8 +480,11 @@ class CoroutineBlockPlannerTest {
                         }
                     }
                     else -> {
-                        val condition = JasBinaryOp(expression(scope), ">",
-                            if (nestedAwaits && random.nextBoolean()) expression(scope) else JasIntLiteral(random.nextLong(-3, 4), ""))
+                        // 右侧是任意表达式时左侧不放调用：调用之后同一表达式里的 await 不在支持集内。
+                        val rightIsExpression = nestedAwaits && random.nextBoolean()
+                        val left = expression(scope, allowCall = !rightIsExpression)
+                        val condition = JasBinaryOp(left, ">",
+                            if (rightIsExpression) expression(scope) else JasIntLiteral(random.nextLong(-3, 4), ""))
                         val (thenBody, thenReturns) = sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop)
                         val withElse = random.nextBoolean()
                         val (elseBody, elseReturns) =
@@ -648,5 +686,79 @@ class CoroutineBlockPlannerTest {
         }
         assertTrue(conditionSuspends > 40, "generator too weak: only $conditionSuspends programs suspend in a loop header")
         assertTrue(temporaries > 150, "generator too weak: only $temporaries programs hoist an await")
+    }
+
+    /**
+     * 做什么：调用实参中的 await 按实参顺序各自提升，调用留在原位、改读临时局部；先于 await
+     *   的实参只能是可推迟的局部读取；类型名限定的静态调用与嵌套调用的最后一个实参同样提升。
+     * 失败模式：实参提升顺序颠倒、调用被提前到挂起之前、丢失 resolvedFunction（发射后无法复查）。
+     */
+    @Test
+    fun `awaits in static call arguments are hoisted in argument order`() {
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("v", mixCall(id("base"), await("input"))),
+            JasReturn(mixCall(await("input"), mixCall(await("input"), id("v")), JasPropertyAccess(id("Owner"), "mix")))
+        ), parameters)
+        assertWellFormed(plan, "call arguments")
+        assertEquals(3, plan.suspensionCount)
+        val temps = plan.locals.map { it.first }.filter { it.startsWith(CoroutineBlockPlanner.TEMP_PREFIX) }
+        assertEquals(3, temps.size, "every awaited argument gets its own temporary: ${plan.locals}")
+        val write = plan.blocks.flatMap { it.assignments }.single { it.first == "v" }.second as JasCall
+        assertEquals(listOf(id("base"), id(temps[0])), write.args)
+        assertTrue(write.resolvedFunction === MIX, "resolved callee must survive the rewrite")
+        val finish = plan.blocks.map { it.exit }.filterIsInstance<CoroutineBlockExit.Finish>().single().value as JasCall
+        assertEquals(JasPropertyAccess(id("Owner"), "mix"), finish.target)
+        assertEquals(id(temps[1]), finish.args[0])
+        assertEquals(listOf(id(temps[2]), id("v")), (finish.args[1] as JasCall).args)
+    }
+
+    /** 块里规划器产出的全部表达式（局部写入右侧与出口表达式）。 */
+    private fun blockExpressions(block: jasper.translator.CoroutineBlock): List<JasExpression> =
+        block.assignments.map { it.second } + when (val exit = block.exit) {
+            is CoroutineBlockExit.Branch -> listOf(exit.condition)
+            is CoroutineBlockExit.Finish -> listOf(exit.value)
+            else -> emptyList()
+        }
+
+    /** 表达式里是否有调用直接以提升出的临时局部为实参。 */
+    private fun readsTempInCallArgument(expression: JasExpression): Boolean = when (expression) {
+        is JasCall -> expression.args.any { (it as? JasIdentifier)?.name?.startsWith(CoroutineBlockPlanner.TEMP_PREFIX) == true } ||
+            expression.args.any(::readsTempInCallArgument)
+        is JasBinaryOp -> readsTempInCallArgument(expression.left) || readsTempInCallArgument(expression.right)
+        is JasUnaryOp -> readsTempInCallArgument(expression.operand)
+        else -> false
+    }
+
+    /**
+     * 做什么：固定种子 20261103 生成 400 个随机程序，在第十三片的随机形态上再加入
+     *   `mix(a, b) = 3a - b` 调用（实参可含 await，可嵌套在最后一个实参），比对 AST 直接解释与块状态机
+     *   的返回值和挂起点数；实参若被颠倒、调用被提前，消费输入或结果即失配。
+     * 失败模式：打印种子、用例与程序 AST。
+     */
+    @Test
+    fun `seeded call-argument awaits match direct AST semantics`() {
+        val seed = 20261103
+        val random = Random(seed)
+        var argumentAwaits = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, nestedAwaits = true, callAwaits = true)
+                .sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (plan.blocks.any { block -> blockExpressions(block).any(::readsTempInCallArgument) }) argumentAwaits++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) { random.nextInt(-6, 7) }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                val (actual, suspensions) = runBlocks(plan, inputs.iterator(), base)
+                assertEquals(expected, actual, "$context round=$round base=$base inputs=$inputs")
+                assertEquals(direct.consumed, suspensions, "$context round=$round suspension count")
+            }
+        }
+        assertTrue(argumentAwaits > 100, "generator too weak: only $argumentAwaits programs mix calls with hoisted awaits")
     }
 }

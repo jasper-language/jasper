@@ -332,7 +332,7 @@ class LinearCoroutinePipelineTest {
             // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest），第十二片起
             // do-while 与三段式 for 内 await 已支持（见 ForLoopCoroutinePipelineTest），第十三片起
             // 条件、return 值与算术子表达式中的 await 已支持（见 ExpressionAwaitCoroutinePipelineTest）；
-            // 这里改锁仍未支持的 try、短路右操作数 / 调用实参中的 await 与有副作用运算之后的 await。
+            // 这里改锁仍未支持的 try、短路右操作数中的 await 与有副作用运算（含调用）之后的 await。
             "await-in-short-circuit-right" to """
                 package demo;
                 import std.Future;
@@ -343,12 +343,34 @@ class LinearCoroutinePipelineTest {
                     }
                 }
             """.trimIndent(),
-            "await-in-call-argument" to """
+            // 第十四片起源码静态函数调用实参中的 await 已支持（见 CallArgumentAwaitCoroutinePipelineTest）；
+            // 先于 await 的实参是调用、以及实参中有 await 的调用之后再 await 仍须诊断。
+            "await-after-call-argument" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function id(value: int32): int32 { return value; }
-                    public static function f(input: Future<int32>): int32 { return P.id(await input); }
+                    public static function add(a: int32, b: int32): int32 { return a + b; }
+                    public static function f(input: Future<int32>): int32 { return P.add(P.add(1, 2), await input); }
+                }
+            """.trimIndent(),
+            "await-after-call-with-awaited-argument" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function add(a: int32, b: int32): int32 { return a + b; }
+                    public static function f(input: Future<int32>): int32 { return P.add(await input, 1) + (await input); }
+                }
+            """.trimIndent(),
+            // 被调函数自身挂起时，即使实参中的 await 可提升，对它的同步调用仍须诊断。
+            "awaited-argument-to-suspending-callee" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function leaf(input: Future<int32>, extra: int32): int32 {
+                        var value: int32 = await input;
+                        return value + extra;
+                    }
+                    public static function caller(input: Future<int32>): int32 { return P.leaf(input, await input); }
                 }
             """.trimIndent(),
             "await-after-call" to """
