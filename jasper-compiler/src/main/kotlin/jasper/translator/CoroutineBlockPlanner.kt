@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十六片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十七片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -13,7 +13,11 @@
 //   的右操作数含 await 时，左操作数写入合成 bool 临时局部并分支，只有需要右操作数的
 //   那一路进入右侧块挂起，两路在新块汇合。带标签的 break / continue 按标签找到外层
 //   循环，跳到它的出口块或续行目标（循环头 / 条件块 / 步进块），与无标签形式共用同一套
-//   前向 / 回边规则。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
+//   前向 / 回边规则。try/finally 登记为清理区域：进入 try 体时把合成局部 `$region`
+//   写成区域编号，正常离开、return 与跨出区域的 break / continue 所在块在出口前按由内
+//   到外的顺序执行各区域的清理（先把 `$region` 退回外层区域，再执行 finally 体）；
+//   异常、挂起点失败 / 取消与作用域取消导致的非正常离开由发射器按 `$region` 展开。
+//   生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
 // 所属层次：
@@ -28,7 +32,10 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - for-in、循环后置块、try/catch/finally、defer、throw、match 一律拒绝；
+//   - for-in、循环后置块、带 catch 的 try、defer、throw、match 一律拒绝；
+//   - finally 体是同步清理：不得含 await、return、try、带标签或跳出 finally 的
+//     break / continue；只接受 int32 / bool 局部声明、对局部的 `=` 赋值、int32 局部
+//     `++` / `--`、调用语句、if/else、while 与块；
 //   - break / continue 的标签必须是某个外层循环的标签；未知标签与遮蔽外层同名标签的
 //     循环拒绝（不退回到最内层循环）；
 //   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 局部的 `++` / `--`；
@@ -76,21 +83,35 @@ data class CoroutineBlock(
     val id: Int,
     val resumeBinding: String?,
     val assignments: List<Pair<String, JasExpression>>,
-    val exit: CoroutineBlockExit
+    val exit: CoroutineBlockExit,
+    val cleanups: List<Int> = emptyList()
 )
+
+/**
+ * try/finally 清理区域。
+ *
+ * [id] 从 1 起按进入顺序分配（0 表示不在任何区域内），外层区域的编号总小于内层；
+ * [parent] 是直接外层区域编号；[cleanup] 是 finally 体（同步、已校验）。
+ * 块的 [CoroutineBlock.cleanups] 按执行顺序列出在出口前要执行的区域；执行一个区域
+ * 前先把 [CoroutineBlockPlanner.REGION_LOCAL] 退回 [parent]，清理抛出时展开从外层继续，
+ * 同一区域的清理不会执行两次。
+ */
+data class CoroutineTryRegion(val id: Int, val parent: Int, val cleanup: JasBlock)
 
 /**
  * 规划结果。
  *
  * [blocks] 按编号排列（编号即下标）；[locals] 是函数体内声明的局部名与类型，
  * 按源码出现顺序；[loopHeaders] 是 while / do-while / for 的循环头块编号，回边只能指向它们；
+ * [tryRegions] 按编号排列的清理区域（有区域时 [locals] 含 int32 的区域局部）；
  * [reason] 非空表示不支持，此时其余字段为空。
  */
 data class CoroutineBlockPlan(
     val blocks: List<CoroutineBlock>,
     val locals: List<Pair<String, JasType>>,
     val reason: String? = null,
-    val loopHeaders: Set<Int> = emptySet()
+    val loopHeaders: Set<Int> = emptySet(),
+    val tryRegions: List<CoroutineTryRegion> = emptyList()
 ) {
     /** 挂起点数量；发射器要求至少一个，否则函数不是由直接 await 挂起。 */
     val suspensionCount: Int get() = blocks.count { it.exit is CoroutineBlockExit.Suspend }
@@ -119,9 +140,13 @@ object CoroutineBlockPlanner {
     /** 合成临时局部的名字前缀；含 `$`，不会与源码标识符冲突。 */
     const val TEMP_PREFIX = "\$await"
 
+    /** 当前所在清理区域编号的合成 int32 局部（0 = 不在区域内）；只在有 try/finally 时登记。 */
+    const val REGION_LOCAL = "\$region"
+
     /** 正在构造、尚未确定出口的块。 */
     private class OpenBlock(val id: Int, val resumeBinding: String?) {
         val assignments = mutableListOf<Pair<String, JasExpression>>()
+        val cleanups = mutableListOf<Int>()
     }
 
     /**
@@ -131,9 +156,10 @@ object CoroutineBlockPlanner {
      * 目标块（do-while 的条件块、for 的步进块）要在循环体之后才分配，先把块记进
      * [continues]。break 的块同样等出口块分配后再封闭。[label] 是 `label name:` 给出的标签，
      * 带标签的 break / continue 据此跳到外层循环；登记到哪个上下文就跟哪个循环的出口块 /
-     * 续行目标一起封闭，所以跨层跳转不需要额外机制。
+     * 续行目标一起封闭，所以跨层跳转不需要额外机制。[tryDepth] 是循环开始时外层清理
+     * 区域的层数：跳到本循环的 break / continue 先执行比它更内层的区域清理。
      */
-    private class LoopContext(val continueTarget: Int?, val label: String?) {
+    private class LoopContext(val continueTarget: Int?, val label: String?, val tryDepth: Int) {
         val breaks = mutableListOf<OpenBlock>()
         val continues = mutableListOf<OpenBlock>()
     }
@@ -160,7 +186,8 @@ object CoroutineBlockPlanner {
                     }
                 }
             }
-            CoroutineBlockPlan(blocks, state.locals.toList(), loopHeaders = state.headers.toSet())
+            CoroutineBlockPlan(blocks, state.locals.toList(), loopHeaders = state.headers.toSet(),
+                tryRegions = state.regions.toList())
         } catch (rejected: Rejected) {
             CoroutineBlockPlan(emptyList(), emptyList(), rejected.message)
         }
@@ -180,7 +207,9 @@ object CoroutineBlockPlanner {
         val locals = LinkedHashMap<String, JasType>()
         val closed = LinkedHashMap<Int, CoroutineBlock>()
         val headers = linkedSetOf<Int>()
+        val regions = mutableListOf<CoroutineTryRegion>()
         private val loops = ArrayDeque<LoopContext>()
+        private val tries = ArrayDeque<CoroutineTryRegion>()
         private var nextId = 0
         private var nextTemp = 0
 
@@ -189,7 +218,8 @@ object CoroutineBlockPlanner {
 
         /** 封闭块并登记出口。 */
         fun close(block: OpenBlock, exit: CoroutineBlockExit) {
-            closed[block.id] = CoroutineBlock(block.id, block.resumeBinding, block.assignments.toList(), exit)
+            closed[block.id] = CoroutineBlock(block.id, block.resumeBinding, block.assignments.toList(), exit,
+                block.cleanups.toList())
         }
 
         /**
@@ -234,11 +264,13 @@ object CoroutineBlockPlanner {
             is JasLabeledStatement -> lowerLabeled(statement, block)
             is JasBreakStatement -> {
                 val loop = targetLoop(statement.label)
+                block.cleanups += crossedRegions(loop.tryDepth)
                 loop.breaks += block
                 null
             }
             is JasContinueStatement -> {
                 val loop = targetLoop(statement.label)
+                block.cleanups += crossedRegions(loop.tryDepth)
                 val target = loop.continueTarget
                 if (target != null) close(block, CoroutineBlockExit.Goto(target)) else loop.continues += block
                 null
@@ -246,9 +278,17 @@ object CoroutineBlockPlanner {
             is JasReturn -> {
                 val value = statement.value ?: throw Rejected("return must carry an int32 value")
                 val (end, rewritten) = hoist(value, block)
-                close(end, CoroutineBlockExit.Finish(rewritten))
+                // 在 try 体内 return：返回值先于清理求值并固定下来，清理改写局部不影响已求出的值。
+                val result = if (tries.isEmpty() || rewritten is JasIntLiteral) rewritten else {
+                    val name = freshTemp(INT)
+                    end.assignments += name to rewritten
+                    JasIdentifier(name)
+                }
+                end.cleanups += crossedRegions(0)
+                close(end, CoroutineBlockExit.Finish(result))
                 null
             }
+            is JasTry -> lowerTry(statement, block)
             is JasBlock -> lowerSequence(statement.statements, block)
             else -> throw Rejected("unsupported control flow node ${statement.javaClass.simpleName}")
         }
@@ -328,7 +368,7 @@ object CoroutineBlockPlanner {
             // 条件中的 await 每趟都从循环头重新挂起；恢复块在循环体之前分配。
             val (conditionEnd, condition) = hoist(statement.condition, header)
             val body = open(null)
-            val loop = LoopContext(header.id, label)
+            val loop = LoopContext(header.id, label, tries.size)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             bodyEnd?.let { close(it, CoroutineBlockExit.Goto(header.id)) }
             val exit = open(null)
@@ -350,7 +390,7 @@ object CoroutineBlockPlanner {
             close(block, CoroutineBlockExit.Goto(header.id))
             val body = open(null)
             close(header, CoroutineBlockExit.Goto(body.id))
-            val loop = LoopContext(null, label)
+            val loop = LoopContext(null, label, tries.size)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             val exitNeeded = bodyEnd != null || loop.continues.isNotEmpty() || loop.breaks.isNotEmpty()
             if (!exitNeeded) return null
@@ -394,7 +434,7 @@ object CoroutineBlockPlanner {
             close(afterInit, CoroutineBlockExit.Goto(header.id))
             val (conditionEnd, condition) = hoist(statement.condition ?: JasBoolLiteral(true), header)
             val body = open(null)
-            val loop = LoopContext(null, label)
+            val loop = LoopContext(null, label, tries.size)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             if (bodyEnd != null || loop.continues.isNotEmpty()) {
                 val step = open(null)
@@ -409,6 +449,103 @@ object CoroutineBlockPlanner {
             close(conditionEnd, CoroutineBlockExit.Branch(condition, body.id, exit.id))
             loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
             return exit
+        }
+
+        /**
+         * try/finally：分配清理区域，当前块写入区域编号后在区域内降级 try 体；try 体正常
+         * 结束的块在出口前执行本区域清理并前进到新块。try 体内的挂起、循环与跳转照常切块，
+         * 跨出区域的 return / break / continue 在各自块上登记清理。
+         * 为什么拒绝 catch：捕获挂起点失败要决定 Failure 与源码异常类型的对应，属于错误模型的
+         * 语义选择，本片不作出；只做不改变失败本身的清理。
+         */
+        private fun lowerTry(statement: JasTry, block: OpenBlock): OpenBlock? {
+            if (statement.catches.isNotEmpty()) throw Rejected("try/catch is not supported in coroutine frames")
+            val cleanup = statement.finallyBody ?: throw Rejected("try without finally is not supported")
+            if (REGION_LOCAL !in types) {
+                types[REGION_LOCAL] = INT
+                locals[REGION_LOCAL] = INT
+            }
+            val region = CoroutineTryRegion(regions.size + 1, tries.lastOrNull()?.id ?: 0, cleanup)
+            regions += region
+            block.assignments += REGION_LOCAL to JasIntLiteral(region.id.toLong(), region.id.toString())
+            tries.addLast(region)
+            val bodyEnd = try {
+                lowerSequence(statement.body.statements, block)
+            } finally {
+                tries.removeLast()
+            }
+            // finally 体按源码顺序在 try 体之后校验，局部登记顺序与源码一致。
+            checkCleanup(cleanup.statements, 0)
+            if (bodyEnd == null) return null
+            bodyEnd.cleanups += region.id
+            val next = open(null)
+            close(bodyEnd, CoroutineBlockExit.Goto(next.id))
+            return next
+        }
+
+        /** 从当前位置跳到外层区域深度 [depth] 时要执行的清理区域编号，由内到外。 */
+        private fun crossedRegions(depth: Int): List<Int> = tries.drop(depth).map { it.id }.reversed()
+
+        /**
+         * 校验 finally 体：同步、正常结束，局部声明登记为帧局部。[loopDepth] 是 finally 体内
+         * 已进入的 while 层数，无标签 break / continue 只能作用于这些循环。
+         * 为什么不允许 return / 跳出 finally：那会丢弃正在传播的失败或已求出的返回值，
+         * 需要单独定义并验证；本片只接受一定正常结束的清理。
+         */
+        private fun checkCleanup(statements: List<JasStatement>, loopDepth: Int) {
+            /** 清理中的表达式不得挂起。 */
+            fun noAwait(expression: JasExpression?) {
+                if (containsAwait(expression)) throw Rejected("await in finally is not supported")
+            }
+            for (statement in statements) {
+                when (statement) {
+                    is JasVariableStatement -> {
+                        val initializer = statement.initializer
+                            ?: throw Rejected("local '${statement.name}' must be initialized")
+                        if (statement.name in types) throw Rejected("parameter and local names must be unique")
+                        val type = statement.type.takeIf { it == INT || it == BOOL }
+                            ?: throw Rejected("only explicitly typed int32 or bool local declarations are supported")
+                        noAwait(initializer)
+                        types[statement.name] = type
+                        locals[statement.name] = type
+                    }
+                    is JasExpressionStatement -> when (val expression = statement.expression) {
+                        is JasAssignment -> {
+                            val target = expression.target as? JasIdentifier
+                            if (expression.op != "=" || target == null || target.name !in locals) {
+                                throw Rejected("only plain '=' assignments to locals are supported")
+                            }
+                            noAwait(expression.value)
+                        }
+                        is JasPostfixIncDec -> {
+                            val target = expression.target as? JasIdentifier
+                            if (target == null || locals[target.name] != INT || expression.op !in setOf("++", "--")) {
+                                throw Rejected("only '++' / '--' on int32 locals are supported")
+                            }
+                        }
+                        is JasCall -> noAwait(expression)
+                        else -> throw Rejected("only assignments, increments and calls may appear as statements in finally")
+                    }
+                    is JasIf -> {
+                        noAwait(statement.condition)
+                        checkCleanup(statement.thenBody.statements, loopDepth)
+                        statement.elseBody?.let { checkCleanup(it.statements, loopDepth) }
+                    }
+                    is JasWhile -> {
+                        if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
+                        noAwait(statement.condition)
+                        checkCleanup(statement.body.statements, loopDepth + 1)
+                    }
+                    is JasBreakStatement, is JasContinueStatement -> {
+                        val label = (statement as? JasBreakStatement)?.label ?: (statement as? JasContinueStatement)?.label
+                        if (label != null || loopDepth == 0) {
+                            throw Rejected("break/continue must not leave finally")
+                        }
+                    }
+                    is JasBlock -> checkCleanup(statement.statements, loopDepth)
+                    else -> throw Rejected("unsupported statement in finally: ${statement.javaClass.simpleName}")
+                }
+            }
         }
 
         /**

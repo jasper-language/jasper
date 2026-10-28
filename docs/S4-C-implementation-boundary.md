@@ -754,3 +754,71 @@ for-in 与循环后置块、try/catch/finally/defer 的清理后继、实例 / �
 取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；AST 构建器丢弃多表达式 for 初始化段的
 既有限制同前。另：同步函数路径（IR 翻译器）对未知标签会退回到最内层循环、不报诊断，是协程帧之外的既有
 行为，本片未改。
+
+## S4-C 第十七片：try/finally 清理后继
+
+本片继续「实现次序」第 5 条（try/finally），只做不改变失败本身的清理：`try { ... } finally { ... }`
+的 try 体内可以挂起，可以经 return / break / continue 跨出区域；finally 体是同步清理。帧协议的
+变化是「非正常离开先展开清理、再发布终态、最后回收」。
+
+### 降级规则
+
+- 每个 try/finally 是一个清理区域，编号从 1 起按进入顺序分配（外层编号总小于内层），合成 int32
+  帧局部 `$region` 记录当前所在区域（0 = 不在区域内）；进入 try 体的块写入区域编号。
+- 正常离开：try 体正常结束、return、跨出区域的 break / continue 所在块，在出口前按由内到外的顺序
+  执行各区域清理；执行一个区域前先把 `$region` 退回外层区域。try 体内 return 的值在清理之前求出
+  并存入合成临时局部（字面量除外），清理改写局部不影响返回值。
+- 非正常离开：挂起点失败 / 取消、段内抛出（含清理本身抛出）与作用域取消都跳出分派循环，按
+  `$region` 由内到外展开清理（按编号从大到小检查一趟即可走完区域链），清理抛出时以新的 platform
+  Failure 取代待发布结果并继续展开外层；展开结束后才发布 Failure / Cancelled（作用域取消时结果
+  已终结，只做清理）。因此帧自己发布的终态在可见时，所有已进入区域的清理都已完成。
+- 回收条件改为「结果已终结且 `$region` 为 0」：挂起点注册回调之后、run 返回之前到达的作用域取消
+  不再让 finally 立即关闭调度门（那会丢弃取消回调请求的恢复、清理永不执行）；该恢复请求由调度门
+  在本段结束后重新运行帧，入口检查跳出分派循环并展开，展开后再回收。挂起块在注册前发现结果已终结
+  时同样跳出分派循环展开（此前直接 return）。没有 try 的函数行为不变（`$region` 不存在，条件退化
+  为结果已终结）。
+- 挂起效果分析与「同步调用挂起函数」检查进入 try 体、catch 体与 finally 体；此前含 try 的函数
+  被视为未知效果。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- 带 catch 的 try：捕获挂起点失败要决定 Failure 与源码错误类型的对应，属于错误模型的语义选择
+  （错误模型尚未定案），本片不作出；
+- finally 体中的 await、return、try、defer、do-while / for、带标签或跳出 finally 的 break / continue；
+  finally 体只接受 int32 / bool 局部声明、对局部的 `=` 赋值、int32 局部 `++` / `--`、调用语句、
+  if/else、while（体内无标签 break / continue）与块；
+- finally 体中对挂起函数的同步调用；defer、throw 照旧拒绝。
+
+### 验收结果
+
+- `CoroutineBlockPlannerTest`：新增嵌套 try 形状测试（区域编号与外层、进入写区域局部、try 体内 return
+  先存临时局部再按内、外顺序清理、break 与 try 体正常结束只清理内层）；拒绝清单新增 try/catch、finally
+  中 await（语句与条件）、finally 中 return、跳出 finally 的 break、finally 内循环的带标签 break、finally
+  中 try / for、finally 局部重名、defer 十例；新增固定种子 20261109 的 400 个随机程序：在第十二片循环
+  形态上随机包 try/finally（可嵌套、在循环内外，try 体可 return / break / continue 跨出区域），清理体
+  调用 `mark(k)` 并可改写外层局部；输入中约 1/12 是挂起点失败哨兵，块状态机按 `$region` 展开（与发射器
+  同一算法）；比对结果（含失败）、挂起点数与清理轨迹。数量下限：嵌套区域、try 体内 return、失败展开
+  各超过 40。
+- `TryFinallyCoroutinePipelineTest` 5 项，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM 执行（class
+  major 52）：挂起期间不清理、恢复后每行内层清理恰好一次、外层清理最后执行、return 值不含外层清理对
+  局部的改写；continue / break 只清理内层，两层 try 内 return 依次清理两层；input 在内层区域失败时两层
+  清理完成后才发布原 Failure，gate 在外层区域失败只清理外层，除零与清理自身抛出发布 platform 失败且
+  外层清理照常执行；挂在内层 / 外层区域时被作用域取消，清理完成后才 settled，晚到输入不复活、不重跑
+  清理；固定种子 20261109 的 64 轮（含失败、除零与清理抛出）结果、清理次数与最近两次清理编号与
+  Kotlin oracle 一致。
+- `LinearCoroutinePipelineTest` 的不支持形态清单：已支持的「try 内 await」换成 try/catch 内 await、
+  finally 中 await、finally 中同步调用挂起函数三例。
+- 变异检查：展开改为按编号升序单趟检查、且 try 体内 return 不先固定返回值时，规划器 2 项与端到端
+  5 项共 7 项失败。
+- TLA+ `TryFinallyCoroutineFrame`（两层区域、挂起点成功 / 失败 / 取消、清理可抛出、作用域取消任意
+  时刻到达）：1984 个不同状态，清理至多一次、由内到外、帧发布的结果可见时与 settled 时已进入区域
+  全部清理、结果稳定、终将 settled、取消终将 settled 全部成立。两组变异配置：展开只清理当前区域
+  违反 NoEarlyResult；回收只看结果是否终结（修复前的实现）违反 SettledAfterCleanup——反例正是
+  「挂起注册后、run 返回前作用域取消」，本片据此修正了回收条件与挂起前的终结检查。端到端测试无法
+  确定性地制造这一竞争窗口，该路径的证据是模型。`run-s4-models.sh` 纳入新模型，共十三组配置。
+
+### 仍未支持
+
+带 catch 的 try、defer、throw、finally 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用实参
+中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；AST 构建器丢弃
+多表达式 for 初始化段、同步路径对未知标签退回最内层循环的既有限制同前。

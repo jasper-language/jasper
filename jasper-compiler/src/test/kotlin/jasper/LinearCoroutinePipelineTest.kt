@@ -332,7 +332,7 @@ class LinearCoroutinePipelineTest {
             // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest），第十二片起
             // do-while 与三段式 for 内 await 已支持（见 ForLoopCoroutinePipelineTest），第十三片起
             // 条件、return 值与算术子表达式中的 await 已支持（见 ExpressionAwaitCoroutinePipelineTest）；
-            // 这里改锁仍未支持的 try 与有副作用运算（含调用）之后的 await。第十五片起短路右操作数中的
+            // 这里改锁有副作用运算（含调用）之后的 await。第十五片起短路右操作数中的
             // await 已支持（见 ShortCircuitAwaitCoroutinePipelineTest），同一表达式中更早的除法之后仍须诊断。
             "short-circuit-await-after-division" to """
                 package demo;
@@ -404,14 +404,42 @@ class LinearCoroutinePipelineTest {
                     }
                 }
             """.trimIndent(),
-            "try-await" to """
+            // 第十七片起 try/finally 内 await 已支持（见 TryFinallyCoroutinePipelineTest）；带 catch 的 try、
+            // finally 中的 await 与 finally 中对挂起函数的同步调用仍须诊断。
+            "try-catch-await" to """
                 package demo;
                 import std.Future;
                 public class P {
                     public static function f(input: Future<int32>): int32 {
                         var value: int32 = 0;
-                        try { value = await input; } finally { value = value + 1; }
+                        try { value = await input; } catch (e: Error) { value = 1; }
                         return value;
+                    }
+                }
+            """.trimIndent(),
+            "await-in-finally" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function f(input: Future<int32>): int32 {
+                        var value: int32 = 0;
+                        try { value = 1; } finally { value = await input; }
+                        return value;
+                    }
+                }
+            """.trimIndent(),
+            "synchronous-call-in-finally" to """
+                package demo;
+                import std.Future;
+                public class P {
+                    public static function leaf(input: Future<int32>): int32 {
+                        var value: int32 = await input;
+                        return value;
+                    }
+                    public static function caller(input: Future<int32>): int32 {
+                        var first: int32 = 0;
+                        try { first = await input; } finally { P.leaf(input); }
+                        return first;
                     }
                 }
             """.trimIndent(),

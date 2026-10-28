@@ -26,10 +26,11 @@
 //     IllegalArgumentException，绝不返回半边生成结果。
 //
 // 边界（本片刻意不做）：
-//   - 函数体只由 int32/bool 局部声明、对局部的 `=` 赋值、if/else、while、无标签
-//     break/continue 与 return 组成；至少一个 await，且每个 await 是局部写入的整个
-//     右侧；不接受 do-while/for/for-in、try、defer、throw、嵌套 await、条件中的 await
-//     或 return await（第十片起支持多 await 与分支，第十一片起支持 while）；
+//   - 支持形态由 CoroutineBlockPlanner 判定（见其文件头）；至少一个 await；
+//   - try/finally（第十七片）：清理在结果发布之前执行——return 先求值再清理再完成；
+//     挂起点失败 / 取消、段内异常与作用域取消一律跳出分派循环，按 `$region` 由内到外
+//     展开清理后再发布 Failure / Cancelled（作用域取消时结果已终结，只做清理）；清理
+//     抛出时以新的 Failure 取代，继续展开外层；
 //   - 不定义显式挂起标记，不改变公开函数 ABI，也不把生成帧冒充为可同步调用的
 //     普通函数；
 //   - 不实现 Future.get 阻塞等待；恢复只经 onComplete -> ContinuationDispatch。
@@ -183,10 +184,16 @@ object LinearCoroutineEmitter {
             else -> throw IllegalArgumentException("unsupported frame expression: ${expression.javaClass.simpleName}")
         }
 
+        /** 记下待发布的失败：`__abort = 1`，`__pending = failure`。 */
+        fun abortFailure(failure: JasExpression) = listOf(
+            assign("__pending", failure),
+            assign("__abort", JasIntLiteral(1, "1"))
+        )
+
         /**
-         * 恢复块入口：消费终态快照。成功取 int32 结果写入绑定；失败原样发布 Failure；
-         * 取消发布 Cancelled，而不是伪装成业务失败。局部名带块编号，避免同一 run 方法
-         * 内多个恢复块的临时变量重名。
+         * 恢复块入口：消费终态快照。成功取 int32 结果写入绑定；失败记为待发布的原 Failure；
+         * 取消记为待发布的 Cancelled，而不是伪装成业务失败；两者都跳出分派循环，先展开
+         * 清理再发布。局部名带块编号，避免同一 run 方法内多个恢复块的临时变量重名。
          */
         fun consumeOutcome(blockId: Int, binding: String): List<JasStatement> {
             val readyName = "__ready$blockId"
@@ -196,18 +203,44 @@ object LinearCoroutineEmitter {
                 JasVariableStatement(readyName, JasNamedType(FUTURE_OUTCOME),
                     JasCastExpr(field("__outcome"), JasNamedType(FUTURE_OUTCOME)), false),
                 JasIf(invoke(ready, "isCancelled"), JasBlock(listOf(
-                    statement(invoke(field("__result"), "cancel")),
-                    JasReturn(null)
+                    assign("__abort", JasIntLiteral(2, "2")),
+                    JasBreakStatement(null)
                 )), null),
                 JasIf(invoke(ready, "isFailed"), JasBlock(listOf(
                     JasVariableStatement(failureName, JasNullableType(JasNamedType(FAILURE)),
-                        invoke(ready, "failure"), false),
-                    statement(invoke(field("__result"), "fail",
-                        JasCastExpr(JasIdentifier(failureName), JasNamedType(FAILURE)))),
-                    JasReturn(null)
-                )), null),
+                        invoke(ready, "failure"), false)
+                ) + abortFailure(JasIdentifier(failureName)) + JasBreakStatement(null)), null),
                 assign(slots.getValue(binding), JasCastExpr(invoke(ready, "value"), INT))
             )
+        }
+
+        /**
+         * 把已校验的 finally 体改写成帧内同步语句：局部声明与赋值写帧字段，`++` / `--` 改写为
+         * 加减 1，调用语句、if/else、while、块与 finally 内循环的 break / continue 保持结构。
+         */
+        fun rewriteCleanup(statement: JasStatement): JasStatement = when (statement) {
+            is JasVariableStatement -> assign(slots.getValue(statement.name), rewrite(requireNotNull(statement.initializer)))
+            is JasExpressionStatement -> when (val expression = statement.expression) {
+                is JasAssignment -> assign(slots.getValue((expression.target as JasIdentifier).name), rewrite(expression.value))
+                is JasPostfixIncDec -> {
+                    val slot = slots.getValue((expression.target as JasIdentifier).name)
+                    assign(slot, JasBinaryOp(field(slot), if (expression.op == "++") "+" else "-", JasIntLiteral(1, "1")))
+                }
+                else -> statement(rewrite(expression))
+            }
+            is JasIf -> JasIf(rewrite(statement.condition), JasBlock(statement.thenBody.statements.map(::rewriteCleanup)),
+                statement.elseBody?.let { JasBlock(it.statements.map(::rewriteCleanup)) })
+            is JasWhile -> JasWhile(rewrite(statement.condition), JasBlock(statement.body.statements.map(::rewriteCleanup)))
+            is JasBreakStatement, is JasContinueStatement -> statement
+            is JasBlock -> JasBlock(statement.statements.map(::rewriteCleanup))
+            else -> throw IllegalArgumentException("unsupported finally statement: ${statement.javaClass.simpleName}")
+        }
+
+        // 区域清理：先把区域局部退回外层区域，再执行 finally 体；清理抛出时展开从外层继续。
+        val regionSlot = slots[CoroutineBlockPlanner.REGION_LOCAL]
+        val cleanupCode = plan.tryRegions.associate { region ->
+            region.id to listOf(assign(requireNotNull(regionSlot), JasIntLiteral(region.parent.toLong(), region.parent.toString()))) +
+                region.cleanup.statements.map(::rewriteCleanup)
         }
 
         // 所有用户表达式先验证并转换；任何失败都在构造类之前抛出，不返回半成品 AST。
@@ -215,6 +248,7 @@ object LinearCoroutineEmitter {
             val code = mutableListOf<JasStatement>()
             block.resumeBinding?.let { code += consumeOutcome(block.id, it) }
             block.assignments.forEach { (name, value) -> code += assign(slots.getValue(name), rewrite(value)) }
+            block.cleanups.forEach { code += cleanupCode.getValue(it) }
             when (val exit = block.exit) {
                 is CoroutineBlockExit.Goto -> code += jump(exit.target)
                 is CoroutineBlockExit.Branch -> code += JasIf(
@@ -224,10 +258,12 @@ object LinearCoroutineEmitter {
                 )
                 is CoroutineBlockExit.Suspend -> {
                     // 操作数先求值且只求值一次；结果已被外部终结（作用域取消）时不再登记新的
-                    // 回调，直接返回由 finally 回收。否则先写下一块编号再注册：注册前已完成
-                    // 的 Future 会同步回调 accept，恢复请求由调度门合并到本段结束之后。
+                    // 回调，跳出分派循环展开清理后由 finally 回收（不能直接 return：那会跳过
+                    // 所在区域的清理，而 finally 随即关闭调度门，之后不会再有展开的机会）。
+                    // 否则先写下一块编号再注册：注册前已完成的 Future 会同步回调 accept，
+                    // 恢复请求由调度门合并到本段结束之后。
                     code += JasVariableStatement("__awaited${block.id}", resultFuture, rewrite(exit.await.operand), false)
-                    code += JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasReturn(null))), null)
+                    code += JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null)
                     code += jump(exit.resume)
                     code += statement(invoke(JasIdentifier("__awaited${block.id}"), "onComplete", JasIdentifier("this")))
                     code += JasReturn(null)
@@ -247,6 +283,8 @@ object LinearCoroutineEmitter {
         val properties = mutableListOf<JasDeclaration>(
             JasProperty("__phase", INT, listOf("private"), null, null),
             JasProperty("__outcome", JasNullableType(JasNamedType(FUTURE_OUTCOME)), listOf("private"), null, null),
+            JasProperty("__abort", INT, listOf("private"), null, null),
+            JasProperty("__pending", JasNullableType(JasNamedType(FAILURE)), listOf("private"), null, null),
             JasProperty("__result", resultFuture, listOf("private"), null, null),
             JasProperty("__dispatch", JasNamedType(DISPATCH), listOf("private"), null, null)
         )
@@ -257,6 +295,8 @@ object LinearCoroutineEmitter {
         val constructorBody = mutableListOf<JasStatement>(
             assign("__phase", JasIntLiteral(0, "0")),
             assign("__outcome", JasNullLiteral),
+            assign("__abort", JasIntLiteral(0, "0")),
+            assign("__pending", JasNullLiteral),
             assign("__result", JasIdentifier("output"))
         )
         function.parameters.forEachIndexed { index, parameter ->
@@ -288,20 +328,65 @@ object LinearCoroutineEmitter {
         // 之前的块，挂起点的操作数每次经过只求值一次。
         // 每趟开头先看结果是否已被外部终结（作用域取消）：第一趟即入口检查，之后的每趟
         // 对应一次回边，不挂起的循环因此也能在回边处响应取消；终结时不再执行业务段，
-        // 直接落到 finally 关闭调度门并标记 settled，等待中的帧因此能被回收。
-        val runBody = JasBlock(listOf(JasWhile(
+        // 跳出分派循环展开清理，再落到 finally 关闭调度门并标记 settled，等待中的帧因此能被回收。
+        // 挂起与完成直接 return（不展开）；挂起点失败 / 取消同样跳出分派循环。
+        val dispatchLoop = JasWhile(
             JasBoolLiteral(true),
             JasBlock(
-                listOf(JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasReturn(null))), null)) + segments
+                listOf(JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null)) + segments
             )
-        )))
-        val caught = JasIdentifier("__error")
-        // 段内任何未捕获异常都必须变成结果 Future 的失败，并在 finally 中结束调度门、
-        // 标记 settled；否则等待者会永远看到 Pending，TaskGroup.close 也无法回收。
-        val guardedRun = JasTry(
-            runBody,
+        )
+        /** 平台异常转成待发布的 Failure。 */
+        fun platformFailure(error: String) =
+            JasNew(JasNamedType(FAILURE), listOf(invoke(JasIdentifier(error), "toString"), JasStringLiteral("platform")))
+        // 段内任何未捕获异常都记为待发布的失败，先展开清理再发布；否则等待者会永远看到 Pending，
+        // TaskGroup.close 也无法回收。
+        val guardedLoop = JasTry(
+            JasBlock(listOf(dispatchLoop)),
             listOf(JasCatchClause(
                 JasParameter("__error", JasNamedType("java.lang.Throwable")),
+                JasBlock(abortFailure(platformFailure("__error")))
+            )),
+            null
+        )
+        // 展开：按区域编号从大到小检查，外层编号总小于内层，一趟即可由内到外走完整条区域链。
+        val unwind = plan.tryRegions.sortedByDescending { it.id }.map { region ->
+            val error = "__cleanupError${region.id}"
+            JasIf(
+                JasBinaryOp(field(requireNotNull(regionSlot)), "==", JasIntLiteral(region.id.toLong(), region.id.toString())),
+                JasBlock(listOf(JasTry(
+                    JasBlock(cleanupCode.getValue(region.id)),
+                    listOf(JasCatchClause(
+                        JasParameter(error, JasNamedType("java.lang.Throwable")),
+                        JasBlock(abortFailure(platformFailure(error)))
+                    )),
+                    null
+                ))),
+                null
+            )
+        }
+        val publish = listOf(
+            JasIf(JasBinaryOp(field("__abort"), "==", JasIntLiteral(1, "1")), JasBlock(listOf(
+                statement(invoke(field("__result"), "fail", JasCastExpr(field("__pending"), JasNamedType(FAILURE))))
+            )), null),
+            JasIf(JasBinaryOp(field("__abort"), "==", JasIntLiteral(2, "2")), JasBlock(listOf(
+                statement(invoke(field("__result"), "cancel"))
+            )), null)
+        )
+        // 只有结果已终结且不在任何清理区域内时才关闭调度门、标记 settled。为什么要看区域：挂起点
+        // 注册回调之后、run 返回之前作用域可能取消结果；此时结果已终结但区域清理尚未执行，若
+        // 照常关闭调度门，取消回调请求的那次恢复会被丢弃，清理永远不会执行。不关闭时该请求由
+        // 调度门在本段结束后重新运行帧，入口检查跳出分派循环并展开清理，展开后区域为 0 再回收。
+        val settleCondition = if (regionSlot == null) invoke(field("__result"), "isDone") else JasBinaryOp(
+            invoke(field("__result"), "isDone"), "&&",
+            JasBinaryOp(field(regionSlot), "==", JasIntLiteral(0, "0"))
+        )
+        // 发布本身（结果回调）抛出时结果已终结，再次失败发布不会改写终态，只保证异常不逃出 run。
+        val caught = JasIdentifier("__late")
+        val guardedRun = JasTry(
+            JasBlock(listOf(guardedLoop) + unwind + publish),
+            listOf(JasCatchClause(
+                JasParameter("__late", JasNamedType("java.lang.Throwable")),
                 JasBlock(listOf(
                     statement(invoke(field("__result"), "fail", JasNew(
                         JasNamedType(FAILURE),
@@ -310,7 +395,7 @@ object LinearCoroutineEmitter {
                 ))
             )),
             JasBlock(listOf(
-                JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(
+                JasIf(settleCondition, JasBlock(listOf(
                     statement(invoke(field("__dispatch"), "finish")),
                     statement(invoke(field("__result"), "markTaskSettled"))
                 )), null)

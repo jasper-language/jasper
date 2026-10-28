@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlannerTest.kt —— S4-C 第十至十六片基本块规划器的契约与属性测试
+// CoroutineBlockPlannerTest.kt —— S4-C 第十至十七片基本块规划器的契约与属性测试
 // ============================================================================
 // 做什么：直接构造已「类型检查」的 AST（真实 await 节点回填 awaitResultType），
 //   锁定块规划器的结构不变量、拒绝边界，并用固定种子随机程序比对两套独立语义：
@@ -12,7 +12,9 @@
 //   误接汇合边）。第十一片起随机程序含 while / break / continue，块状态机解释器
 //   允许回边，但只允许回到规划器登记的循环头；第十二片另有一组随机程序含 do-while 与三段式 for
 //   （continue 前进到条件块 / 步进块）；第十六片另有一组随机程序给循环随机加标签，break /
-//   continue 随机跳到任一外层循环。
+//   continue 随机跳到任一外层循环；第十七片另有一组随机程序含 try/finally，清理体调用 `mark(k)`
+//   记录轨迹，输入中的哨兵值表示挂起点失败：块状态机按 `$region` 展开清理（与发射器相同的算法），
+//   两套语义比对结果（含失败）与清理轨迹。
 // ============================================================================
 
 package jasper
@@ -21,6 +23,7 @@ import jasper.ast.*
 import jasper.translator.CoroutineBlockExit
 import jasper.translator.CoroutineBlockPlan
 import jasper.translator.CoroutineBlockPlanner
+import jasper.translator.CoroutineTryRegion
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -309,7 +312,27 @@ class CoroutineBlockPlannerTest {
                 JasIf(id("flag"), block(decl("v", await("input")), JasReturn(id("v"))), block(decl("v", lit(1)), JasReturn(id("v"))))
             ),
             "untyped-local" to function(decl("v", lit(1), null), JasReturn(id("v"))),
-            "throw" to function(JasThrow(id("input")))
+            "throw" to function(JasThrow(id("input"))),
+            "try-catch" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))),
+                listOf(JasCatchClause(JasParameter("e", JasNamedType("Error")), block())), block()), JasReturn(id("v"))),
+            "await-in-finally" to function(decl("v", lit(0)), JasTry(block(set("v", lit(1))), emptyList(),
+                block(set("v", await("input")))), JasReturn(id("v"))),
+            "await-in-finally-condition" to function(decl("v", await("input")), JasTry(block(set("v", lit(1))), emptyList(),
+                block(JasIf(JasBinaryOp(await("input"), ">", lit(0)), block(), null))), JasReturn(id("v"))),
+            "return-in-finally" to function(decl("v", await("input")), JasTry(block(set("v", lit(1))), emptyList(),
+                block(JasReturn(lit(2)))), JasReturn(id("v"))),
+            "break-out-of-finally" to function(decl("v", await("input")), JasWhile(id("flag"), block(
+                JasTry(block(set("v", lit(1))), emptyList(), block(JasBreakStatement(null))))), JasReturn(id("v"))),
+            "labeled-break-in-finally-loop" to function(decl("v", await("input")), JasLabeledStatement("outer", JasWhile(id("flag"), block(
+                JasTry(block(set("v", lit(1))), emptyList(), block(JasWhile(id("flag"), block(JasBreakStatement("outer")))))))),
+                JasReturn(id("v"))),
+            "try-in-finally" to function(decl("v", await("input")), JasTry(block(set("v", lit(1))), emptyList(),
+                block(JasTry(block(), emptyList(), block()))), JasReturn(id("v"))),
+            "for-in-finally" to function(decl("v", await("input")), JasTry(block(set("v", lit(1))), emptyList(),
+                block(JasForStatement(null, id("flag"), null, block()))), JasReturn(id("v"))),
+            "finally-duplicate-local" to function(decl("v", await("input")), JasTry(block(decl("w", lit(1))), emptyList(),
+                block(decl("w", lit(2)))), JasReturn(id("v"))),
+            "defer" to function(decl("v", await("input")), JasDefer(block(set("v", lit(1)))), JasReturn(id("v")))
         )
         for ((name, fn) in cases) {
             val plan = CoroutineBlockPlanner.plan(fn, parameters)
@@ -320,6 +343,12 @@ class CoroutineBlockPlannerTest {
 
     // ---------------------------------------------------------------- 属性测试
 
+    /** 挂起点失败的输入哨兵（正常输入都在 [-6, 6]）。 */
+    private val FAIL = 99
+
+    /** 直接解释器中挂起点失败沿调用栈传播的信号。 */
+    private class AwaitFailed : RuntimeException(null, null, false, false)
+
     /** 循环控制在直接解释器中的跳出信号。 */
     private class LoopJump(val isBreak: Boolean, val label: String?) : RuntimeException(null, null, false, false)
 
@@ -327,13 +356,17 @@ class CoroutineBlockPlannerTest {
     private class AstInterpreter(val inputs: Iterator<Int>) {
         val env = mutableMapOf<String, Int>()
         var consumed = 0
+        /** 清理体中 `mark(k)` 的调用轨迹。 */
+        val trace = mutableListOf<Int>()
 
         fun eval(expression: JasExpression): Int = when (expression) {
             is JasIntLiteral -> expression.value.toInt()
             is JasIdentifier -> env.getValue(expression.name)
-            is JasUnaryOp -> { consumed++; inputs.next() }
-            // 生成器里唯一的被调函数 mix(a, b) = 3a - b：实参自左向右求值，不可交换，顺序错位即失配。
-            is JasCall -> expression.args.map(::eval).let { (a, b) -> 3 * a - b }
+            is JasUnaryOp -> { consumed++; inputs.next().also { if (it == 99) throw AwaitFailed() } }
+            // `mark(k)` 只记录轨迹；其余被调函数是 mix(a, b) = 3a - b：实参自左向右求值，不可交换，顺序错位即失配。
+            is JasCall -> if ((expression.target as? JasIdentifier)?.name == "mark") {
+                trace += eval(expression.args.single()); 0
+            } else expression.args.map(::eval).let { (a, b) -> 3 * a - b }
             is JasBinaryOp -> when (expression.op) {
                 // 短路：左操作数决定结果时右操作数（及其中的 await）不求值。
                 "&&" -> if (eval(expression.left) != 0 && eval(expression.right) != 0) 1 else 0
@@ -354,6 +387,7 @@ class CoroutineBlockPlannerTest {
                     val name = (expression.target as JasIdentifier).name
                     env[name] = env.getValue(name) + if (expression.op == "++") 1 else -1
                 }
+                is JasCall -> eval(expression)
                 else -> error(expression.javaClass.simpleName)
             }
         }
@@ -416,6 +450,13 @@ class CoroutineBlockPlannerTest {
                     is JasBreakStatement -> throw LoopJump(true, statement.label)
                     is JasContinueStatement -> throw LoopJump(false, statement.label)
                     is JasReturn -> return eval(requireNotNull(statement.value))
+                    // Kotlin 的 try/finally 与源码同义：返回值先求出，跳转与失败信号在清理之后继续传播。
+                    is JasTry -> try {
+                        run(statement.body.statements)
+                    } finally {
+                        run(requireNotNull(statement.finallyBody).statements)
+                    }?.let { return it }
+                    is JasBlock -> run(statement.statements)?.let { return it }
                     else -> error(statement.javaClass.simpleName)
                 }
             }
@@ -428,21 +469,47 @@ class CoroutineBlockPlannerTest {
      * 循环头；步数有上限，回边接错导致的死循环直接失败。
      */
     private fun runBlocks(plan: CoroutineBlockPlan, inputs: Iterator<Int>, base: Int): Pair<Int, Int> {
+        val (result, suspensions, _) = runBlocksUnwinding(plan, inputs, base)
+        return requireNotNull(result) { "block machine failed without failure inputs" } to suspensions
+    }
+
+    /**
+     * 带清理区域的块状态机解释器：块的 cleanups 在出口前执行（先把 `$region` 退回外层）；
+     * 恢复块消费到失败哨兵时，按 `$region` 以编号从大到小展开清理（与发射器生成的展开代码
+     * 同一算法），结果为 null。返回 (结果, 挂起点数, 清理轨迹)。
+     */
+    private fun runBlocksUnwinding(plan: CoroutineBlockPlan, inputs: Iterator<Int>, base: Int): Triple<Int?, Int, List<Int>> {
         val env = mutableMapOf("base" to base)
         val ast = AstInterpreter(inputs).also { it.env.putAll(env) }
+        val regions = plan.tryRegions.associateBy(CoroutineTryRegion::id)
+        fun cleanup(region: CoroutineTryRegion) {
+            ast.env[CoroutineBlockPlanner.REGION_LOCAL] = region.parent
+            check(ast.run(region.cleanup.statements) == null) { "cleanup returned" }
+        }
         var phase = 0
         var suspensions = 0
         var steps = 0
         while (true) {
             check(++steps < 100_000) { "block machine did not terminate" }
             val block = plan.blocks[phase]
-            block.resumeBinding?.let { ast.env[it] = inputs.next(); suspensions++ }
+            block.resumeBinding?.let {
+                val value = inputs.next()
+                suspensions++
+                if (value == FAIL) {
+                    plan.tryRegions.sortedByDescending { it.id }.forEach { region ->
+                        if (ast.env[CoroutineBlockPlanner.REGION_LOCAL] == region.id) cleanup(region)
+                    }
+                    return Triple(null, suspensions, ast.trace)
+                }
+                ast.env[it] = value
+            }
             block.assignments.forEach { (name, value) -> ast.env[name] = ast.eval(value) }
+            block.cleanups.forEach { cleanup(regions.getValue(it)) }
             val next = when (val exit = block.exit) {
                 is CoroutineBlockExit.Goto -> exit.target
                 is CoroutineBlockExit.Branch -> if (ast.eval(exit.condition) != 0) exit.whenTrue else exit.whenFalse
                 is CoroutineBlockExit.Suspend -> exit.resume
-                is CoroutineBlockExit.Finish -> return ast.eval(exit.value) to suspensions
+                is CoroutineBlockExit.Finish -> return Triple(ast.eval(exit.value), suspensions, ast.trace)
             }
             check(next > phase || next in plan.loopHeaders) { "phase jumped backwards to a non-header: $phase -> $next" }
             phase = next
@@ -460,7 +527,8 @@ class CoroutineBlockPlannerTest {
         val nestedAwaits: Boolean = false,
         val callAwaits: Boolean = false,
         val shortCircuits: Boolean = false,
-        val labels: Boolean = false
+        val labels: Boolean = false,
+        val tries: Boolean = false
     ) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
@@ -497,6 +565,8 @@ class CoroutineBlockPlannerTest {
 
         fun awaitNode() = JasUnaryOp("await", JasIdentifier("input")).also { it.awaitResultType = JasPrimitiveType("int32") }
 
+        fun markCall(code: Int) = JasExpressionStatement(JasCall(JasIdentifier("mark"), listOf(JasIntLiteral(code.toLong(), ""))))
+
         /**
          * 生成语句序列；mustReturn 时以 return 结束；inLoop 时可能以 break/continue 结束。
          * [enclosing] 是由内到外的外层循环标签（无标签为 null），labels 时跳转随机选一层带标签的
@@ -513,8 +583,29 @@ class CoroutineBlockPlannerTest {
             val statements = mutableListOf<JasStatement>()
             repeat(random.nextInt(0, 4)) {
                 // labels 时循环体内额外偏向再开一层循环，使「内层循环跳到外层标签」有足够的嵌套可用。
-                val choice = if (labels && inLoop && depth > 0 && random.nextInt(3) == 0) 5 else random.nextInt(if (depth > 0) 7 else 4)
+                val choice = when {
+                    tries && depth > 0 && random.nextInt(3) == 0 -> 7
+                    labels && inLoop && depth > 0 && random.nextInt(3) == 0 -> 5
+                    else -> random.nextInt(if (depth > 0) 7 else 4)
+                }
                 when (choice) {
+                    7 -> {
+                        // try 体可以 return / break / continue 跨出区域；清理体先记轨迹，再随机改写外层
+                        // 局部（正常路径上可观察）、可带一个条件分支。
+                        val (body, bodyTerminates) = sequence(depth - 1, scope, random.nextInt(4) == 0, inLoop, enclosing)
+                        val code = counter++
+                        val cleanup = mutableListOf<JasStatement>(markCall(code))
+                        val writable = scope.filter { it != "base" && it !in counters }
+                        if (writable.isNotEmpty() && random.nextBoolean()) {
+                            cleanup += JasExpressionStatement(JasAssignment(JasIdentifier(writable.random(random)), expression(scope)))
+                        }
+                        if (random.nextInt(3) == 0) {
+                            cleanup += JasIf(JasBinaryOp(expression(scope), ">", JasIntLiteral(0, "0")),
+                                JasBlock(listOf(markCall(-code))), null)
+                        }
+                        statements += JasTry(JasBlock(body), emptyList(), JasBlock(cleanup))
+                        if (bodyTerminates) return statements to true
+                    }
                     0, 1 -> {
                         val name = "v${counter++}"
                         val value = if (random.nextInt(3) == 0) awaitNode() else expression(scope)
@@ -724,6 +815,7 @@ class CoroutineBlockPlannerTest {
                     is JasIf -> jumpsToThisLoop(statement.thenBody.statements, label, nested) ||
                         (statement.elseBody?.let { jumpsToThisLoop(it.statements, label, nested) } ?: false)
                     is JasLabeledStatement -> jumpsToThisLoop(listOf(statement.statement), label, nested)
+                    is JasTry -> jumpsToThisLoop(statement.body.statements, label, nested)
                     is JasWhile -> jumpsToThisLoop(statement.body.statements, label, nested = true)
                     is JasDoWhile -> jumpsToThisLoop(statement.body.statements, label, nested = true)
                     is JasForStatement -> jumpsToThisLoop(statement.body.statements, label, nested = true)
@@ -1031,5 +1123,104 @@ class CoroutineBlockPlannerTest {
         }
         assertTrue(shortCircuitPrograms > 100, "generator too weak: only $shortCircuitPrograms programs branch on a short-circuit")
         assertTrue(nestedPrograms > 40, "generator too weak: only $nestedPrograms programs with several short-circuits")
+    }
+
+    /**
+     * 做什么：嵌套 try/finally 的块形状：进入 try 体的块写区域编号；内层 try 体中 await 之后的
+     *   return 先把返回值存入临时局部，再按内、外顺序清理；循环内跨出内层区域的 break 只清理
+     *   内层；try 体正常结束的块清理后前进到新块。
+     * 失败模式：清理顺序颠倒、返回值在清理之后才求值、break 多清理了循环外的区域。
+     */
+    @Test
+    fun `try finally blocks record regions and run cleanups before leaving`() {
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("v", lit(0)),
+            JasTry(block(
+                JasWhile(id("flag"), block(
+                    JasTry(block(
+                        set("v", await("input")),
+                        JasIf(JasBinaryOp(id("v"), ">", lit(3)), block(JasReturn(id("v"))), null),
+                        JasIf(JasBinaryOp(id("v"), ">", lit(1)), block(JasBreakStatement(null)), null)
+                    ), emptyList(), block(set("v", JasBinaryOp(id("v"), "+", lit(10)))))
+                )),
+                set("v", JasBinaryOp(id("v"), "+", lit(1)))
+            ), emptyList(), block(JasExpressionStatement(JasCall(id("mark"), listOf(lit(1)))))),
+            JasReturn(id("v"))
+        ), parameters)
+        assertWellFormed(plan, "nested try")
+        assertEquals(listOf(1 to 0, 2 to 1), plan.tryRegions.map { it.id to it.parent })
+        assertTrue(CoroutineBlockPlanner.REGION_LOCAL to int in plan.locals)
+        val entries = plan.blocks.flatMap { block ->
+            block.assignments.filter { it.first == CoroutineBlockPlanner.REGION_LOCAL }.map { it.second }
+        }
+        assertEquals(listOf<JasExpression>(lit(1), lit(2)), entries)
+        val finishes = plan.blocks.filter { it.exit is CoroutineBlockExit.Finish }
+        // try 体内的 return：返回值存入临时局部，内层先清理；函数末尾的 return 不在区域内，不清理。
+        val inner = finishes.single { it.cleanups.isNotEmpty() }
+        assertEquals(listOf(2, 1), inner.cleanups)
+        val temp = (inner.exit as CoroutineBlockExit.Finish).value as JasIdentifier
+        assertTrue(temp.name.startsWith(CoroutineBlockPlanner.TEMP_PREFIX))
+        assertEquals(temp.name to id("v"), inner.assignments.last())
+        // break 与内层 try 体的正常结束只清理内层区域；外层 try 体正常结束只清理外层。
+        val cleanupLists = plan.blocks.filter { it.exit !is CoroutineBlockExit.Finish }.map { it.cleanups }.filter { it.isNotEmpty() }
+        assertEquals(listOf(listOf(2), listOf(2), listOf(1)), cleanupLists)
+    }
+
+    /** 是否有 try 体（任意深度）中的 return：它必然跨出区域并按由内到外执行清理。 */
+    private fun returnsFromRegion(statements: List<JasStatement>, inTry: Boolean): Boolean = statements.any { statement ->
+        when (statement) {
+            is JasReturn -> inTry
+            is JasTry -> returnsFromRegion(statement.body.statements, true)
+            is JasIf -> returnsFromRegion(statement.thenBody.statements, inTry) ||
+                returnsFromRegion(statement.elseBody?.statements.orEmpty(), inTry)
+            is JasLabeledStatement -> returnsFromRegion(listOf(statement.statement), inTry)
+            is JasWhile, is JasDoWhile, is JasForStatement -> returnsFromRegion(loopBody(statement), inTry)
+            else -> false
+        }
+    }
+
+    /**
+     * 做什么：固定种子 20261109 生成 400 个随机程序：在第十二片循环形态上随机包 try/finally（可嵌套、
+     *   可在循环内外，try 体可 return / break / continue 跨出区域），清理体调用 `mark(k)` 并可改写外层
+     *   局部；每个程序 4 组输入，输入中约 1/12 是失败哨兵。比对两套语义的结果（失败为 null）、挂起点数
+     *   与清理轨迹（顺序与次数）；另要求跨区域跳转、挂起点失败展开与嵌套区域都有足够数量。
+     * 失败模式：打印种子、用例、输入与程序 AST。
+     */
+    @Test
+    fun `seeded try finally block machines match direct AST semantics`() {
+        val seed = 20261109
+        val random = Random(seed)
+        var nested = 0
+        var unwound = 0
+        var leavingJumps = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, tries = true).sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (plan.tryRegions.any { it.parent != 0 }) nested++
+            if (returnsFromRegion(body, inTry = false)) leavingJumps++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) { if (random.nextInt(12) == 0) FAIL else random.nextInt(-6, 7) }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = try {
+                    requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                } catch (_: AwaitFailed) {
+                    null
+                }
+                val (actual, suspensions, trace) = runBlocksUnwinding(plan, inputs.iterator(), base)
+                val detail = "$context round=$round base=$base inputs=${inputs.take(64)}"
+                assertEquals(expected, actual, detail)
+                assertEquals(direct.consumed, suspensions, "$detail suspension count")
+                assertEquals(direct.trace, trace, "$detail cleanup trace")
+                if (actual == null && trace.isNotEmpty()) unwound++
+            }
+        }
+        assertTrue(nested > 40, "generator too weak: only $nested programs with nested regions")
+        assertTrue(leavingJumps > 40, "generator too weak: only $leavingJumps programs return from inside a region")
+        assertTrue(unwound > 40, "generator too weak: only $unwound failed rounds unwound cleanups")
     }
 }
