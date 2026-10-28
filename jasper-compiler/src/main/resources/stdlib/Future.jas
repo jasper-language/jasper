@@ -10,6 +10,7 @@ package std;
 //
 // 关键不变量：
 //   1) 终态恰好发布一次：complete/fail/cancel 只有第一个成功，其余返回 false；
+//      取消原因随 Cancelled 终态一起写入，因此首个原因稳定；
 //   2) 回调永不在持有互斥锁时执行，避免用户在回调里再次调用本 Future 造成死锁；
 //   3) get() 先注册等待者再检查终态，终态发布时按等待者数量精确唤醒，不丢通知；
 //   4) 失败以 Failure（业务数据）保存，不保存 Error 对象——语言裁决「错误不是值」。
@@ -92,18 +93,20 @@ public class FutureOutcome {
     private var statusValue: FutureStatus;
     private var valueValue: any;
     private var failureValue: Failure?;
+    private var reasonValue: CancellationReason?;
 
     /**
      * 做什么：构造一次终态快照。
      * 什么时候用：仅供 Future 内部发布终态时调用。
-     * 前置条件：statusValue 不是 Pending；Completed 带 value，Failed 带 failure。
+     * 前置条件：statusValue 不是 Pending；Completed 带 value，Failed 带 failure，Cancelled 带 reason。
      * 失败模式：不会失败。
      * 为什么这样设计：不可变视图让回调看到的永远是发布瞬间的结果。
      */
-    public constructor(statusValue: FutureStatus, valueValue: any, failureValue: Failure?) {
+    public constructor(statusValue: FutureStatus, valueValue: any, failureValue: Failure?, reasonValue: CancellationReason?) {
         this.statusValue = statusValue;
         this.valueValue = valueValue;
         this.failureValue = failureValue;
+        this.reasonValue = reasonValue;
     }
 
     /** 做什么：返回终态类别。前置条件：无；失败模式：不会失败。 */
@@ -134,6 +137,11 @@ public class FutureOutcome {
     /** 做什么：返回失败快照。前置条件：仅 Failed 非空；失败模式：其他状态返回 null。 */
     public function failure(): Failure? {
         return this.failureValue;
+    }
+
+    /** 做什么：返回取消原因。前置条件：仅 Cancelled 非空；失败模式：其他状态返回 null。 */
+    public function cancellationReason(): CancellationReason? {
+        return this.reasonValue;
     }
 }
 
@@ -192,6 +200,8 @@ public class Future<T> {
     private var statusValue: FutureStatus;
     private var valueValue: any;
     private var failureValue: Failure?;
+    // 只在 Cancelled 终态非空：首个生效的取消原因，与终态一起在 finish 中一次写入。
+    private var reasonValue: CancellationReason?;
     private var acknowledged: bool;
     private var handlers: MutableList<Action<FutureOutcome>>;
     private var waiters: int32;
@@ -212,6 +222,7 @@ public class Future<T> {
         this.statusValue = FutureStatus.Pending;
         this.valueValue = 0;
         this.failureValue = null;
+        this.reasonValue = null;
         this.acknowledged = false;
         this.handlers = new MutableList<Action<FutureOutcome>>();
         this.waiters = 0;
@@ -297,7 +308,7 @@ public class Future<T> {
      * 失败模式：已终态返回 false；发布成功后回调全部尝试，有失败则抛 CallbackDispatchError。
      */
     public function complete(value: T): bool {
-        return this.finish(FutureStatus.Completed, value, null);
+        return this.finish(FutureStatus.Completed, value, null, null);
     }
 
     /**
@@ -311,17 +322,59 @@ public class Future<T> {
         if (failure == null) {
             return false;
         }
-        return this.finish(FutureStatus.Failed, 0, failure);
+        return this.finish(FutureStatus.Failed, 0, failure, null);
     }
 
     /**
-     * 做什么：尝试请求取消。
+     * 做什么：以 Explicit 原因尝试请求取消；等价于 cancelWith(CancellationReason.Explicit)。
      * 什么时候用：调用方不再需要结果时；运行中的任务需通过 CancellationToken 协作退出。
      * 前置条件：无。
-     * 失败模式：已终态返回 false；通知失败在取消后汇总抛出，不强制终止线程。
+     * 失败模式：同 cancelWith。
      */
     public function cancel(): bool {
-        return this.finish(FutureStatus.Cancelled, 0, null);
+        return this.cancelWith(CancellationReason.Explicit);
+    }
+
+    /**
+     * 做什么：以指定原因尝试发布 Cancelled 终态。
+     * 什么时候用：TaskGroup 级联取消（SiblingFailed）、作用域已取消时新帧沿用作用域原因、
+     *   TaskRunner 把任务体观察到的取消原因写入结果。
+     * 前置条件：reason 非 null。
+     * 失败模式：已终态返回 false 且不改原因；通知失败在取消后汇总抛出，不强制终止线程。
+     * 为什么原因随终态一起写：原因只属于 Cancelled 终态，终态互斥即保证首个原因稳定。
+     */
+    public function cancelWith(reason: CancellationReason): bool {
+        return this.finish(FutureStatus.Cancelled, 0, null, reason);
+    }
+
+    /**
+     * 做什么：返回取消原因；非 Cancelled 状态返回 null。
+     * 什么时候用：TaskGroup.close 报告取消原因、诊断与测试。
+     * 前置条件：无。
+     * 失败模式：不会失败；一旦非 null 便不再改变。
+     */
+    public function cancellationReason(): CancellationReason? {
+        this.mutex.acquireUninterruptibly();
+        var result: CancellationReason? = this.reasonValue;
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：Cancelled 时返回取消原因，其他状态返回 fallback。
+     * 什么时候用：调用方已观察到 Cancelled、需要把原因交给只接受非空原因的接口时（TaskGroup.close）。
+     * 前置条件：fallback 非 null。
+     * 失败模式：不会失败。
+     * 为什么提供：状态与原因在同一把锁下读取，调用方无需对可空结果再做判空分支。
+     */
+    public function cancellationReasonOr(fallback: CancellationReason): CancellationReason {
+        this.mutex.acquireUninterruptibly();
+        var result: CancellationReason = fallback;
+        if (this.statusValue == FutureStatus.Cancelled) {
+            result = cast this.reasonValue as CancellationReason;
+        }
+        this.mutex.release();
+        return result;
     }
 
     /**
@@ -409,12 +462,12 @@ public class Future<T> {
     /**
      * 做什么：把 Future 推入指定终态，并唤醒等待者、复制并执行回调。
      * 什么时候用：complete/fail/cancel 的唯一实现路径。
-     * 前置条件：nextStatus 不是 Pending。
+     * 前置条件：nextStatus 不是 Pending；只有 Cancelled 带非空 nextReason。
      * 失败模式：已有终态时返回 false；回调全部尝试后以 CallbackDispatchError 汇总失败。
      * 为什么把迁移集中到一处：终态互斥、恰好一次发布、通知顺序都是同一变化点；
      *   分散实现会让双重完成或漏唤醒在某条路径上复发。
      */
-    private function finish(nextStatus: FutureStatus, nextValue: any, nextFailure: Failure?): bool {
+    private function finish(nextStatus: FutureStatus, nextValue: any, nextFailure: Failure?, nextReason: CancellationReason?): bool {
         this.mutex.acquireUninterruptibly();
         if (this.statusValue != FutureStatus.Pending) {
             this.mutex.release();
@@ -423,6 +476,7 @@ public class Future<T> {
         this.statusValue = nextStatus;
         this.valueValue = nextValue;
         this.failureValue = nextFailure;
+        this.reasonValue = nextReason;
         var pendingHandlers: MutableList<Action<FutureOutcome>> = new MutableList<Action<FutureOutcome>>();
         for (handler in this.handlers) {
             pendingHandlers.add(handler);
@@ -434,7 +488,7 @@ public class Future<T> {
         if (waiterCount > 0) {
             this.terminalSignal.release(waiterCount);
         }
-        var snapshot: FutureOutcome = new FutureOutcome(nextStatus, nextValue, nextFailure);
+        var snapshot: FutureOutcome = new FutureOutcome(nextStatus, nextValue, nextFailure, nextReason);
         // 回调在锁外按注册顺序执行；单个失败不能丢弃后续通知。
         var callbackFailures: int32 = 0;
         var firstFailure: string = "";
@@ -460,7 +514,7 @@ public class Future<T> {
      */
     private function outcome(): FutureOutcome {
         this.mutex.acquireUninterruptibly();
-        var snapshot: FutureOutcome = new FutureOutcome(this.statusValue, this.valueValue, this.failureValue);
+        var snapshot: FutureOutcome = new FutureOutcome(this.statusValue, this.valueValue, this.failureValue, this.reasonValue);
         this.mutex.release();
         return snapshot;
     }

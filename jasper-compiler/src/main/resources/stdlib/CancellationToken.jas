@@ -4,12 +4,14 @@ package std;
 // CancellationToken.jas —— 只触发一次的协作式取消令牌
 // ============================================================================
 // 职责：
-//   保存一个布尔取消状态和一组取消回调；取消是请求，不是线程终止。重复 cancel()
-//   幂等；onCancel 与 cancel 的竞争由同一把互斥锁线性化，注册时若已取消则立即回调。
+//   保存一个布尔取消状态、首个取消原因和一组取消回调；取消是请求，不是线程终止。
+//   重复取消幂等且保留第一次的原因；onCancel 与取消的竞争由同一把互斥锁线性化，
+//   注册时若已取消则立即回调。
 //
 // 父子关系：
 //   createChild() 建立根令牌到子令牌的单向链接：父取消传播到子，子取消不反传。
-//   子令牌自己仍可独立取消；父令牌不知道子的存在。
+//   子令牌自己仍可独立取消；父令牌不知道子的存在。父取消传播时子令牌沿用父的原因
+//   （同一作用域内的取消源是同一个），子令牌若已先因别的原因取消则保留自己的原因。
 //
 // 设计边界（变化点）：
 //   「取消如何被观察」集中在 isCancelled/onCancel；Future、TaskGroup 和未来的阻塞
@@ -21,18 +23,50 @@ package std;
 // ============================================================================
 
 /**
+ * 取消原因（S4 草案 §4.1 的取消源表）。
+ *
+ * 做什么：区分一次取消「为什么发生」，供清理代码与作用域关闭报告判定。
+ * 什么时候用：令牌、Future 与 TaskGroup 记录首个取消原因；CancellationException.reason() 返回它。
+ * 失败模式：纯枚举，无失败路径。
+ * 各值含义：
+ *   - Explicit：调用方直接取消（Future.cancel / TaskGroup.cancel / CancellationToken.cancel）；
+ *   - Parent：父任务取消跨任务传播到子任务（嵌套作用域链接由后续切片使用）；
+ *   - Deadline：截止时间到期（契约 §4 称 DeadlineExceeded；计时由后续切片接入）；
+ *   - ScopeExit：作用域异常退出时取消未完成子任务（由后续切片使用）；
+ *   - SiblingFailed：普通组首个业务失败级联取消其余兄弟。
+ * 契约 §4 把 Deadline 以外的原因统称为普通取消请求（Cancelled）；这里保留更细的取消源，
+ *   isDeadline 一类判定由调用方按值比较完成。
+ * 为什么首个原因稳定：取消可能被多个源同时请求，只有第一个生效的源决定原因，后到者不覆盖。
+ */
+public enum CancellationReason {
+    Explicit,
+    Parent,
+    Deadline,
+    ScopeExit,
+    SiblingFailed,
+}
+
+/**
  * 取消通道使用的结构化异常。
  *
- * 做什么：让「任务主动观察取消」与「业务失败」走不同 catch 分支。
- * 什么时候用：任务体调用 throwIfCancelled，或在协作检查点决定终止时。
- * 前置条件：令牌已取消。
+ * 做什么：让「任务主动观察取消」与「业务失败」走不同 catch 分支，并携带取消原因。
+ * 什么时候用：任务体调用 throwIfCancelled、协作检查点决定终止，或作用域关闭只观察到取消时。
+ * 前置条件：令牌或作用域已取消，reason 为首个生效的取消原因。
  * 失败模式：不会失败。
  * 为什么独立类型：TaskGroup 的聚合必须把取消原因与业务 primary 分开。
  */
 public class CancellationException extends Error {
-    /** 做什么：构造取消异常。前置条件：message 非 null；失败模式：不会失败。 */
-    public constructor(message: string) {
+    private var reasonValue: CancellationReason;
+
+    /** 做什么：构造取消异常。前置条件：message 与 reason 非 null；失败模式：不会失败。 */
+    public constructor(message: string, reason: CancellationReason) {
         super(message);
+        this.reasonValue = reason;
+    }
+
+    /** 做什么：返回首个生效的取消原因。前置条件：无；失败模式：不会失败。 */
+    public function reason(): CancellationReason {
+        return this.reasonValue;
     }
 }
 
@@ -49,6 +83,8 @@ public class CancellationException extends Error {
 public class CancellationToken {
     private var mutex: java.util.concurrent.Semaphore;
     private var cancelled: bool;
+    // 仅在 cancelled 为真时有意义；构造时的值不可观察（reason() 未取消时返回 null）。
+    private var reasonValue: CancellationReason;
     private var handlers: MutableList<Action<CancellationToken>>;
 
     /**
@@ -61,6 +97,7 @@ public class CancellationToken {
     public constructor() {
         this.mutex = new java.util.concurrent.Semaphore(1);
         this.cancelled = false;
+        this.reasonValue = CancellationReason.Explicit;
         this.handlers = new MutableList<Action<CancellationToken>>();
     }
 
@@ -78,20 +115,64 @@ public class CancellationToken {
     }
 
     /**
-     * 做什么：请求取消并触发全部回调；只有第一次返回 true。
-     * 什么时候用：TaskGroup 首个失败取消兄弟、父令牌取消传播、或调用方主动取消。
+     * 做什么：返回首个生效的取消原因；未取消时返回 null。
+     * 什么时候用：清理代码区分「为什么停下」，TaskGroup.close 报告取消原因。
      * 前置条件：无。
-     * 失败模式：全部回调尝试后以 CallbackDispatchError 汇总失败；重复调用返回 false。
-     * 为什么先置位再回调：保证回调里调用 isCancelled() 一定能观察到已取消，
-     *   也保证注册与取消的竞争有确定结果。
+     * 失败模式：不会失败；一旦非 null 便不再改变。
+     */
+    public function reason(): CancellationReason? {
+        this.mutex.acquireUninterruptibly();
+        var result: CancellationReason? = null;
+        if (this.cancelled) {
+            result = this.reasonValue;
+        }
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：已取消时返回首个原因，未取消时返回 fallback。
+     * 什么时候用：调用方已观察到取消、需要把原因继续传给只接受非空原因的接口时。
+     * 前置条件：fallback 非 null。
+     * 失败模式：不会失败。
+     * 为什么提供：取消状态与原因在同一把锁下读取，避免「先 isCancelled 再 reason」两次读取之间的空窗。
+     */
+    public function reasonOr(fallback: CancellationReason): CancellationReason {
+        this.mutex.acquireUninterruptibly();
+        var result: CancellationReason = fallback;
+        if (this.cancelled) {
+            result = this.reasonValue;
+        }
+        this.mutex.release();
+        return result;
+    }
+
+    /**
+     * 做什么：以 Explicit 原因请求取消；等价于 cancelWith(CancellationReason.Explicit)。
+     * 什么时候用：调用方主动取消。
+     * 前置条件：无。
+     * 失败模式：同 cancelWith。
      */
     public function cancel(): bool {
+        return this.cancelWith(CancellationReason.Explicit);
+    }
+
+    /**
+     * 做什么：以指定原因请求取消并触发全部回调；只有第一次返回 true，且只有第一次的原因被记录。
+     * 什么时候用：TaskGroup 首个失败取消兄弟、父令牌取消传播、或调用方主动取消。
+     * 前置条件：reason 非 null。
+     * 失败模式：全部回调尝试后以 CallbackDispatchError 汇总失败；重复调用返回 false 且不改原因。
+     * 为什么先置位再回调：保证回调里调用 isCancelled()/reason() 一定能观察到已取消与原因，
+     *   也保证注册与取消的竞争有确定结果。
+     */
+    public function cancelWith(reason: CancellationReason): bool {
         this.mutex.acquireUninterruptibly();
         if (this.cancelled) {
             this.mutex.release();
             return false;
         }
         this.cancelled = true;
+        this.reasonValue = reason;
         var pending: MutableList<Action<CancellationToken>> = new MutableList<Action<CancellationToken>>();
         for (handler in this.handlers) {
             pending.add(handler);
@@ -154,12 +235,16 @@ public class CancellationToken {
      * 做什么：在协作检查点观察取消并抛出 CancellationException。
      * 什么时候用：任务体准备继续业务计算前。
      * 前置条件：无。
-     * 失败模式：已取消时抛 CancellationException；未取消时直接返回。
+     * 失败模式：已取消时抛携带首个原因的 CancellationException；未取消时直接返回。
      * 为什么单独提供：让业务代码用统一 catch 通道处理取消，而不是散落 if 判断。
      */
     public function throwIfCancelled(): void {
-        if (this.isCancelled()) {
-            throw new CancellationException("operation cancelled");
+        this.mutex.acquireUninterruptibly();
+        var observed: bool = this.cancelled;
+        var observedReason: CancellationReason = this.reasonValue;
+        this.mutex.release();
+        if (observed) {
+            throw new CancellationException("operation cancelled", observedReason);
         }
     }
 }
@@ -167,7 +252,7 @@ public class CancellationToken {
 /**
  * 父令牌到子令牌的传播动作。
  *
- * 做什么：作为 Action<CancellationToken> 注册到父令牌，在父取消时取消子令牌。
+ * 做什么：作为 Action<CancellationToken> 注册到父令牌，在父取消时以父的原因取消子令牌。
  * 什么时候用：CancellationToken.createChild 内部使用。
  * 前置条件：child 非 null。
  * 失败模式：child.cancel 幂等；子回调失败由父取消批次汇总。
@@ -182,12 +267,14 @@ public class ChildCancellation implements Action<CancellationToken> {
     }
 
     /**
-     * 做什么：父令牌取消时取消子令牌。
-     * 什么时候用：由父令牌 cancel 触发。
-     * 前置条件：child 已构造。
-     * 失败模式：子令牌已取消时返回；子回调失败向父批次传播但不阻断其他子令牌。
+     * 做什么：父令牌取消时以父的首个原因取消子令牌。
+     * 什么时候用：由父令牌 cancelWith 触发（回调在父令牌已置位之后执行，原因已确定）。
+     * 前置条件：child 已构造；parent 已取消。
+     * 失败模式：子令牌已取消时保留子的原因并返回；子回调失败向父批次传播但不阻断其他子令牌。
+     * 为什么 fallback 写 Parent：父已取消时 reasonOr 必返回父的原因，fallback 不可达；
+     *   选 Parent 是因为它是「父传播」语义下唯一不说谎的默认。
      */
     public function accept(parent: CancellationToken): void {
-        this.child.cancel();
+        this.child.cancelWith(parent.reasonOr(CancellationReason.Parent));
     }
 }

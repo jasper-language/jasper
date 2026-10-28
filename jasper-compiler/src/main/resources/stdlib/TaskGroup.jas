@@ -117,6 +117,7 @@ public class TaskGroup {
     private var aggregatePrimary: Failure?;
     private var aggregateSuppressed: int32;
     private var aggregateCancelled: bool;
+    private var aggregateReason: CancellationReason;
 
     /**
      * 做什么：创建普通组或监督组。
@@ -135,6 +136,7 @@ public class TaskGroup {
         this.aggregatePrimary = null;
         this.aggregateSuppressed = 0;
         this.aggregateCancelled = false;
+        this.aggregateReason = CancellationReason.Explicit;
     }
 
     /** 做什么：判断是否监督组。前置条件：无；失败模式：不会失败。 */
@@ -223,7 +225,8 @@ public class TaskGroup {
         if (scopeCancelled) {
             // 已取消（显式取消或普通组失败级联）的作用域里新帧不执行任何业务段：
             // 先发布 Cancelled，start 后帧在入口检查处直接回收，与 spawn 的令牌语义一致。
-            future.cancel();
+            // 原因沿用作用域根令牌的首个原因（Explicit 或 SiblingFailed），与 spawn 派生令牌一致。
+            future.cancelWith(this.rootToken.reasonOr(CancellationReason.Explicit));
         }
         try {
             task.start();
@@ -244,6 +247,8 @@ public class TaskGroup {
      * 什么时候用：作用域正常结束或异常退出前的 finally 中。
      * 前置条件：调用方接受等待已经启动的子任务；不可中断的外部阻塞可能让 close 阻塞。
      * 失败模式：未处理失败抛 TaskGroupFailure，仅有取消抛 CancellationException；首次聚合冻结。
+     *   CancellationException 的原因：作用域根令牌已取消时取其首个原因；否则取创建序最早的
+     *   已取消子任务的原因（子任务被单独取消），与 primary 的确定性顺序规则一致。
      * 为什么先复制子任务列表：等待期间不持锁，允许任务完成回调正常推进，也避免
      *   把长阻塞放进临界区。
      */
@@ -266,8 +271,12 @@ public class TaskGroup {
             var primary: Failure? = null;
             var suppressed: int32 = 0;
             var cancelled: bool = this.rootToken.isCancelled();
+            var reason: CancellationReason = this.rootToken.reasonOr(CancellationReason.Explicit);
             for (child in snapshot) {
-                if (child.status() == FutureStatus.Cancelled) { cancelled = true; }
+                if (child.status() == FutureStatus.Cancelled && !cancelled) {
+                    cancelled = true;
+                    reason = child.cancellationReasonOr(reason);
+                }
                 var failure: Failure? = child.failureOrNull();
                 if (failure == null) {
                     continue;
@@ -286,15 +295,17 @@ public class TaskGroup {
             this.aggregatePrimary = primary;
             this.aggregateSuppressed = suppressed;
             this.aggregateCancelled = cancelled;
+            this.aggregateReason = reason;
         }
         var decided: Failure? = this.aggregatePrimary;
         var decidedSuppressed: int32 = this.aggregateSuppressed;
         var decidedCancelled: bool = this.aggregateCancelled;
+        var decidedReason: CancellationReason = this.aggregateReason;
         this.mutex.release();
 
         if (decided == null) {
             if (decidedCancelled) {
-                throw new CancellationException("TaskGroup cancelled");
+                throw new CancellationException("TaskGroup cancelled", decidedReason);
             }
             return;
         }
@@ -306,22 +317,38 @@ public class TaskGroup {
     }
 
     /**
-     * 做什么：主动取消根令牌与全部未终态子任务。
-     * 什么时候用：父作用域异常或调用方提前放弃时；普通组首个失败内部也调用它。
+     * 做什么：以 Explicit 原因主动取消根令牌与全部未终态子任务。
+     * 什么时候用：父作用域异常或调用方提前放弃时。
      * 前置条件：无。
+     * 失败模式：同 cancelBecause。
+     */
+    public function cancel(): void {
+        this.cancelBecause(CancellationReason.Explicit);
+    }
+
+    /**
+     * 做什么：以指定原因取消根令牌与全部未终态子任务。
+     * 什么时候用：cancel（Explicit）与普通组首个失败级联（SiblingFailed）。
+     * 前置条件：reason 非 null。
      * 失败模式：通知全部尝试后汇总回调错误；取消不代表执行体已退出，仍应 close join。
      * 为什么同时取消根令牌与 Future：令牌负责协作检查，Future 负责让等待者立即
      *   观察到取消；两者都由同一取消请求驱动，不互相替代。
+     * 为什么子任务用根令牌的原因而不是传入原因：作用域只有一个取消原因——根令牌的首个
+     *   原因。两个取消源并发时（如显式取消与兄弟失败级联），后到者对根是空操作，若仍把自己
+     *   的原因写进尚未终态的子 Future，同一子任务的令牌（经 createChild 沿用根原因）与结果
+     *   会报告不同原因。读根令牌之后再写子任务，保证二者一致。
      */
-    public function cancel(): void {
+    private function cancelBecause(reason: CancellationReason): void {
         var callbackFailures: int32 = 0;
         var firstFailure: string = "";
         try {
-            this.rootToken.cancel();
+            this.rootToken.cancelWith(reason);
         } catch (error: java.lang.Throwable) {
             firstFailure = error.toString();
             callbackFailures = callbackFailures + 1;
         }
+        // 根令牌此时必已取消（cancelWith 先置位再回调，回调失败也不回滚），reasonOr 的回退不可达。
+        var effective: CancellationReason = this.rootToken.reasonOr(reason);
         var snapshot: MutableList<Future<any>> = new MutableList<Future<any>>();
         this.mutex.acquireUninterruptibly();
         for (child in this.children) {
@@ -330,7 +357,7 @@ public class TaskGroup {
         this.mutex.release();
         for (child in snapshot) {
             try {
-                child.cancel();
+                child.cancelWith(effective);
             } catch (error: java.lang.Throwable) {
                 if (callbackFailures == 0) { firstFailure = error.toString(); }
                 callbackFailures = callbackFailures + 1;
@@ -354,7 +381,7 @@ public class TaskGroup {
         if (this.supervisorScope) {
             return;
         }
-        this.cancel();
+        this.cancelBecause(CancellationReason.SiblingFailed);
     }
 }
 
@@ -434,13 +461,13 @@ public class TaskRunner<T> implements Runnable {
                 try {
                     var value: T = this.body.run(this.token);
                     if (this.token.isCancelled()) {
-                        this.future.cancel();
+                        this.future.cancelWith(this.token.reasonOr(CancellationReason.Explicit));
                     } else {
                         this.future.complete(value);
                     }
                 } catch (cancelled: CancellationException) {
-                    // 取消是独立终态，不写业务 Failure，也不触发兄弟失败级联。
-                    this.future.cancel();
+                    // 取消是独立终态，不写业务 Failure，也不触发兄弟失败级联；原因取自异常本身。
+                    this.future.cancelWith(cancelled.reason());
                 }
             } catch (error: Error) {
                 var failure: Failure = new Failure(error.message(), "error");

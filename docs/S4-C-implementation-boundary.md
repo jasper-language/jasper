@@ -1012,3 +1012,47 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 处理体使用捕获参数（含重新抛出）、构造实参中的 await、finally / defer 中的 throw / 挂起 / 跳出、for-in
 与循环后置块、实例 / 接收者调用实参中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与
 显式挂起标记名称；清理抛出以新失败取代原失败的既有差异同第十九片。
+
+## S4 取消原因运行时子片（实现次序第 6 条之一）
+
+本片只改 Jasper 运行时（`CancellationToken.jas`、`Future.jas`、`TaskGroup.jas`），编译器与帧协议不变。
+按草案 §4.1 取消源表新增公开枚举 `CancellationReason { Explicit, Parent, Deadline, ScopeExit, SiblingFailed }`。
+契约 §4 中的 `DeadlineExceeded` 对应 `Deadline`；其余四个值都属于契约所说的普通取消请求（`Cancelled`），
+这里保留更细的取消源。
+
+### 运行时规则
+
+- `CancellationToken.cancelWith(reason)` 只有首次置位返回 true 并记录原因；`cancel()` ≡ `cancelWith(Explicit)`；
+  `reason()` 未取消时为 null，之后不再改变；`reasonOr(fallback)` 在同一把锁下读状态与原因。
+- 子令牌（`createChild`）在父取消时沿用父的首个原因；已先因别的原因取消的子令牌保留自己的原因。
+  `throwIfCancelled` 抛出的 `CancellationException` 带该原因（`reason()`）。
+- `Future.cancelWith(reason)`：原因随 Cancelled 终态在 `finish` 中一次写入，终态互斥即首因稳定；
+  `cancel()` ≡ `cancelWith(Explicit)`；`cancellationReason()` / `cancellationReasonOr(fallback)`；
+  `FutureOutcome.cancellationReason()` 让回调看到原因。成功与失败终态无原因。
+- `TaskGroup.cancel()` 以 Explicit、普通组首个失败级联以 SiblingFailed 取消根令牌；随后取消子 Future 时
+  一律用根令牌的首个原因（而不是本次请求的原因）——作用域只有一个原因，并发的两个取消源中后到者对根是
+  空操作，若仍写自己的原因，同一子任务的令牌与结果会报告不同原因（TLA+ 变异配置复现）。
+- `launch` 进入已取消作用域的新帧以根令牌原因取消；`TaskRunner` 把任务体检查点异常的原因、或任务体返回后
+  观察到的令牌原因写入结果。
+- `close` 只有取消时抛 `CancellationException(message, reason)`：根令牌已取消取其首个原因，否则取创建序
+  最早的已取消子任务的原因（与 primary 的确定性顺序规则一致）。
+
+### 尚未接入（后续切片）
+
+- `Parent`：嵌套作用域 / 跨任务令牌链接尚不存在（TaskGroup 仍为单层）。
+- `ScopeExit`：作用域异常退出时取消未完成子任务的路径尚未实现（close 只等待）。
+- `Deadline`：截止时间计时与挂起点入口的截止检查尚未实现；当前只有调用方显式 `cancelWith(Deadline)`。
+- 生成帧：结果被作用域取消时原因正确（由 TaskGroup 写入）；帧自身因被等待的 Future 取消而发布 Cancelled
+  时仍按 `cancel()` 记 Explicit；帧内（清理代码中）查询取消原因的语言形态尚未提供。
+  `FutureCancelledError` 不带原因。
+
+### 验收结果
+
+- `CancellationReasonTest` 端到端 4 项（令牌首因与继承、Future 原因与回调快照、TaskGroup 显式 / 兄弟失败 /
+  单独取消 / 任务体 Deadline 的 close 报告、launch 进入已取消作用域），种子 20261121 的 300 个随机事件序列
+  逐步按精确 oracle 判定；`CancellationReasonLincheckTest` 两线程交错；`CancellationReasonFuzzTest`
+  61 秒 271841 次无失败、165 条语料入库。
+- 变异：子任务用请求原因、子令牌固定 Parent、TaskRunner 丢弃异常原因均被抓；「close 忽略根原因」在当前
+  API 下为等价变异（见登记表 `LANG-S4-REASON-01`）。
+- TLA+：新增 `CancellationReasonPropagation`（9709 个不同状态）与变异配置；`run-s4-models.sh` 十五组通过。
+- 全量 `./gradlew test` 0 失败 / 0 错误。
