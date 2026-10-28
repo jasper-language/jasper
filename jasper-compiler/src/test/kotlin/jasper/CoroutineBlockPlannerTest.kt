@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlannerTest.kt —— S4-C 第十、十一片基本块规划器的契约与属性测试
+// CoroutineBlockPlannerTest.kt —— S4-C 第十至十五片基本块规划器的契约与属性测试
 // ============================================================================
 // 做什么：直接构造已「类型检查」的 AST（真实 await 节点回填 awaitResultType），
 //   锁定块规划器的结构不变量、拒绝边界，并用固定种子随机程序比对两套独立语义：
@@ -211,7 +211,7 @@ class CoroutineBlockPlannerTest {
     /**
      * 做什么：仍未支持的形态必须给出具体原因，而不是返回部分计划。
      * 失败模式：for-in / 循环后置块 / 步进段非局部写入 / 非 int32 自增 / 带标签或循环外的 break、continue /
-     *   短路右操作数、转换中的 await / 未解析调用、局部接收者调用、安全调用的实参中的 await /
+     *   转换中的 await / 更早有副作用运算之后、或操作数写局部的短路右操作数 await / 未解析调用、局部接收者调用、安全调用的实参中的 await /
      *   可能抛出或有副作用的运算（含先于 await 的调用实参）之后的 await /
      *   await 操作数内的 await 或局部写入 /
      *   return 或 break 之后的不可达语句 /
@@ -229,8 +229,13 @@ class CoroutineBlockPlannerTest {
                 JasReturn(lit(0))),
             "loop-suffix" to function(decl("v", lit(0)),
                 JasWhile(id("flag"), block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
-            "short-circuit-right-await" to function(JasIf(JasBinaryOp(id("flag"), "&&", JasBinaryOp(await("input"), ">", lit(0))),
+            // 短路左操作数被提前到分支前求值：同一表达式中更早的除法尚未求值时拒绝。
+            "short-circuit-after-division" to function(JasIf(JasBinaryOp(
+                JasBinaryOp(JasBinaryOp(id("base"), "/", lit(2)), ">", lit(0)), "==",
+                JasBinaryOp(id("flag"), "&&", JasBinaryOp(await("input"), ">", lit(0)))),
                 block(JasReturn(lit(1))), null), JasReturn(lit(0))),
+            "short-circuit-operand-writes-local" to function(decl("v", lit(0)), JasIf(JasBinaryOp(id("flag"), "||",
+                JasBinaryOp(await("input"), ">", JasAssignment(id("v"), lit(1)))), block(JasReturn(lit(1))), null), JasReturn(id("v"))),
             "unresolved-call-argument-await" to function(JasReturn(JasCall(id("g"), listOf(await("input"))))),
             "local-receiver-call-argument-await" to function(
                 JasReturn(mixCall(await("input"), lit(0), JasPropertyAccess(id("base"), "mix")))),
@@ -288,6 +293,9 @@ class CoroutineBlockPlannerTest {
             // 生成器里唯一的被调函数 mix(a, b) = 3a - b：实参自左向右求值，不可交换，顺序错位即失配。
             is JasCall -> expression.args.map(::eval).let { (a, b) -> 3 * a - b }
             is JasBinaryOp -> when (expression.op) {
+                // 短路：左操作数决定结果时右操作数（及其中的 await）不求值。
+                "&&" -> if (eval(expression.left) != 0 && eval(expression.right) != 0) 1 else 0
+                "||" -> if (eval(expression.left) != 0 || eval(expression.right) != 0) 1 else 0
                 "+" -> eval(expression.left) + eval(expression.right)
                 "-" -> eval(expression.left) - eval(expression.right)
                 ">" -> if (eval(expression.left) > eval(expression.right)) 1 else 0
@@ -391,7 +399,8 @@ class CoroutineBlockPlannerTest {
         val random: Random,
         val extendedLoops: Boolean = false,
         val nestedAwaits: Boolean = false,
-        val callAwaits: Boolean = false
+        val callAwaits: Boolean = false,
+        val shortCircuits: Boolean = false
     ) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
@@ -412,6 +421,18 @@ class CoroutineBlockPlannerTest {
                 return if (random.nextBoolean()) call(1) else JasBinaryOp(leaf(), op, call(1))
             }
             return if (random.nextInt(3) == 0) JasBinaryOp(leaf(), op, leaf()) else leaf()
+        }
+
+        /**
+         * shortCircuits 时三分之二的条件改写为 `c && d` / `c || d`（可再嵌套一层），d 是任意比较，其中
+         * 可含 await 与调用；循环条件只用 `&&`，计数器比较仍在其中一侧，保证至多 k 趟。
+         */
+        fun combine(condition: JasExpression, scope: List<String>, allowOr: Boolean, depth: Int = 1): JasExpression {
+            if (!shortCircuits || random.nextInt(3) == 0) return condition
+            val comparison = JasBinaryOp(expression(scope), ">", JasIntLiteral(random.nextLong(-3, 4), ""))
+            val other = if (depth > 0) combine(comparison, scope, allowOr, depth - 1) else comparison
+            val op = if (allowOr && random.nextBoolean()) "||" else "&&"
+            return if (random.nextBoolean()) JasBinaryOp(condition, op, other) else JasBinaryOp(other, op, condition)
         }
 
         fun awaitNode() = JasUnaryOp("await", JasIdentifier("input")).also { it.awaitResultType = JasPrimitiveType("int32") }
@@ -455,7 +476,7 @@ class CoroutineBlockPlannerTest {
                         val limit = JasIntLiteral(random.nextLong(0, 4), "")
                         // 循环条件里的 await 每趟都重新挂起；输入在 [-6, 6]，计数器每趟自增，仍至多 10 趟。
                         val bound = if (nestedAwaits && random.nextInt(3) == 0) JasBinaryOp(limit, "+", awaitNode()) else limit
-                        val condition = JasBinaryOp(bound, ">", JasIdentifier(loopCounter))
+                        val condition = combine(JasBinaryOp(bound, ">", JasIdentifier(loopCounter)), scope, allowOr = false)
                         statements += when (if (extendedLoops) random.nextInt(3) else 0) {
                             0 -> JasWhile(condition, JasBlock(head + body))
                             // do-while：计数器在循环体首句自增，continue 前进到条件块也不会死循环。
@@ -483,8 +504,8 @@ class CoroutineBlockPlannerTest {
                         // 右侧是任意表达式时左侧不放调用：调用之后同一表达式里的 await 不在支持集内。
                         val rightIsExpression = nestedAwaits && random.nextBoolean()
                         val left = expression(scope, allowCall = !rightIsExpression)
-                        val condition = JasBinaryOp(left, ">",
-                            if (rightIsExpression) expression(scope) else JasIntLiteral(random.nextLong(-3, 4), ""))
+                        val condition = combine(JasBinaryOp(left, ">",
+                            if (rightIsExpression) expression(scope) else JasIntLiteral(random.nextLong(-3, 4), "")), scope, allowOr = true)
                         val (thenBody, thenReturns) = sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop)
                         val withElse = random.nextBoolean()
                         val (elseBody, elseReturns) =
@@ -760,5 +781,100 @@ class CoroutineBlockPlannerTest {
             }
         }
         assertTrue(argumentAwaits > 100, "generator too weak: only $argumentAwaits programs mix calls with hoisted awaits")
+    }
+
+    /**
+     * 计划中短路运算的判定块：写入合成 bool 临时局部并按它分支的块（汇合块里读同一临时局部的
+     * if / 循环分支不算）。
+     */
+    private fun shortCircuitDecisions(plan: CoroutineBlockPlan): List<CoroutineBlockExit.Branch> {
+        val boolTemps = plan.locals.filter { it.first.startsWith(CoroutineBlockPlanner.TEMP_PREFIX) && it.second == bool }
+            .map { it.first }.toSet()
+        return plan.blocks.mapNotNull { block ->
+            val exit = block.exit as? CoroutineBlockExit.Branch
+            val name = (exit?.condition as? JasIdentifier)?.name
+            exit?.takeIf { name in boolTemps && block.assignments.any { it.first == name } }
+        }
+    }
+
+    /**
+     * 做什么：`&&` / `||` 的右操作数含 await 时，左操作数写入合成 bool 临时局部并在当前块分支：
+     *   `&&` 为真进入右侧块、为假直接到汇合块，`||` 相反；右侧块挂起后覆写同一临时局部再汇合；
+     *   原条件改读该临时局部。循环头起步时先前进到新块，循环头本身不承载写入。
+     * 失败模式：右操作数被无条件求值（多挂起一次）、`||` 分支方向接反、临时局部类型错、
+     *   循环头被写入。
+     */
+    @Test
+    fun `awaits in short-circuit right operands branch on a bool temporary`() {
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("v", lit(0)),
+            JasIf(JasBinaryOp(JasBinaryOp(id("base"), ">", lit(0)), "&&", JasBinaryOp(await("input"), ">", lit(3))),
+                block(set("v", lit(1))), null),
+            JasWhile(JasBinaryOp(JasBinaryOp(id("v"), ">", lit(5)), "||", JasBinaryOp(await("input"), ">", id("v"))),
+                block(set("v", JasBinaryOp(id("v"), "+", lit(1))))),
+            JasReturn(id("v"))
+        ), parameters)
+        assertWellFormed(plan, "short circuit")
+        assertEquals(2, plan.suspensionCount)
+        val decisions = shortCircuitDecisions(plan)
+        assertEquals(2, decisions.size, "one decision per short-circuit: ${plan.blocks}")
+        val (andExit, orExit) = decisions
+        val andDecision = plan.blocks.single { it.exit == andExit }
+        val andTemp = (andExit.condition as JasIdentifier).name
+        assertEquals(andTemp to JasBinaryOp(id("base"), ">", lit(0)), andDecision.assignments.last())
+        // `&&`：为真进入挂起的右侧块，为假直接到汇合块；右侧恢复块覆写临时局部后汇合。
+        val andRight = plan.blocks[andExit.whenTrue].exit as CoroutineBlockExit.Suspend
+        val andResume = plan.blocks[andRight.resume]
+        assertEquals(andTemp to JasBinaryOp(id(andRight.binding), ">", lit(3)), andResume.assignments.single())
+        assertEquals(CoroutineBlockExit.Goto(andExit.whenFalse), andResume.exit)
+        // 汇合块按临时局部进入 if 的两条分支。
+        assertEquals(CoroutineBlockExit.Branch(id(andTemp), andExit.whenFalse + 1, andExit.whenFalse + 2),
+            plan.blocks[andExit.whenFalse].exit)
+        // `||`：为真直接到汇合块，为假进入右侧块；循环头不写临时局部，先前进到判定块。
+        val header = plan.loopHeaders.single()
+        val orDecision = plan.blocks.single { it.exit == orExit }
+        assertEquals(CoroutineBlockExit.Goto(orDecision.id), plan.blocks[header].exit)
+        val orRight = plan.blocks[orExit.whenFalse].exit as CoroutineBlockExit.Suspend
+        assertEquals(CoroutineBlockExit.Goto(orExit.whenTrue), plan.blocks[orRight.resume].exit)
+        assertTrue(orExit.whenTrue > orRight.resume)
+        val loopBranch = plan.blocks[orExit.whenTrue].exit as CoroutineBlockExit.Branch
+        assertEquals(id((orExit.condition as JasIdentifier).name), loopBranch.condition)
+    }
+
+    /**
+     * 做什么：固定种子 20261105 生成 400 个随机程序，在第十四片随机形态上把 if 条件与循环条件
+     *   随机改写为 `&&` / `||` 组合（可嵌套，右操作数可含 await 与调用），比对 AST 直接解释（短路求值）
+     *   与块状态机的返回值和挂起点数；右操作数若被无条件求值，消费的输入即失配。
+     * 失败模式：打印种子、用例与程序 AST。
+     */
+    @Test
+    fun `seeded short-circuit awaits match direct AST semantics`() {
+        val seed = 20261105
+        val random = Random(seed)
+        var shortCircuitPrograms = 0
+        var nestedPrograms = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, nestedAwaits = true, callAwaits = true, shortCircuits = true)
+                .sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            val decisions = shortCircuitDecisions(plan).size
+            if (decisions > 0) shortCircuitPrograms++
+            if (decisions > 1) nestedPrograms++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) { random.nextInt(-6, 7) }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                val (actual, suspensions) = runBlocks(plan, inputs.iterator(), base)
+                assertEquals(expected, actual, "$context round=$round base=$base inputs=$inputs")
+                assertEquals(direct.consumed, suspensions, "$context round=$round suspension count")
+            }
+        }
+        assertTrue(shortCircuitPrograms > 100, "generator too weak: only $shortCircuitPrograms programs branch on a short-circuit")
+        assertTrue(nestedPrograms > 40, "generator too weak: only $nestedPrograms programs with several short-circuits")
     }
 }

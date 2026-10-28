@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十三片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十五片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -9,7 +9,9 @@
 //   的循环头是不带工作的空块（直接进入循环体），条件块在循环体之后；三段式 for
 //   先在当前块做初始化，continue 与循环体末尾前进到步进块，步进块回到循环头；
 //   return 结束一条路径。出现在条件、return 值或算术子表达式中的 await 按求值顺序
-//   提升为合成临时局部（每个各占一个挂起点），原位置改读该临时局部。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
+//   提升为合成临时局部（每个各占一个挂起点），原位置改读该临时局部；`&&` / `||`
+//   的右操作数含 await 时，左操作数写入合成 bool 临时局部并分支，只有需要右操作数的
+//   那一路进入右侧块挂起，两路在新块汇合。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
 // 所属层次：
@@ -27,9 +29,10 @@
 //   - for-in、循环后置块、带标签的 break/continue、try/catch/finally、defer、
 //     throw、match 一律拒绝；
 //   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 局部的 `++` / `--`；
-//   - 子表达式中的 await 只允许出现在一元 `+ - !` 与二元运算之下（`&&` / `||` 只许左
-//     操作数），先于它求值、未被提升的部分只能是字面量、局部读取与不会抛出的运算
-//     （否则提升会改变副作用或异常与挂起的先后，拒绝）；调用实参、属性、下标、
+//   - 子表达式中的 await 只允许出现在一元 `+ - !`、二元运算与源码静态调用实参之下，
+//     先于它求值、未被提升的部分只能是字面量、局部读取与不会抛出的运算
+//     （否则提升会改变副作用或异常与挂起的先后，拒绝；短路运算的左操作数在分支前
+//     求值，故其中的调用 / 除法不妨碍右操作数中的 await）；属性、下标、
 //     转换等位置中的 await 一律拒绝；await 操作数内不能再有 await 或局部写入；
 //   - 每条路径必须以 return 结束；return / break / continue 之后的语句视为不可达
 //     并拒绝。
@@ -418,6 +421,48 @@ object CoroutineBlockPlanner {
             var effectPending = false
 
             fun visit(node: JasExpression): JasExpression {
+                /**
+                 * 右操作数含 await 的 `&&` / `||`：左操作数求值后写入合成 bool 临时局部并在当前块分支，
+                 * 只有需要右操作数的那一路进入右侧块（其中的 await 各自挂起），右侧结果覆写同一临时
+                 * 局部后汇合；原位置改读该临时局部。为什么入口要求没有前序副作用：左操作数被提前到
+                 * 分支之前求值，若同一表达式中更早求值、尚未提升的部分可能有副作用或抛出，二者的先后
+                 * 会颠倒。左右操作数都不得写局部：左侧被提前到更早的无副作用局部读取之前，右侧在
+                 * 汇合前执行，写入会改变那些读取看到的值。分支之后左右两侧都已执行完，前序副作用清空。
+                 */
+                fun shortCircuit(node: JasBinaryOp): JasExpression {
+                    if (effectPending) {
+                        throw Rejected("'${node.op}' with an awaited right operand after an operation that may fail or have side effects")
+                    }
+                    if (containsLocalWrite(node)) throw Rejected("'${node.op}' operands with awaits must not write locals")
+                    val left = visit(node.left)
+                    // 循环头只负责「每趟开始」，不承载写入：从循环头起步时先前进到新块再写临时局部。
+                    if (current.id in headers) {
+                        val decisionBlock = open(null)
+                        close(current, CoroutineBlockExit.Goto(decisionBlock.id))
+                        current = decisionBlock
+                    }
+                    val name = freshTemp(BOOL)
+                    current.assignments += name to left
+                    val decision = current
+                    val right = open(null)
+                    current = right
+                    effectPending = false
+                    val value = visit(node.right)
+                    current.assignments += name to value
+                    val rightEnd = current
+                    val join = open(null)
+                    close(rightEnd, CoroutineBlockExit.Goto(join.id))
+                    val condition = JasIdentifier(name)
+                    close(decision, if (node.op == "&&") {
+                        CoroutineBlockExit.Branch(condition, right.id, join.id)
+                    } else {
+                        CoroutineBlockExit.Branch(condition, join.id, right.id)
+                    })
+                    current = join
+                    effectPending = false
+                    return JasIdentifier(name)
+                }
+
                 val await = directAwait(node)
                 if (await != null) {
                     if (effectPending) {
@@ -426,10 +471,7 @@ object CoroutineBlockPlanner {
                     if (await.awaitResultType != INT) throw Rejected("await result type must be int32")
                     rejectNestedAwait(await.operand)
                     if (containsLocalWrite(await.operand)) throw Rejected("await operand must not write locals")
-                    var name: String
-                    do { name = "$TEMP_PREFIX${nextTemp++}" } while (name in types)
-                    types[name] = INT
-                    locals[name] = INT
+                    val name = freshTemp(INT)
                     val resume = open(name)
                     close(current, CoroutineBlockExit.Suspend(await, name, resume.id))
                     current = resume
@@ -441,9 +483,7 @@ object CoroutineBlockPlanner {
                 }
                 return when (node) {
                     is JasBinaryOp -> {
-                        if (node.op in SHORT_CIRCUIT && containsAwait(node.right)) {
-                            throw Rejected("await in the right operand of '${node.op}' is not supported")
-                        }
+                        if (node.op in SHORT_CIRCUIT && containsAwait(node.right)) return shortCircuit(node)
                         val left = visit(node.left)
                         val right = visit(node.right)
                         // 运算本身在两侧求值之后执行；可能抛出的运算对其后的 await 构成前序副作用。
@@ -470,6 +510,15 @@ object CoroutineBlockPlanner {
 
             val rewritten = visit(expression)
             return current to rewritten
+        }
+
+        /** 分配不与参数 / 局部重名的合成临时局部并登记为帧局部。 */
+        private fun freshTemp(type: JasType): String {
+            var name: String
+            do { name = "$TEMP_PREFIX${nextTemp++}" } while (name in types)
+            types[name] = type
+            locals[name] = type
+            return name
         }
 
         /**

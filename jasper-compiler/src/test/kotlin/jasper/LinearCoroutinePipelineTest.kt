@@ -332,13 +332,14 @@ class LinearCoroutinePipelineTest {
             // 第十一片起 while 内 await 已支持（见 LoopingCoroutinePipelineTest），第十二片起
             // do-while 与三段式 for 内 await 已支持（见 ForLoopCoroutinePipelineTest），第十三片起
             // 条件、return 值与算术子表达式中的 await 已支持（见 ExpressionAwaitCoroutinePipelineTest）；
-            // 这里改锁仍未支持的 try、短路右操作数中的 await 与有副作用运算（含调用）之后的 await。
-            "await-in-short-circuit-right" to """
+            // 这里改锁仍未支持的 try 与有副作用运算（含调用）之后的 await。第十五片起短路右操作数中的
+            // await 已支持（见 ShortCircuitAwaitCoroutinePipelineTest），同一表达式中更早的除法之后仍须诊断。
+            "short-circuit-await-after-division" to """
                 package demo;
                 import std.Future;
                 public class P {
-                    public static function f(input: Future<int32>, flag: bool): int32 {
-                        if (flag && (await input) > 0) { return 1; }
+                    public static function f(input: Future<int32>, flag: bool, d: int32): int32 {
+                        if ((10 / d > 0) == (flag && (await input) > 0)) { return 1; }
                         return 0;
                     }
                 }
