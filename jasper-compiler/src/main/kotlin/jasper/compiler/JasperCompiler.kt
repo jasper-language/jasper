@@ -389,7 +389,7 @@ class JasperCompiler {
         // 只登记生成声明，不能把已检查过的原始声明整份重新 collect（会制造重复声明）。
         val symbolErrorsBefore = symbolTable.errors.size
         val frameFiles = result.frames.map { frame ->
-            jasper.ast.JasSourceFile(frame.packageName, listOf(frame.declaration), emptyList())
+            jasper.ast.JasSourceFile(frame.packageName, listOf(frame.declaration), frame.imports)
         }
         frameFiles.forEach(symbolTable::collectDeclarations)
         val errors: MutableList<CompileError> = symbolTable.errors.drop(symbolErrorsBefore).map { se ->

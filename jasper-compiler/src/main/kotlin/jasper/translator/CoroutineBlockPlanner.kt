@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十七片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十八片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -17,6 +17,9 @@
 //   写成区域编号，正常离开、return 与跨出区域的 break / continue 所在块在出口前按由内
 //   到外的顺序执行各区域的清理（先把 `$region` 退回外层区域，再执行 finally 体）；
 //   异常、挂起点失败 / 取消与作用域取消导致的非正常离开由发射器按 `$region` 展开。
+//   try/catch 登记为 catch 区域（同一条 `$region` 链，无清理语句），每个 catch 子句开一个
+//   没有前驱边的处理块，在区域之外降级；`try B catch H finally F` 为 finally 区域包住
+//   catch 区域。段内抛出与挂起点失败 / 取消由发射器的异常路由按捕获类型转入处理块。
 //   生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
@@ -32,7 +35,8 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - for-in、循环后置块、带 catch 的 try、defer、throw、match 一律拒绝；
+//   - for-in、循环后置块、defer、throw、match 一律拒绝；catch 处理体不得引用捕获参数
+//     （Error 不能成为帧字段），捕获类型须是无类型实参的具名类型；
 //   - finally 体是同步清理：不得含 await、return、try、带标签或跳出 finally 的
 //     break / continue；只接受 int32 / bool 局部声明、对局部的 `=` 赋值、int32 局部
 //     `++` / `--`、调用语句、if/else、while 与块；
@@ -88,15 +92,28 @@ data class CoroutineBlock(
 )
 
 /**
- * try/finally 清理区域。
+ * catch 子句的降级结果：[type] 是源码写出的捕获类型（生成帧与源码同文件，按同一组 import
+ * 解析），[entry] 是处理块入口编号。处理块没有前驱边，只由发射器的异常路由跳入。
+ */
+data class CoroutineCatchHandler(val type: JasNamedType, val entry: Int)
+
+/**
+ * try 区域：finally 清理区域或 catch 区域。
  *
  * [id] 从 1 起按进入顺序分配（0 表示不在任何区域内），外层区域的编号总小于内层；
- * [parent] 是直接外层区域编号；[cleanup] 是 finally 体（同步、已校验）。
- * 块的 [CoroutineBlock.cleanups] 按执行顺序列出在出口前要执行的区域；执行一个区域
- * 前先把 [CoroutineBlockPlanner.REGION_LOCAL] 退回 [parent]，清理抛出时展开从外层继续，
- * 同一区域的清理不会执行两次。
+ * [parent] 是直接外层区域编号；[cleanup] 是 finally 体（同步、已校验；catch 区域为空块）；
+ * [handlers] 非空表示 catch 区域，按源码顺序匹配。`try B catch H finally F` 降级为外层
+ * finally 区域包住内层 catch 区域，与源码中 finally 也覆盖 catch 处理块的语义一致。
+ * 块的 [CoroutineBlock.cleanups] 按执行顺序列出在出口前要离开的区域；离开一个区域
+ * 前先把 [CoroutineBlockPlanner.REGION_LOCAL] 退回 [parent]，再执行 [cleanup]，清理抛出时
+ * 展开从外层继续，同一区域的清理不会执行两次。
  */
-data class CoroutineTryRegion(val id: Int, val parent: Int, val cleanup: JasBlock)
+data class CoroutineTryRegion(
+    val id: Int,
+    val parent: Int,
+    val cleanup: JasBlock,
+    val handlers: List<CoroutineCatchHandler> = emptyList()
+)
 
 /**
  * 规划结果。
@@ -452,15 +469,79 @@ object CoroutineBlockPlanner {
         }
 
         /**
-         * try/finally：分配清理区域，当前块写入区域编号后在区域内降级 try 体；try 体正常
-         * 结束的块在出口前执行本区域清理并前进到新块。try 体内的挂起、循环与跳转照常切块，
-         * 跨出区域的 return / break / continue 在各自块上登记清理。
-         * 为什么拒绝 catch：捕获挂起点失败要决定 Failure 与源码异常类型的对应，属于错误模型的
-         * 语义选择，本片不作出；只做不改变失败本身的清理。
+         * try：有 finally 时分配清理区域，当前块写入区域编号后在区域内降级 try 体（有 catch
+         * 时降级内层 catch 区域）；正常结束的块在出口前执行本区域清理并前进到新块。try 体内的
+         * 挂起、循环与跳转照常切块，跨出区域的 return / break / continue 在各自块上登记清理。
          */
         private fun lowerTry(statement: JasTry, block: OpenBlock): OpenBlock? {
-            if (statement.catches.isNotEmpty()) throw Rejected("try/catch is not supported in coroutine frames")
-            val cleanup = statement.finallyBody ?: throw Rejected("try without finally is not supported")
+            val cleanup = statement.finallyBody
+            if (cleanup == null) {
+                if (statement.catches.isEmpty()) throw Rejected("try without catch or finally is not supported")
+                return lowerCatch(statement, block)
+            }
+            val region = enterRegion(block, cleanup)
+            val bodyEnd = try {
+                if (statement.catches.isEmpty()) lowerSequence(statement.body.statements, block)
+                else lowerCatch(statement, block)
+            } finally {
+                tries.removeLast()
+            }
+            // finally 体按源码顺序在 try 体（与 catch 处理块）之后校验，局部登记顺序与源码一致。
+            checkCleanup(cleanup.statements, 0)
+            if (bodyEnd == null) return null
+            bodyEnd.cleanups += region.id
+            val next = open(null)
+            close(bodyEnd, CoroutineBlockExit.Goto(next.id))
+            return next
+        }
+
+        /**
+         * try/catch（S4-C 第十八片，按 2026-10-28 裁决 C）：分配 catch 区域并在区域内降级 try 体，
+         * 正常结束时离开区域（只把区域局部退回外层，无清理语句）；每个 catch 子句开一个没有前驱的
+         * 处理块，在区域之外（外层区域内）降级处理体，可以挂起、跳转与 return。try 体与各处理块
+         * 正常结束的出口汇合到新块。
+         *
+         * 进入 catch 的只有 try 体内段抛出的异常与被等待 Future 的终态（失败 / 取消分别按
+         * `Future.get()` 语义抛 FutureFailureError / FutureCancelledError），由发射器在异常路由中
+         * 按类型匹配；本任务自身的取消不是异常，catch 看不到，只展开 finally。
+         *
+         * 为什么处理体不得引用捕获参数：语言禁止 Error 出现在字段中，参数无法成为跨挂起的帧字段；
+         * 引用（含同名遮蔽外层局部）一律拒绝，而不是悄悄改指别的绑定。
+         * 为什么捕获类型只接受无类型实参的具名类型：生成帧用 instanceof 匹配，泛型实参会被擦除。
+         */
+        private fun lowerCatch(statement: JasTry, block: OpenBlock): OpenBlock? {
+            val clauses = statement.catches.map { clause ->
+                val type = clause.parameter.type as? JasNamedType
+                if (type == null || type.typeArguments.isNotEmpty()) {
+                    throw Rejected("catch type must be a plain named error type")
+                }
+                if (clause.body.statements.any { mentions(it, clause.parameter.name) }) {
+                    throw Rejected("catch parameter '${clause.parameter.name}' cannot be used in coroutine frames")
+                }
+                type to clause.body
+            }
+            val region = enterRegion(block, JasBlock(emptyList()))
+            val bodyEnd = try {
+                lowerSequence(statement.body.statements, block)
+            } finally {
+                tries.removeLast()
+            }
+            bodyEnd?.cleanups?.add(region.id)
+            val ends = listOfNotNull(bodyEnd).toMutableList()
+            val handlers = clauses.map { (type, body) ->
+                val entry = open(null)
+                lowerSequence(body.statements, entry)?.let(ends::add)
+                CoroutineCatchHandler(type, entry.id)
+            }
+            regions[region.id - 1] = region.copy(handlers = handlers)
+            if (ends.isEmpty()) return null
+            val join = open(null)
+            ends.forEach { close(it, CoroutineBlockExit.Goto(join.id)) }
+            return join
+        }
+
+        /** 登记新区域、在 [block] 写入区域编号并压入区域栈；调用者负责在区域体之后弹栈。 */
+        private fun enterRegion(block: OpenBlock, cleanup: JasBlock): CoroutineTryRegion {
             if (REGION_LOCAL !in types) {
                 types[REGION_LOCAL] = INT
                 locals[REGION_LOCAL] = INT
@@ -469,18 +550,7 @@ object CoroutineBlockPlanner {
             regions += region
             block.assignments += REGION_LOCAL to JasIntLiteral(region.id.toLong(), region.id.toString())
             tries.addLast(region)
-            val bodyEnd = try {
-                lowerSequence(statement.body.statements, block)
-            } finally {
-                tries.removeLast()
-            }
-            // finally 体按源码顺序在 try 体之后校验，局部登记顺序与源码一致。
-            checkCleanup(cleanup.statements, 0)
-            if (bodyEnd == null) return null
-            bodyEnd.cleanups += region.id
-            val next = open(null)
-            close(bodyEnd, CoroutineBlockExit.Goto(next.id))
-            return next
+            return region
         }
 
         /** 从当前位置跳到外层区域深度 [depth] 时要执行的清理区域编号，由内到外。 */
@@ -764,6 +834,48 @@ object CoroutineBlockPlanner {
         is JasArrayAccess -> containsLocalWrite(expression.target) || containsLocalWrite(expression.index)
         is JasNew -> expression.args.any(::containsLocalWrite)
         else -> false
+    }
+
+    /**
+     * 语句子树中是否出现名字 [name]（读取、写入或同名声明）。供 catch 参数检查使用：
+     * 覆盖规划器与清理校验接受的全部语句 / 表达式形态，其余形态本身会被拒绝。
+     */
+    private fun mentions(statement: JasStatement?, name: String): Boolean {
+        /** 表达式子树中是否出现该名字。 */
+        fun inExpression(expression: JasExpression?): Boolean = when (expression) {
+            null -> false
+            is JasIdentifier -> expression.name == name
+            is JasUnaryOp -> inExpression(expression.operand)
+            is JasBinaryOp -> inExpression(expression.left) || inExpression(expression.right)
+            is JasCall -> inExpression(expression.target) || expression.args.any(::inExpression)
+            is JasPropertyAccess -> inExpression(expression.target)
+            is JasCastExpr -> inExpression(expression.expression)
+            is JasInstanceOfExpr -> inExpression(expression.expression)
+            is JasArrayAccess -> inExpression(expression.target) || inExpression(expression.index)
+            is JasNew -> expression.args.any(::inExpression)
+            is JasAssignment -> inExpression(expression.target) || inExpression(expression.value)
+            is JasAssignmentIncrement -> inExpression(expression.target) || inExpression(expression.increment)
+            is JasPostfixIncDec -> inExpression(expression.target)
+            else -> false
+        }
+        /** 块（可为空）中是否有语句出现该名字。 */
+        fun inBlock(block: JasBlock?) = block?.statements?.any { mentions(it, name) } ?: false
+        return when (statement) {
+            null -> false
+            is JasVariableStatement -> statement.name == name || inExpression(statement.initializer)
+            is JasExpressionStatement -> inExpression(statement.expression)
+            is JasReturn -> inExpression(statement.value)
+            is JasIf -> inExpression(statement.condition) || inBlock(statement.thenBody) || inBlock(statement.elseBody)
+            is JasWhile -> inExpression(statement.condition) || inBlock(statement.body)
+            is JasDoWhile -> inBlock(statement.body) || inExpression(statement.condition)
+            is JasForStatement -> mentions(statement.init, name) || inExpression(statement.condition) ||
+                inExpression(statement.update) || inBlock(statement.body)
+            is JasLabeledStatement -> mentions(statement.statement, name)
+            is JasTry -> inBlock(statement.body) || inBlock(statement.finallyBody) ||
+                statement.catches.any { it.parameter.name == name || inBlock(it.body) }
+            is JasBlock -> inBlock(statement)
+            else -> false
+        }
     }
 
     /** 子树中出现真实 await 即拒绝；用于 await 操作数等不允许再挂起的位置。 */

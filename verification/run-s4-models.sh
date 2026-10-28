@@ -10,7 +10,7 @@ if [[ ! -f "$jar" ]]; then
     exit 2
 fi
 mkdir -p evidence/s4-models build/tmp/s4-models
-for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregation_supervisor CleanupBudgetNesting CallbackDispatch ContinuationDispatch ContinuationResultBinding LinearCoroutineFrame BranchingCoroutineFrame LoopingCoroutineFrame TryFinallyCoroutineFrame CoroutineScopeLaunch_normal CoroutineScopeLaunch_supervisor; do
+for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregation_supervisor CleanupBudgetNesting CallbackDispatch ContinuationDispatch ContinuationResultBinding LinearCoroutineFrame BranchingCoroutineFrame LoopingCoroutineFrame TryFinallyCoroutineFrame TryCatchCoroutineFrame CoroutineScopeLaunch_normal CoroutineScopeLaunch_supervisor; do
     model="$config"
     case "$config" in
         TaskGroupAggregation_*) model=TaskGroupAggregation ;;

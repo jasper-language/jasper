@@ -404,15 +404,17 @@ class LinearCoroutinePipelineTest {
                     }
                 }
             """.trimIndent(),
-            // 第十七片起 try/finally 内 await 已支持（见 TryFinallyCoroutinePipelineTest）；带 catch 的 try、
-            // finally 中的 await 与 finally 中对挂起函数的同步调用仍须诊断。
-            "try-catch-await" to """
+            // 第十七片起 try/finally 内 await 已支持（见 TryFinallyCoroutinePipelineTest），第十八片起 try/catch
+            // 内 await 已支持（见 TryCatchCoroutinePipelineTest）；处理体引用捕获参数、finally 中的 await 与
+            // finally 中对挂起函数的同步调用仍须诊断。
+            "catch-parameter-used" to """
                 package demo;
                 import std.Future;
+                import std.Error;
                 public class P {
                     public static function f(input: Future<int32>): int32 {
                         var value: int32 = 0;
-                        try { value = await input; } catch (e: Error) { value = 1; }
+                        try { value = await input; } catch (e: Error) { var m: string = e.message(); value = 1; }
                         return value;
                     }
                 }

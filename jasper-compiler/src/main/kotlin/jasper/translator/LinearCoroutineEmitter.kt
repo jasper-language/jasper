@@ -31,6 +31,10 @@
 //     挂起点失败 / 取消、段内异常与作用域取消一律跳出分派循环，按 `$region` 由内到外
 //     展开清理后再发布 Failure / Cancelled（作用域取消时结果已终结，只做清理）；清理
 //     抛出时以新的 Failure 取代，继续展开外层；
+//   - try/catch（第十八片，裁决 C）：有 catch 区域时挂起点失败 / 取消按 Future.get() 语义抛出
+//     FutureFailureError / FutureCancelledError，段内抛出经异常路由按 `$region` 由内到外执行
+//     finally 清理、按捕获类型匹配 catch，命中则转入处理块并重新进入分派循环（入口检查照常）；
+//     本任务自身的取消不抛异常，只展开 finally，catch 看不到它；
 //   - 不定义显式挂起标记，不改变公开函数 ABI，也不把生成帧冒充为可同步调用的
 //     普通函数；
 //   - 不实现 Future.get 阻塞等待；恢复只经 onComplete -> ContinuationDispatch。
@@ -67,6 +71,9 @@ object LinearCoroutineEmitter {
     private const val RUNNABLE = "std.Runnable"
     private const val ACTION = "std.Action"
     private const val COROUTINE_TASK = "std.CoroutineTask"
+    private const val FUTURE_FAILURE_ERROR = "std.FutureFailureError"
+    private const val FUTURE_CANCELLED_ERROR = "std.FutureCancelledError"
+    private const val THROWABLE = "java.lang.Throwable"
 
     /** 仅 int32 结果；更宽类型需要重新审视字段布局与描述符，不能静默复用。 */
     private val INT = JasPrimitiveType("int32")
@@ -190,26 +197,45 @@ object LinearCoroutineEmitter {
             assign("__abort", JasIntLiteral(1, "1"))
         )
 
+        // 有 catch 区域的帧：挂起点的失败 / 取消按 Future.get() 语义变成抛出的错误，经异常路由
+        // 进入匹配的 catch；没有 catch 区域的帧保持第十七片的直接展开，生成代码不变。
+        val hasCatch = plan.tryRegions.any { it.handlers.isNotEmpty() }
+
         /**
          * 恢复块入口：消费终态快照。成功取 int32 结果写入绑定；失败记为待发布的原 Failure；
-         * 取消记为待发布的 Cancelled，而不是伪装成业务失败；两者都跳出分派循环，先展开
-         * 清理再发布。局部名带块编号，避免同一 run 方法内多个恢复块的临时变量重名。
+         * 取消记为待发布的 Cancelled，而不是伪装成业务失败。没有 catch 区域时两者都跳出分派
+         * 循环，先展开清理再发布；有 catch 区域时先记下同样的待发布终态，再抛出
+         * FutureFailureError（消息取自原 Failure，与 get() 一致）/ FutureCancelledError：被 catch
+         * 匹配时待发布终态被清除，未被匹配时发布的仍是原 Failure / Cancelled，与没有 catch 时相同。
+         * 局部名带块编号，避免同一 run 方法内多个恢复块的临时变量重名。
          */
         fun consumeOutcome(blockId: Int, binding: String): List<JasStatement> {
             val readyName = "__ready$blockId"
             val failureName = "__failure$blockId"
             val ready = JasIdentifier(readyName)
+            val failure = JasIdentifier(failureName)
+            /** 抛出 std 错误；生成帧可位于任意用户包，类型名必须限定。 */
+            fun raise(type: String, message: JasExpression) =
+                JasThrow(JasNew(JasNamedType(type), listOf(message)))
+            val onCancelled = if (!hasCatch) JasBreakStatement(null)
+                else raise(FUTURE_CANCELLED_ERROR, JasStringLiteral("future was cancelled"))
+            val onFailed = if (!hasCatch) listOf(JasBreakStatement(null)) else listOf(
+                JasIf(JasBinaryOp(failure, "==", JasNullLiteral), JasBlock(listOf(
+                    raise(FUTURE_FAILURE_ERROR, JasStringLiteral("future failed without a failure snapshot"))
+                )), null),
+                raise(FUTURE_FAILURE_ERROR, invoke(JasCastExpr(failure, JasNamedType(FAILURE)), "message"))
+            )
             return listOf(
                 JasVariableStatement(readyName, JasNamedType(FUTURE_OUTCOME),
                     JasCastExpr(field("__outcome"), JasNamedType(FUTURE_OUTCOME)), false),
                 JasIf(invoke(ready, "isCancelled"), JasBlock(listOf(
                     assign("__abort", JasIntLiteral(2, "2")),
-                    JasBreakStatement(null)
+                    onCancelled
                 )), null),
                 JasIf(invoke(ready, "isFailed"), JasBlock(listOf(
                     JasVariableStatement(failureName, JasNullableType(JasNamedType(FAILURE)),
                         invoke(ready, "failure"), false)
-                ) + abortFailure(JasIdentifier(failureName)) + JasBreakStatement(null)), null),
+                ) + abortFailure(failure) + onFailed), null),
                 assign(slots.getValue(binding), JasCastExpr(invoke(ready, "value"), INT))
             )
         }
@@ -339,16 +365,80 @@ object LinearCoroutineEmitter {
         /** 平台异常转成待发布的 Failure。 */
         fun platformFailure(error: String) =
             JasNew(JasNamedType(FAILURE), listOf(invoke(JasIdentifier(error), "toString"), JasStringLiteral("platform")))
+        /**
+         * 有 catch 区域时的分派：段内抛出（含挂起点失败 / 取消转成的错误）先记下待发布终态
+         * （挂起点已记的原 Failure / Cancelled 不覆盖），再按 `$region` 由内到外路由——finally 区域
+         * 执行清理（清理抛出时以新异常继续路由，可被外层 catch 捕获），catch 区域先退回外层区域
+         * 再按源码顺序用 instanceof 匹配捕获类型；命中时清除待发布终态、`__phase` 指向处理块，
+         * 重新进入分派循环，入口检查照常进行（本任务若已被取消，处理块不执行，直接展开外层
+         * finally）。走完区域链仍未命中时区域为 0，后续展开为空，发布待发布终态。
+         *
+         * 为什么本任务自身的取消不经过这里：入口检查与挂起前检查发现结果已终结时直接跳出分派
+         * 循环，不抛异常，展开只执行 finally（catch 区域只退回外层区域），catch 看不到它（裁决 C）。
+         */
+        fun routedLoop(): JasStatement {
+            val slot = requireNotNull(regionSlot)
+            val caught = JasIdentifier("__caught")
+            val thrown = JasIdentifier("__thrown")
+            val route = mutableListOf<JasStatement>(
+                JasIf(JasBinaryOp(field("__abort"), "==", JasIntLiteral(0, "0")),
+                    JasBlock(abortFailure(platformFailure("__error"))), null),
+                JasVariableStatement("__thrown", JasNamedType(THROWABLE), JasIdentifier("__error"), false)
+            )
+            plan.tryRegions.sortedByDescending { it.id }.forEach { region ->
+                val body = if (region.handlers.isEmpty()) {
+                    val error = "__routeError${region.id}"
+                    listOf(JasTry(
+                        JasBlock(cleanupCode.getValue(region.id)),
+                        listOf(JasCatchClause(
+                            JasParameter(error, JasNamedType(THROWABLE)),
+                            JasBlock(abortFailure(platformFailure(error)) +
+                                statement(JasAssignment(thrown, JasIdentifier(error))))
+                        )),
+                        null
+                    ))
+                } else {
+                    // 处理块按源码顺序匹配：嵌套 if/else，首个命中者生效。
+                    val match = region.handlers.foldRight(null as JasStatement?) { handler, otherwise ->
+                        JasIf(JasInstanceOfExpr(thrown, handler.type), JasBlock(listOf(
+                            statement(JasAssignment(caught, JasBoolLiteral(true))),
+                            jump(handler.entry)
+                        )), otherwise?.let { JasBlock(listOf(it)) })
+                    }
+                    cleanupCode.getValue(region.id) + listOfNotNull(match)
+                }
+                route += JasIf(
+                    JasBinaryOp(JasUnaryOp("!", caught, true), "&&",
+                        JasBinaryOp(field(slot), "==", JasIntLiteral(region.id.toLong(), region.id.toString()))),
+                    JasBlock(body),
+                    null
+                )
+            }
+            route += JasIf(caught, JasBlock(listOf(
+                assign("__abort", JasIntLiteral(0, "0")),
+                assign("__pending", JasNullLiteral)
+            )), null)
+            return JasWhile(JasBoolLiteral(true), JasBlock(listOf(
+                JasVariableStatement("__caught", BOOL, JasBoolLiteral(false), false),
+                JasTry(
+                    JasBlock(listOf(dispatchLoop)),
+                    listOf(JasCatchClause(JasParameter("__error", JasNamedType(THROWABLE)), JasBlock(route))),
+                    null
+                ),
+                JasIf(JasUnaryOp("!", caught, true), JasBlock(listOf(JasBreakStatement(null))), null)
+            )))
+        }
+
         // 段内任何未捕获异常都记为待发布的失败，先展开清理再发布；否则等待者会永远看到 Pending，
         // TaskGroup.close 也无法回收。
-        val guardedLoop = JasTry(
+        val guardedLoop = if (!hasCatch) JasTry(
             JasBlock(listOf(dispatchLoop)),
             listOf(JasCatchClause(
-                JasParameter("__error", JasNamedType("java.lang.Throwable")),
+                JasParameter("__error", JasNamedType(THROWABLE)),
                 JasBlock(abortFailure(platformFailure("__error")))
             )),
             null
-        )
+        ) else routedLoop()
         // 展开：按区域编号从大到小检查，外层编号总小于内层，一趟即可由内到外走完整条区域链。
         val unwind = plan.tryRegions.sortedByDescending { it.id }.map { region ->
             val error = "__cleanupError${region.id}"

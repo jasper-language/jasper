@@ -92,8 +92,13 @@ class CoroutineBlockPlannerTest {
             assertTrue(plan.blocks[header].resumeBinding == null && plan.blocks[header].assignments.isEmpty(),
                 "$context: header $header carries work")
         }
-        val reached = mutableSetOf(0)
-        val work = ArrayDeque(listOf(0))
+        // catch 处理块没有前驱边，只由异常路由进入，与入口块一起作为可达性的根。
+        val roots = listOf(0) + plan.tryRegions.flatMap { region -> region.handlers.map { it.entry } }
+        roots.forEach { entry ->
+            assertTrue(plan.blocks[entry].resumeBinding == null, "$context: root $entry is a resume block")
+        }
+        val reached = roots.toMutableSet()
+        val work = ArrayDeque(roots)
         while (work.isNotEmpty()) {
             CoroutineBlockPlanner.targets(plan.blocks[work.removeFirst()].exit).forEach { if (reached.add(it)) work += it }
         }
@@ -313,8 +318,21 @@ class CoroutineBlockPlannerTest {
             ),
             "untyped-local" to function(decl("v", lit(1), null), JasReturn(id("v"))),
             "throw" to function(JasThrow(id("input"))),
-            "try-catch" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))),
-                listOf(JasCatchClause(JasParameter("e", JasNamedType("Error")), block())), block()), JasReturn(id("v"))),
+            // 捕获参数无法成为帧字段：读取、同名局部声明与嵌套 catch 遮蔽都拒绝；带类型实参的捕获类型拒绝。
+            "catch-parameter-read" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))),
+                listOf(JasCatchClause(JasParameter("e", JasNamedType("Error")),
+                    block(JasExpressionStatement(JasCall(JasPropertyAccess(id("e"), "message"), emptyList()))))), null),
+                JasReturn(id("v"))),
+            "catch-parameter-shadows-local" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))),
+                listOf(JasCatchClause(JasParameter("v", JasNamedType("Error")), block(JasReturn(id("v"))))), null),
+                JasReturn(id("v"))),
+            "catch-generic-type" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))),
+                listOf(JasCatchClause(JasParameter("e", JasNamedType("Box", listOf(int))), block())), null), JasReturn(id("v"))),
+            "try-without-catch-or-finally" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))), emptyList(), null),
+                JasReturn(id("v"))),
+            "await-in-finally-after-catch" to function(decl("v", lit(0)), JasTry(block(set("v", await("input"))),
+                listOf(JasCatchClause(JasParameter("e", JasNamedType("Error")), block())), block(set("v", await("input")))),
+                JasReturn(id("v"))),
             "await-in-finally" to function(decl("v", lit(0)), JasTry(block(set("v", lit(1))), emptyList(),
                 block(set("v", await("input")))), JasReturn(id("v"))),
             "await-in-finally-condition" to function(decl("v", await("input")), JasTry(block(set("v", lit(1))), emptyList(),
@@ -346,8 +364,15 @@ class CoroutineBlockPlannerTest {
     /** 挂起点失败的输入哨兵（正常输入都在 [-6, 6]）。 */
     private val FAIL = 99
 
-    /** 直接解释器中挂起点失败沿调用栈传播的信号。 */
-    private class AwaitFailed : RuntimeException(null, null, false, false)
+    /** 挂起点被取消的输入哨兵（第十八片）。 */
+    private val CANCEL = 98
+
+    /**
+     * 直接解释器中挂起点失败沿调用栈传播的信号；[cancelled] 区分 FutureCancelledError 与
+     * FutureFailureError（按 Future.get() 语义）。
+     */
+    private class AwaitFailed(val cancelled: Boolean = false) : RuntimeException(null, null, false, false)
+
 
     /** 循环控制在直接解释器中的跳出信号。 */
     private class LoopJump(val isBreak: Boolean, val label: String?) : RuntimeException(null, null, false, false)
@@ -362,7 +387,10 @@ class CoroutineBlockPlannerTest {
         fun eval(expression: JasExpression): Int = when (expression) {
             is JasIntLiteral -> expression.value.toInt()
             is JasIdentifier -> env.getValue(expression.name)
-            is JasUnaryOp -> { consumed++; inputs.next().also { if (it == 99) throw AwaitFailed() } }
+            is JasUnaryOp -> {
+                consumed++
+                inputs.next().also { if (it == 99 || it == 98) throw AwaitFailed(cancelled = it == 98) }
+            }
             // `mark(k)` 只记录轨迹；其余被调函数是 mix(a, b) = 3a - b：实参自左向右求值，不可交换，顺序错位即失配。
             is JasCall -> if ((expression.target as? JasIdentifier)?.name == "mark") {
                 trace += eval(expression.args.single()); 0
@@ -450,11 +478,18 @@ class CoroutineBlockPlannerTest {
                     is JasBreakStatement -> throw LoopJump(true, statement.label)
                     is JasContinueStatement -> throw LoopJump(false, statement.label)
                     is JasReturn -> return eval(requireNotNull(statement.value))
-                    // Kotlin 的 try/finally 与源码同义：返回值先求出，跳转与失败信号在清理之后继续传播。
+                    // Kotlin 的 try/catch/finally 与源码同义：返回值先求出，跳转与失败信号在清理之后继续
+                    // 传播；只有挂起点失败按捕获类型进入 catch，循环跳转信号直接穿过。
                     is JasTry -> try {
-                        run(statement.body.statements)
+                        try {
+                            run(statement.body.statements)
+                        } catch (failure: AwaitFailed) {
+                            val handler = statement.catches.firstOrNull { catches(it.parameter.type as JasNamedType, failure) }
+                                ?: throw failure
+                            run(handler.body.statements)
+                        }
                     } finally {
-                        run(requireNotNull(statement.finallyBody).statements)
+                        statement.finallyBody?.let { check(run(it.statements) == null) { "cleanup returned" } }
                     }?.let { return it }
                     is JasBlock -> run(statement.statements)?.let { return it }
                     else -> error(statement.javaClass.simpleName)
@@ -492,16 +527,25 @@ class CoroutineBlockPlannerTest {
         while (true) {
             check(++steps < 100_000) { "block machine did not terminate" }
             val block = plan.blocks[phase]
-            block.resumeBinding?.let {
+            val binding = block.resumeBinding
+            if (binding != null) {
                 val value = inputs.next()
                 suspensions++
-                if (value == FAIL) {
+                if (value == FAIL || value == CANCEL) {
+                    // 与发射器的异常路由同一算法：按编号从大到小沿 `$region` 走一趟，finally 区域执行
+                    // 清理，catch 区域先退回外层区域再按源码顺序匹配；命中即转入处理块。
+                    val failure = AwaitFailed(cancelled = value == CANCEL)
+                    var handler: Int? = null
                     plan.tryRegions.sortedByDescending { it.id }.forEach { region ->
-                        if (ast.env[CoroutineBlockPlanner.REGION_LOCAL] == region.id) cleanup(region)
+                        if (handler == null && ast.env[CoroutineBlockPlanner.REGION_LOCAL] == region.id) {
+                            cleanup(region)
+                            handler = region.handlers.firstOrNull { catches(it.type, failure) }?.entry
+                        }
                     }
-                    return Triple(null, suspensions, ast.trace)
+                    phase = handler ?: return Triple(null, suspensions, ast.trace)
+                    continue
                 }
-                ast.env[it] = value
+                ast.env[binding] = value
             }
             block.assignments.forEach { (name, value) -> ast.env[name] = ast.eval(value) }
             block.cleanups.forEach { cleanup(regions.getValue(it)) }
@@ -528,7 +572,8 @@ class CoroutineBlockPlannerTest {
         val callAwaits: Boolean = false,
         val shortCircuits: Boolean = false,
         val labels: Boolean = false,
-        val tries: Boolean = false
+        val tries: Boolean = false,
+        val catches: Boolean = false
     ) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
@@ -603,8 +648,18 @@ class CoroutineBlockPlannerTest {
                             cleanup += JasIf(JasBinaryOp(expression(scope), ">", JasIntLiteral(0, "0")),
                                 JasBlock(listOf(markCall(-code))), null)
                         }
-                        statements += JasTry(JasBlock(body), emptyList(), JasBlock(cleanup))
-                        if (bodyTerminates) return statements to true
+                        // catches 时三分之二的 try 带 1～2 个 catch（捕获类型随机，处理体可挂起、跳转与
+                        // return），其中一半省略 finally。
+                        val handlers = if (!catches || random.nextInt(3) == 0) emptyList() else List(random.nextInt(1, 3)) {
+                            val type = listOf("FutureFailureError", "FutureCancelledError", "Error").random(random)
+                            val (handlerBody, handlerTerminates) =
+                                sequence(depth - 1, scope, random.nextInt(4) == 0, inLoop, enclosing)
+                            JasCatchClause(JasParameter("e${counter++}", JasNamedType(type)), JasBlock(handlerBody)) to
+                                handlerTerminates
+                        }
+                        val finallyBody = if (handlers.isNotEmpty() && random.nextBoolean()) null else JasBlock(cleanup)
+                        statements += JasTry(JasBlock(body), handlers.map { it.first }, finallyBody)
+                        if (bodyTerminates && handlers.all { it.second }) return statements to true
                     }
                     0, 1 -> {
                         val name = "v${counter++}"
@@ -802,11 +857,19 @@ class CoroutineBlockPlannerTest {
         assertTrue(suspendingLoops > 50, "generator too weak: only $suspendingLoops programs suspend inside a loop")
     }
 
-    /**
-     * 语句序列中是否有以本层循环（标签 [label]）为目标的 break / continue：本层的无标签跳转
-     * 穿过 if、不进入内层循环；带本层标签的跳转可以在任意深度的内层循环里。
-     */
     private companion object {
+        /** catch 子句的捕获类型是否接住 [failure]：Error 是两者的共同父类。 */
+        fun catches(type: JasNamedType, failure: AwaitFailed) = when (type.name) {
+            "Error" -> true
+            "FutureCancelledError" -> failure.cancelled
+            "FutureFailureError" -> !failure.cancelled
+            else -> error(type.name)
+        }
+
+        /**
+         * 语句序列中是否有以本层循环（标签 [label]）为目标的 break / continue：本层的无标签跳转
+         * 穿过 if、不进入内层循环；带本层标签的跳转可以在任意深度的内层循环里。
+         */
         fun jumpsToThisLoop(statements: List<JasStatement>, label: String?, nested: Boolean = false): Boolean =
             statements.any { statement ->
                 when (statement) {
@@ -815,7 +878,8 @@ class CoroutineBlockPlannerTest {
                     is JasIf -> jumpsToThisLoop(statement.thenBody.statements, label, nested) ||
                         (statement.elseBody?.let { jumpsToThisLoop(it.statements, label, nested) } ?: false)
                     is JasLabeledStatement -> jumpsToThisLoop(listOf(statement.statement), label, nested)
-                    is JasTry -> jumpsToThisLoop(statement.body.statements, label, nested)
+                    is JasTry -> jumpsToThisLoop(statement.body.statements, label, nested) ||
+                        statement.catches.any { jumpsToThisLoop(it.body.statements, label, nested) }
                     is JasWhile -> jumpsToThisLoop(statement.body.statements, label, nested = true)
                     is JasDoWhile -> jumpsToThisLoop(statement.body.statements, label, nested = true)
                     is JasForStatement -> jumpsToThisLoop(statement.body.statements, label, nested = true)
@@ -1222,5 +1286,117 @@ class CoroutineBlockPlannerTest {
         assertTrue(nested > 40, "generator too weak: only $nested programs with nested regions")
         assertTrue(leavingJumps > 40, "generator too weak: only $leavingJumps programs return from inside a region")
         assertTrue(unwound > 40, "generator too weak: only $unwound failed rounds unwound cleanups")
+    }
+
+    /**
+     * 做什么：`try { v = await input } catch (FutureCancelledError) { v = await input } catch (Error) {
+     *   return 7 } finally { mark(1) }` 降级为外层 finally 区域（1）包住内层 catch 区域（2，父区域 1）；
+     *   catch 区域没有清理语句，处理块按源码顺序登记、入口没有前驱边且不是恢复块；try 体正常结束
+     *   只离开 catch 区域，处理块在 finally 区域内，处理块中的 return 先固定返回值再清理 finally 区域；
+     *   try 体与第一个处理块的正常出口汇合后清理 finally 区域。
+     * 失败模式：区域嵌套顺序颠倒、处理块落在 catch 区域内（处理体再失败会被自己捕获）、处理块中的
+     *   return 漏掉 finally 清理。
+     */
+    @Test
+    fun `try catch finally plans a catch region inside the cleanup region`() {
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("v", lit(0)),
+            JasTry(block(set("v", await("input"))), listOf(
+                JasCatchClause(JasParameter("e", JasNamedType("FutureCancelledError")), block(set("v", await("input")))),
+                JasCatchClause(JasParameter("e", JasNamedType("Error")), block(JasReturn(lit(7))))
+            ), block(JasExpressionStatement(JasCall(id("mark"), listOf(lit(1)))))),
+            JasReturn(id("v"))
+        ), parameters)
+        assertWellFormed(plan, "try catch finally")
+        assertEquals(listOf(1 to 0, 2 to 1), plan.tryRegions.map { it.id to it.parent })
+        val (cleanupRegion, catchRegion) = plan.tryRegions
+        assertTrue(cleanupRegion.handlers.isEmpty())
+        assertTrue(catchRegion.cleanup.statements.isEmpty())
+        assertEquals(listOf("FutureCancelledError", "Error"), catchRegion.handlers.map { it.type.name })
+        val entries = catchRegion.handlers.map { it.entry }
+        // 处理块入口没有前驱边。
+        plan.blocks.forEach { block -> entries.forEach { assertTrue(it !in CoroutineBlockPlanner.targets(block.exit)) } }
+        // try 体挂起点的恢复块正常结束：只离开 catch 区域。
+        val bodyResume = plan.blocks.first { it.resumeBinding == "v" }
+        assertEquals(listOf(2), bodyResume.cleanups)
+        // 第一个处理块挂起后恢复，正常结束时已不在 catch 区域内，不再离开它。
+        val handlerSuspend = plan.blocks[entries[0]].exit as CoroutineBlockExit.Suspend
+        assertTrue(plan.blocks[handlerSuspend.resume].cleanups.isEmpty())
+        // 第二个处理块的 return：字面量直接返回，只清理 finally 区域。
+        val handlerReturn = plan.blocks[entries[1]]
+        assertEquals(CoroutineBlockExit.Finish(lit(7)), handlerReturn.exit)
+        assertEquals(listOf(1), handlerReturn.cleanups)
+        // 汇合块清理 finally 区域后前进到函数末尾的 return。
+        assertEquals(1, plan.blocks.count { it.cleanups == listOf(1) && it.exit is CoroutineBlockExit.Goto })
+    }
+
+    /** 程序中 catch 子句的数量（任意深度）。 */
+    private fun catchCount(statements: List<JasStatement>): Int = statements.sumOf { statement ->
+        when (statement) {
+            is JasTry -> statement.catches.size + catchCount(statement.body.statements) +
+                statement.catches.sumOf { catchCount(it.body.statements) } + catchCount(statement.finallyBody?.statements.orEmpty())
+            is JasIf -> catchCount(statement.thenBody.statements) + catchCount(statement.elseBody?.statements.orEmpty())
+            is JasLabeledStatement -> catchCount(listOf(statement.statement))
+            is JasWhile, is JasDoWhile, is JasForStatement -> catchCount(loopBody(statement))
+            else -> 0
+        }
+    }
+
+    /**
+     * 做什么：固定种子 20261111 生成 400 个随机程序：在第十七片的 try/finally 随机程序上，三分之二的 try
+     *   带 1～2 个 catch（捕获类型在 FutureFailureError / FutureCancelledError / Error 中随机，处理体可挂起、
+     *   跳转、return，一半省略 finally）；输入中各约 1/12 是失败哨兵与取消哨兵。比对源码 AST 直接解释（Kotlin
+     *   try/catch/finally）与块状态机异常路由（与发射器同一算法）的结果（未捕获为 null）、挂起点数与清理
+     *   轨迹；另要求被捕获后继续执行、未匹配穿过 catch 区域、处理块内挂起各超过 40 例。
+     * 失败模式：打印种子、用例、输入与程序 AST。
+     */
+    @Test
+    fun `seeded try catch block machines match direct AST semantics`() {
+        val seed = 20261111
+        val random = Random(seed)
+        var caughtRounds = 0
+        var passedThrough = 0
+        var suspendingHandlers = 0
+        var programsWithCatch = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, tries = true, catches = true)
+                .sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (catchCount(body) > 0) programsWithCatch++
+            val handlerEntries = plan.tryRegions.flatMap { region -> region.handlers.map { it.entry } }
+            if (handlerEntries.any { entry -> plan.blocks[entry].exit is CoroutineBlockExit.Suspend }) suspendingHandlers++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) {
+                    when (random.nextInt(12)) {
+                        0 -> FAIL
+                        1 -> CANCEL
+                        else -> random.nextInt(-6, 7)
+                    }
+                }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = try {
+                    requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                } catch (_: AwaitFailed) {
+                    null
+                }
+                val (actual, suspensions, trace) = runBlocksUnwinding(plan, inputs.iterator(), base)
+                val detail = "$context round=$round base=$base inputs=${inputs.take(64)}"
+                assertEquals(expected, actual, detail)
+                assertEquals(direct.consumed, suspensions, "$detail suspension count")
+                assertEquals(direct.trace, trace, "$detail cleanup trace")
+                val failures = inputs.take(direct.consumed).count { it == FAIL || it == CANCEL }
+                if (actual != null && failures > 0) caughtRounds++
+                if (actual == null && handlerEntries.isNotEmpty()) passedThrough++
+            }
+        }
+        assertTrue(programsWithCatch > 150, "generator too weak: only $programsWithCatch programs with catch")
+        assertTrue(caughtRounds > 40, "generator too weak: only $caughtRounds rounds recovered from a failure")
+        assertTrue(passedThrough > 40, "generator too weak: only $passedThrough failures escaped past catch regions")
+        assertTrue(suspendingHandlers > 40, "generator too weak: only $suspendingHandlers programs suspend in a handler entry")
     }
 }

@@ -822,3 +822,74 @@ for-in 与循环后置块、try/catch/finally/defer 的清理后继、实例 / �
 带 catch 的 try、defer、throw、finally 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用实参
 中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；AST 构建器丢弃
 多表达式 for 初始化段、同步路径对未知标签退回最内层循环的既有限制同前。
+
+## S4-C 第十八片：协程帧内 try/catch
+
+本片继续「实现次序」第 5 条，按 2026-10-28 裁决 C（见 `S4-coroutine-context.md` §11.1）实现带 catch
+的 try：try 体内可以挂起，被等待 Future 的失败 / 取消与段内抛出的错误按捕获类型进入 catch；本任务
+自身的取消不是异常，catch 看不到它，只执行 finally。
+
+### 降级规则
+
+- catch 区域与 finally 区域共用 `$region` 链与编号规则；catch 区域没有清理语句，正常离开（try 体
+  正常结束、跨出区域的 return / break / continue）只把 `$region` 退回外层区域。`try B catch H finally F`
+  降级为外层 finally 区域包住内层 catch 区域，因此处理块也在 finally 的覆盖之下，与源码语义一致。
+- 每个 catch 子句开一个处理块，没有前驱边，在 catch 区域之外（外层区域内）降级；处理体可以挂起、
+  分支、循环、return 与 break / continue。try 体与各处理块的正常出口汇合到同一块。
+- 有 catch 区域的帧：恢复块消费到失败时先把原 Failure 记为待发布结果，再抛出
+  `FutureFailureError(原 Failure 的 message)`；消费到取消时记待发布 Cancelled，再抛出
+  `FutureCancelledError`——与 `Future.get()` 的既有语义相同。
+- 异常路由（run 内包住分派循环的 catch）：段内抛出时若尚无待发布结果则记为 platform Failure；随后按
+  `$region` 编号从大到小走一趟——finally 区域执行清理（清理抛出时以新异常继续路由，可被更外层 catch
+  捕获，待发布结果改为新的 platform Failure），catch 区域先退回外层区域，再按源码顺序用 `instanceof`
+  匹配捕获类型。命中时清除待发布结果、`__phase` 指向处理块并重新进入分派循环；入口检查照常进行，
+  本任务若已被取消，处理块不执行，直接展开外层 finally。走完仍未命中时 `$region` 为 0，发布待发布结果
+  ——未被捕获的挂起点失败 / 取消因此发布的仍是原 Failure / Cancelled，与没有 catch 时相同。
+- 本任务自身的取消：入口检查与挂起前检查发现结果已终结时跳出分派循环，不抛异常；展开只执行 finally，
+  catch 区域只退回外层区域。
+- 没有 catch 区域的帧生成代码与第十七片相同。
+- 生成帧的二次类型检查带上来源文件的 import：帧追加在来源文件中翻译，捕获类型等源码写出的类型名
+  按同一组 import 解析，检查与翻译看到的名字一致（此前检查不带 import，短名捕获类型无法解析）。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- 处理体引用捕获参数（读取、同名局部声明、嵌套 catch 同名参数）：语言禁止 Error 出现在字段中，
+  捕获参数无法成为跨挂起的帧字段；也不悄悄改指同名的外层局部；
+- 捕获类型带类型实参（`instanceof` 会擦除）；既无 catch 也无 finally 的 try；
+- finally 体的既有限制（await、return、try、跳出 finally 等）、defer、throw 语句同第十七片。
+
+### 验收结果
+
+- `CoroutineBlockPlannerTest`：新增 try/catch/finally 形状测试（finally 区域包住 catch 区域、catch 区域无
+  清理语句、处理块按源码顺序且没有前驱、处理块中的 return 只清理 finally 区域、汇合块清理 finally
+  区域）；拒绝清单新增捕获参数读取、捕获参数遮蔽局部、泛型捕获类型、无 catch 无 finally、catch 之后的
+  finally 中 await 五例；结构检查把处理块入口作为可达性根。新增固定种子 20261111 的 400 个随机程序：
+  在第十七片的 try/finally 随机程序上三分之二的 try 带 1～2 个 catch（捕获类型在 FutureFailureError /
+  FutureCancelledError / Error 中随机，处理体可挂起、跳转、return，一半省略 finally），输入中各约 1/12 是
+  失败与取消哨兵；源码 AST 直接解释（Kotlin try/catch/finally）与块状态机异常路由（与发射器同一算法）
+  比对结果、挂起点数与清理轨迹。数量下限：含 catch 的程序超过 150，失败后被捕获继续执行、失败穿过
+  catch 区域、处理块入口即挂起各超过 40。过程中发现测试生成器的「是否跳到本循环」扫描漏看 catch 体，
+  已修正。
+- `TryCatchCoroutinePipelineTest` 5 项，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM 执行（class
+  major 52）：input 失败时每行进入 FutureFailureError 处理块后继续、内层 finally 每行一次、外层 finally
+  最后；input 取消进入 FutureCancelledError 处理块并在处理块内挂起；处理块中 gate 失败不被同一 try 的
+  catch 捕获、穿过内层 finally 被外层 `catch (e: Error)` 捕获；源码 `throw new Error` 被外层捕获；除零
+  （平台异常）穿过全部 catch 区域、两层清理后发布 platform 失败；作用域取消（挂在 try 体内或处理块内）
+  只执行 finally、不执行任何处理块，晚到输入不复活；固定种子 20261111 的 64 轮与 Kotlin oracle 一致。
+- `LinearCoroutinePipelineTest` 的不支持形态清单：已支持的 try/catch 内 await 换成处理体引用捕获参数。
+- 变异检查：发射器忽略捕获类型（首个处理块总命中）4 项失败；规划器把处理块放进 catch 区域内 1 项失败；
+  路由时跳过 finally 清理 3 项失败；去掉有 catch 帧的分派循环入口检查（自身取消的结果快照被当成
+  被等待 Future 的取消、进入处理块）被作用域取消测试抓到。另试过「自身取消以异常进入路由」的变异：
+  由于命中后重新进入分派循环先做入口检查，处理块不会执行，可观察行为与正确实现相同，不算有效变异。
+- TLA+ `TryCatchCoroutineFrame`（finally 区域包住 catch 区域、挂起点成功 / 失败 / 取消、段内与处理块与
+  清理可抛出可匹配 / 不可匹配错误、作用域取消任意时刻到达）：2520 个不同状态，清理至多一次、结果
+  可见与 settled 时已清理、处理块入口检查点之前到达的自身取消使处理块不执行（OwnCancelInvisible）、
+  catch 只接住匹配类型、被捕获错误不残留待发布结果、结果稳定、终将 settled、取消终将 settled 全部成立。
+  两组变异配置：命中后不经入口检查直接执行处理块违反 OwnCancelInvisible；忽略捕获类型违反
+  CatchMatchesType。`run-s4-models.sh` 纳入新模型，共十四组配置。
+
+### 仍未支持
+
+处理体使用捕获参数、defer、throw 语句、finally 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用
+实参中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；AST 构建器
+丢弃多表达式 for 初始化段、同步路径对未知标签退回最内层循环的既有限制同前。

@@ -47,13 +47,16 @@ import java.util.IdentityHashMap
  * 什么时候用：CoroutineLowering.lower 返回后由 JasperCompiler 消费。
  * 失败模式：纯数据；declaration 已通过发射器支持范围检查（仍可能被二次类型检查拒绝）。
  * 为什么保留来源信息：生成类名是编译器约定，不应让调用方靠字符串猜来源。
+ * 为什么带 [imports]：生成类追加在来源文件中翻译，源码写出的类型名（如 catch 的捕获类型）按
+ *   来源文件的 import 解析；二次类型检查必须看到同一组 import，否则同一名字在两处解析不一致。
  */
 data class GeneratedCoroutineFrame(
     val packageName: String?,
     val ownerName: String?,
     val functionName: String,
     val className: String,
-    val declaration: JasClass
+    val declaration: JasClass,
+    val imports: List<JasDeclaration> = emptyList()
 )
 
 /**
@@ -232,7 +235,7 @@ object CoroutineLowering {
             SuspendingAwaitScanner.scanFunction(function).forEach { reportedAwaits[it] = true }
             return function
         }
-        frames += GeneratedCoroutineFrame(source.packageName, ownerName, function.name, className, generated)
+        frames += GeneratedCoroutineFrame(source.packageName, ownerName, function.name, className, generated, source.imports)
         localFrames += generated
         return null
     }

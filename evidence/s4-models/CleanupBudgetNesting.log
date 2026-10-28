@@ -1,7 +1,7 @@
 TLC2 Version 2.16 of 31 December 2020 (rev: cdddf55)
 Warning: Please run the Java VM which executes TLC with a throughput optimized garbage collector by passing the "-XX:+UseParallelGC" property.
 (Use the -nowarning option to disable this warning.)
-Running breadth-first search Model-Checking with fp 74 and seed 6193029699311579880 with 1 worker on 8 cores with 1984MB heap and 64MB offheap memory [pid: 269362] (Linux 7.0.0-38-generic amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 53 and seed -2411482356447533864 with 1 worker on 8 cores with 1984MB heap and 64MB offheap memory [pid: 301591] (Linux 7.0.0-38-generic amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file verification/tla/CleanupBudgetNesting.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/TLC.tla
@@ -12,9 +12,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module CleanupBudgetNesting
-Starting... (2026-10-28 15:16:24)
+Starting... (2026-10-28 16:12:43)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-28 15:16:24.
+Finished computing initial states: 1 distinct state generated at 2026-10-28 16:12:43.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
@@ -22,4 +22,4 @@ Model checking completed. No error has been found.
 29940 states generated, 8425 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 18.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 1).
-Finished in 01s at (2026-10-28 15:16:24)
+Finished in 01s at (2026-10-28 16:12:44)
