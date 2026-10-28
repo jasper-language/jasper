@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十五片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十六片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -11,7 +11,9 @@
 //   return 结束一条路径。出现在条件、return 值或算术子表达式中的 await 按求值顺序
 //   提升为合成临时局部（每个各占一个挂起点），原位置改读该临时局部；`&&` / `||`
 //   的右操作数含 await 时，左操作数写入合成 bool 临时局部并分支，只有需要右操作数的
-//   那一路进入右侧块挂起，两路在新块汇合。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
+//   那一路进入右侧块挂起，两路在新块汇合。带标签的 break / continue 按标签找到外层
+//   循环，跳到它的出口块或续行目标（循环头 / 条件块 / 步进块），与无标签形式共用同一套
+//   前向 / 回边规则。生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
 // 所属层次：
@@ -26,8 +28,9 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - for-in、循环后置块、带标签的 break/continue、try/catch/finally、defer、
-//     throw、match 一律拒绝；
+//   - for-in、循环后置块、try/catch/finally、defer、throw、match 一律拒绝；
+//   - break / continue 的标签必须是某个外层循环的标签；未知标签与遮蔽外层同名标签的
+//     循环拒绝（不退回到最内层循环）；
 //   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 局部的 `++` / `--`；
 //   - 子表达式中的 await 只允许出现在一元 `+ - !`、二元运算与源码静态调用实参之下，
 //     先于它求值、未被提升的部分只能是字面量、局部读取与不会抛出的运算
@@ -126,9 +129,11 @@ object CoroutineBlockPlanner {
      *
      * [continueTarget] 非空时 continue 直接跳过去（while 的循环头）；为空时 continue 的
      * 目标块（do-while 的条件块、for 的步进块）要在循环体之后才分配，先把块记进
-     * [continues]。break 的块同样等出口块分配后再封闭。
+     * [continues]。break 的块同样等出口块分配后再封闭。[label] 是 `label name:` 给出的标签，
+     * 带标签的 break / continue 据此跳到外层循环；登记到哪个上下文就跟哪个循环的出口块 /
+     * 续行目标一起封闭，所以跨层跳转不需要额外机制。
      */
-    private class LoopContext(val continueTarget: Int?) {
+    private class LoopContext(val continueTarget: Int?, val label: String?) {
         val breaks = mutableListOf<OpenBlock>()
         val continues = mutableListOf<OpenBlock>()
     }
@@ -223,16 +228,17 @@ object CoroutineBlockPlanner {
                 else -> lowerIncrement(expression, block)
             }
             is JasIf -> lowerIf(statement, block)
-            is JasWhile -> lowerWhile(statement, block)
-            is JasDoWhile -> lowerDoWhile(statement, block)
-            is JasForStatement -> lowerFor(statement, block)
+            is JasWhile -> lowerWhile(statement, block, null)
+            is JasDoWhile -> lowerDoWhile(statement, block, null)
+            is JasForStatement -> lowerFor(statement, block, null)
+            is JasLabeledStatement -> lowerLabeled(statement, block)
             is JasBreakStatement -> {
-                val loop = innermostLoop(statement.label)
+                val loop = targetLoop(statement.label)
                 loop.breaks += block
                 null
             }
             is JasContinueStatement -> {
-                val loop = innermostLoop(statement.label)
+                val loop = targetLoop(statement.label)
                 val target = loop.continueTarget
                 if (target != null) close(block, CoroutineBlockExit.Goto(target)) else loop.continues += block
                 null
@@ -314,7 +320,7 @@ object CoroutineBlockPlanner {
          * 出口块。循环体末尾与 continue 是回边（回到循环头），break 前进到出口块。出口块
          * 在循环体之后分配，所以除回边外的所有边仍是前向的。
          */
-        private fun lowerWhile(statement: JasWhile, block: OpenBlock): OpenBlock {
+        private fun lowerWhile(statement: JasWhile, block: OpenBlock, label: String?): OpenBlock {
             if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
             val header = open(null)
             headers += header.id
@@ -322,7 +328,7 @@ object CoroutineBlockPlanner {
             // 条件中的 await 每趟都从循环头重新挂起；恢复块在循环体之前分配。
             val (conditionEnd, condition) = hoist(statement.condition, header)
             val body = open(null)
-            val loop = LoopContext(header.id)
+            val loop = LoopContext(header.id, label)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             bodyEnd?.let { close(it, CoroutineBlockExit.Goto(header.id)) }
             val exit = open(null)
@@ -338,13 +344,13 @@ object CoroutineBlockPlanner {
          * 没有任何路径到达条件块时（循环体每条路径都 return / break）不分配条件块；也没有
          * break 时整个循环不会正常结束，返回 null，其后的语句按不可达拒绝。
          */
-        private fun lowerDoWhile(statement: JasDoWhile, block: OpenBlock): OpenBlock? {
+        private fun lowerDoWhile(statement: JasDoWhile, block: OpenBlock, label: String?): OpenBlock? {
             val header = open(null)
             headers += header.id
             close(block, CoroutineBlockExit.Goto(header.id))
             val body = open(null)
             close(header, CoroutineBlockExit.Goto(body.id))
-            val loop = LoopContext(null)
+            val loop = LoopContext(null, label)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             val exitNeeded = bodyEnd != null || loop.continues.isNotEmpty() || loop.breaks.isNotEmpty()
             if (!exitNeeded) return null
@@ -369,7 +375,7 @@ object CoroutineBlockPlanner {
          * 循环体末尾与 continue 前进到步进块，步进块执行步进段后回到循环头；break 前进到
          * 出口块。步进块与出口块都在循环体之后分配，除两条回边外所有边仍是前向的。
          */
-        private fun lowerFor(statement: JasForStatement, block: OpenBlock): OpenBlock {
+        private fun lowerFor(statement: JasForStatement, block: OpenBlock, label: String?): OpenBlock {
             if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
             // 多个绑定的声明式初始化（`var a = 0, b = 0`）由 AST 构建器包成 JasBlock，逐条降级。
             val afterInit = when (val init = statement.init) {
@@ -388,7 +394,7 @@ object CoroutineBlockPlanner {
             close(afterInit, CoroutineBlockExit.Goto(header.id))
             val (conditionEnd, condition) = hoist(statement.condition ?: JasBoolLiteral(true), header)
             val body = open(null)
-            val loop = LoopContext(null)
+            val loop = LoopContext(null, label)
             val bodyEnd = lowerLoopBody(statement.body, body, loop)
             if (bodyEnd != null || loop.continues.isNotEmpty()) {
                 val step = open(null)
@@ -403,6 +409,23 @@ object CoroutineBlockPlanner {
             close(conditionEnd, CoroutineBlockExit.Branch(condition, body.id, exit.id))
             loop.breaks.forEach { close(it, CoroutineBlockExit.Goto(exit.id)) }
             return exit
+        }
+
+        /**
+         * `label name: <循环>`：文法只允许标签包住 while / do-while / for（for-in 照常拒绝）。
+         * 为什么拒绝与外层同名的标签：遮蔽后 `break name` 指向哪一层取决于实现约定，源码读者
+         * 容易看错；协程帧不在这里作出选择，诊断即可。
+         */
+        private fun lowerLabeled(statement: JasLabeledStatement, block: OpenBlock): OpenBlock? {
+            if (loops.any { it.label == statement.label }) {
+                throw Rejected("label '${statement.label}' shadows an enclosing loop label")
+            }
+            return when (val loop = statement.statement) {
+                is JasWhile -> lowerWhile(loop, block, statement.label)
+                is JasDoWhile -> lowerDoWhile(loop, block, statement.label)
+                is JasForStatement -> lowerFor(loop, block, statement.label)
+                else -> throw Rejected("unsupported labeled statement ${loop.javaClass.simpleName}")
+            }
         }
 
         /**
@@ -557,10 +580,13 @@ object CoroutineBlockPlanner {
             }
         }
 
-        /** break/continue 的目标循环；带标签或不在循环内时拒绝。 */
-        private fun innermostLoop(label: String?): LoopContext {
-            if (label != null) throw Rejected("labeled break/continue is not supported")
-            return loops.lastOrNull() ?: throw Rejected("break/continue outside a loop")
+        /**
+         * break/continue 的目标循环：无标签取最内层，带标签取同名的外层循环。不在循环内或标签
+         * 未知时拒绝，不退回到最内层循环（那会把跳转悄悄接到错误的一层）。
+         */
+        private fun targetLoop(label: String?): LoopContext {
+            if (label == null) return loops.lastOrNull() ?: throw Rejected("break/continue outside a loop")
+            return loops.lastOrNull { it.label == label } ?: throw Rejected("unknown loop label '$label'")
         }
     }
 

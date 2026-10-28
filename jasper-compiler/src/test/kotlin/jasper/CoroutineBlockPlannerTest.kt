@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlannerTest.kt —— S4-C 第十至十五片基本块规划器的契约与属性测试
+// CoroutineBlockPlannerTest.kt —— S4-C 第十至十六片基本块规划器的契约与属性测试
 // ============================================================================
 // 做什么：直接构造已「类型检查」的 AST（真实 await 节点回填 awaitResultType），
 //   锁定块规划器的结构不变量、拒绝边界，并用固定种子随机程序比对两套独立语义：
@@ -11,7 +11,8 @@
 //   只有把块状态机的执行结果与源码语义逐例对齐才能发现（例如 else 全部 return 时
 //   误接汇合边）。第十一片起随机程序含 while / break / continue，块状态机解释器
 //   允许回边，但只允许回到规划器登记的循环头；第十二片另有一组随机程序含 do-while 与三段式 for
-//   （continue 前进到条件块 / 步进块）。
+//   （continue 前进到条件块 / 步进块）；第十六片另有一组随机程序给循环随机加标签，break /
+//   continue 随机跳到任一外层循环。
 // ============================================================================
 
 package jasper
@@ -217,6 +218,39 @@ class CoroutineBlockPlannerTest {
      *   return 或 break 之后的不可达语句 /
      *   缺 return 路径 / 重名 / 未写类型的非 await 局部被静默接受。
      */
+    /**
+     * 做什么：`label outer: while (flag) { while (flag) { v = await; if (flag) continue outer;
+     *   break outer; } }`：continue outer 是回到外层循环头的回边，break outer 前进到外层出口块，
+     *   内层循环的出口块没有任何入边以外的跳转；相邻的两个循环可以复用同一标签。
+     * 失败模式：带标签跳转接到内层循环、外层出口未分配在内层之后或同名兄弟标签被误拒。
+     */
+    @Test
+    fun `labeled break and continue target the enclosing loop`() {
+        val inner = JasWhile(id("flag"), block(
+            set("v", await("input")),
+            JasIf(id("flag"), block(JasContinueStatement("outer")), null),
+            JasBreakStatement("outer")))
+        val fn = function(decl("v", lit(0)),
+            JasLabeledStatement("outer", JasWhile(id("flag"), block(inner))),
+            JasLabeledStatement("outer", JasDoWhile(block(JasBreakStatement("outer")), id("flag"))),
+            JasReturn(id("v")))
+        val plan = CoroutineBlockPlanner.plan(fn, parameters)
+        assertWellFormed(plan, "labeled")
+        // 外层循环头是第一个循环头，内层循环头是第二个。
+        val (outerHeader, innerHeader) = plan.loopHeaders.sorted()
+        val outerExit = (plan.blocks[outerHeader].exit as CoroutineBlockExit.Branch).whenFalse
+        val innerExit = (plan.blocks[innerHeader].exit as CoroutineBlockExit.Branch).whenFalse
+        assertTrue(outerExit > innerExit, "outer exit must be allocated after the inner loop")
+        val gotos = plan.blocks.mapNotNull { block -> (block.exit as? CoroutineBlockExit.Goto)?.let { block.id to it.target } }
+        // 挂起恢复块之后的 if：then 分支 continue outer（回到外层循环头），汇合块 break outer（到外层出口）。
+        val resume = plan.blocks.single { it.resumeBinding == "v" }.id
+        assertTrue(gotos.any { (from, to) -> from > resume && to == outerHeader }, "continue outer must jump to the outer header: $gotos")
+        assertTrue(gotos.any { (from, to) -> from > resume && to == outerExit }, "break outer must jump to the outer exit: $gotos")
+        assertTrue(gotos.none { (from, to) -> from > resume && to == innerHeader }, "labeled jumps must not reach the inner header")
+        // 内层出口只由内层条件为假进入，再无条件回到外层循环头。
+        assertEquals(CoroutineBlockExit.Goto(outerHeader), plan.blocks[innerExit].exit)
+    }
+
     @Test
     fun `unsupported shapes are rejected with reasons`() {
         val cases = mapOf(
@@ -255,7 +289,15 @@ class CoroutineBlockPlannerTest {
             "await-operand-writes-local" to function(decl("v", lit(0)),
                 JasReturn(JasBinaryOp(id("v"), "+", JasUnaryOp("await", JasCall(id("g"), listOf(JasAssignment(id("v"), lit(1)))))
                     .also { it.awaitResultType = int }))),
-            "labeled-break" to function(decl("v", await("input")), JasWhile(id("flag"), block(JasBreakStatement("outer"))), JasReturn(id("v"))),
+            "unknown-label" to function(decl("v", await("input")), JasWhile(id("flag"), block(JasBreakStatement("outer"))), JasReturn(id("v"))),
+            // 内层循环的标签不是外层可见的跳转目标。
+            "inner-label-from-outside" to function(decl("v", await("input")), JasWhile(id("flag"), block(
+                JasLabeledStatement("inner", JasWhile(id("flag"), block(JasBreakStatement(null)))),
+                JasContinueStatement("inner"))), JasReturn(id("v"))),
+            "shadowed-label" to function(decl("v", await("input")), JasLabeledStatement("outer", JasWhile(id("flag"), block(
+                JasLabeledStatement("outer", JasWhile(id("flag"), block(JasBreakStatement("outer"))))))), JasReturn(id("v"))),
+            "labeled-for-in" to function(decl("v", lit(0)),
+                JasLabeledStatement("outer", JasForInStatement("x", id("base"), block(set("v", await("input"))))), JasReturn(id("v"))),
             "break-outside-loop" to function(decl("v", await("input")), JasBreakStatement(null), JasReturn(id("v"))),
             "continue-outside-loop" to function(decl("v", await("input")), JasContinueStatement(null), JasReturn(id("v"))),
             "after-break" to function(decl("v", await("input")),
@@ -279,7 +321,7 @@ class CoroutineBlockPlannerTest {
     // ---------------------------------------------------------------- 属性测试
 
     /** 循环控制在直接解释器中的跳出信号。 */
-    private class LoopJump(val isBreak: Boolean) : RuntimeException(null, null, false, false)
+    private class LoopJump(val isBreak: Boolean, val label: String?) : RuntimeException(null, null, false, false)
 
     /** 源码 AST 直接解释器：await 按出现顺序从 inputs 取值；break/continue 用信号跳出。 */
     private class AstInterpreter(val inputs: Iterator<Int>) {
@@ -316,46 +358,63 @@ class CoroutineBlockPlannerTest {
             }
         }
 
+        /**
+         * 运行一个循环；[label] 是包住它的标签。跳转信号的标签为空（最内层）或等于 [label]
+         * 时由本循环处理，否则继续向外传播给同名的外层循环。返回 null 表示循环正常结束。
+         */
+        fun runLoop(statement: JasStatement, label: String?): Int? {
+            fun mine(jump: LoopJump) = jump.label == null || jump.label == label
+            when (statement) {
+                is JasDoWhile -> do {
+                    val returned = try {
+                        run(statement.body.statements)
+                    } catch (jump: LoopJump) {
+                        if (!mine(jump)) throw jump
+                        if (jump.isBreak) break else continue
+                    }
+                    if (returned != null) return returned
+                } while (eval(statement.condition) != 0)
+                is JasForStatement -> {
+                    statement.init?.let { run(listOf(it)) }
+                    while (statement.condition?.let { eval(it) != 0 } != false) {
+                        val returned = try {
+                            run(statement.body.statements)
+                        } catch (jump: LoopJump) {
+                            if (!mine(jump)) throw jump
+                            if (jump.isBreak) break else null
+                        }
+                        if (returned != null) return returned
+                        statement.update?.let(::write)
+                    }
+                }
+                is JasWhile -> while (eval(statement.condition) != 0) {
+                    val returned = try {
+                        run(statement.body.statements)
+                    } catch (jump: LoopJump) {
+                        if (!mine(jump)) throw jump
+                        if (jump.isBreak) break else continue
+                    }
+                    if (returned != null) return returned
+                }
+                else -> error(statement.javaClass.simpleName)
+            }
+            return null
+        }
+
         /** 返回 null 表示序列正常结束（未 return）。 */
         fun run(statements: List<JasStatement>): Int? {
             for (statement in statements) {
                 when (statement) {
                     is JasVariableStatement -> env[statement.name] = eval(requireNotNull(statement.initializer))
                     is JasExpressionStatement -> write(statement.expression)
-                    is JasDoWhile -> do {
-                        val returned = try {
-                            run(statement.body.statements)
-                        } catch (jump: LoopJump) {
-                            if (jump.isBreak) break else continue
-                        }
-                        if (returned != null) return returned
-                    } while (eval(statement.condition) != 0)
-                    is JasForStatement -> {
-                        statement.init?.let { run(listOf(it)) }
-                        while (statement.condition?.let { eval(it) != 0 } != false) {
-                            val returned = try {
-                                run(statement.body.statements)
-                            } catch (jump: LoopJump) {
-                                if (jump.isBreak) break else null
-                            }
-                            if (returned != null) return returned
-                            statement.update?.let(::write)
-                        }
-                    }
+                    is JasDoWhile, is JasForStatement, is JasWhile -> runLoop(statement, null)?.let { return it }
+                    is JasLabeledStatement -> runLoop(statement.statement, statement.label)?.let { return it }
                     is JasIf -> {
                         val taken = if (eval(statement.condition) != 0) statement.thenBody else statement.elseBody
                         taken?.let { run(it.statements) }?.let { return it }
                     }
-                    is JasWhile -> while (eval(statement.condition) != 0) {
-                        val returned = try {
-                            run(statement.body.statements)
-                        } catch (jump: LoopJump) {
-                            if (jump.isBreak) break else continue
-                        }
-                        if (returned != null) return returned
-                    }
-                    is JasBreakStatement -> throw LoopJump(true)
-                    is JasContinueStatement -> throw LoopJump(false)
+                    is JasBreakStatement -> throw LoopJump(true, statement.label)
+                    is JasContinueStatement -> throw LoopJump(false, statement.label)
                     is JasReturn -> return eval(requireNotNull(statement.value))
                     else -> error(statement.javaClass.simpleName)
                 }
@@ -400,7 +459,8 @@ class CoroutineBlockPlannerTest {
         val extendedLoops: Boolean = false,
         val nestedAwaits: Boolean = false,
         val callAwaits: Boolean = false,
-        val shortCircuits: Boolean = false
+        val shortCircuits: Boolean = false,
+        val labels: Boolean = false
     ) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
@@ -439,13 +499,22 @@ class CoroutineBlockPlannerTest {
 
         /**
          * 生成语句序列；mustReturn 时以 return 结束；inLoop 时可能以 break/continue 结束。
-         * 返回 (语句, 是否所有路径都已终止)。
+         * [enclosing] 是由内到外的外层循环标签（无标签为 null），labels 时跳转随机选一层带标签的
+         * 外层循环。返回 (语句, 是否所有路径都已终止)。
          */
-        fun sequence(depth: Int, outer: List<String>, mustReturn: Boolean, inLoop: Boolean = false): Pair<List<JasStatement>, Boolean> {
+        fun sequence(
+            depth: Int,
+            outer: List<String>,
+            mustReturn: Boolean,
+            inLoop: Boolean = false,
+            enclosing: List<String?> = emptyList()
+        ): Pair<List<JasStatement>, Boolean> {
             val scope = outer.toMutableList()
             val statements = mutableListOf<JasStatement>()
             repeat(random.nextInt(0, 4)) {
-                when (random.nextInt(if (depth > 0) 7 else 4)) {
+                // labels 时循环体内额外偏向再开一层循环，使「内层循环跳到外层标签」有足够的嵌套可用。
+                val choice = if (labels && inLoop && depth > 0 && random.nextInt(3) == 0) 5 else random.nextInt(if (depth > 0) 7 else 4)
+                when (choice) {
                     0, 1 -> {
                         val name = "v${counter++}"
                         val value = if (random.nextInt(3) == 0) awaitNode() else expression(scope)
@@ -472,19 +541,23 @@ class CoroutineBlockPlannerTest {
                             head += JasVariableStatement(name, JasPrimitiveType("int32"), awaitNode())
                             bodyScope += name
                         }
-                        val (body, bodyTerminates) = sequence(depth - 1, bodyScope, random.nextInt(5) == 0, inLoop = true)
+                        // labels 时四分之三的循环带标签；标签名全程唯一，兄弟循环也不复用，便于从 AST 文本定位。
+                        val label = if (labels && random.nextInt(4) != 0) "L${counter++}" else null
+                        val (body, bodyTerminates) =
+                            sequence(depth - 1, bodyScope, random.nextInt(5) == 0, inLoop = true, enclosing = listOf(label) + enclosing)
+                        val wrap = { loop: JasStatement -> if (label == null) loop else JasLabeledStatement(label, loop) }
                         val limit = JasIntLiteral(random.nextLong(0, 4), "")
                         // 循环条件里的 await 每趟都重新挂起；输入在 [-6, 6]，计数器每趟自增，仍至多 10 趟。
                         val bound = if (nestedAwaits && random.nextInt(3) == 0) JasBinaryOp(limit, "+", awaitNode()) else limit
                         val condition = combine(JasBinaryOp(bound, ">", JasIdentifier(loopCounter)), scope, allowOr = false)
-                        statements += when (if (extendedLoops) random.nextInt(3) else 0) {
+                        statements += wrap(when (if (extendedLoops) random.nextInt(3) else 0) {
                             0 -> JasWhile(condition, JasBlock(head + body))
                             // do-while：计数器在循环体首句自增，continue 前进到条件块也不会死循环。
                             1 -> JasDoWhile(JasBlock(head + body), condition).also {
                                 // 循环体至少执行一趟：所有路径都 return 且没有跳到本循环的 break /
                                 // continue 时循环不会正常结束，其后语句不可达，序列就此结束。
-                                if (bodyTerminates && !jumpsToThisLoop(body)) {
-                                    statements += it
+                                if (bodyTerminates && !jumpsToThisLoop(body, label)) {
+                                    statements += wrap(it)
                                     return statements to true
                                 }
                             }
@@ -498,7 +571,7 @@ class CoroutineBlockPlannerTest {
                                         JasBinaryOp(JasIdentifier(loopCounter), "+", JasIntLiteral(1, "1")))
                                 JasForStatement(init, condition, update, JasBlock(head.drop(1) + body))
                             }
-                        }
+                        })
                     }
                     else -> {
                         // 右侧是任意表达式时左侧不放调用：调用之后同一表达式里的 await 不在支持集内。
@@ -506,10 +579,11 @@ class CoroutineBlockPlannerTest {
                         val left = expression(scope, allowCall = !rightIsExpression)
                         val condition = combine(JasBinaryOp(left, ">",
                             if (rightIsExpression) expression(scope) else JasIntLiteral(random.nextLong(-3, 4), "")), scope, allowOr = true)
-                        val (thenBody, thenReturns) = sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop)
+                        val (thenBody, thenReturns) = sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop, enclosing)
                         val withElse = random.nextBoolean()
                         val (elseBody, elseReturns) =
-                            if (withElse) sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop) else emptyList<JasStatement>() to false
+                            if (withElse) sequence(depth - 1, scope, random.nextInt(3) == 0, inLoop, enclosing)
+                            else emptyList<JasStatement>() to false
                         statements += JasIf(condition, JasBlock(thenBody), if (withElse) JasBlock(elseBody) else null)
                         if (thenReturns && elseReturns) return statements to true
                     }
@@ -519,8 +593,16 @@ class CoroutineBlockPlannerTest {
                 statements += JasReturn(if (random.nextInt(4) == 0) JasIntLiteral(random.nextLong(-5, 6), "") else expression(scope))
                 return statements to true
             }
-            if (inLoop && random.nextInt(3) == 0) {
-                statements += if (random.nextBoolean()) JasBreakStatement(null) else JasContinueStatement(null)
+            // labels 时跳转更频繁，且优先跳到更外层的带标签循环，保证跨层跳转占足够比例。
+            if (inLoop && random.nextInt(if (labels) 2 else 3) == 0) {
+                val named = enclosing.filterNotNull()
+                val outerNamed = enclosing.drop(1).filterNotNull()
+                val target = when {
+                    outerNamed.isNotEmpty() && random.nextInt(3) != 0 -> outerNamed.random(random)
+                    named.isNotEmpty() && random.nextBoolean() -> named.random(random)
+                    else -> null
+                }
+                statements += if (random.nextBoolean()) JasBreakStatement(target) else JasContinueStatement(target)
                 return statements to true
             }
             return statements to false
@@ -532,6 +614,70 @@ class CoroutineBlockPlannerTest {
      *   与上一测试同样比对两套语义；另要求 do-while 与 for 各自出现足够多次。
      * 失败模式：打印种子、用例与程序 AST。
      */
+    /**
+     * 做什么：固定种子 20261107 生成 400 个随机程序：在第十二片的 while / do-while / for 形态上
+     *   四分之三的循环带标签，break / continue 多数跳到随机一层带标签的外层循环；规划必须成功且结构
+     *   良好，4 组输入下比对两套语义的返回值与挂起点数；另要求跨层跳转足够多。
+     * 失败模式：打印种子、用例与程序 AST。
+     */
+    @Test
+    fun `seeded labeled jumps match direct AST semantics`() {
+        val seed = 20261107
+        val random = Random(seed)
+        var crossLevel = 0
+        var suspendingLoops = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, labels = true).sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            if (crossesLoops(body)) crossLevel++
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (suspendsInsideLoop(plan)) suspendingLoops++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) { random.nextInt(-6, 7) }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                val (actual, suspensions) = runBlocks(plan, inputs.iterator(), base)
+                assertEquals(expected, actual, "$context round=$round base=$base inputs=$inputs")
+                assertEquals(direct.consumed, suspensions, "$context round=$round suspension count")
+            }
+        }
+        assertTrue(crossLevel > 40, "generator too weak: only $crossLevel programs jump across loop levels")
+        assertTrue(suspendingLoops > 50, "generator too weak: only $suspendingLoops programs suspend inside a loop")
+    }
+
+    /** 程序中是否有从内层循环跳到外层带标签循环的 break / continue。 */
+    private fun crossesLoops(statements: List<JasStatement>): Boolean = statements.any { statement ->
+        when (statement) {
+            is JasLabeledStatement -> loopBody(statement.statement).let { body ->
+                innerLoops(body).any { jumpsToThisLoop(loopBody(it), statement.label, nested = true) } || crossesLoops(body)
+            }
+            is JasWhile, is JasDoWhile, is JasForStatement -> crossesLoops(loopBody(statement))
+            is JasIf -> crossesLoops(statement.thenBody.statements) || crossesLoops(statement.elseBody?.statements.orEmpty())
+            else -> false
+        }
+    }
+
+    /** 序列中（穿过 if 与标签）直接出现的循环，不再深入它们的循环体。 */
+    private fun innerLoops(statements: List<JasStatement>): List<JasStatement> = statements.flatMap { statement ->
+        when (statement) {
+            is JasLabeledStatement -> listOf(statement.statement)
+            is JasWhile, is JasDoWhile, is JasForStatement -> listOf(statement)
+            is JasIf -> innerLoops(statement.thenBody.statements) + innerLoops(statement.elseBody?.statements.orEmpty())
+            else -> emptyList()
+        }
+    }
+
+    private fun loopBody(loop: JasStatement): List<JasStatement> = when (loop) {
+        is JasWhile -> loop.body.statements
+        is JasDoWhile -> loop.body.statements
+        is JasForStatement -> loop.body.statements
+        else -> error(loop.javaClass.simpleName)
+    }
+
     @Test
     fun `seeded do-while and for block machines match direct AST semantics`() {
         val seed = 20261031
@@ -565,16 +711,25 @@ class CoroutineBlockPlannerTest {
         assertTrue(suspendingLoops > 50, "generator too weak: only $suspendingLoops programs suspend inside a loop")
     }
 
-    /** 语句序列中是否有以本层循环为目标的 break / continue（穿过 if，不进入内层循环）。 */
+    /**
+     * 语句序列中是否有以本层循环（标签 [label]）为目标的 break / continue：本层的无标签跳转
+     * 穿过 if、不进入内层循环；带本层标签的跳转可以在任意深度的内层循环里。
+     */
     private companion object {
-        fun jumpsToThisLoop(statements: List<JasStatement>): Boolean = statements.any { statement ->
-            when (statement) {
-                is JasBreakStatement, is JasContinueStatement -> true
-                is JasIf -> jumpsToThisLoop(statement.thenBody.statements) ||
-                    (statement.elseBody?.let { jumpsToThisLoop(it.statements) } ?: false)
-                else -> false
+        fun jumpsToThisLoop(statements: List<JasStatement>, label: String?, nested: Boolean = false): Boolean =
+            statements.any { statement ->
+                when (statement) {
+                    is JasBreakStatement -> if (statement.label == null) !nested else statement.label == label
+                    is JasContinueStatement -> if (statement.label == null) !nested else statement.label == label
+                    is JasIf -> jumpsToThisLoop(statement.thenBody.statements, label, nested) ||
+                        (statement.elseBody?.let { jumpsToThisLoop(it.statements, label, nested) } ?: false)
+                    is JasLabeledStatement -> jumpsToThisLoop(listOf(statement.statement), label, nested)
+                    is JasWhile -> jumpsToThisLoop(statement.body.statements, label, nested = true)
+                    is JasDoWhile -> jumpsToThisLoop(statement.body.statements, label, nested = true)
+                    is JasForStatement -> jumpsToThisLoop(statement.body.statements, label, nested = true)
+                    else -> false
+                }
             }
-        }
     }
 
     /** 计划中是否有挂起点位于某个循环内（挂起块与某循环头互相可达）。 */

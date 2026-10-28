@@ -103,6 +103,8 @@ object SuspensionEffectAnalysis {
                 scan(node.body, facts)
                 if (node.suffix != null) facts.unknown = true
             }
+            // 标签只决定跳转目标，不引入求值；挂起与否由被标记的循环决定。
+            is JasLabeledStatement -> scan(node.statement, facts)
             is JasBreakStatement, is JasContinueStatement -> Unit
             is JasAssignment -> { scan(node.target, facts); scan(node.value, facts) }
             is JasPostfixIncDec -> scan(node.target, facts)
