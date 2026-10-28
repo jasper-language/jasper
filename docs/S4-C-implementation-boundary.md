@@ -955,8 +955,60 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 
 ### 仍未支持
 
-处理体使用捕获参数、throw 语句、finally / defer 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用
+处理体使用捕获参数、finally / defer 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用
 实参中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；清理抛出时
 以新失败取代原失败（与草案 §4.4 第 4 条「原失败为主错误、清理错误只记诊断」不同，finally 与 defer
 现均按前者）待错误模型定案时统一；AST 构建器丢弃多表达式 for 初始化段、同步路径对未知标签退回最内层
 循环的既有限制同前。
+
+
+## S4-C 第二十片：协程帧内 throw
+
+### 降级规则
+
+- 规划器把 `throw E` 降级为新出口 `Throw(E)`：E 在当前块求值（其中的 await 与 return 值同一提升
+  规则），随后在段内抛出并结束该路径；throw 之后的同块语句按不可达拒绝，「每条路径以 return 结束」
+  放宽为「以 return 或 throw 结束」。
+- throw 块不登记块清理：抛出是非正常离开，所在区域的 finally / defer 与 catch 匹配全部由第十七、十八片
+  已有的异常路由 / 展开按 `$region` 完成，与段内其他抛出（除零、被调函数抛出）走同一条路径。帧协议
+  未改。
+- 未被捕获时的发布：段内与清理抛出的 `std.Error` 发布为 `Failure(message(), "error")`，其余平台异常
+  仍为 `Failure(toString(), "platform")`；与 `TaskGroup.spawn` 子任务体的既有约定一致（此前协程帧把
+  被调函数抛出的 Error 也记为 platform）。挂起点失败未被匹配时发布的仍是原 Failure 对象，取消仍为
+  Cancelled。
+- 挂起效果分析扫描抛出值；「同步调用挂起函数」检查进入抛出值与构造实参。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- finally / defer 体中的 throw（清理须正常结束，同第十七片）；
+- 处理体重新抛出捕获参数（`throw e`：捕获参数不能成为帧字段，同第十八片）；
+- 构造实参中的 await（`throw new E(await f)`，await 不提升进 `new`）；
+- throw 之后的同块语句。
+
+错误不是值（`LANG-ERR`），函数不能返回 Error，所以抛出值实际上总是就地 `new` 构造。
+
+### 验收结果
+
+- `CoroutineBlockPlannerTest`：新增形状测试（try 体与处理块内、函数末尾各一个 throw 都是不带块清理的
+  Throw 出口；原拒绝用例 `throw input` 改为断言规划成单块 Throw 出口）；拒绝清单新增 finally / defer
+  中 throw、重新抛出捕获参数、构造实参 await、throw 后语句五例。新增固定种子 20261119 的 400 个随机
+  程序：在第十九片 try/catch/finally/defer 随机程序上，三分之一的必终止位置改为
+  `throw new T()`（T 在 FutureFailureError / FutureCancelledError / Error 中随机），输入各约 1/12 为失败
+  与取消哨兵；直接解释器按源码语义抛出，与块状态机异常路由比对结果、挂起点数与清理轨迹；数量下限：
+  含 throw 的程序超过 150，抛出后被捕获并继续、抛出逃出全部区域且执行过清理各超过 40。
+- `ThrowCoroutinePipelineTest` 4 项，经真实 ANTLR 解析、标准库 + 用户源码（含 `LimitError extends Error`）
+  编译与 JVM 执行（class major 52）：内层 catch (LimitError) 捕获源码抛出后继续循环；处理块再抛出先执行
+  内层 finally、被外层捕获；Error 穿过 catch (LimitError) 在两层 finally 之后发布为
+  `Failure("overflow", "error")`；挂起点失败发布原 Failure 对象、取消发布 Cancelled；没有 catch 的帧在
+  分支内挂起时不执行 defer，恢复后抛出，finally 先于 defer 执行；固定种子 20261119 的 run / plain
+  各 64 轮与 Kotlin oracle 比对值、失败消息与种类、清理与处理次数。
+- 变异检查：Error 仍发布为 platform 与 throw 块登记块清理两组同时注入，规划器 2 项（仅受后者影响）与
+  端到端 4 项共 6 项失败。
+- TLA+：帧协议未改（throw 是段内抛出的另一种来源，`TryCatchCoroutineFrame` 已建模段内抛出），
+  `run-s4-models.sh` 十四组配置复跑通过。
+
+### 仍未支持
+
+处理体使用捕获参数（含重新抛出）、构造实参中的 await、finally / defer 中的 throw / 挂起 / 跳出、for-in
+与循环后置块、实例 / 接收者调用实参中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与
+显式挂起标记名称；清理抛出以新失败取代原失败的既有差异同第十九片。

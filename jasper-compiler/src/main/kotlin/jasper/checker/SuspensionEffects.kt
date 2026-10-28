@@ -106,6 +106,8 @@ object SuspensionEffectAnalysis {
             // 标签只决定跳转目标，不引入求值；挂起与否由被标记的循环决定。
             is JasLabeledStatement -> scan(node.statement, facts)
             is JasBreakStatement, is JasContinueStatement -> Unit
+            // throw 只改变离开路径；抛出值照常扫描（构造调用等未覆盖结构仍记为未知）。
+            is JasThrow -> scan(node.expression, facts)
             // try 只改变清理与异常路径，不引入挂起；三部分都扫描，省略的 finally 不算未知结构。
             is JasTry -> {
                 scan(node.body, facts)

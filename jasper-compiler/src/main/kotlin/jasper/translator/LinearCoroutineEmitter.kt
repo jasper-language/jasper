@@ -35,6 +35,9 @@
 //     FutureFailureError / FutureCancelledError，段内抛出经异常路由按 `$region` 由内到外执行
 //     finally 清理、按捕获类型匹配 catch，命中则转入处理块并重新进入分派循环（入口检查照常）；
 //     本任务自身的取消不抛异常，只展开 finally，catch 看不到它；
+//   - throw（第二十片）：段内直接抛出，与段内其他异常走同一条路由 / 展开路径；未被捕获时
+//     std.Error 发布为 Failure(message, "error")，其余平台异常为 Failure(toString, "platform")，
+//     与 TaskGroup.spawn 的子任务体约定一致；
 //   - 不定义显式挂起标记，不改变公开函数 ABI，也不把生成帧冒充为可同步调用的
 //     普通函数；
 //   - 不实现 Future.get 阻塞等待；恢复只经 onComplete -> ContinuationDispatch。
@@ -74,6 +77,7 @@ object LinearCoroutineEmitter {
     private const val FUTURE_FAILURE_ERROR = "std.FutureFailureError"
     private const val FUTURE_CANCELLED_ERROR = "std.FutureCancelledError"
     private const val THROWABLE = "java.lang.Throwable"
+    private const val ERROR = "std.Error"
 
     /** 仅 int32 结果；更宽类型需要重新审视字段布局与描述符，不能静默复用。 */
     private val INT = JasPrimitiveType("int32")
@@ -188,6 +192,7 @@ object LinearCoroutineEmitter {
             is JasPropertyAccess -> expression.copy(target = rewrite(expression.target))
             is JasCall -> JasCall(rewrite(expression.target), expression.args.map(::rewrite), expression.isSafe)
             is JasCastExpr -> expression.copy(expression = rewrite(expression.expression))
+            is JasNew -> expression.copy(args = expression.args.map(::rewrite))
             else -> throw IllegalArgumentException("unsupported frame expression: ${expression.javaClass.simpleName}")
         }
 
@@ -298,6 +303,8 @@ object LinearCoroutineEmitter {
                     code += statement(invoke(field("__result"), "complete", rewrite(exit.value)))
                     code += JasReturn(null)
                 }
+                // 抛出值在段内求值后直接抛出；所在区域的 finally / catch 由外层路由按 `$region` 处理。
+                is CoroutineBlockExit.Throw -> code += JasThrow(rewrite(exit.value))
             }
             JasIf(
                 JasBinaryOp(field("__phase"), "==", JasIntLiteral(block.id.toLong(), block.id.toString())),
@@ -366,6 +373,18 @@ object LinearCoroutineEmitter {
         fun platformFailure(error: String) =
             JasNew(JasNamedType(FAILURE), listOf(invoke(JasIdentifier(error), "toString"), JasStringLiteral("platform")))
         /**
+         * 段内或清理抛出的 [error] 记为待发布的失败：std.Error 记为 Failure(message, "error")，其余平台
+         * 异常记为 Failure(toString, "platform")。为什么区分：与 TaskGroup.spawn 子任务体的约定一致，
+         * 等待者按 kind 区分业务错误与平台故障，源码 throw 的错误消息原样可见。
+         */
+        fun abortThrown(error: String) = listOf(JasIf(
+            JasInstanceOfExpr(JasIdentifier(error), JasNamedType(ERROR)),
+            JasBlock(abortFailure(JasNew(JasNamedType(FAILURE), listOf(
+                invoke(JasCastExpr(JasIdentifier(error), JasNamedType(ERROR)), "message"), JasStringLiteral("error")
+            )))),
+            JasBlock(abortFailure(platformFailure(error)))
+        ))
+        /**
          * 有 catch 区域时的分派：段内抛出（含挂起点失败 / 取消转成的错误）先记下待发布终态
          * （挂起点已记的原 Failure / Cancelled 不覆盖），再按 `$region` 由内到外路由——finally 区域
          * 执行清理（清理抛出时以新异常继续路由，可被外层 catch 捕获），catch 区域先退回外层区域
@@ -382,7 +401,7 @@ object LinearCoroutineEmitter {
             val thrown = JasIdentifier("__thrown")
             val route = mutableListOf<JasStatement>(
                 JasIf(JasBinaryOp(field("__abort"), "==", JasIntLiteral(0, "0")),
-                    JasBlock(abortFailure(platformFailure("__error"))), null),
+                    JasBlock(abortThrown("__error")), null),
                 JasVariableStatement("__thrown", JasNamedType(THROWABLE), JasIdentifier("__error"), false)
             )
             plan.tryRegions.sortedByDescending { it.id }.forEach { region ->
@@ -392,7 +411,7 @@ object LinearCoroutineEmitter {
                         JasBlock(cleanupCode.getValue(region.id)),
                         listOf(JasCatchClause(
                             JasParameter(error, JasNamedType(THROWABLE)),
-                            JasBlock(abortFailure(platformFailure(error)) +
+                            JasBlock(abortThrown(error) +
                                 statement(JasAssignment(thrown, JasIdentifier(error))))
                         )),
                         null
@@ -435,7 +454,7 @@ object LinearCoroutineEmitter {
             JasBlock(listOf(dispatchLoop)),
             listOf(JasCatchClause(
                 JasParameter("__error", JasNamedType(THROWABLE)),
-                JasBlock(abortFailure(platformFailure("__error")))
+                JasBlock(abortThrown("__error"))
             )),
             null
         ) else routedLoop()
@@ -448,7 +467,7 @@ object LinearCoroutineEmitter {
                     JasBlock(cleanupCode.getValue(region.id)),
                     listOf(JasCatchClause(
                         JasParameter(error, JasNamedType("java.lang.Throwable")),
-                        JasBlock(abortFailure(platformFailure(error)))
+                        JasBlock(abortThrown(error))
                     )),
                     null
                 ))),

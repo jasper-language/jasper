@@ -261,18 +261,20 @@ object CoroutineLowering {
             is JasUnaryOp -> find(expression.operand)
             is JasPropertyAccess -> find(expression.target)
             is JasCastExpr -> find(expression.expression)
+            is JasNew -> expression.args.firstNotNullOfOrNull(::find)
             else -> null
         }
         /**
          * 按语句递归查找；分支条件与两条分支体（第十片起支持 if/else）、循环条件与循环体
          * （第十一片起支持 while，第十二片起支持 do-while 与三段式 for 的初始化 / 步进段，
-         * 第十六片起循环可带标签，第十七片起 try 体 / finally 体，第十九片起 defer 体）都要覆盖。
+         * 第十六片起循环可带标签，第十七片起 try 体 / finally 体，第十九片起 defer 体，第二十片起 throw 的抛出值）都要覆盖。
          */
         fun search(statement: JasStatement): JasCall? = when (statement) {
             is JasVariableStatement -> find(statement.initializer)
             is JasExpressionStatement -> (statement.expression as? JasAssignment)?.let { find(it.value) }
                 ?: find(statement.expression)
             is JasReturn -> find(statement.value)
+            is JasThrow -> find(statement.expression)
             is JasIf -> find(statement.condition)
                 ?: statement.thenBody.statements.firstNotNullOfOrNull(::search)
                 ?: statement.elseBody?.statements?.firstNotNullOfOrNull(::search)

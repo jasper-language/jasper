@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十九片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至二十片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -22,6 +22,8 @@
 //   catch 区域。段内抛出与挂起点失败 / 取消由发射器的异常路由按捕获类型转入处理块。
 //   `defer D` 在当前作用域（所在块）结束时执行：同一块中其后的语句降级为 try 体、D 为
 //   finally 体，复用清理区域，同块多个 defer 因此后声明先执行。
+//   `throw E` 先在当前块求值 E（其中的 await 与 return 值一样提升），随后在段内抛出并结束
+//   路径；离开区域的清理与 catch 匹配由发射器的异常路由按 `$region` 完成，块上不登记清理。
 //   生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
@@ -37,9 +39,9 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - for-in、循环后置块、throw、match 一律拒绝；catch 处理体不得引用捕获参数
+//   - for-in、循环后置块、match 一律拒绝；catch 处理体不得引用捕获参数
 //     （Error 不能成为帧字段），捕获类型须是无类型实参的具名类型；
-//   - finally 体与 defer 体是同步清理：不得含 await、return、try、defer、带标签或跳出清理的
+//   - finally 体与 defer 体是同步清理：不得含 await、return、throw、try、defer、带标签或跳出清理的
 //     break / continue；只接受 int32 / bool 局部声明、对局部的 `=` 赋值、int32 局部
 //     `++` / `--`、调用语句、if/else、while 与块；
 //   - break / continue 的标签必须是某个外层循环的标签；未知标签与遮蔽外层同名标签的
@@ -50,8 +52,8 @@
 //     （否则提升会改变副作用或异常与挂起的先后，拒绝；短路运算的左操作数在分支前
 //     求值，故其中的调用 / 除法不妨碍右操作数中的 await）；属性、下标、
 //     转换等位置中的 await 一律拒绝；await 操作数内不能再有 await 或局部写入；
-//   - 每条路径必须以 return 结束；return / break / continue 之后的语句视为不可达
-//     并拒绝。
+//   - 每条路径必须以 return 或 throw 结束；return / throw / break / continue 之后的语句
+//     视为不可达并拒绝；构造实参中的 await（`throw new E(await f)`）不提升，拒绝。
 // ============================================================================
 
 package jasper.translator
@@ -76,6 +78,12 @@ sealed class CoroutineBlockExit {
 
     /** 以 [value] 作为成功结果结束整个帧。 */
     data class Finish(val value: JasExpression) : CoroutineBlockExit()
+
+    /**
+     * 在段内抛出 [value]（源码 `throw`）。不登记块清理：抛出是非正常离开，所在区域的 finally
+     * 与 catch 匹配由发射器的异常路由 / 展开按区域局部完成，与段内其他抛出同一条路径。
+     */
+    data class Throw(val value: JasExpression) : CoroutineBlockExit()
 }
 
 /**
@@ -195,7 +203,7 @@ object CoroutineBlockPlanner {
         val state = State(slotTypes)
         return try {
             val tail = state.lowerSequence(statements, state.open(null))
-            if (tail != null) throw Rejected("every path must end with return")
+            if (tail != null) throw Rejected("every path must end with return or throw")
             val blocks = state.closed.values.sortedBy { it.id }
             check(blocks.map { it.id } == blocks.indices.toList()) { "coroutine block ids are not dense" }
             blocks.forEach { block ->
@@ -217,7 +225,7 @@ object CoroutineBlockPlanner {
         is CoroutineBlockExit.Goto -> listOf(exit.target)
         is CoroutineBlockExit.Branch -> listOf(exit.whenTrue, exit.whenFalse)
         is CoroutineBlockExit.Suspend -> listOf(exit.resume)
-        is CoroutineBlockExit.Finish -> emptyList()
+        is CoroutineBlockExit.Finish, is CoroutineBlockExit.Throw -> emptyList()
     }
 
     /** 一次规划的可变状态；与单例分离，保证并发编译互不干扰。 */
@@ -248,7 +256,7 @@ object CoroutineBlockPlanner {
         fun lowerSequence(statements: List<JasStatement>, start: OpenBlock): OpenBlock? {
             var current: OpenBlock? = start
             for ((index, statement) in statements.withIndex()) {
-                val block = current ?: throw Rejected("unreachable statement after return, break or continue")
+                val block = current ?: throw Rejected("unreachable statement after return, throw, break or continue")
                 // defer（S4-C 第十九片）：「当前作用域结束时执行」= 同一块中其后的语句是 try 体、defer 体是
                 // finally 体，复用清理区域；同块多个 defer 因此嵌套成由内到外（后声明先执行）。
                 if (statement is JasDefer) {
@@ -310,6 +318,13 @@ object CoroutineBlockPlanner {
                 }
                 end.cleanups += crossedRegions(0)
                 close(end, CoroutineBlockExit.Finish(result))
+                null
+            }
+            is JasThrow -> {
+                // 抛出值中的 await 先于构造与抛出求值（与 return 值同一规则）；抛出由区域路由处理，
+                // 不需要像 return 那样先固定值再在块上执行清理。
+                val (end, rewritten) = hoist(statement.expression, block)
+                close(end, CoroutineBlockExit.Throw(rewritten))
                 null
             }
             is JasTry -> lowerTry(statement, block)
@@ -873,6 +888,7 @@ object CoroutineBlockPlanner {
             is JasVariableStatement -> statement.name == name || inExpression(statement.initializer)
             is JasExpressionStatement -> inExpression(statement.expression)
             is JasReturn -> inExpression(statement.value)
+            is JasThrow -> inExpression(statement.expression)
             is JasIf -> inExpression(statement.condition) || inBlock(statement.thenBody) || inBlock(statement.elseBody)
             is JasWhile -> inExpression(statement.condition) || inBlock(statement.body)
             is JasDoWhile -> inBlock(statement.body) || inExpression(statement.condition)
