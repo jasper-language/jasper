@@ -1,5 +1,5 @@
 // ============================================================================
-// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十八片）
+// CoroutineBlockPlanner.kt —— 协程帧的基本块规划（S4-C 第十至十九片）
 // ============================================================================
 // 职责：
 //   把一个已通过类型检查的受限函数体切成基本块序列：每个真实 await（局部初始化
@@ -20,6 +20,8 @@
 //   try/catch 登记为 catch 区域（同一条 `$region` 链，无清理语句），每个 catch 子句开一个
 //   没有前驱边的处理块，在区域之外降级；`try B catch H finally F` 为 finally 区域包住
 //   catch 区域。段内抛出与挂起点失败 / 取消由发射器的异常路由按捕获类型转入处理块。
+//   `defer D` 在当前作用域（所在块）结束时执行：同一块中其后的语句降级为 try 体、D 为
+//   finally 体，复用清理区域，同块多个 defer 因此后声明先执行。
 //   生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
@@ -35,9 +37,9 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - for-in、循环后置块、defer、throw、match 一律拒绝；catch 处理体不得引用捕获参数
+//   - for-in、循环后置块、throw、match 一律拒绝；catch 处理体不得引用捕获参数
 //     （Error 不能成为帧字段），捕获类型须是无类型实参的具名类型；
-//   - finally 体是同步清理：不得含 await、return、try、带标签或跳出 finally 的
+//   - finally 体与 defer 体是同步清理：不得含 await、return、try、defer、带标签或跳出清理的
 //     break / continue；只接受 int32 / bool 局部声明、对局部的 `=` 赋值、int32 局部
 //     `++` / `--`、调用语句、if/else、while 与块；
 //   - break / continue 的标签必须是某个外层循环的标签；未知标签与遮蔽外层同名标签的
@@ -245,8 +247,13 @@ object CoroutineBlockPlanner {
          */
         fun lowerSequence(statements: List<JasStatement>, start: OpenBlock): OpenBlock? {
             var current: OpenBlock? = start
-            for (statement in statements) {
+            for ((index, statement) in statements.withIndex()) {
                 val block = current ?: throw Rejected("unreachable statement after return, break or continue")
+                // defer（S4-C 第十九片）：「当前作用域结束时执行」= 同一块中其后的语句是 try 体、defer 体是
+                // finally 体，复用清理区域；同块多个 defer 因此嵌套成由内到外（后声明先执行）。
+                if (statement is JasDefer) {
+                    return lowerTry(JasTry(JasBlock(statements.drop(index + 1)), emptyList(), statement.body), block, "defer")
+                }
                 current = lowerStatement(statement, block)
             }
             return current
@@ -472,8 +479,9 @@ object CoroutineBlockPlanner {
          * try：有 finally 时分配清理区域，当前块写入区域编号后在区域内降级 try 体（有 catch
          * 时降级内层 catch 区域）；正常结束的块在出口前执行本区域清理并前进到新块。try 体内的
          * 挂起、循环与跳转照常切块，跨出区域的 return / break / continue 在各自块上登记清理。
+         * [cleanupKind] 只用于诊断措辞（defer 降级为 try/finally 时为 "defer"）。
          */
-        private fun lowerTry(statement: JasTry, block: OpenBlock): OpenBlock? {
+        private fun lowerTry(statement: JasTry, block: OpenBlock, cleanupKind: String = "finally"): OpenBlock? {
             val cleanup = statement.finallyBody
             if (cleanup == null) {
                 if (statement.catches.isEmpty()) throw Rejected("try without catch or finally is not supported")
@@ -487,7 +495,7 @@ object CoroutineBlockPlanner {
                 tries.removeLast()
             }
             // finally 体按源码顺序在 try 体（与 catch 处理块）之后校验，局部登记顺序与源码一致。
-            checkCleanup(cleanup.statements, 0)
+            checkCleanup(cleanup.statements, 0, cleanupKind)
             if (bodyEnd == null) return null
             bodyEnd.cleanups += region.id
             val next = open(null)
@@ -557,15 +565,15 @@ object CoroutineBlockPlanner {
         private fun crossedRegions(depth: Int): List<Int> = tries.drop(depth).map { it.id }.reversed()
 
         /**
-         * 校验 finally 体：同步、正常结束，局部声明登记为帧局部。[loopDepth] 是 finally 体内
-         * 已进入的 while 层数，无标签 break / continue 只能作用于这些循环。
+         * 校验 finally 体（或 defer 体）：同步、正常结束，局部声明登记为帧局部。[loopDepth] 是清理体内
+         * 已进入的 while 层数，无标签 break / continue 只能作用于这些循环；[kind] 是诊断措辞。
          * 为什么不允许 return / 跳出 finally：那会丢弃正在传播的失败或已求出的返回值，
          * 需要单独定义并验证；本片只接受一定正常结束的清理。
          */
-        private fun checkCleanup(statements: List<JasStatement>, loopDepth: Int) {
+        private fun checkCleanup(statements: List<JasStatement>, loopDepth: Int, kind: String) {
             /** 清理中的表达式不得挂起。 */
             fun noAwait(expression: JasExpression?) {
-                if (containsAwait(expression)) throw Rejected("await in finally is not supported")
+                if (containsAwait(expression)) throw Rejected("await in $kind is not supported")
             }
             for (statement in statements) {
                 when (statement) {
@@ -594,26 +602,26 @@ object CoroutineBlockPlanner {
                             }
                         }
                         is JasCall -> noAwait(expression)
-                        else -> throw Rejected("only assignments, increments and calls may appear as statements in finally")
+                        else -> throw Rejected("only assignments, increments and calls may appear as statements in $kind")
                     }
                     is JasIf -> {
                         noAwait(statement.condition)
-                        checkCleanup(statement.thenBody.statements, loopDepth)
-                        statement.elseBody?.let { checkCleanup(it.statements, loopDepth) }
+                        checkCleanup(statement.thenBody.statements, loopDepth, kind)
+                        statement.elseBody?.let { checkCleanup(it.statements, loopDepth, kind) }
                     }
                     is JasWhile -> {
                         if (statement.suffix != null) throw Rejected("loop suffix blocks are not supported")
                         noAwait(statement.condition)
-                        checkCleanup(statement.body.statements, loopDepth + 1)
+                        checkCleanup(statement.body.statements, loopDepth + 1, kind)
                     }
                     is JasBreakStatement, is JasContinueStatement -> {
                         val label = (statement as? JasBreakStatement)?.label ?: (statement as? JasContinueStatement)?.label
                         if (label != null || loopDepth == 0) {
-                            throw Rejected("break/continue must not leave finally")
+                            throw Rejected("break/continue must not leave $kind")
                         }
                     }
-                    is JasBlock -> checkCleanup(statement.statements, loopDepth)
-                    else -> throw Rejected("unsupported statement in finally: ${statement.javaClass.simpleName}")
+                    is JasBlock -> checkCleanup(statement.statements, loopDepth, kind)
+                    else -> throw Rejected("unsupported statement in $kind: ${statement.javaClass.simpleName}")
                 }
             }
         }
@@ -871,6 +879,7 @@ object CoroutineBlockPlanner {
             is JasForStatement -> mentions(statement.init, name) || inExpression(statement.condition) ||
                 inExpression(statement.update) || inBlock(statement.body)
             is JasLabeledStatement -> mentions(statement.statement, name)
+            is JasDefer -> inBlock(statement.body)
             is JasTry -> inBlock(statement.body) || inBlock(statement.finallyBody) ||
                 statement.catches.any { it.parameter.name == name || inBlock(it.body) }
             is JasBlock -> inBlock(statement)

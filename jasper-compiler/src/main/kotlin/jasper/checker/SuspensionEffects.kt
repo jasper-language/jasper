@@ -112,6 +112,8 @@ object SuspensionEffectAnalysis {
                 node.catches.forEach { scan(it.body, facts) }
                 node.finallyBody?.let { scan(it, facts) }
             }
+            // defer 体是作用域结束时的清理，与 finally 体同样扫描。
+            is JasDefer -> scan(node.body, facts)
             is JasAssignment -> { scan(node.target, facts); scan(node.value, facts) }
             is JasPostfixIncDec -> scan(node.target, facts)
             is JasCall -> {

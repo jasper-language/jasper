@@ -893,3 +893,61 @@ for-in 与循环后置块、try/catch/finally/defer 的清理后继、实例 / �
 处理体使用捕获参数、defer、throw 语句、finally 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用
 实参中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；AST 构建器
 丢弃多表达式 for 初始化段、同步路径对未知标签退回最内层循环的既有限制同前。
+
+## S4-C 第十九片：协程帧内 defer
+
+本片继续「实现次序」第 5 条，实现规范 10.8 的 `defer`：「在当前作用域结束时执行」。协程帧中的作用域
+就是源码块（函数体、if / else 分支、循环体每一趟、try 体、catch 处理体）；无论以正常结束、return、
+break / continue、挂起点失败 / 取消、段内抛出还是作用域取消离开该块，defer 体都恰好执行一次，同一块中
+后声明的先执行。帧协议不变。
+
+### 降级规则
+
+- 规划器降级语句序列时遇到 `defer D`：同一块中 D 之后的全部语句降级为 try 体，D 为 finally 体，即
+  `defer D; S…` ≡ `try { S… } finally { D }`，直接复用第十七片的清理区域（区域编号、`$region`、出口前
+  由内到外清理、非正常离开先展开后发布、回收要求区域为 0）。同块多个 defer 因此逐层嵌套，后声明的在
+  内层、先执行；块末尾的 defer（其后没有语句）降级为空 try 体，离开块时执行。
+- 块内的 return 照常先固定返回值再清理，所以 defer 改写局部不影响已求出的返回值（与同步路径「defer 在
+  return 求值之后、真正返回之前执行」一致）。
+- defer 体与 finally 体同为同步清理，接受的语句与限制相同；诊断措辞写 defer。
+- 挂起效果分析与「同步调用挂起函数」检查进入 defer 体（此前含 defer 的函数被视为未知效果）。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- defer 体中的 await、return、try、defer、do-while / for、带标签或跳出 defer 体的 break / continue；
+- defer 体中对挂起函数的同步调用；
+- 作用域结束后仍未 return 的路径（「每条路径以 return 结束」的要求不变）。
+
+### 验收结果
+
+- `CoroutineBlockPlannerTest`：新增形状测试（if 分支末尾的 defer、函数体两个 defer 嵌套为父子区域、
+  循环体 defer 在 continue 与循环体末尾各清理一次且不越过循环、return 先存临时局部再按后声明先执行的
+  顺序清理）；拒绝清单原「defer」一例换成 defer 中 await / return / 跳出 / defer、finally 中 defer、
+  defer 之后缺 return 六例。新增固定种子 20261113 的 400 个随机程序：在第十八片 try/catch/finally 随机
+  程序上，每个语句位置约 1/4 插入 defer（可在循环体、分支、try 体与处理块中，同块可多个），输入各约
+  1/12 为失败与取消哨兵；直接解释器按规范语义执行 defer（每个块一个作用域，离开时后进先出，**不经过**
+  try/finally 改写），与块状态机比对结果、挂起点数与清理轨迹。数量下限：同块多个 defer、循环体内 defer、
+  失败展开各超过 40。
+- `DeferCoroutinePipelineTest` 5 项，经真实 ANTLR 解析（单语句与块两种 defer 形式）、标准库 + 用户源码
+  编译与 JVM 执行（class major 52）：挂起期间不执行 defer、循环体 defer 每趟一次、函数结束时后声明的先
+  执行、return 值不含 defer 的改写；continue / break 只执行循环体 defer，循环体内 return 依次执行三个；
+  input 失败时三个 defer 完成后才发布原 Failure，gate 失败只执行函数体两个，除零与 defer 体自身抛出发布
+  platform 失败且外层 defer 照常执行；挂在循环体内 / 循环后被作用域取消，defer 完成后才 settled，晚到
+  输入不复活；固定种子 20261113 的 64 轮与 Kotlin oracle 一致。
+- 变异检查：同块 defer 改为按声明顺序合并执行（先声明先执行）规划器 2 项与端到端 5 项共 7 项失败；
+  丢弃 defer 共 8 项失败。
+- TLA+：帧协议未改（defer 只是清理区域的另一种源码来源），`run-s4-models.sh` 十四组配置复跑通过。
+
+### 已知差异（未在本片修改）
+
+同步函数路径（`JasperToIrTranslator`）的 defer 不按作用域执行：defer 体按词法顺序累积，只在其后的
+`return` 处全部展开——分支里未执行到的 defer 也会执行，循环体中的 defer 不按趟执行，块正常结束与异常
+离开都不执行。协程帧按规范语义实现，两条路径在这些形态上行为不同；同步路径的修复另立项。
+
+### 仍未支持
+
+处理体使用捕获参数、throw 语句、finally / defer 中的挂起与跳出、for-in 与循环后置块、实例 / 接收者调用
+实参中的 await、实例分派、取消原因与 Deadline、公开源码挂起调用 ABI 与显式挂起标记名称；清理抛出时
+以新失败取代原失败（与草案 §4.4 第 4 条「原失败为主错误、清理错误只记诊断」不同，finally 与 defer
+现均按前者）待错误模型定案时统一；AST 构建器丢弃多表达式 for 初始化段、同步路径对未知标签退回最内层
+循环的既有限制同前。

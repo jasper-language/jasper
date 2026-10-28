@@ -350,7 +350,16 @@ class CoroutineBlockPlannerTest {
                 block(JasForStatement(null, id("flag"), null, block()))), JasReturn(id("v"))),
             "finally-duplicate-local" to function(decl("v", await("input")), JasTry(block(decl("w", lit(1))), emptyList(),
                 block(decl("w", lit(2)))), JasReturn(id("v"))),
-            "defer" to function(decl("v", await("input")), JasDefer(block(set("v", lit(1)))), JasReturn(id("v")))
+            // defer 体与 finally 体同为同步清理（第十九片）：挂起、return、跳出清理、defer 中再 defer 拒绝。
+            "await-in-defer" to function(decl("v", lit(0)), JasDefer(block(set("v", await("input")))), JasReturn(id("v"))),
+            "return-in-defer" to function(decl("v", await("input")), JasDefer(block(JasReturn(lit(2)))), JasReturn(id("v"))),
+            "break-out-of-defer" to function(decl("v", await("input")), JasWhile(id("flag"), block(
+                JasDefer(block(JasBreakStatement(null))), set("v", lit(1)))), JasReturn(id("v"))),
+            "defer-in-defer" to function(decl("v", await("input")), JasDefer(block(JasDefer(block()))), JasReturn(id("v"))),
+            "defer-in-finally" to function(decl("v", await("input")), JasTry(block(set("v", lit(1))), emptyList(),
+                block(JasDefer(block()))), JasReturn(id("v"))),
+            // 作用域结束后的路径仍要以 return 结束：defer 不改变「每条路径以 return 结束」的要求。
+            "defer-missing-return" to function(decl("v", await("input")), JasDefer(block(set("v", lit(1)))))
         )
         for ((name, fn) in cases) {
             val plan = CoroutineBlockPlanner.plan(fn, parameters)
@@ -463,10 +472,24 @@ class CoroutineBlockPlannerTest {
             return null
         }
 
-        /** 返回 null 表示序列正常结束（未 return）。 */
+        /**
+         * 返回 null 表示序列正常结束（未 return）。每次调用是一个作用域：其中的 defer 体登记到本层，
+         * 离开本层时（正常结束、return、跳转信号或失败）按后进先出执行——直接按规范语义解释，
+         * 不经过「改写为 try/finally」的降级。
+         */
         fun run(statements: List<JasStatement>): Int? {
+            val deferred = mutableListOf<JasBlock>()
+            try {
+                return runScope(statements, deferred)
+            } finally {
+                deferred.asReversed().forEach { check(run(it.statements) == null) { "defer returned" } }
+            }
+        }
+
+        private fun runScope(statements: List<JasStatement>, deferred: MutableList<JasBlock>): Int? {
             for (statement in statements) {
                 when (statement) {
+                    is JasDefer -> deferred += statement.body
                     is JasVariableStatement -> env[statement.name] = eval(requireNotNull(statement.initializer))
                     is JasExpressionStatement -> write(statement.expression)
                     is JasDoWhile, is JasForStatement, is JasWhile -> runLoop(statement, null)?.let { return it }
@@ -573,7 +596,8 @@ class CoroutineBlockPlannerTest {
         val shortCircuits: Boolean = false,
         val labels: Boolean = false,
         val tries: Boolean = false,
-        val catches: Boolean = false
+        val catches: Boolean = false,
+        val defers: Boolean = false
     ) {
         private var counter = 0
         private val counters = mutableSetOf<String>()
@@ -629,11 +653,27 @@ class CoroutineBlockPlannerTest {
             repeat(random.nextInt(0, 4)) {
                 // labels 时循环体内额外偏向再开一层循环，使「内层循环跳到外层标签」有足够的嵌套可用。
                 val choice = when {
+                    defers && random.nextInt(4) == 0 -> 8
                     tries && depth > 0 && random.nextInt(3) == 0 -> 7
                     labels && inLoop && depth > 0 && random.nextInt(3) == 0 -> 5
                     else -> random.nextInt(if (depth > 0) 7 else 4)
                 }
                 when (choice) {
+                    8 -> {
+                        // defer：清理体与 try/finally 同形（记轨迹、可改写外层局部、可带条件分支），在所在
+                        // 序列（块）结束时执行；同一序列可有多个 defer。
+                        val code = counter++
+                        val cleanup = mutableListOf<JasStatement>(markCall(code))
+                        val writable = scope.filter { it != "base" && it !in counters }
+                        if (writable.isNotEmpty() && random.nextBoolean()) {
+                            cleanup += JasExpressionStatement(JasAssignment(JasIdentifier(writable.random(random)), expression(scope)))
+                        }
+                        if (random.nextInt(3) == 0) {
+                            cleanup += JasIf(JasBinaryOp(expression(scope), ">", JasIntLiteral(0, "0")),
+                                JasBlock(listOf(markCall(-code))), null)
+                        }
+                        statements += JasDefer(JasBlock(cleanup))
+                    }
                     7 -> {
                         // try 体可以 return / break / continue 跨出区域；清理体先记轨迹，再随机改写外层
                         // 局部（正常路径上可观察）、可带一个条件分支。
@@ -1398,5 +1438,129 @@ class CoroutineBlockPlannerTest {
         assertTrue(caughtRounds > 40, "generator too weak: only $caughtRounds rounds recovered from a failure")
         assertTrue(passedThrough > 40, "generator too weak: only $passedThrough failures escaped past catch regions")
         assertTrue(suspendingHandlers > 40, "generator too weak: only $suspendingHandlers programs suspend in a handler entry")
+    }
+
+    /**
+     * 做什么：同一块中的两个 defer 降级为两层嵌套清理区域（先声明的在外层），return 先固定返回值、
+     *   再按后声明先执行的顺序清理两层；while 循环体中的 defer 在 continue 与循环体末尾各清理一次，
+     *   不越过循环；块末尾的 defer（其后没有语句）降级为空 try 体，离开该块时清理。
+     * 失败模式：defer 顺序颠倒（先声明的先执行）、defer 作用域扩大到整个函数（循环体内的 defer 在
+     *   每趟结束时不执行）、块末尾的 defer 被丢弃。
+     */
+    @Test
+    fun `defer lowers the rest of its block into a cleanup region`() {
+        fun mark(code: Int) = JasExpressionStatement(JasCall(id("mark"), listOf(lit(code))))
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("v", lit(0)),
+            JasIf(id("flag"), block(set("v", lit(5)), JasDefer(block(mark(4)))), null),
+            JasDefer(block(mark(1))),
+            JasDefer(block(mark(2))),
+            JasWhile(id("flag"), block(
+                JasDefer(block(mark(3))),
+                set("v", await("input")),
+                JasIf(JasBinaryOp(id("v"), ">", lit(1)), block(JasContinueStatement(null)), null),
+                set("v", JasBinaryOp(id("v"), "+", lit(1)))
+            )),
+            JasReturn(id("v"))
+        ), parameters)
+        assertWellFormed(plan, "defer")
+        fun code(region: CoroutineTryRegion) =
+            ((region.cleanup.statements.single() as JasExpressionStatement).expression as JasCall).args.single()
+        // 区域按进入顺序编号：if 块末尾的 defer（1）、函数体的两个 defer（2 包住 3）、循环体的 defer（4）。
+        assertEquals(listOf(1 to 0, 2 to 0, 3 to 2, 4 to 3), plan.tryRegions.map { it.id to it.parent })
+        assertEquals(listOf<JasExpression>(lit(4), lit(1), lit(2), lit(3)), plan.tryRegions.map(::code))
+        assertTrue(plan.tryRegions.all { it.handlers.isEmpty() })
+        // 函数末尾的 return：返回值先存入临时局部，后声明的 defer 先清理。
+        val finish = plan.blocks.single { it.exit is CoroutineBlockExit.Finish }
+        assertEquals(listOf(3, 2), finish.cleanups)
+        val temp = (finish.exit as CoroutineBlockExit.Finish).value as JasIdentifier
+        assertTrue(temp.name.startsWith(CoroutineBlockPlanner.TEMP_PREFIX))
+        // if 块末尾的 defer 离开 then 块时清理一次；循环体的 defer 在 continue 与循环体末尾各清理一次。
+        val others = plan.blocks.filter { it.exit !is CoroutineBlockExit.Finish }.map { it.cleanups }.filter { it.isNotEmpty() }
+        assertEquals(listOf(listOf(1), listOf(4), listOf(4)), others)
+    }
+
+    /** 同一语句序列（块）中 defer 的最大个数（任意深度）。 */
+    private fun maxDefersInBlock(statements: List<JasStatement>): Int {
+        val here = statements.count { it is JasDefer }
+        val nested = statements.maxOfOrNull { statement ->
+            when (statement) {
+                is JasTry -> maxOf(maxDefersInBlock(statement.body.statements),
+                    statement.catches.maxOfOrNull { maxDefersInBlock(it.body.statements) } ?: 0)
+                is JasIf -> maxOf(maxDefersInBlock(statement.thenBody.statements),
+                    maxDefersInBlock(statement.elseBody?.statements.orEmpty()))
+                is JasLabeledStatement -> maxDefersInBlock(listOf(statement.statement))
+                is JasWhile, is JasDoWhile, is JasForStatement -> maxDefersInBlock(loopBody(statement))
+                else -> 0
+            }
+        } ?: 0
+        return maxOf(here, nested)
+    }
+
+    /** 是否有循环体（任意深度）中直接或经 if / try 含 defer：它在每趟结束时执行。 */
+    private fun defersInLoop(statements: List<JasStatement>, inLoop: Boolean): Boolean = statements.any { statement ->
+        when (statement) {
+            is JasDefer -> inLoop
+            is JasTry -> defersInLoop(statement.body.statements, inLoop) ||
+                statement.catches.any { defersInLoop(it.body.statements, inLoop) }
+            is JasIf -> defersInLoop(statement.thenBody.statements, inLoop) ||
+                defersInLoop(statement.elseBody?.statements.orEmpty(), inLoop)
+            is JasLabeledStatement -> defersInLoop(listOf(statement.statement), inLoop)
+            is JasWhile, is JasDoWhile, is JasForStatement -> defersInLoop(loopBody(statement), true)
+            else -> false
+        }
+    }
+
+    /**
+     * 做什么：固定种子 20261113 生成 400 个随机程序：在第十八片的 try/catch/finally 随机程序上，每个
+     *   语句位置约 1/4 插入 defer（清理体记轨迹、可改写外层局部、可带条件分支；同块可多个、可在循环体 /
+     *   分支 / try 体 / 处理块中）；输入中各约 1/12 是失败与取消哨兵。直接解释器按规范语义执行 defer
+     *   （每个块是一个作用域，离开时后进先出，不经过 try/finally 改写），与块状态机比对结果、挂起点数与
+     *   清理轨迹；另要求同块多个 defer、循环体内 defer、失败展开 defer 各有足够数量。
+     * 失败模式：打印种子、用例、输入与程序 AST。
+     */
+    @Test
+    fun `seeded defer block machines match direct AST semantics`() {
+        val seed = 20261113
+        val random = Random(seed)
+        var multiple = 0
+        var looping = 0
+        var unwound = 0
+        repeat(400) { index ->
+            val (body, _) = Generator(random, extendedLoops = true, tries = true, catches = true, defers = true)
+                .sequence(3, listOf("base"), mustReturn = true)
+            val fn = JasFunction("f", listOf(JasParameter("input", futureInt), JasParameter("base", int)), int,
+                JasBlock(body), listOf("public", "static"))
+            val context = "seed=$seed case=$index body=$body"
+            val plan = CoroutineBlockPlanner.plan(fn, mapOf("input" to futureInt, "base" to int))
+            assertWellFormed(plan, context)
+            if (maxDefersInBlock(body) >= 2) multiple++
+            if (defersInLoop(body, inLoop = false)) looping++
+            repeat(4) { round ->
+                val base = random.nextInt(-4, 5)
+                val inputs = List(4096) {
+                    when (random.nextInt(12)) {
+                        0 -> FAIL
+                        1 -> CANCEL
+                        else -> random.nextInt(-6, 7)
+                    }
+                }
+                val direct = AstInterpreter(inputs.iterator()).also { it.env["base"] = base }
+                val expected = try {
+                    requireNotNull(direct.run(body)) { "$context: generator produced a fall-through path" }
+                } catch (_: AwaitFailed) {
+                    null
+                }
+                val (actual, suspensions, trace) = runBlocksUnwinding(plan, inputs.iterator(), base)
+                val detail = "$context round=$round base=$base inputs=${inputs.take(64)}"
+                assertEquals(expected, actual, detail)
+                assertEquals(direct.consumed, suspensions, "$detail suspension count")
+                assertEquals(direct.trace, trace, "$detail cleanup trace")
+                if (actual == null && trace.isNotEmpty()) unwound++
+            }
+        }
+        assertTrue(multiple > 40, "generator too weak: only $multiple programs with several defers in one block")
+        assertTrue(looping > 40, "generator too weak: only $looping programs defer inside a loop body")
+        assertTrue(unwound > 40, "generator too weak: only $unwound failed rounds unwound cleanups")
     }
 }

@@ -266,7 +266,7 @@ object CoroutineLowering {
         /**
          * 按语句递归查找；分支条件与两条分支体（第十片起支持 if/else）、循环条件与循环体
          * （第十一片起支持 while，第十二片起支持 do-while 与三段式 for 的初始化 / 步进段，
-         * 第十六片起循环可带标签，第十七片起 try 体 / finally 体）都要覆盖。
+         * 第十六片起循环可带标签，第十七片起 try 体 / finally 体，第十九片起 defer 体）都要覆盖。
          */
         fun search(statement: JasStatement): JasCall? = when (statement) {
             is JasVariableStatement -> find(statement.initializer)
@@ -289,6 +289,7 @@ object CoroutineLowering {
             is JasTry -> statement.body.statements.firstNotNullOfOrNull(::search)
                 ?: statement.catches.firstNotNullOfOrNull { clause -> clause.body.statements.firstNotNullOfOrNull(::search) }
                 ?: statement.finallyBody?.statements?.firstNotNullOfOrNull(::search)
+            is JasDefer -> statement.body.statements.firstNotNullOfOrNull(::search)
             else -> null
         }
         val call = function.body?.statements.orEmpty().firstNotNullOfOrNull(::search) ?: return null
