@@ -248,8 +248,6 @@ data class TranslationContext(
     val loopBreakFlags: MutableMap<IrLoop, IrVariableSymbolImpl> = java.util.IdentityHashMap(),
     // labeledStatement 翻译期间暂存标签，由被包裹的第一个循环消费。
     var pendingLoopLabel: String? = null,
-    // 当前函数内累积的 defer 体；return/yield 时逆序展开。由 scopedDefers 保证不泄漏到相邻函数。
-    val deferredBodies: MutableList<IrBlock> = mutableListOf(),
     // 当前函数；return 的目标符号与 defer 作用域依赖它。
     var currentFunction: IrSimpleFunction? = null,
     // 当前 IR 文件；匿名类（lambda/方法引用）在翻译中即时追加到这里。
@@ -1029,14 +1027,7 @@ class JasperToIrTranslator {
             val prevFunc = ctx.currentFunction
             ctx.currentFunction = irFunc
             val body = irFunc.body as? IrBlockBody ?: factory.createBlockBody(0, 0)
-            scopedDefers(ctx) {
-                for (stmt in bodyStatements) {
-                    val irStmt = translateStatement(stmt, ctx)
-                    if (irStmt != null) {
-                        (body.statements as MutableList<IrStatement>).add(irStmt)
-                    }
-                }
-            }
+            (body.statements as MutableList<IrStatement>).addAll(translateStatementSequence(bodyStatements, ctx))
             irFunc.body = body
             ctx.currentFunction = prevFunc
         }
@@ -1420,14 +1411,7 @@ class JasperToIrTranslator {
             (body.statements as MutableList<IrStatement>).add(delegateCallExpr)
         }
         if (ctor.body != null) {
-            scopedDefers(ctx) {
-                for (stmt in ctor.body!!.statements) {
-                    val irStmt = translateStatement(stmt, ctx)
-                    if (irStmt != null) {
-                        (body.statements as MutableList<IrStatement>).add(irStmt)
-                    }
-                }
-            }
+            (body.statements as MutableList<IrStatement>).addAll(translateStatementSequence(ctor.body!!.statements, ctx))
         }
         irCtor.body = body
         return irCtor
@@ -1780,14 +1764,7 @@ class JasperToIrTranslator {
             val prevFunc = ctx.currentFunction
             ctx.currentFunction = irFunc
             val body = irFunc.body as? IrBlockBody ?: factory.createBlockBody(0, 0)
-            scopedDefers(ctx) {
-                for (stmt in accessor.body!!.statements) {
-                    val irStmt = translateStatement(stmt, ctx)
-                    if (irStmt != null) {
-                        (body.statements as MutableList<IrStatement>).add(irStmt)
-                    }
-                }
-            }
+            (body.statements as MutableList<IrStatement>).addAll(translateStatementSequence(accessor.body!!.statements, ctx))
             irFunc.body = body
             ctx.currentFunction = prevFunc
         }
@@ -1839,7 +1816,6 @@ class JasperToIrTranslator {
                 ctx.pendingLoopLabel = previous
                 translated
             }
-            is JasDefer -> translateDefer(stmt, ctx)
             is JasLock -> translateLock(stmt, ctx)
             is JasAssert -> translateAssert(stmt, ctx)
             is JasYield -> translateYield(stmt, ctx)
@@ -1852,13 +1828,39 @@ class JasperToIrTranslator {
 
     private fun translateBlock(block: JasBlock, ctx: TranslationContext): IrBlock {
         val body = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
-        for (stmt in block.statements) {
-            val irStmt = translateStatement(stmt, ctx)
-            if (irStmt != null) {
-                (body.statements as MutableList<IrStatement>).add(irStmt)
-            }
-        }
+        (body.statements as MutableList<IrStatement>).addAll(translateStatementSequence(block.statements, ctx))
         return body
+    }
+
+    /**
+     * 翻译一个作用域（源码块 / 函数体）的语句序列，并按规范 10.8 降级其中的 defer。
+     *
+     * 做什么：遇到 `defer D` 时，把同一序列中 D 之后的全部语句翻译为 try 体、D 为 finally 体，
+     *   即 `defer D; S…` ≡ `try { S… } finally { D }`；其后的 defer 在递归中嵌套到内层。
+     * 什么时候用：translateBlock 与函数 / 构造函数 / 访问器 / lambda 体的翻译。
+     * 为什么这样设计：defer「在当前作用域结束时执行」——作用域的每条离开路径（正常结束、return、
+     *   break / continue、异常）恰好执行一次，只执行已到达的 defer，同块后声明的先执行，return 值
+     *   先于 defer 固定。这些正是 try/finally 的语义，后端已为 finally 生成三条路径，无需另设展开表；
+     *   协程帧（CoroutineBlockPlanner）采用同一改写，两条路径语义一致。
+     */
+    private fun translateStatementSequence(statements: List<JasStatement>, ctx: TranslationContext): List<IrStatement> {
+        val result = mutableListOf<IrStatement>()
+        for ((index, stmt) in statements.withIndex()) {
+            if (stmt is JasDefer) {
+                val irTry = IrNodeFactory.createTry(0, 0, typeMapper.unitType())
+                val tryBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+                (tryBody.statements as MutableList<IrStatement>).addAll(
+                    translateStatementSequence(statements.subList(index + 1, statements.size), ctx)
+                )
+                irTry.tryResult = tryBody
+                irTry.finallyExpression = translateBlock(stmt.body, ctx)
+                result.add(irTry)
+                return result
+            }
+            val irStmt = translateStatement(stmt, ctx)
+            if (irStmt != null) result.add(irStmt)
+        }
+        return result
     }
 
     private fun translateVariableStatement(stmt: JasVariableStatement, ctx: TranslationContext): IrVariable {
@@ -2522,19 +2524,9 @@ class JasperToIrTranslator {
     }
 
     private fun translateReturn(stmt: JasReturn, ctx: TranslationContext): IrReturn {
-        var value = if (stmt.value != null) translateExpression(stmt.value!!, ctx) else typeMapper.unitExpr()
-        // defer 展开：按声明的逆序（后声明先执行，LIFO）把已累积的 defer 体塞进一个块，
-        // 最后再放返回值，使 defer 在 return 求值之后、真正返回之前执行。
-        if (ctx.deferredBodies.isNotEmpty()) {
-            val block = IrNodeFactory.createBlock(0, 0, value.type, null)
-            for (body in ctx.deferredBodies.reversed()) {
-                for (s in body.statements) {
-                    (block.statements as MutableList<IrStatement>).add(s)
-                }
-            }
-            (block.statements as MutableList<IrStatement>).add(value)
-            value = block
-        }
+        // defer 已降级为包住其后语句的 try/finally（见 translateStatementSequence），
+        // 后端在返回值固定之后、真正返回之前执行外层 finally。
+        val value = if (stmt.value != null) translateExpression(stmt.value!!, ctx) else typeMapper.unitExpr()
         val target = ctx.currentFunction?.symbol ?: IrSimpleFunctionSymbolImpl()
         return IrNodeFactory.createReturn(0, 0, value.type, value, target)
     }
@@ -2604,36 +2596,6 @@ class JasperToIrTranslator {
         return translateAssignment(stmt, ctx)
     }
 
-    private fun translateDefer(stmt: JasDefer, ctx: TranslationContext): IrBlock {
-        // defer 体先翻译成 IR 块并压栈；自身不产生运行时代码（返回空块），只在 return/yield 处逆序展开。
-        val defBlock = translateBlock(stmt.body, ctx)
-        ctx.deferredBodies.add(defBlock)
-        return IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
-    }
-
-    /**
-     * Runs [body] with a fresh `defer` scope, restoring the enclosing scope
-     * afterwards. `defer` belongs strictly to the function that declares it;
-     * without this the deferred bodies accumulate in the shared translation
-     * context and leak into every later function's `return`.
-     *
-     * 做什么：在一个「全新 defer 作用域」里执行 body，结束后恢复外层 defer 栈。
-     * 什么时候用：翻译函数/构造函数/lambda/属性访问器的体时（进入前调用）。
-     * 前置条件：进入体之前 ctx.deferredBodies 保存的是外层的 defer。
-     * 为什么这样设计：defer 只属于声明它的那个函数；不隔离的话延迟体会滞留在共享 ctx 里，
-     *   泄漏到之后每个函数的 return 中（跨函数污染）。
-     */
-    private inline fun <T> scopedDefers(ctx: TranslationContext, body: () -> T): T {
-        val enclosing = ctx.deferredBodies.toMutableList()
-        ctx.deferredBodies.clear()
-        try {
-            return body()
-        } finally {
-            ctx.deferredBodies.clear()
-            ctx.deferredBodies.addAll(enclosing)
-        }
-    }
-
     private fun translateLock(stmt: JasLock, ctx: TranslationContext): IrBlock {
         val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
         val monitorExpr = translateExpression(stmt.expression, ctx)
@@ -2678,17 +2640,7 @@ class JasperToIrTranslator {
         )
         yieldVar.initializer = value
         (block.statements as MutableList<IrStatement>).add(yieldVar)
-        var retVal: IrExpression = IrNodeFactory.createGetValue(0, 0, value.type, yieldSymbol, null)
-        if (ctx.deferredBodies.isNotEmpty()) {
-            val retBlock = IrNodeFactory.createBlock(0, 0, value.type, null)
-            for (body in ctx.deferredBodies.reversed()) {
-                for (s in body.statements) {
-                    (retBlock.statements as MutableList<IrStatement>).add(s)
-                }
-            }
-            (retBlock.statements as MutableList<IrStatement>).add(retVal)
-            retVal = retBlock
-        }
+        val retVal: IrExpression = IrNodeFactory.createGetValue(0, 0, value.type, yieldSymbol, null)
         val target = ctx.currentFunction?.symbol ?: IrSimpleFunctionSymbolImpl()
         (block.statements as MutableList<IrStatement>).add(
             IrNodeFactory.createReturn(0, 0, retVal.type, retVal, target)
@@ -3960,14 +3912,7 @@ class JasperToIrTranslator {
         val body = factory.createBlockBody(0, 0)
         val prevFunc = ctx.currentFunction
         ctx.currentFunction = irFunc
-        scopedDefers(ctx) {
-            for (stmt in expr.body.statements) {
-                val irStmt = translateStatement(stmt, ctx)
-                if (irStmt != null) {
-                    (body.statements as MutableList<IrStatement>).add(irStmt)
-                }
-            }
-        }
+        (body.statements as MutableList<IrStatement>).addAll(translateStatementSequence(expr.body.statements, ctx))
         // Add return if needed
         val lastStmt = expr.body.statements.lastOrNull()
         if (lastStmt !is JasReturn && !body.statements.any { it is IrReturn }) {

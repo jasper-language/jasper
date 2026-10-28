@@ -945,7 +945,8 @@ class JvmBackendTest {
                 return sb.toString();
             }
         """.trimIndent()
-        runAndCheck(code, "abc")
+        // 规范 10.8：return 值先于 defer 固定（示例 `defer close(f); return f.read();`）。
+        runAndCheck(code, "ab")
     }
 
     @Test

@@ -154,6 +154,8 @@ class IrBackendSmokeTest {
 
     @Test
     fun `defer via IR`() {
+        // 规范 10.8：return 值先求出，再执行 defer（示例 `defer close(f); return f.read();` 依赖此顺序），
+        // 故返回 "ab"，sb 之后才追加 "c"。
         testIr("""
             package test;
             public function main(): string {
@@ -163,7 +165,7 @@ class IrBackendSmokeTest {
                 sb.append("b");
                 return sb.toString();
             }
-        """.trimIndent(), "test.main", "main", expected = "abc")
+        """.trimIndent(), "test.main", "main", expected = "ab")
     }
 
     @Test

@@ -186,7 +186,8 @@ class IrBackendTest {
             val method = clazz.getDeclaredMethods().first { it.name == "main" && it.parameterCount == 0 }
             method.isAccessible = true
             val ret = method.invoke(null)
-            assertEquals("abc", ret, "Expected 'abc'")
+            // 规范 10.8：return 值先于 defer 固定（示例 `defer close(f); return f.read();`）。
+            assertEquals("ab", ret, "Expected 'ab'")
         } finally {
             outputDir.toFile().deleteRecursively()
         }

@@ -938,11 +938,14 @@ break / continue、挂起点失败 / 取消、段内抛出还是作用域取消�
   丢弃 defer 共 8 项失败。
 - TLA+：帧协议未改（defer 只是清理区域的另一种源码来源），`run-s4-models.sh` 十四组配置复跑通过。
 
-### 已知差异（未在本片修改）
+### 同步路径对齐（本片之后）
 
-同步函数路径（`JasperToIrTranslator`）的 defer 不按作用域执行：defer 体按词法顺序累积，只在其后的
-`return` 处全部展开——分支里未执行到的 defer 也会执行，循环体中的 defer 不按趟执行，块正常结束与异常
-离开都不执行。协程帧按规范语义实现，两条路径在这些形态上行为不同；同步路径的修复另立项。
+同步函数路径（`JasperToIrTranslator`）原先的 defer 按词法累积、只在其后的 `return` 处展开（分支里未执行
+到的 defer 也执行，循环体不按趟，块正常结束与异常离开都不执行，且在 return 值求值之前执行）。现已改为与
+本片相同的改写 `defer D; S…` ≡ `try { S… } finally { D }`，并修正后端 try/finally 的两处缺陷：break /
+continue 跨出循环内的 try/finally 时执行其 finally；return / break / continue 处内联的 finally 代码从
+所属 try 及内层 try 的异常表中挖掉，finally 自身抛出时不再重进自己或被内层 catch 截获。见
+`LANG-SYNC-DEFER-01`。
 
 ### 仍未支持
 

@@ -196,9 +196,27 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         // 生成 IrReturn 时据此在返回前按「内层到外层」顺序执行所有尚未执行的 finally，
         // 这样「提前 return 也执行 finally」才能成立，且每个 finally 只执行一次（FINDINGS #4）。
         val finallyStack: MutableList<FinallyContext> = mutableListOf(),
-        // 延迟生成的语句块（预留给 translator 的延迟体机制；当前后端未消费）。
-        val deferredBodies: MutableList<IrBlock> = mutableListOf()
+        // 每个循环进入时 finallyStack 的深度：break/continue 只执行比它更内层的 finally。
+        val loopFinallyDepth: MutableMap<Pair<Label, Label>, Int> = java.util.IdentityHashMap(),
+        // 当前仍在生成中的受保护区间（try 体 / catch 体），由外到内。
+        val openRanges: MutableList<ProtectedRange> = mutableListOf(),
+        // 标签生成序号：受保护区间的空隙按它判定先后与嵌套。
+        var labelSeq: Int = 0
     )
+
+    /**
+     * 一个 try 体或 catch 体的受保护区间，以及其中需要排除的「空隙」。
+     * 为什么需要：return / break / continue 在受保护区间内就地内联 finally 体；这段内联代码若仍在
+     *   本 try（及其内层 try）的异常表范围内，finally 自身抛出时会再次进入同一 finally 处理器
+     *   （finally 执行两次），或被内层 catch 截获。与 javac 一致，登记异常表时把这些空隙挖掉。
+     */
+    class ProtectedRange {
+        // 空隙按生成顺序排列；嵌套在后加空隙内部的旧空隙在加入时被并掉。
+        val gaps: MutableList<Gap> = mutableListOf()
+    }
+
+    /** 受保护区间中的一段内联 finally 代码；seq 为起点标签的生成序号。 */
+    class Gap(val seq: Int, val start: Label, val end: Label)
 
     /**
      * 一个 try/finally 的 finally 体（IR 表达式）在生成期的上下文。
@@ -208,7 +226,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      *   「执行 finally」的代码；用一个显式上下文栈把「哪些 finally 还没跑」记录下来，
      *   才能让 return 走对路径且只跑一次。
      */
-    data class FinallyContext(val block: IrExpression)
+    data class FinallyContext(val block: IrExpression, val rangeIndex: Int)
     // 当前正在生成的包名（以 '/' 分隔的内部名形式），决定 class 内部名与字段 owner 兜底。
     private var currentPkg: String = ""
     // —— 以下 5 张表在 generate() 第一遍里按符号填入，第二遍生成时只读 ——
@@ -1237,12 +1255,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         ctx.nextSlot += if (returnDesc == "J" || returnDesc == "D") 2 else 1
                         storeLocal(mv, returnDesc, savedSlot)
                     }
-                    val pending = ctx.finallyStack.toMutableList()
-                    ctx.finallyStack.clear()
-                    for (f in pending.asReversed()) {
-                        generateFinallyBody(mv, f.block, ctx, owner)
-                    }
-                    ctx.finallyStack.addAll(pending)
+                    emitPendingFinally(mv, ctx, owner, 0)
                     if (hasValue) loadLocal(mv, returnDesc, savedSlot)
                 }
                 generateIrReturn(mv, ctx.returnType)
@@ -1263,6 +1276,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val targets = Pair(loopLabel, endLabel)
                 ctx.loopStack.add(targets)
                 ctx.loopTargets[stmt] = targets
+                ctx.loopFinallyDepth[targets] = ctx.finallyStack.size
                 mv.visitLabel(loopLabel)
                 val cond = stmt.condition
                 generateIrExpression(mv, cond, ctx, owner)
@@ -1279,6 +1293,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // 出循环后弹栈，恢复上层的 break/continue 目标。
                 ctx.loopStack.removeLast()
                 ctx.loopTargets.remove(stmt)
+                ctx.loopFinallyDepth.remove(targets)
             }
             is IrDoWhileLoop -> {
                 // do body while(cond)：体至少执行一次，条件在末尾判断。
@@ -1290,6 +1305,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val targets = Pair(loopLabel, endLabel)
                 ctx.loopStack.add(targets)
                 ctx.loopTargets[stmt] = targets
+                ctx.loopFinallyDepth[targets] = ctx.finallyStack.size
                 mv.visitLabel(loopLabel)
                 val loopBody = stmt.body
                 if (loopBody is IrBlock) {
@@ -1304,6 +1320,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 mv.visitLabel(endLabel)
                 ctx.loopStack.removeLast()
                 ctx.loopTargets.remove(stmt)
+                ctx.loopFinallyDepth.remove(targets)
             }
             is IrTry -> {
                 // try/catch/finally 的统一生成。JVM 没有结构化 finally 指令，必须让三条路径都补上
@@ -1316,7 +1333,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 val finallyExpr = stmt.finallyExpression
                 val hasFinally = finallyExpr != null
                 val hasCatches = stmt.catches.isNotEmpty()
-                val fctx = if (hasFinally) FinallyContext(finallyExpr!!) else null
+                // 本 try 体的受保护区间；外层 finally 内联进来的代码会在这里留下空隙。
+                val tryRange = ProtectedRange()
+                val fctx = if (hasFinally) FinallyContext(finallyExpr!!, ctx.openRanges.size) else null
 
                 val tryStart = Label()
                 val tryEnd = Label()
@@ -1337,7 +1356,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // ---- ① try 体 ----
                 // 生成 try 体期间把 finally 上下文压栈，使体内任何 return 都能在返回前执行 finally。
                 if (fctx != null) ctx.finallyStack.add(fctx)
+                ctx.openRanges.add(tryRange)
                 mv.visitLabel(tryStart)
+                // try 体可能为空（如块末尾的 defer 降级出的 try）：一条 NOP 使受保护区间非空。
+                mv.visitInsn(Opcodes.NOP)
                 val tryBody = stmt.tryResult
                 if (tryBody is IrBlock) {
                     for (s in tryBody.statements) generateIrStatement(mv, s, ctx, owner)
@@ -1346,13 +1368,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 }
                 mv.visitLabel(tryEnd)
                 if (fctx != null) ctx.finallyStack.removeLast()
+                ctx.openRanges.removeLast()
                 // 生成完 try 体后登记本 try 范围的处理器：内层（体里嵌套 try）已先登记。
                 if (hasCatches) {
-                    mv.visitTryCatchBlock(tryStart, tryEnd, catchStart, catchTypeInternal)
+                    registerProtectedRange(mv, tryStart, tryEnd, tryRange, catchStart, catchTypeInternal)
                 }
                 if (hasFinally) {
                     // try 体内未被 catch 命中的异常 → finallyHandler（兜底，type=null）。
-                    mv.visitTryCatchBlock(tryStart, tryEnd, finallyHandler, null)
+                    registerProtectedRange(mv, tryStart, tryEnd, tryRange, finallyHandler, null)
                 }
                 // 正常结束：执行 finally 后跳过 catch / finally 处理器。
                 if (hasFinally) generateFinallyBody(mv, finallyExpr!!, ctx, owner)
@@ -1361,7 +1384,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 // ---- ② catch 分支 ----
                 if (hasCatches) {
                     mv.visitLabel(catchStart)
-                    if (fctx != null) ctx.finallyStack.add(fctx)
+                    // catch 体是另一段受 finally 兜底保护的区间，内联其 finally 时从这里挖空隙。
+                    val catchRange = ProtectedRange()
+                    val catchFctx = if (hasFinally) FinallyContext(finallyExpr!!, ctx.openRanges.size) else null
+                    if (catchFctx != null) ctx.finallyStack.add(catchFctx)
+                    ctx.openRanges.add(catchRange)
                     // 进入 catch 时操作数栈顶是抛出的异常对象；每个 catch 参数都必须从它取值。
                     // 下面为每个 catch 子句分配一个槽并 ASTORE（先按 Throwable 存，
                     // 具体类型不足时再 CHECKCAST 回写），最后按 catch 顺序生成体。
@@ -1392,10 +1419,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                     }
                     mv.visitLabel(catchEnd)
-                    if (fctx != null) ctx.finallyStack.removeLast()
+                    if (catchFctx != null) ctx.finallyStack.removeLast()
+                    ctx.openRanges.removeLast()
                     // catch 体自身抛出的异常同样要跑 finally；登记时机同样晚于 catch 体内层处理器。
                     if (hasFinally) {
-                        mv.visitTryCatchBlock(catchStart, catchEnd, finallyHandler, null)
+                        registerProtectedRange(mv, catchStart, catchEnd, catchRange, finallyHandler, null)
                     }
                     // catch 正常结束同样要执行 finally。
                     if (hasFinally) generateFinallyBody(mv, finallyExpr!!, ctx, owner)
@@ -1424,12 +1452,19 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
             is IrBreak -> {
                 // 优先跳到 IR 指定的循环；旧 IR/无目标时退回最内层。
+                // 跳出位于循环内的 try/finally（含 defer 降级）时，先由内到外执行这些 finally。
                 val target = ctx.loopTargets[stmt.loop] ?: ctx.loopStack.lastOrNull()
-                target?.second?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
+                if (target != null) {
+                    emitPendingFinally(mv, ctx, owner, ctx.loopFinallyDepth[target] ?: ctx.finallyStack.size)
+                    mv.visitJumpInsn(Opcodes.GOTO, target.second)
+                }
             }
             is IrContinue -> {
                 val target = ctx.loopTargets[stmt.loop] ?: ctx.loopStack.lastOrNull()
-                target?.first?.let { mv.visitJumpInsn(Opcodes.GOTO, it) }
+                if (target != null) {
+                    emitPendingFinally(mv, ctx, owner, ctx.loopFinallyDepth[target] ?: ctx.finallyStack.size)
+                    mv.visitJumpInsn(Opcodes.GOTO, target.first)
+                }
             }
             is IrSetValue -> {
                 // 赋值语句形态：符号 → 名字 → 槽，找不到槽就什么都不生成（例如
@@ -2650,6 +2685,54 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 只检查顶层（不递归进 if/loop）——嵌套分支的 return 由各分支自己发射。
     private fun hasIrReturn(body: IrBlockBody): Boolean {
         return body.statements.any { it is IrReturn }
+    }
+
+    /**
+     * 在 return / break / continue 处，由内到外执行 finallyStack 中下标 ≥ [downTo] 的 finally 体。
+     *
+     * 做什么：对每个待执行的 finally（下标 k），生成期间把 finallyStack 截到前 k 项——其中的
+     *   return / break / continue 只再执行更外层的 finally；生成的代码作为空隙从该 finally 所属区间
+     *   及其内层区间的异常表中挖掉，使它自身抛出时交给更外层处理器，而不是重进自己或被内层 catch 截获。
+     * 前置条件：调用方已把返回值存入临时槽（return 路径），操作数栈为空。
+     */
+    private fun emitPendingFinally(mv: MethodVisitor, ctx: MethodContext, owner: String, downTo: Int) {
+        val pending = ctx.finallyStack.toList()
+        for (k in pending.indices.reversed()) {
+            if (k < downTo) break
+            val f = pending[k]
+            val gapStart = Label()
+            val seq = ctx.labelSeq++
+            // 保证空隙之前的受保护段非空（见 registerProtectedRange）。
+            mv.visitInsn(Opcodes.NOP)
+            mv.visitLabel(gapStart)
+            ctx.finallyStack.subList(k, ctx.finallyStack.size).clear()
+            generateFinallyBody(mv, f.block, ctx, owner)
+            ctx.finallyStack.clear()
+            ctx.finallyStack.addAll(pending)
+            val gapEnd = Label()
+            mv.visitLabel(gapEnd)
+            for (r in f.rangeIndex until ctx.openRanges.size) {
+                val gaps = ctx.openRanges[r].gaps
+                gaps.removeAll { it.seq > seq }
+                gaps.add(Gap(seq, gapStart, gapEnd))
+            }
+        }
+    }
+
+    /**
+     * 登记 [start, end) 去掉 [range] 空隙后的各段异常表项。
+     * 各段不会为空（JVM 要求 start_pc < end_pc）：try 体起点与每个空隙之前各有一条 NOP，
+     * 每个空隙之后紧跟 return / GOTO 指令。
+     */
+    private fun registerProtectedRange(
+        mv: MethodVisitor, start: Label, end: Label, range: ProtectedRange, handler: Label, type: String?
+    ) {
+        var segStart = start
+        for (gap in range.gaps) {
+            mv.visitTryCatchBlock(segStart, gap.start, handler, type)
+            segStart = gap.end
+        }
+        mv.visitTryCatchBlock(segStart, end, handler, type)
     }
 
     /**
