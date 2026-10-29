@@ -32,11 +32,35 @@ dependencies {
     add(antlrTool.name, "org.antlr:antlr4:4.13.2")
 }
 
+// Lincheck 模型检查单独一个测试 JVM：Lincheck 只经系统类加载器读取 / 查找被插桩类，Jasper 编译
+// 产物必须在系统类路径上才会被插桩（否则 std 运行时类静默不插桩，模型检查只覆盖 Kotlin 驱动层）。
+// 该目录在 JVM 启动前建好、启动后由测试写入类文件（目录类路径按需查找）；放在独立 JVM 里，
+// 避免普通测试经父加载器委派拿到这里的 std 类。test 依赖本任务，./gradlew test 仍运行全部测试。
+val lincheckRuntimeDir = layout.buildDirectory.dir("lincheck-runtime")
+val lincheckTest = tasks.register<Test>("lincheckTest") {
+    description = "Runs Lincheck model checks with the compiled Jasper runtime on the system classpath"
+    group = "verification"
+    testClassesDirs = sourceSets["test"].output.classesDirs
+    classpath = sourceSets["test"].runtimeClasspath + files(lincheckRuntimeDir)
+    useJUnitPlatform()
+    jvmArgs("-XX:+EnableDynamicAgentLoading")
+    filter { includeTestsMatching("*LincheckTest") }
+    systemProperty("jasper.lincheck.runtimeDir", lincheckRuntimeDir.get().asFile.absolutePath)
+    doFirst {
+        val dir = lincheckRuntimeDir.get().asFile
+        dir.deleteRecursively()
+        dir.mkdirs()
+    }
+}
+
 tasks.test {
     // 同时运行 JUnit Jupiter（动态一致性测试）与 Vintage（既有 JUnit 4 测试）。
     useJUnitPlatform()
     // Lincheck 与 Jazzer 在测试 JVM 内动态挂载插桩代理；JDK 21 需显式允许。
     jvmArgs("-XX:+EnableDynamicAgentLoading")
+    // Lincheck 模型检查由 lincheckTest 在独立 JVM 中运行（见上）。
+    filter { excludeTestsMatching("*LincheckTest") }
+    dependsOn(lincheckTest)
 }
 
 application {

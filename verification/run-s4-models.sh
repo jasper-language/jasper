@@ -10,11 +10,12 @@ if [[ ! -f "$jar" ]]; then
     exit 2
 fi
 mkdir -p evidence/s4-models build/tmp/s4-models
-for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregation_supervisor CleanupBudgetNesting CallbackDispatch ContinuationDispatch ContinuationResultBinding LinearCoroutineFrame BranchingCoroutineFrame LoopingCoroutineFrame TryFinallyCoroutineFrame TryCatchCoroutineFrame CancellationReasonPropagation CoroutineScopeLaunch_normal CoroutineScopeLaunch_supervisor; do
+for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregation_supervisor CleanupBudgetNesting CallbackDispatch ContinuationDispatch ContinuationResultBinding LinearCoroutineFrame BranchingCoroutineFrame LoopingCoroutineFrame TryFinallyCoroutineFrame TryCatchCoroutineFrame CancellationReasonPropagation DeadlinePropagation CoroutineScopeLaunch_normal CoroutineScopeLaunch_supervisor; do
     model="$config"
     case "$config" in
         TaskGroupAggregation_*) model=TaskGroupAggregation ;;
         CoroutineScopeLaunch_*) model=CoroutineScopeLaunch ;;
+        DeadlinePropagation_*) model=DeadlinePropagation ;;
     esac
     java -cp "$jar" tlc2.TLC -workers 1 \
         -metadir "build/tmp/s4-models/$config" \

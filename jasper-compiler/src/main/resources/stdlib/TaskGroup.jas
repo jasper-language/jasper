@@ -15,6 +15,13 @@ package std;
 //     不进入聚合；未确认失败必须聚合。普通组不受确认影响，仍以最早创建的失败为
 //     primary 并保留其余为 suppressed 计数。
 //
+// 截止点（S4 契约 §2 / §4）：
+//   作用域截止点保存在根令牌上（restrictDeadline 只能收紧）；spawnWithDeadline 给单个子任务
+//   更严格的期限，子有效截止点 = min(作用域, 显式)。到期只在检查点观察：任务体开始前、
+//   任务体调用 throwIfCancelled 时、launch 登记帧时。作用域到期取消根令牌（全部子任务得到
+//   Deadline 原因，close 报 Deadline）；子任务自身期限到期只取消该子任务。到期不是业务失败，
+//   不触发普通组的兄弟级联。计时唤醒挂起中的帧、帧内挂起点检查截止时间留给后续切片。
+//
 // 依赖方向：
 //   TaskGroup -> Executor / Future / CancellationToken；这些下层不知道 TaskGroup，
 //   因此运行时模块之间没有环。
@@ -162,6 +169,26 @@ public class TaskGroup {
      *   等待它，随后调度一定会为它发布终态或失败。
      */
     public function spawn<T>(executor: Executor, body: TaskBody<T>): Future<T> {
+        return this.spawnWithin(executor, body, null);
+    }
+
+    /**
+     * 做什么：创建并调度一个带显式截止点的子任务；有效截止点 = min(作用域截止点, deadline)。
+     * 什么时候用：某个子任务需要比作用域更严格的期限时（契约 §6 ChildOptions.deadline）。
+     * 前置条件：同 spawn；deadline 非 null。
+     * 失败模式：同 spawn；到期时任务体在检查点观察到 Deadline 取消，结果为 Cancelled(Deadline)。
+     * 为什么显式期限不能放宽：子令牌只能收紧，晚于作用域的 deadline 不起作用（子不能延长父期限）。
+     */
+    public function spawnWithDeadline<T>(executor: Executor, body: TaskBody<T>, deadline: Deadline): Future<T> {
+        return this.spawnWithin(executor, body, deadline);
+    }
+
+    /**
+     * 做什么：spawn / spawnWithDeadline 的共同实现；deadline 为 null 表示只继承作用域截止点。
+     * 前置条件 / 失败模式：同 spawn。
+     * 为什么公开：Jasper 当前没有包内可见性；调用方应使用 spawn / spawnWithDeadline。
+     */
+    public function spawnWithin<T>(executor: Executor, body: TaskBody<T>, deadline: Deadline?): Future<T> {
         this.mutex.acquireUninterruptibly();
         if (this.closed) {
             this.mutex.release();
@@ -173,6 +200,10 @@ public class TaskGroup {
         // 因此这里不再另存一份序列号，避免两份顺序来源漂移。
         this.children.add(erased);
         var token: CancellationToken = this.rootToken.createChild();
+        if (deadline != null) {
+            // 检查器的空值收窄不作用于实参位置，判空后显式转换。
+            token.restrictDeadline(cast deadline as Deadline);
+        }
         this.mutex.release();
 
         var runner: TaskRunner<T> = new TaskRunner<T>(this, body, future, token);
@@ -210,6 +241,9 @@ public class TaskGroup {
     public function launch<T>(task: CoroutineTask<T>): Future<T> {
         var future: Future<T> = task.resultFuture();
         var erased: Future<any> = cast future as Future<any>;
+        // 登记帧是检查点：作用域已到期则先以 Deadline 取消根令牌，下面的已取消分支随之生效。
+        // 放在锁外：到期取消会同步执行根令牌回调。
+        this.rootToken.pollDeadline();
         this.mutex.acquireUninterruptibly();
         if (this.closed) {
             this.mutex.release();
@@ -314,6 +348,22 @@ public class TaskGroup {
             message = message + " (+" + decidedSuppressed + " suppressed)";
         }
         throw new TaskGroupFailure(message, decidedSuppressed);
+    }
+
+    /**
+     * 做什么：把作用域截止点收紧为 min(当前, deadline)；已创建与之后创建的子任务都受其约束。
+     * 什么时候用：进入作用域后设定期限（契约 §2：作用域设定 Deadline）。
+     * 前置条件：deadline 非 null。
+     * 失败模式：不会失败；更晚的 deadline 不改变任何东西。
+     * 为什么不立即取消：到期只在检查点观察；子令牌经父引用实时看到收紧后的期限。
+     */
+    public function restrictDeadline(deadline: Deadline): void {
+        this.rootToken.restrictDeadline(deadline);
+    }
+
+    /** 做什么：返回作用域有效截止点；未设定时返回 null。前置条件：无；失败模式：不会失败。 */
+    public function deadline(): Deadline? {
+        return this.rootToken.deadline();
     }
 
     /**
@@ -459,6 +509,10 @@ public class TaskRunner<T> implements Runnable {
         try {
             try {
                 try {
+                    // 任务体开始前是首个检查点：父期限已过的子任务在此取消（契约 §10），
+                    // 任务体随后用 isCancelled 也能观察到。到期取消不抛异常、不跳过任务体，
+                    // 与「已取消作用域中 spawn 的任务体照常运行并自行观察」一致。
+                    this.token.pollDeadline();
                     var value: T = this.body.run(this.token);
                     if (this.token.isCancelled()) {
                         this.future.cancelWith(this.token.reasonOr(CancellationReason.Explicit));

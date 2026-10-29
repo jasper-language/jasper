@@ -13,6 +13,14 @@ package std;
 //   子令牌自己仍可独立取消；父令牌不知道子的存在。父取消传播时子令牌沿用父的原因
 //   （同一作用域内的取消源是同一个），子令牌若已先因别的原因取消则保留自己的原因。
 //
+// 截止点（S4 契约 §2 / §4）：
+//   每个令牌可带自己的截止点（ownDeadline），有效截止点 = min(自身, 父的有效截止点)，
+//   子不能延长父期限；restrictDeadline 只能收紧。为此子令牌持有父引用（只用于读取截止点
+//   与在检查点检查父期限；取消仍只经父到子的回调传播）。截止点到期不会自行触发取消：
+//   pollDeadline 检查点先检查最上层祖先、再往下检查，到期的是哪个令牌就以 Deadline 原因取消哪个
+//   令牌，再经既有回调传给它的全部后代。因此根作用域到期时所有兄弟得到同一个 Deadline
+//   原因，单个子任务自己的期限到期只取消它自己。
+//
 // 设计边界（变化点）：
 //   「取消如何被观察」集中在 isCancelled/onCancel；Future、TaskGroup 和未来的阻塞
 //   I/O 端口都只依赖这两个查询，不直接持有内部列表。
@@ -31,7 +39,8 @@ package std;
  * 各值含义：
  *   - Explicit：调用方直接取消（Future.cancel / TaskGroup.cancel / CancellationToken.cancel）；
  *   - Parent：父任务取消跨任务传播到子任务（嵌套作用域链接由后续切片使用）；
- *   - Deadline：截止时间到期（契约 §4 称 DeadlineExceeded；计时由后续切片接入）；
+ *   - Deadline：截止时间到期，由检查点 pollDeadline 发现（契约 §4 称 DeadlineExceeded；
+ *     到期唤醒挂起任务的计时由后续切片接入）；
  *   - ScopeExit：作用域异常退出时取消未完成子任务（由后续切片使用）；
  *   - SiblingFailed：普通组首个业务失败级联取消其余兄弟。
  * 契约 §4 把 Deadline 以外的原因统称为普通取消请求（Cancelled）；这里保留更细的取消源，
@@ -86,6 +95,9 @@ public class CancellationToken {
     // 仅在 cancelled 为真时有意义；构造时的值不可观察（reason() 未取消时返回 null）。
     private var reasonValue: CancellationReason;
     private var handlers: MutableList<Action<CancellationToken>>;
+    // 截止点相关：父引用由 createChild 绑定一次；ownDeadline 只会被 restrictDeadline 收紧。
+    private var parentToken: CancellationToken?;
+    private var ownDeadline: Deadline?;
 
     /**
      * 做什么：创建一个未取消的根令牌。
@@ -99,6 +111,8 @@ public class CancellationToken {
         this.cancelled = false;
         this.reasonValue = CancellationReason.Explicit;
         this.handlers = new MutableList<Action<CancellationToken>>();
+        this.parentToken = null;
+        this.ownDeadline = null;
     }
 
     /**
@@ -225,6 +239,8 @@ public class CancellationToken {
      */
     public function createChild(): CancellationToken {
         var child: CancellationToken = new CancellationToken();
+        // 先绑定父引用再注册传播回调：子令牌一旦可能被观察到，它的有效截止点就已包含父期限。
+        child.bindParent(this);
         // onCancel 自带「已取消立即回调」语义，因此这里不需要在父锁内做双重检查；
         // 竞争窗口由 onCancel 的同一把锁消除。
         this.onCancel(new ChildCancellation(child));
@@ -232,20 +248,172 @@ public class CancellationToken {
     }
 
     /**
-     * 做什么：在协作检查点观察取消并抛出 CancellationException。
+     * 做什么：在协作检查点先检查截止时间，再观察取消并抛出 CancellationException。
      * 什么时候用：任务体准备继续业务计算前。
      * 前置条件：无。
-     * 失败模式：已取消时抛携带首个原因的 CancellationException；未取消时直接返回。
+     * 失败模式：已取消（含本次检查发现到期）时抛携带首个原因的 CancellationException；
+     *   未取消时直接返回；到期取消的回调失败以 CallbackDispatchError 传播（同 cancelWith）。
      * 为什么单独提供：让业务代码用统一 catch 通道处理取消，而不是散落 if 判断。
      */
     public function throwIfCancelled(): void {
-        this.mutex.acquireUninterruptibly();
-        var observed: bool = this.cancelled;
-        var observedReason: CancellationReason = this.reasonValue;
-        this.mutex.release();
-        if (observed) {
-            throw new CancellationException("operation cancelled", observedReason);
+        // 检查点先检查截止时间（契约 §4：进入挂起点时先检查父令牌及截止时间）。
+        // 检查与读取原因是同一次快照（pollReasonAt），不再另加一次锁。
+        var now: int64 = java.lang.System.nanoTime();
+        var observed: CancellationReason? = this.pollReasonAt(now);
+        if (observed != null) {
+            throw new CancellationException("operation cancelled", cast observed as CancellationReason);
         }
+    }
+
+    /**
+     * 做什么：派生带显式截止点的子令牌；子的有效截止点 = min(父有效截止点, deadline)。
+     * 什么时候用：TaskGroup.spawnWithDeadline 为单个子任务设定更严格的期限时。
+     * 前置条件：deadline 非 null。
+     * 失败模式：同 createChild。
+     * 为什么在子令牌上保存显式值而不是预先取 min：父之后若再收紧，子通过父引用实时看到；
+     *   预先算好的快照会漏掉父的后续收紧。
+     */
+    public function createChildWithDeadline(deadline: Deadline): CancellationToken {
+        var child: CancellationToken = this.createChild();
+        child.restrictDeadline(deadline);
+        return child;
+    }
+
+    /**
+     * 做什么：建立子到父的截止点链接；每个令牌只允许绑定一次。
+     * 什么时候用：仅 createChild 内部使用。
+     * 前置条件：本令牌刚构造、尚未绑定父。
+     * 失败模式：重复绑定抛 DeadlineError，拒绝把令牌挂到第二个父下（那会让截止点链成环或分叉）。
+     * 为什么公开：Jasper 当前没有包内可见性；调用方不应直接使用。
+     */
+    public function bindParent(parent: CancellationToken): void {
+        this.mutex.acquireUninterruptibly();
+        if (this.parentToken != null) {
+            this.mutex.release();
+            throw new DeadlineError("cancellation token already has a parent");
+        }
+        this.parentToken = parent;
+        this.mutex.release();
+    }
+
+    /**
+     * 做什么：把自身截止点收紧为 min(当前自身截止点, deadline)；不能延长。
+     * 什么时候用：作用域或子任务设定期限时（TaskGroup.restrictDeadline / createChildWithDeadline）。
+     * 前置条件：deadline 非 null。
+     * 失败模式：不会失败；更晚的 deadline 不改变任何东西。
+     * 为什么只收紧：契约 §2「子不能延长父期限」推广到同一令牌——期限一旦给出就是承诺的上限。
+     * 为什么不立即检查到期：取消只在检查点观察（契约 §4），收紧本身不是检查点。
+     */
+    public function restrictDeadline(deadline: Deadline): void {
+        this.mutex.acquireUninterruptibly();
+        this.ownDeadline = Deadline.earliest(this.ownDeadline, deadline);
+        this.mutex.release();
+    }
+
+    /**
+     * 做什么：返回有效截止点 = min(自身截止点, 父的有效截止点)；都没有时返回 null（无穷远）。
+     * 什么时候用：调用方需要剩余时长，或测试检查「子不晚于父」。
+     * 前置条件：无。
+     * 失败模式：不会失败。
+     * 为什么先释放自身锁再读父：两把锁从不同时持有，读父不会与父的回调互相等待。
+     */
+    public function deadline(): Deadline? {
+        this.mutex.acquireUninterruptibly();
+        var own: Deadline? = this.ownDeadline;
+        var parent: CancellationToken? = this.parentToken;
+        this.mutex.release();
+        if (parent == null) {
+            return own;
+        }
+        var inherited: Deadline? = parent.deadline();
+        if (inherited == null) {
+            return own;
+        }
+        return Deadline.earliest(own, inherited);
+    }
+
+    /**
+     * 做什么：按当前单调时钟检查截止时间，等价于 pollDeadlineAt(System.nanoTime())。
+     * 什么时候用：协作检查点（throwIfCancelled 自动调用；TaskRunner 在任务体开始前、launch 登记帧时调用）。
+     * 前置条件：无。
+     * 失败模式：同 pollDeadlineAt。
+     * 为什么总是读时钟、不先扫描链上有无截止点：nanoTime 是不加锁的单调时钟读取，而预扫描
+     *   要给链上每个令牌多加一次锁；整条链共用同一个时刻，保证父子同一期限时先判父（见 pollReasonAt）。
+     */
+    public function pollDeadline(): bool {
+        var now: int64 = java.lang.System.nanoTime();
+        return this.pollReasonAt(now) != null;
+    }
+
+    /**
+     * 做什么：在单调时刻 nowNanos 检查截止时间；返回检查后本令牌是否已取消。
+     * 什么时候用：检查点；测试以确定时刻驱动。
+     * 前置条件 / 失败模式 / 返回保证：同 pollReasonAt（返回 true ⇔ 其结果非 null）。
+     */
+    public function pollDeadlineAt(nowNanos: int64): bool {
+        return this.pollReasonAt(nowNanos) != null;
+    }
+
+    /**
+     * 做什么：在单调时刻 nowNanos 检查截止时间：先递归检查父链，再检查自身截止点；
+     *   到期且未取消的令牌以 Deadline 原因取消。返回检查后本令牌的首个取消原因，未取消时返回 null。
+     * 什么时候用：pollDeadline / pollDeadlineAt / throwIfCancelled 的共同实现。
+     * 前置条件：nowNanos 与截止点同一刻度。
+     * 失败模式：到期取消或帮助传播的回调失败以 CallbackDispatchError 传播，取消状态已置位不回滚。
+     * 为什么每个令牌只加一次锁：检查点在每个挂起点与任务体入口都会运行，链上每层一次快照
+     *   （父引用、自身截止点、是否已取消及原因）就够做全部判断；之后的决定都经 cancelWith
+     *   在锁内再判，快照过时只会让本次检查线性化在并发的收紧 / 取消之前。
+     * 为什么本令牌已取消仍检查祖先：本令牌的结果已确定（首因稳定），但作用域到期应能被任何
+     *   检查点观察——单独取消的子任务在检查点上照样让到期的作用域以 Deadline 取消。
+     * 为什么先父后己：父到期时应取消父（让兄弟与作用域都得到 Deadline 原因），再经回调
+     *   传给本令牌；若先检查自身，同时到期时只会取消自己，作用域原因就依赖观察顺序。
+     * 为什么已取消就不再改原因：首因稳定——先到的显式取消或兄弟失败不被之后的到期覆盖。
+     * 返回保证：返回 null 时，本令牌与每个祖先在各自快照时都未取消、自身截止点在 nowNanos 未到期；
+     *   返回非 null 时本令牌已取消且该值就是它的首个原因（祖先已取消时经帮助传播立即成立）。
+     */
+    public function pollReasonAt(nowNanos: int64): CancellationReason? {
+        this.mutex.acquireUninterruptibly();
+        var parent: CancellationToken? = this.parentToken;
+        var own: Deadline? = this.ownDeadline;
+        var alreadyCancelled: bool = this.cancelled;
+        var firstReason: CancellationReason = this.reasonValue;
+        this.mutex.release();
+        if (parent != null) {
+            var parentReason: CancellationReason? = parent.pollReasonAt(nowNanos);
+            if (alreadyCancelled) {
+                return firstReason;
+            }
+            if (parentReason != null) {
+                // 帮助传播：父已取消但其回调可能仍在别的线程里逐个传给子令牌。这里直接以父的
+                // 首个原因取消自己（与 ChildCancellation 写的是同一个值，重复调用幂等），保证
+                // 检查点返回时「祖先已取消 ⇒ 本令牌已取消」，不依赖另一线程的回调进度。
+                return this.settleWith(cast parentReason as CancellationReason);
+            }
+        }
+        if (alreadyCancelled) {
+            return firstReason;
+        }
+        if (own != null) {
+            var deadline: Deadline = cast own as Deadline;
+            if (deadline.isExpiredAt(nowNanos)) {
+                return this.settleWith(CancellationReason.Deadline);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 做什么：以 reason 请求取消，并返回本令牌最终的首个原因（自己置位则为 reason，否则为先到者）。
+     * 什么时候用：仅 pollReasonAt 内部使用。
+     * 前置条件：reason 非 null。
+     * 失败模式：同 cancelWith。
+     * 为什么公开：Jasper 当前没有包内可见性；调用方应使用 cancelWith。
+     */
+    public function settleWith(reason: CancellationReason): CancellationReason {
+        if (this.cancelWith(reason)) {
+            return reason;
+        }
+        return this.reasonOr(reason);
     }
 }
 

@@ -364,13 +364,8 @@ object ReasonRuntime {
         }
     """.trimIndent()
 
-    val loader: URLClassLoader by lazy {
-        val output = Paths.get("build", "tmp", "cancellation-reason", "harness")
-        output.toFile().deleteRecursively()
-        Files.createDirectories(output)
-        val result = JasperCompiler().compileAllWithStdlib(mapOf("ProbeBody.jas" to bodySource), output)
-        check(result is JasperCompiler.CompileResult.Success) { "compilation failed: $result" }
-        URLClassLoader(arrayOf(output.toUri().toURL()))
+    val loader: ClassLoader by lazy {
+        CompiledRuntimeLoader.compile("cancellation-reason/harness", mapOf("ProbeBody.jas" to bodySource))
     }
     private fun type(name: String): Class<*> = loader.loadClass(name)
     val token by lazy { type("std.CancellationToken") }

@@ -1041,7 +1041,8 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 
 - `Parent`：嵌套作用域 / 跨任务令牌链接尚不存在（TaskGroup 仍为单层）。
 - `ScopeExit`：作用域异常退出时取消未完成子任务的路径尚未实现（close 只等待）。
-- `Deadline`：截止时间计时与挂起点入口的截止检查尚未实现；当前只有调用方显式 `cancelWith(Deadline)`。
+- `Deadline`：截止点与检查点已接入（见下节「Deadline 运行时子片」）；到期唤醒挂起中的帧（计时器）与生成帧
+  挂起点入口的截止检查尚未实现。
 - 生成帧：结果被作用域取消时原因正确（由 TaskGroup 写入）；帧自身因被等待的 Future 取消而发布 Cancelled
   时仍按 `cancel()` 记 Explicit；帧内（清理代码中）查询取消原因的语言形态尚未提供。
   `FutureCancelledError` 不带原因。
@@ -1056,3 +1057,55 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
   API 下为等价变异（见登记表 `LANG-S4-REASON-01`）。
 - TLA+：新增 `CancellationReasonPropagation`（9709 个不同状态）与变异配置；`run-s4-models.sh` 十五组通过。
 - 全量 `./gradlew test` 0 失败 / 0 错误。
+
+## Deadline 运行时子片（纯 Jasper 运行时）
+
+### 已支持
+
+- `std.Deadline`：单调时钟（`System.nanoTime`）刻度上的不可变截止点。`afterNanos` 拒绝负时长
+  （`DeadlineError`），超大时长夹到 2^62 防止溢出；`fromNanos` 供确定性测试；比较一律用差值
+  （`a - b < 0`），跨 `Long` 回绕仍正确；`earliest(a, b)` 把 null 视为无穷远；`remainingNanosAt` 夹到 0。
+- `CancellationToken`：每个令牌可带自身截止点，`restrictDeadline` 只收紧；子令牌持父引用（`createChild`
+  绑定一次，重复绑定抛 `DeadlineError`），有效截止点 `deadline()` = min(自身, 父的有效截止点)，父之后的
+  收紧对子实时可见；`createChildWithDeadline`。
+- 检查点 `pollDeadline` / `pollDeadlineAt(now)` / `throwIfCancelled`：整条链共用一个时刻；每层一次加锁快照
+  （父引用、自身截止点、是否已取消及原因），先递归检查父、再决定本层——父结果为已取消时以父的首个原因
+  帮助传播（不依赖另一线程的回调进度），否则自身到期以 `Deadline` 取消。已取消的令牌仍检查祖先，作用域
+  到期可被任何检查点观察；首因稳定，先到的显式取消 / 兄弟失败不被到期覆盖。
+- `TaskGroup`：`restrictDeadline` / `deadline()` 作用于根令牌；`spawnWithDeadline` 为单个子任务设更严格的
+  期限（不能放宽作用域期限）；检查点在任务体开始前（`TaskRunner`）、任务体调用 `throwIfCancelled` 时、
+  `launch` 登记帧时。作用域到期取消根令牌，全部子任务与 `close` 报 `Deadline`；子任务自身期限到期只取消它
+  自己，不是业务失败，不触发普通组兄弟级联。
+
+### 仍不支持（后续切片）
+
+- 到期不会唤醒正在挂起等待的帧或阻塞调用（无计时器）；只在上述检查点观察。
+- 生成帧挂起点入口尚未检查截止时间；`ScopeExit`、嵌套作用域 `Parent` 链接同上节。
+- 帧内（源码层）设定 / 查询期限的语言形态未提供。
+
+### 验收结果
+
+- `DeadlineTest` 端到端 5 项：截止点值与回绕比较、令牌合并与到期者取消、帮助传播复制祖先首因（在根上
+  更早注册的回调里对尚未收到传播的孙令牌做检查点，确定地构造回调未送达窗口）、TaskGroup 作用域 / 子任务
+  期限与 launch、种子 20261123 的 300 轮随机令牌树按单线程精确 oracle 逐步判定（含回绕）。
+- `DeadlineLincheckTest`：两线程交错三个检查点与显式取消（40 × 400）；`DeadlineFuzzTest` 覆盖引导 61 秒
+  293219 次无失败，181 条语料入库作回归输入。
+- 变异 5 组均被抓：检查点不帮助传播、帮助传播写 `Parent` 而非父的首因（只有确定性回调窗口用例能抓）、
+  `throwIfCancelled` 不检查截止、已取消即不检查祖先、先判自身再判父。
+- TLA+ `DeadlinePropagation` 与实现同构（下行逐层快照、上行逐层决定），1325300 个不同状态（含传播活性）
+  通过；变异配置 `_nohelp` 违反 PollSeesExpiry / PollSeesCancel。
+
+### 测试设施：Lincheck 必须真实插桩 Jasper 运行时
+
+Lincheck 2.39 只经系统类加载器读取被插桩类、用 `Class.forName` 查找类；编译产物放在测试自建的
+`URLClassLoader` 里时，std 运行时类静默不插桩，交错只发生在 Kotlin 驱动层。`lincheckTest` 任务因此在独立
+JVM 中把编译产物目录放上系统类路径（`CompiledRuntimeLoader`），`./gradlew test` 依赖它。此前登记的
+`CancellationReasonLincheckTest`、`LinearCoroutineScopeLincheckTest` 证据未覆盖运行时内部交错，现均在
+真实插桩下重新通过。
+
+另：Lincheck 发现超时 / 活锁或单次调用事件数超过固定上限 10001 时，以 `ThreadAbortedError` 中止线程；
+Jasper 运行时 `catch (java.lang.Throwable)` 会把它当平台失败吞掉，表现为 Lincheck 内部
+`Check failed`（`ManagedStrategy.runInvocation`）。本子片最初每个检查点每层加锁 3～4 次，令
+`CancellationReasonLincheckTest` 的调用越过事件上限；合并为每层一次快照后通过。遇到同样的内部 check
+失败时，先查事件量与吞异常，而不是放宽场景。
+

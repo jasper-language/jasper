@@ -27,7 +27,6 @@ import org.jetbrains.kotlinx.lincheck.check
 import org.jetbrains.kotlinx.lincheck.strategy.managed.modelchecking.ModelCheckingOptions
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
-import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -51,13 +50,8 @@ object ScopeFvRuntime {
         }
     """.trimIndent()
 
-    val loader: URLClassLoader by lazy {
-        val output = Paths.get("build", "tmp", "linear-coroutine-scope", "fv")
-        output.toFile().deleteRecursively()
-        Files.createDirectories(output)
-        val result = JasperCompiler().compileAllWithStdlib(mapOf("Program.jas" to source), output)
-        check(result is JasperCompiler.CompileResult.Success) { "compilation failed: $result" }
-        URLClassLoader(arrayOf(output.toUri().toURL()))
+    val loader: ClassLoader by lazy {
+        CompiledRuntimeLoader.compile("linear-coroutine-scope/fv", mapOf("Program.jas" to source))
     }
     val future: Class<*> by lazy { loader.loadClass("std.Future") }
     private val failure: Class<*> by lazy { loader.loadClass("std.Failure") }

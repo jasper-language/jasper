@@ -102,6 +102,8 @@ object StdLib {
         "Runnable.jas",
         "Executor.jas",
         "Future.jas",
+        // S4 Deadline：截止点被 CancellationToken 引用，排在其前。
+        "Deadline.jas",
         "CancellationToken.jas",
         "CallbackDispatchError.jas",
         // S4-C 第九片：生成帧进入作用域的协议须先于使用它的 TaskGroup.launch。

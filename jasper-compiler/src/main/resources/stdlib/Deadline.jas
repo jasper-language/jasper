@@ -1,0 +1,178 @@
+package std;
+
+// ============================================================================
+// Deadline.jas —— 单调时钟截止点
+// ============================================================================
+// 职责：
+//   表示「最晚在哪个单调时钟时刻之前完成」，并提供到期判断、剩余时长与取更严格
+//   （更早）两个截止点的合并。CancellationToken 按父子关系合并截止点，到期时在检查点
+//   以 CancellationReason.Deadline 取消（S4 契约 §2 继承矩阵、§4 取消与截止时间）。
+//
+// 时间表示：
+//   截止点保存为 System.nanoTime 刻度上的绝对纳秒值。nanoTime 只承诺单调、可回绕，
+//   因此所有比较都用差值符号（a - b < 0 表示 a 早于 b），不直接比较原值；这要求同时
+//   存活的截止点彼此相距小于 2^63 纳秒。afterNanos 把时长夹到 MAX_SPAN_NANOS（约 146 年），
+//   保证「当前时刻 + 时长」与现在相距不超过 2^62，任意两个存活截止点的差值都不会溢出。
+//
+// 变化点隔离：
+//   时钟源只在 afterNanos / remainingNanos / isExpired 三处读取；其余判断都接收显式
+//   当前时刻（...At 系列），测试与未来 Jasper OS 单调时钟适配器都不必改语义。
+//
+// 已知边界：
+//   - 截止点只是数据：到期本身不会唤醒任何人，取消只在检查点观察（契约 §4）；
+//     计时唤醒挂起中的任务留给后续切片；
+//   - 不提供墙钟日期换算：nanoTime 的原点不对应任何日期。
+// ============================================================================
+
+/**
+ * 截止点参数非法。
+ *
+ * 做什么：拒绝负时长，避免「负的剩余时间」被悄悄解释成已到期或无穷远。
+ * 什么时候用：Deadline.afterNanos 收到负数时。
+ * 前置条件：调用方传入了错误的时长。
+ * 失败模式：不会失败。
+ * 为什么抛错而不是夹到 0：与 CleanupBudgetError 一致，静默夹取会掩盖配置错误。
+ */
+public class DeadlineError extends Error {
+    /** 做什么：构造截止点错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/**
+ * 单调时钟截止点（不可变）。
+ *
+ * 做什么：保存一个绝对单调时刻，判断是否到期、还剩多久，以及与另一个截止点取更早者。
+ * 什么时候用：TaskGroup 作用域或单个子任务需要期限时；CancellationToken 保存并合并它。
+ * 前置条件：同时比较的截止点来自同一个单调时钟、彼此相距小于 2^63 纳秒。
+ * 失败模式：afterNanos 的负时长抛 DeadlineError；其余查询不会失败。
+ * 为什么不可变：截止点只能被更严格的值替换（取更早者），不可变值保证没有人能在别处
+ *   把已发出的截止点往后挪。
+ */
+public class Deadline {
+    private var atNanosValue: int64;
+
+    /**
+     * 做什么：以绝对单调时刻构造截止点。
+     * 什么时候用：afterNanos / fromNanos 内部，以及测试给出确定时刻时。
+     * 前置条件：atNanos 与当前 nanoTime 处在同一刻度上。
+     * 失败模式：不会失败。
+     * 为什么公开：Jasper 当前没有包内可见性；推荐入口是 afterNanos。
+     */
+    public constructor(atNanos: int64) {
+        this.atNanosValue = atNanos;
+    }
+
+    /**
+     * 做什么：返回从现在起 durationNanos 纳秒后的截止点。
+     * 什么时候用：为作用域或子任务设定相对期限。
+     * 前置条件：durationNanos 非负；0 表示已到期。
+     * 失败模式：负数抛 DeadlineError。
+     * 为什么夹到 MAX_SPAN_NANOS：见文件头「时间表示」，过大的时长会让差值比较溢出、
+     *   把远期截止点误判成已到期；146 年对任何期限都等同于无穷远。
+     */
+    public static function afterNanos(durationNanos: int64): Deadline {
+        if (java.lang.Long.compare(durationNanos, 0) < 0) {
+            throw new DeadlineError("deadline duration must be non-negative");
+        }
+        var span: int64 = java.lang.Math.min(durationNanos, Deadline.maxSpanNanos());
+        var now: int64 = java.lang.System.nanoTime();
+        return new Deadline(now + span);
+    }
+
+    /**
+     * 做什么：以绝对单调时刻构造截止点（等价于构造器）。
+     * 什么时候用：调用方已持有 nanoTime 刻度上的时刻，或测试需要确定时刻时。
+     * 前置条件：同构造器。
+     * 失败模式：不会失败。
+     */
+    public static function fromNanos(atNanos: int64): Deadline {
+        return new Deadline(atNanos);
+    }
+
+    /**
+     * 做什么：返回 a、b 中更早（更严格）的一个；null 视为无穷远。
+     * 什么时候用：子截止点 = min(父截止点, 显式子截止点)（契约 §2）。
+     * 前置条件：同类说明。
+     * 失败模式：不会失败；两者都为 null 时返回 null。
+     * 为什么相等时返回 a：结果只按时刻比较，返回哪个实例不可观察；固定返回 a 让结果确定。
+     */
+    public static function earliest(a: Deadline?, b: Deadline?): Deadline? {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        if (b.isBefore(a)) {
+            return b;
+        }
+        return a;
+    }
+
+    /** 做什么：返回绝对单调时刻。前置条件：无；失败模式：不会失败。 */
+    public function atNanos(): int64 {
+        return this.atNanosValue;
+    }
+
+    /**
+     * 做什么：判断本截止点是否严格早于 other。
+     * 前置条件：other 非 null。失败模式：不会失败。
+     * 为什么用差值符号：nanoTime 可回绕，原值比较在回绕处会颠倒先后。
+     */
+    public function isBefore(other: Deadline): bool {
+        var mine: int64 = this.atNanosValue;
+        var theirs: int64 = other.atNanos();
+        var delta: int64 = mine - theirs;
+        return java.lang.Long.compare(delta, 0) < 0;
+    }
+
+    /**
+     * 做什么：判断在单调时刻 nowNanos 时是否已到期（到达截止点即到期）。
+     * 什么时候用：CancellationToken 检查点；测试以确定时刻驱动。
+     * 前置条件：nowNanos 与截止点同一刻度。
+     * 失败模式：不会失败。
+     * 为什么「到达即到期」：afterNanos(0) 必须立即到期，期限 d 意味着最多运行 d 纳秒。
+     */
+    public function isExpiredAt(nowNanos: int64): bool {
+        var at: int64 = this.atNanosValue;
+        var elapsed: int64 = nowNanos - at;
+        return java.lang.Long.compare(elapsed, 0) >= 0;
+    }
+
+    /** 做什么：按当前单调时钟判断是否已到期。前置条件：无；失败模式：不会失败。 */
+    public function isExpired(): bool {
+        var now: int64 = java.lang.System.nanoTime();
+        return this.isExpiredAt(now);
+    }
+
+    /**
+     * 做什么：返回在 nowNanos 时的剩余纳秒数；已到期返回 0。
+     * 前置条件：同 isExpiredAt。失败模式：不会失败。
+     * 为什么夹到 0：负剩余对调用方没有额外含义，与 CleanupBudget.remainingNanos 一致。
+     */
+    public function remainingNanosAt(nowNanos: int64): int64 {
+        var at: int64 = this.atNanosValue;
+        var remaining: int64 = at - nowNanos;
+        if (java.lang.Long.compare(remaining, 0) < 0) {
+            return 0;
+        }
+        return remaining;
+    }
+
+    /** 做什么：按当前单调时钟返回剩余纳秒数。前置条件：无；失败模式：不会失败。 */
+    public function remainingNanos(): int64 {
+        var now: int64 = java.lang.System.nanoTime();
+        return this.remainingNanosAt(now);
+    }
+
+    /**
+     * 做什么：返回 afterNanos 接受的最大时长（2^62 纳秒，约 146 年）。
+     * 前置条件：无；失败模式：不会失败。
+     * 为什么带 L：裸整数字面量默认 int32，见 CleanupBudget.defaultGlobalNanos。
+     */
+    public static function maxSpanNanos(): int64 {
+        return 4611686018427387904L;
+    }
+}
