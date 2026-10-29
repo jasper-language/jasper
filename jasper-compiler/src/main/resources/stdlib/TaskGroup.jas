@@ -17,10 +17,13 @@ package std;
 //
 // 截止点（S4 契约 §2 / §4）：
 //   作用域截止点保存在根令牌上（restrictDeadline 只能收紧）；spawnWithDeadline 给单个子任务
-//   更严格的期限，子有效截止点 = min(作用域, 显式)。到期只在检查点观察：任务体开始前、
-//   任务体调用 throwIfCancelled 时、launch 登记帧时。作用域到期取消根令牌（全部子任务得到
-//   Deadline 原因，close 报 Deadline）；子任务自身期限到期只取消该子任务。到期不是业务失败，
-//   不触发普通组的兄弟级联。计时唤醒挂起中的帧、帧内挂起点检查截止时间留给后续切片。
+//   更严格的期限，子有效截止点 = min(作用域, 显式)；launchWithDeadline 对生成帧同理。到期只在
+//   检查点观察：任务体开始前、任务体调用 throwIfCancelled 时、launch 登记帧时、生成帧每趟分派
+//   与每个挂起点入口。作用域到期取消根令牌（全部子任务得到 Deadline 原因，close 报 Deadline）；
+//   子任务自身期限到期只取消该子任务。到期不是业务失败，不触发普通组的兄弟级联。
+//   每个生成帧持有根令牌的子令牌，令牌取消经 ScopeCancellationRelay 以首个原因取消帧的结果
+//   Future——任何检查点观察到的作用域到期都会唤醒挂起中的帧。计时唤醒（无检查点时到期）
+//   留给后续切片。
 //
 // 依赖方向：
 //   TaskGroup -> Executor / Future / CancellationToken；这些下层不知道 TaskGroup，
@@ -227,8 +230,28 @@ public class TaskGroup {
     }
 
     /**
-     * 做什么：把编译器生成的协程帧作为子任务登记并启动。
+     * 做什么：把编译器生成的协程帧作为子任务登记并启动；帧只继承作用域截止点。
      * 什么时候用：S4-C 生成帧需要随作用域一起 join、级联取消与聚合失败时。
+     * 前置条件 / 失败模式：同 launchWithin。
+     */
+    public function launch<T>(task: CoroutineTask<T>): Future<T> {
+        return this.launchWithin(task, null);
+    }
+
+    /**
+     * 做什么：登记并启动一个带显式截止点的生成帧；有效截止点 = min(作用域截止点, deadline)。
+     * 什么时候用：某个协程子任务需要比作用域更严格的期限时（契约 §6 ChildOptions.deadline）。
+     * 前置条件：同 launch；deadline 非 null。
+     * 失败模式：同 launch；到期时帧在下一个检查点（分派入口或挂起点入口）以 Deadline 取消
+     *   自己的结果，不执行其后的业务段；子任务自身到期不触发普通组兄弟级联。
+     * 为什么显式期限不能放宽：同 spawnWithDeadline，子令牌只能收紧。
+     */
+    public function launchWithDeadline<T>(task: CoroutineTask<T>, deadline: Deadline): Future<T> {
+        return this.launchWithin(task, deadline);
+    }
+
+    /**
+     * 做什么：launch / launchWithDeadline 的共同实现；deadline 为 null 表示只继承作用域截止点。
      * 前置条件：task 尚未 start，其结果 Future 只属于这一个帧且仍为 Pending；
      *   帧负责在结果终态后（含被作用域取消）调用 markTaskSettled。
      * 失败模式：关闭后抛 TaskGroupClosedError，帧不会启动；执行器拒绝首次恢复时
@@ -237,11 +260,17 @@ public class TaskGroup {
      *   帧可能发布失败之前注册，否则早到的失败会漏掉兄弟取消。
      * 为什么用结果 Future 的回调做级联：帧的失败在恢复段内发布，不存在 TaskRunner
      *   那样包住整个执行体的 finally；Future 终态回调恰好覆盖所有失败发布路径。
+     * 为什么给帧一个根令牌的子令牌：帧在检查点上用它观察作用域与自身的截止点；令牌取消
+     *   （作用域到期被任一检查点观察、显式取消、兄弟失败）经 ScopeCancellationRelay 以首个原因
+     *   取消结果 Future，挂起中的帧由结果回调唤醒并回收。只靠 cancelBecause 的快照不够：
+     *   别处检查点发现作用域到期时只取消根令牌，不经过 cancelBecause。
+     * 为什么子令牌在锁内派生：与 spawnWithin 相同，cancel 先取消根令牌再在锁内快照子任务；
+     *   派生时根已取消则子令牌立即取消，之后取消则经根的回调传播，两边不会都漏掉。
      */
-    public function launch<T>(task: CoroutineTask<T>): Future<T> {
+    public function launchWithin<T>(task: CoroutineTask<T>, deadline: Deadline?): Future<T> {
         var future: Future<T> = task.resultFuture();
         var erased: Future<any> = cast future as Future<any>;
-        // 登记帧是检查点：作用域已到期则先以 Deadline 取消根令牌，下面的已取消分支随之生效。
+        // 登记帧是检查点：作用域已到期则先以 Deadline 取消根令牌，派生的子令牌随之已取消。
         // 放在锁外：到期取消会同步执行根令牌回调。
         this.rootToken.pollDeadline();
         this.mutex.acquireUninterruptibly();
@@ -250,18 +279,18 @@ public class TaskGroup {
             throw new TaskGroupClosedError("cannot launch after TaskGroup.close");
         }
         this.children.add(erased);
-        // 登记之后再读根令牌：cancel 先取消根令牌、再在锁内快照子任务，因此并发取消
-        // 要么在快照里看到本帧，要么在这里被本帧看到，不会两边都漏掉。
-        var scopeCancelled: bool = this.rootToken.isCancelled();
+        var token: CancellationToken = this.rootToken.createChild();
+        if (deadline != null) {
+            token.restrictDeadline(cast deadline as Deadline);
+        }
         this.mutex.release();
 
         erased.onComplete(new ChildFailureRelay(this));
-        if (scopeCancelled) {
-            // 已取消（显式取消或普通组失败级联）的作用域里新帧不执行任何业务段：
-            // 先发布 Cancelled，start 后帧在入口检查处直接回收，与 spawn 的令牌语义一致。
-            // 原因沿用作用域根令牌的首个原因（Explicit 或 SiblingFailed），与 spawn 派生令牌一致。
-            future.cancelWith(this.rootToken.reasonOr(CancellationReason.Explicit));
-        }
+        task.bindToken(token);
+        // 已取消（显式取消、普通组失败级联或已观察到的到期）的作用域里新帧不执行任何业务段：
+        // 子令牌派生时已取消，下面的注册立即以根令牌的首个原因发布 Cancelled，start 后帧在
+        // 入口检查处直接回收，与 spawn 的令牌语义一致。
+        token.onCancel(new ScopeCancellationRelay(erased));
         try {
             task.start();
         } catch (rejected: java.lang.Throwable) {
@@ -458,6 +487,31 @@ public class ChildFailureRelay implements Action<FutureOutcome> {
         if (snapshot.isFailed()) {
             this.owner.onChildFailure();
         }
+    }
+}
+
+/**
+ * 协程子任务令牌到结果的取消传播。
+ *
+ * 做什么：作为 Action<CancellationToken> 注册到生成帧的子令牌，令牌取消时以其首个原因取消
+ *   帧的结果 Future；结果已终态时为空操作。
+ * 什么时候用：TaskGroup.launchWithin 在启动帧之前注册。
+ * 前置条件：future 是该帧的结果 Future。
+ * 失败模式：结果回调（帧恢复请求、失败级联）失败时抛 CallbackDispatchError，由令牌的批次汇总。
+ * 为什么 fallback 写 Explicit：回调在令牌已置位之后执行，reasonOr 必返回令牌的首个原因，
+ *   fallback 不可达；Explicit 与 cancel() 的默认一致。
+ */
+public class ScopeCancellationRelay implements Action<CancellationToken> {
+    private var future: Future<any>;
+
+    /** 做什么：绑定要取消的结果 Future。前置条件：future 非 null；失败模式：不会失败。 */
+    public constructor(future: Future<any>) {
+        this.future = future;
+    }
+
+    /** 做什么：令牌取消时以其首个原因取消结果。前置条件：token 已取消。 */
+    public function accept(token: CancellationToken): void {
+        this.future.cancelWith(token.reasonOr(CancellationReason.Explicit));
     }
 }
 

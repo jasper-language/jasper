@@ -38,6 +38,10 @@
 //   - throw（第二十片）：段内直接抛出，与段内其他异常走同一条路由 / 展开路径；未被捕获时
 //     std.Error 发布为 Failure(message, "error")，其余平台异常为 Failure(toString, "platform")，
 //     与 TaskGroup.spawn 的子任务体约定一致；
+//   - 截止检查（Q130）：帧持有 bindToken 交来的作用域子令牌（不经作用域启动时为构造时自带的
+//     无期限令牌），每趟分派开头与每个挂起点入口先 pollReason，令牌已取消（作用域 / 自身到期、
+//     作用域取消）时以其首个原因取消自己的结果，再由随后的终结检查跳出分派循环展开清理；
+//     到期不唤醒挂起中的帧（无计时器），只在检查点观察；
 //   - 不定义显式挂起标记，不改变公开函数 ABI，也不把生成帧冒充为可同步调用的
 //     普通函数；
 //   - 不实现 Future.get 阻塞等待；恢复只经 onComplete -> ContinuationDispatch。
@@ -74,6 +78,8 @@ object LinearCoroutineEmitter {
     private const val RUNNABLE = "std.Runnable"
     private const val ACTION = "std.Action"
     private const val COROUTINE_TASK = "std.CoroutineTask"
+    private const val CANCELLATION_TOKEN = "std.CancellationToken"
+    private const val CANCELLATION_REASON = "std.CancellationReason"
     private const val FUTURE_FAILURE_ERROR = "std.FutureFailureError"
     private const val FUTURE_CANCELLED_ERROR = "std.FutureCancelledError"
     private const val THROWABLE = "java.lang.Throwable"
@@ -123,7 +129,7 @@ object LinearCoroutineEmitter {
     /**
      * 生成完整的帧类 AST。
      *
-     * 做什么：把支持范围内的函数改写为字段 + 构造器 + `run` + `accept` +
+     * 做什么：把支持范围内的函数改写为字段 + 构造器 + `run` + `accept` + `bindToken` +
      *   `resultFuture` + `start`；构造器把结果 Future 绑定到 ContinuationDispatch，
      *   `start` 订阅自身结果 Future 后只请求第一次恢复。
      * 什么时候用：compiler 已确认 [unsupportedReason] 返回 null 后调用。
@@ -194,6 +200,24 @@ object LinearCoroutineEmitter {
             is JasCastExpr -> expression.copy(expression = rewrite(expression.expression))
             is JasNew -> expression.copy(args = expression.args.map(::rewrite))
             else -> throw IllegalArgumentException("unsupported frame expression: ${expression.javaClass.simpleName}")
+        }
+
+        /**
+         * 截止检查点：令牌（含祖先）检查截止时间，已取消时以令牌的首个原因取消结果。紧随其后的
+         * `__result.isDone` 检查负责跳出。为什么帧自己也取消结果：令牌可能刚被别的线程取消、其
+         * 回调（ScopeCancellationRelay）尚未送达；检查点返回时结果必须已终结，与令牌的帮助传播
+         * 同理。结果已终结时 cancelWith 是空操作。[suffix] 让同一 run 方法内的临时名不重复。
+         */
+        fun checkpoint(suffix: String): List<JasStatement> {
+            val seen = "__seen$suffix"
+            return listOf(
+                JasVariableStatement(seen, JasNullableType(JasNamedType(CANCELLATION_REASON)),
+                    invoke(field("__token"), "pollReason"), false),
+                JasIf(JasBinaryOp(JasIdentifier(seen), "!=", JasNullLiteral), JasBlock(listOf(
+                    statement(invoke(field("__result"), "cancelWith",
+                        JasCastExpr(JasIdentifier(seen), JasNamedType(CANCELLATION_REASON))))
+                )), null)
+            )
         }
 
         /** 记下待发布的失败：`__abort = 1`，`__pending = failure`。 */
@@ -294,6 +318,8 @@ object LinearCoroutineEmitter {
                     // 否则先写下一块编号再注册：注册前已完成的 Future 会同步回调 accept，
                     // 恢复请求由调度门合并到本段结束之后。
                     code += JasVariableStatement("__awaited${block.id}", resultFuture, rewrite(exit.await.operand), false)
+                    // 挂起点入口检查截止时间（契约 §4：进入挂起点时先检查父令牌及截止时间）。
+                    code += checkpoint(block.id.toString())
                     code += JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null)
                     code += jump(exit.resume)
                     code += statement(invoke(JasIdentifier("__awaited${block.id}"), "onComplete", JasIdentifier("this")))
@@ -319,7 +345,8 @@ object LinearCoroutineEmitter {
             JasProperty("__abort", INT, listOf("private"), null, null),
             JasProperty("__pending", JasNullableType(JasNamedType(FAILURE)), listOf("private"), null, null),
             JasProperty("__result", resultFuture, listOf("private"), null, null),
-            JasProperty("__dispatch", JasNamedType(DISPATCH), listOf("private"), null, null)
+            JasProperty("__dispatch", JasNamedType(DISPATCH), listOf("private"), null, null),
+            JasProperty("__token", JasNamedType(CANCELLATION_TOKEN), listOf("private"), null, null)
         )
         slotTypes.forEach { (name, type) ->
             properties += JasProperty(slots.getValue(name), type, listOf("private"), null, null)
@@ -330,7 +357,8 @@ object LinearCoroutineEmitter {
             assign("__outcome", JasNullLiteral),
             assign("__abort", JasIntLiteral(0, "0")),
             assign("__pending", JasNullLiteral),
-            assign("__result", JasIdentifier("output"))
+            assign("__result", JasIdentifier("output")),
+            assign("__token", JasNew(JasNamedType(CANCELLATION_TOKEN), emptyList()))
         )
         function.parameters.forEachIndexed { index, parameter ->
             constructorBody += assign(slots.getValue(parameter.name), JasIdentifier("arg$index"))
@@ -359,14 +387,15 @@ object LinearCoroutineEmitter {
         // 段按块编号顺序排列：前向跳转在同一趟内顺序走到目标段；回边把 `__phase` 设为
         // 更小的循环头编号，本趟其余段都不匹配，分派循环开启新一趟。恢复不会重放挂起点
         // 之前的块，挂起点的操作数每次经过只求值一次。
-        // 每趟开头先看结果是否已被外部终结（作用域取消）：第一趟即入口检查，之后的每趟
+        // 每趟开头先过截止检查点，再看结果是否已被外部终结（作用域取消）：第一趟即入口检查，之后的每趟
         // 对应一次回边，不挂起的循环因此也能在回边处响应取消；终结时不再执行业务段，
         // 跳出分派循环展开清理，再落到 finally 关闭调度门并标记 settled，等待中的帧因此能被回收。
         // 挂起与完成直接 return（不展开）；挂起点失败 / 取消同样跳出分派循环。
         val dispatchLoop = JasWhile(
             JasBoolLiteral(true),
             JasBlock(
-                listOf(JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null)) + segments
+                checkpoint("") +
+                    JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null) + segments
             )
         )
         /** 平台异常转成待发布的 Failure。 */
@@ -520,6 +549,14 @@ object LinearCoroutineEmitter {
                 assign("__outcome", JasIdentifier("snapshot")),
                 statement(invoke(field("__dispatch"), "resume"))
             )),
+            listOf("public")
+        )
+        // bindToken 只在 start 之前由作用域调用一次；之后由执行器的调度保证工作线程看到这次写入。
+        properties += JasFunction(
+            "bindToken",
+            listOf(JasParameter("token", JasNamedType(CANCELLATION_TOKEN))),
+            JasUnitType,
+            JasBlock(listOf(assign("__token", JasIdentifier("token")))),
             listOf("public")
         )
         properties += JasFunction(

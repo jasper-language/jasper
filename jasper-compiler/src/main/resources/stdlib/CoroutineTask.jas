@@ -9,7 +9,7 @@ package std;
 //   帧已绑定的结果 Future 进行登记，再请求首次恢复。
 //
 // 协作方：
-//   - TaskGroup.launch：登记结果 Future → 挂接失败级联 → start；
+//   - TaskGroup.launch：登记结果 Future → 挂接失败级联 → bindToken → start；
 //   - 编译器生成帧：构造时把结果 Future 绑定到 ContinuationDispatch，start 时
 //     同时订阅自身结果 Future，作用域取消该 Future 后帧会被唤醒并在调度门内回收。
 //
@@ -36,6 +36,17 @@ public interface CoroutineTask<T> {
      * 失败模式：不会失败。
      */
     public function resultFuture(): Future<T>;
+
+    /**
+     * 做什么：交给帧一个属于作用域的取消令牌；帧在每趟分派与每个挂起点入口用它检查截止时间，
+     *   检查发现令牌已取消（作用域或自身到期、作用域取消）时以令牌的首个原因取消自己的结果。
+     * 什么时候用：TaskGroup.launch 在 start 之前调用一次。
+     * 前置条件：尚未 start；token 非 null。不经作用域启动的帧使用构造时自带的无期限令牌。
+     * 失败模式：不会失败。
+     * 为什么由作用域给令牌而不是帧自己创建：截止点与取消原因都属于作用域；子令牌挂在根令牌下，
+     *   帧的检查点才能观察作用域截止点，并帮助传播作用域的取消。
+     */
+    public function bindToken(token: CancellationToken): void;
 
     /**
      * 做什么：请求帧的第一次恢复；真正执行在执行器线程上发生。

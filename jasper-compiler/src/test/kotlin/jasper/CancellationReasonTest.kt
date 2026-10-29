@@ -264,6 +264,7 @@ class CancellationReasonTest {
             private var ran: bool;
             public constructor() { this.result = new Future<int32>(); this.ran = false; }
             public function resultFuture(): Future<int32> { return this.result; }
+            public function bindToken(token: CancellationToken): void { }
             public function start(): void {
                 if (!this.result.isDone()) {
                     this.ran = true;

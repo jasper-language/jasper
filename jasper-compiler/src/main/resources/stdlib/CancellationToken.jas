@@ -346,6 +346,17 @@ public class CancellationToken {
     }
 
     /**
+     * 做什么：按当前单调时钟检查截止时间，返回检查后本令牌的首个取消原因，未取消时返回 null；
+     *   等价于 pollReasonAt(System.nanoTime())。
+     * 什么时候用：生成协程帧的检查点——需要在一次快照里同时得到「是否已取消」与原因。
+     * 前置条件 / 失败模式：同 pollReasonAt。
+     */
+    public function pollReason(): CancellationReason? {
+        var now: int64 = java.lang.System.nanoTime();
+        return this.pollReasonAt(now);
+    }
+
+    /**
      * 做什么：在单调时刻 nowNanos 检查截止时间；返回检查后本令牌是否已取消。
      * 什么时候用：检查点；测试以确定时刻驱动。
      * 前置条件 / 失败模式 / 返回保证：同 pollReasonAt（返回 true ⇔ 其结果非 null）。

@@ -1889,8 +1889,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // 的选择见 binaryOpWiderDesc），再按操作符选具体 opcode。
                         val arg0 = expr.getValueArgument(0)!!
                         val arg1 = expr.getValueArgument(1)!!
-                        val desc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
-                        val desc1 = typeMapper.jvmDescriptorFromIrType(arg1.type)
+                        // 操作数是平台调用时 IR 类型记为 Unit，按真实返回描述符回填（见 receiverJvmDescriptor），
+                        // 否则 `System.nanoTime() - 1L` 会选 ISUB 而产出无法校验的字节码。
+                        val desc0 = receiverJvmDescriptor(arg0)
+                        val desc1 = receiverJvmDescriptor(arg1)
                         // 左操作数是字符串时整条表达式退化为字符串拼接（+ 的重载解析结果）。
                         if (desc0 == "Ljava/lang/String;" || desc0 == "Ljava/lang/String") {
                             emitStringConcatCall(mv, expr, ctx, owner)
@@ -1914,8 +1916,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // Objects.equals（值相等语义），基本类型走 xCMP + 条件跳转。
                         val arg0 = expr.getValueArgument(0)!!
                         val arg1 = expr.getValueArgument(1)!!
-                        val desc0 = typeMapper.jvmDescriptorFromIrType(arg0.type)
-                        val desc1 = typeMapper.jvmDescriptorFromIrType(arg1.type)
+                        // 操作数是平台调用时 IR 类型记为 Unit，按真实返回描述符回填（见 receiverJvmDescriptor），
+                        // 否则 `System.nanoTime() - 1L` 会选 ISUB 而产出无法校验的字节码。
+                        val desc0 = receiverJvmDescriptor(arg0)
+                        val desc1 = receiverJvmDescriptor(arg1)
                         val wider = binaryOpWiderDesc(desc0, desc1)
                         generateIrExpression(mv, arg0, ctx, owner)
                         widenIfNeeded(mv, desc0, wider)

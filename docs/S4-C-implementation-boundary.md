@@ -1041,8 +1041,8 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 
 - `Parent`：嵌套作用域 / 跨任务令牌链接尚不存在（TaskGroup 仍为单层）。
 - `ScopeExit`：作用域异常退出时取消未完成子任务的路径尚未实现（close 只等待）。
-- `Deadline`：截止点与检查点已接入（见下节「Deadline 运行时子片」）；到期唤醒挂起中的帧（计时器）与生成帧
-  挂起点入口的截止检查尚未实现。
+- `Deadline`：截止点与检查点已接入（见下节「Deadline 运行时子片」），生成帧分派入口与挂起点入口的截止检查
+  见「生成帧截止检查点」；到期唤醒挂起中的帧（计时器）尚未实现。
 - 生成帧：结果被作用域取消时原因正确（由 TaskGroup 写入）；帧自身因被等待的 Future 取消而发布 Cancelled
   时仍按 `cancel()` 记 Explicit；帧内（清理代码中）查询取消原因的语言形态尚未提供。
   `FutureCancelledError` 不带原因。
@@ -1080,7 +1080,7 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 ### 仍不支持（后续切片）
 
 - 到期不会唤醒正在挂起等待的帧或阻塞调用（无计时器）；只在上述检查点观察。
-- 生成帧挂起点入口尚未检查截止时间；`ScopeExit`、嵌套作用域 `Parent` 链接同上节。
+- 生成帧挂起点入口的截止检查见后文「生成帧截止检查点」；`ScopeExit`、嵌套作用域 `Parent` 链接同上节。
 - 帧内（源码层）设定 / 查询期限的语言形态未提供。
 
 ### 验收结果
@@ -1109,3 +1109,44 @@ Jasper 运行时 `catch (java.lang.Throwable)` 会把它当平台失败吞掉，
 `CancellationReasonLincheckTest` 的调用越过事件上限；合并为每层一次快照后通过。遇到同样的内部 check
 失败时，先查事件量与吞异常，而不是放宽场景。
 
+
+## 生成帧截止检查点（LANG-S4-FRAME-DEADLINE-01）
+
+### 已支持
+
+- 生成帧新增私有字段 `__token` 与公开方法 `bindToken(token)`（`CoroutineTask` 接口同步新增）。经作用域启动时
+  `TaskGroup.launch` / `launchWithDeadline` 在锁内派生根令牌的子令牌交给帧；不经作用域启动的帧使用构造时自带的
+  无期限令牌。`launchWithDeadline(task, deadline)` 的有效截止点 = min(作用域, deadline)，只能收紧。
+- 检查点：每趟分派开头（第一趟即入口，之后每趟对应一次恢复或回边）与每个挂起点入口（挂起点操作数求值之后、
+  注册回调之前）调用 `CancellationToken.pollReason()`；令牌（含祖先）已取消或到期时以其首个原因取消自己的
+  结果，随后的终结检查跳出分派循环、展开 finally / defer，再标记 settled。到期之后不再执行其后的业务段，
+  业务段内到期也不会再挂起等待输入。无截止点时检查点不读时钟。
+- 作用域到期被任一检查点（任一帧、`launch`、子任务体开始前、`throwIfCancelled`）观察时根令牌以 `Deadline`
+  取消，经子令牌回调 `ScopeCancellationRelay` 以首个原因取消全部帧的结果，挂起中的帧由结果回调唤醒并回收；
+  原先 launch 登记时对根令牌的一次快照由派生子令牌 + 注册传播取代（已取消作用域里的新帧仍立即 Cancelled）。
+- 帧自身期限到期只取消它自己，不是业务失败，不触发普通组兄弟级联；`close` 照常聚合（报 `Deadline`）。
+
+### 仍不支持（后续切片）
+
+- 到期本身不是检查点：挂起中的帧在作用域或自身期限到期后，若没有任何检查点观察到，会一直挂起（无计时器）。
+- `ScopeExit`、嵌套作用域 `Parent`、帧内（源码层）设定 / 查询期限的语言形态同前。
+- 帧自身因被等待的 Future 取消而发布 Cancelled 时仍记 Explicit。
+
+### 顺带修复：平台调用作二元运算操作数（LANG-PLATFORM-BINOP-01）
+
+translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端二元算术 / 比较只看 IR 类型：
+`System.nanoTime() - 1L` 选了 ISUB，直线代码类加载时 `VerifyError`，`if` 体内则在 ASM 帧计算处编译内部错误。
+二元算术与比较的操作数描述符现经平台解析器回填（与成员调用接收者同一个 `receiverJvmDescriptor`）。
+
+### 验收结果
+
+- `FrameDeadlineCoroutinePipelineTest` 端到端 6 项（编译标准库 + 用户源码，经 `TaskGroup.launch` /
+  `launchWithDeadline` 运行，类经 JVM 校验加载）：首趟前到期不执行业务段、挂起中到期于恢复时观察并清理、
+  别处检查点（launch / spawn）观察作用域到期唤醒挂起帧、帧自身期限不级联、业务段内到期被同一趟挂起点入口
+  观察，以及种子 20261125 的 300 轮随机事件序列按单线程精确 oracle 逐步判定（结果 / 原因 / 业务段与清理
+  次数 / settled / close 聚合，四类覆盖下限各 ≥ 20）。
+- `PlatformCallBinaryOperandTest` 2 项：`nanoTime() - 1L` 直线 / if 体 / 比较；种子 20261127 的 240 个
+  `Math.abs(a) op 字面量` 函数（int32 / int64 / float64，直线与 if 体）× 4 输入与 Kotlin 计算比对。
+- 变异 4 组均被抓：后端回退 2 项失败、去掉挂起点入口检查 1 项、去掉分派入口检查 4 项、去掉作用域传播 4 项。
+- TLA+ `FrameDeadlineCheckpoint`（两帧，普通组 4992 / 监督组 4872 个不同状态，含回收活性）通过；变异配置
+  `_nosuspendcheck` 违反 NoSuspendAfterExpiry、`_norelay` 违反 CancelledScopeHasNoPending。
