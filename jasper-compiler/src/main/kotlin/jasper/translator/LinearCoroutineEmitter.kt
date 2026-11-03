@@ -1,9 +1,9 @@
 // ============================================================================
-// LinearCoroutineEmitter.kt —— 多挂起点、条件分支与 while 循环 int32 函数的内部状态机发射器
+// LinearCoroutineEmitter.kt —— 多挂起点、条件分支与循环函数的内部状态机发射器
 // ============================================================================
 // 职责：
 //   把已经通过类型检查、且已被直接调用图判定为「可能挂起」的窄范围函数，翻译成
-//   一个实现 Runnable + Action<FutureOutcome> + CoroutineTask<int32> 的生成帧类。
+//   一个实现 Runnable + Action<FutureOutcome> + CoroutineTask<T> 的生成帧类（T 是源码返回类型）。
 //   生成类保存源码函数的参数与跨挂起局部，使用 Future.onComplete 注册恢复，并通过
 //   ContinuationDispatch 的串行恢复门与结果绑定桥运行；CoroutineTask 协议让
 //   TaskGroup.launch 把帧作为结构化作用域的子任务登记、取消与回收。
@@ -52,7 +52,7 @@ package jasper.translator
 import jasper.ast.*
 
 /**
- * 多挂起点、条件分支与 while 循环 int32 函数的内部 AST 发射器。
+ * 多挂起点、条件分支与循环函数的内部 AST 发射器。
  *
  * 做什么：把一个受限函数改写成显式状态机类；原函数参数/局部变量成为帧字段，
  *   程序位置由 `__phase`（下一个基本块编号）表示，awaited Future 的回调只请求恢复，
@@ -85,8 +85,9 @@ object LinearCoroutineEmitter {
     private const val THROWABLE = "java.lang.Throwable"
     private const val ERROR = "std.Error"
 
-    /** 仅 int32 结果；更宽类型需要重新审视字段布局与描述符，不能静默复用。 */
     private val INT = JasPrimitiveType("int32")
+    private val INT64 = JasPrimitiveType("int64")
+    private val FLOAT64 = JasPrimitiveType("float64")
     private val BOOL = JasPrimitiveType("bool")
 
     /**
@@ -109,11 +110,11 @@ object LinearCoroutineEmitter {
         if (function.typeParameters.isNotEmpty()) {
             return "generic functions are not supported"
         }
-        if (function.returnType != INT) {
-            return "only int32 return type is supported"
+        if (!CoroutineBlockPlanner.isFrameValueType(function.returnType)) {
+            return "return type must be ${CoroutineBlockPlanner.FRAME_VALUE_TYPES}"
         }
         if (function.parameters.any { !isSupportedParameter(it.type) }) {
-            return "parameters must be int32, bool or std.Future<int32>"
+            return "parameters must be ${CoroutineBlockPlanner.FRAME_VALUE_TYPES}, or std.Future of one of them"
         }
         if (function.parameters.map { it.name }.distinct().size != function.parameters.size) {
             return "parameter and local names must be unique"
@@ -147,13 +148,15 @@ object LinearCoroutineEmitter {
         require(className.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) { "invalid generated class name" }
 
         val plan = CoroutineBlockPlanner.plan(function, parameterTypes(function))
-        val resultFuture = JasNamedType(FUTURE, listOf(INT))
+        val returnType = requireNotNull(function.returnType)
+        val resultFuture = JasNamedType(FUTURE, listOf(returnType))
 
         // 槽位按「参数在前、局部按源码出现顺序」固定分配；字段名不直接使用用户名字，
         // 避免生成类与用户局部/字段重名，也让跨段布局在代码中可见。分支内局部同样
         // 成为帧字段：它们可能跨越分支内的挂起点。
         val slotTypes = function.parameters.map { it.name to normalize(requireNotNull(it.type)) } + plan.locals
         val slots = slotTypes.withIndex().associate { it.value.first to "__slot${it.index}" }
+        val slotType = slotTypes.toMap()
 
         /** 生成当前帧字段引用。 */
         fun field(name: String) = JasPropertyAccess(JasIdentifier("this"), name)
@@ -164,6 +167,16 @@ object LinearCoroutineEmitter {
         fun statement(expression: JasExpression) = JasExpressionStatement(expression)
         /** 生成帧字段赋值。 */
         fun assign(name: String, value: JasExpression) = statement(JasAssignment(field(name), value))
+        /**
+         * 写入 [type] 的值：int64 / float64 显式转换。为什么：源码允许 int32 字面量与表达式隐式宽化到
+         * 这两种类型，改写后写入帧字段、经 `Future.complete` 装箱时也必须是目标类型——装箱成 Integer
+         * 的话，`FutureOutcome.value` 的消费方拆箱会失败。其余类型赋值即值本身。
+         */
+        fun coerced(value: JasExpression, type: JasType) =
+            if (type == INT64 || type == FLOAT64) JasCastExpr(value, type) else value
+        /** 写入源码局部 / 合成临时局部对应的帧字段。 */
+        fun assignLocal(name: String, value: JasExpression) =
+            assign(slots.getValue(name), coerced(value, slotType.getValue(name)))
         /** 生成 `__phase = target`。 */
         fun jump(target: Int) = assign("__phase", JasIntLiteral(target.toLong(), target.toString()))
 
@@ -231,7 +244,7 @@ object LinearCoroutineEmitter {
         val hasCatch = plan.tryRegions.any { it.handlers.isNotEmpty() }
 
         /**
-         * 恢复块入口：消费终态快照。成功取 int32 结果写入绑定；失败记为待发布的原 Failure；
+         * 恢复块入口：消费终态快照。成功取结果按绑定局部的类型写入绑定；失败记为待发布的原 Failure；
          * 取消记为待发布的 Cancelled 并记下被等待 Future 的首个原因（与保留原 Failure 同理，
          * 超时不会在帧边界变成 Explicit），而不是伪装成业务失败。没有 catch 区域时两者都跳出分派
          * 循环，先展开清理再发布；有 catch 区域时先记下同样的待发布终态，再抛出
@@ -272,7 +285,7 @@ object LinearCoroutineEmitter {
                     JasVariableStatement(failureName, JasNullableType(JasNamedType(FAILURE)),
                         invoke(ready, "failure"), false)
                 ) + abortFailure(failure) + onFailed), null),
-                assign(slots.getValue(binding), JasCastExpr(invoke(ready, "value"), INT))
+                assign(slots.getValue(binding), JasCastExpr(invoke(ready, "value"), slotType.getValue(binding)))
             )
         }
 
@@ -281,12 +294,13 @@ object LinearCoroutineEmitter {
          * 加减 1，调用语句、if/else、while、块与 finally 内循环的 break / continue 保持结构。
          */
         fun rewriteCleanup(statement: JasStatement): JasStatement = when (statement) {
-            is JasVariableStatement -> assign(slots.getValue(statement.name), rewrite(requireNotNull(statement.initializer)))
+            is JasStatementIncrement -> rewriteCleanup(JasExpressionStatement(statement.increment))
+            is JasVariableStatement -> assignLocal(statement.name, rewrite(requireNotNull(statement.initializer)))
             is JasExpressionStatement -> when (val expression = statement.expression) {
-                is JasAssignment -> assign(slots.getValue((expression.target as JasIdentifier).name), rewrite(expression.value))
+                is JasAssignment -> assignLocal((expression.target as JasIdentifier).name, rewrite(expression.value))
                 is JasPostfixIncDec -> {
-                    val slot = slots.getValue((expression.target as JasIdentifier).name)
-                    assign(slot, JasBinaryOp(field(slot), if (expression.op == "++") "+" else "-", JasIntLiteral(1, "1")))
+                    val name = (expression.target as JasIdentifier).name
+                    assignLocal(name, JasBinaryOp(field(slots.getValue(name)), if (expression.op == "++") "+" else "-", JasIntLiteral(1, "1")))
                 }
                 else -> statement(rewrite(expression))
             }
@@ -309,7 +323,7 @@ object LinearCoroutineEmitter {
         val segments = plan.blocks.map { block ->
             val code = mutableListOf<JasStatement>()
             block.resumeBinding?.let { code += consumeOutcome(block.id, it) }
-            block.assignments.forEach { (name, value) -> code += assign(slots.getValue(name), rewrite(value)) }
+            block.assignments.forEach { (name, value) -> code += assignLocal(name, rewrite(value)) }
             block.cleanups.forEach { code += cleanupCode.getValue(it) }
             when (val exit = block.exit) {
                 is CoroutineBlockExit.Goto -> code += jump(exit.target)
@@ -324,7 +338,9 @@ object LinearCoroutineEmitter {
                     // 所在区域的清理，而 finally 随即关闭调度门，之后不会再有展开的机会）。
                     // 否则先写下一块编号再注册：注册前已完成的 Future 会同步回调 accept，
                     // 恢复请求由调度门合并到本段结束之后。
-                    code += JasVariableStatement("__awaited${block.id}", resultFuture, rewrite(exit.await.operand), false)
+                    code += JasVariableStatement("__awaited${block.id}",
+                        JasNamedType(FUTURE, listOf(requireNotNull(exit.await.awaitResultType))),
+                        rewrite(exit.await.operand), false)
                     // 挂起点入口检查截止时间（契约 §4：进入挂起点时先检查父令牌及截止时间）。
                     code += checkpoint(block.id.toString())
                     code += JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null)
@@ -333,7 +349,7 @@ object LinearCoroutineEmitter {
                     code += JasReturn(null)
                 }
                 is CoroutineBlockExit.Finish -> {
-                    code += statement(invoke(field("__result"), "complete", rewrite(exit.value)))
+                    code += statement(invoke(field("__result"), "complete", coerced(rewrite(exit.value), returnType)))
                     code += JasReturn(null)
                 }
                 // 抛出值在段内求值后直接抛出；所在区域的 finally / catch 由外层路由按 `$region` 处理。
@@ -373,8 +389,7 @@ object LinearCoroutineEmitter {
             constructorBody += assign(slots.getValue(parameter.name), JasIdentifier("arg$index"))
         }
         plan.locals.forEach { (name, type) ->
-            constructorBody += assign(slots.getValue(name),
-                if (type == BOOL) JasBoolLiteral(false) else JasIntLiteral(0, "0"))
+            constructorBody += assign(slots.getValue(name), zeroValue(type))
         }
         constructorBody += assign("__dispatch", JasNew(
             JasNamedType(DISPATCH),
@@ -594,7 +609,7 @@ object LinearCoroutineEmitter {
             listOf(
                 JasNamedType(RUNNABLE),
                 JasNamedType(ACTION, listOf(JasNamedType(FUTURE_OUTCOME))),
-                JasNamedType(COROUTINE_TASK, listOf(INT))
+                JasNamedType(COROUTINE_TASK, listOf(returnType))
             ),
             properties,
             listOf(constructor)
@@ -605,24 +620,34 @@ object LinearCoroutineEmitter {
         }
     }
 
-    /** 参数只接受 int32、bool 或 std.Future<int32>；短名 Future 由同一文件 import 解析。 */
+    /** 参数只接受帧值类型或帧值类型的 Future；短名 Future 由同一文件 import 解析。 */
     private fun isSupportedParameter(type: JasType?): Boolean =
-        type == INT || type == BOOL || isFutureInt(type)
+        CoroutineBlockPlanner.isFrameValueType(type) || isFutureOfValue(type)
+
+    /** 局部字段在构造器里的初值：规划器要求局部先初始化再使用，这个值不可观察。 */
+    private fun zeroValue(type: JasType): JasExpression = when (type) {
+        BOOL -> JasBoolLiteral(false)
+        INT64 -> JasCastExpr(JasIntLiteral(0, "0"), INT64)
+        FLOAT64 -> JasFloatLiteral(0.0, "0.0")
+        JasStringType -> JasStringLiteral("")
+        else -> JasIntLiteral(0, "0")
+    }
 
     /** 参数名到（规范化后）类型；供块规划器校验局部写入目标与名字唯一性。 */
     private fun parameterTypes(function: JasFunction): Map<String, JasType> =
         function.parameters.associate { it.name to normalize(requireNotNull(it.type)) }
 
     /**
-     * 参数若是短名 Future<int32>，生成类统一写成 std.Future<int32>，避免用户包中
+     * 参数若是短名 Future<T>，生成类统一写成 std.Future<T>，避免用户包中
      * 同名类型改变字段语义；其它类型原样返回。
      */
     private fun normalize(type: JasType): JasType =
-        if (isFutureInt(type)) JasNamedType(FUTURE, listOf(INT)) else type
+        if (isFutureOfValue(type)) JasNamedType(FUTURE, (type as JasNamedType).typeArguments) else type
 
-    /** 识别 Future<int32> 的两种常见书写；包身份最终仍由生成类重新类型检查确认。 */
-    private fun isFutureInt(type: JasType?): Boolean {
+    /** 识别帧值类型 Future 的两种常见书写；包身份最终仍由生成类重新类型检查确认。 */
+    private fun isFutureOfValue(type: JasType?): Boolean {
         val named = type as? JasNamedType ?: return false
-        return named.name in setOf("Future", FUTURE) && named.typeArguments == listOf(INT)
+        return named.name in setOf("Future", FUTURE) && named.typeArguments.size == 1 &&
+            CoroutineBlockPlanner.isFrameValueType(named.typeArguments.single())
     }
 }

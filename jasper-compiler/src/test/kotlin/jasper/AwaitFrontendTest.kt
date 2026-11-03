@@ -19,9 +19,9 @@ class AwaitFrontendTest {
         val types = listOf("int32", "int64", "bool", "string", "float64", "Future<int32>")
         repeat(12) { index ->
             val type = types[random.nextInt(types.size)]
-            // 第十三片起 `return await` 的 int32 形态可降级：成功编译即证明结果类型解包为 int32。
-            if (type == "int32") {
-                assertLowered("seed-$index", "seed=$seed case=$index")
+            // 帧值类型的 `return await` 可降级：成功编译即证明结果类型按实参解包（帧经二次类型检查）。
+            if (type != "Future<int32>") {
+                assertLowered("seed-$index", "seed=$seed case=$index type=$type", type)
                 return@repeat
             }
             val message = compile("seed-$index", type, "Future<$type>")
@@ -46,9 +46,9 @@ class AwaitFrontendTest {
         return result to output
     }
 
-    /** int32 结果的 `return await` 必须编译成功并写出生成帧的 class，不能因类型识别错误失配。 */
-    private fun assertLowered(name: String, context: String) {
-        val (result, output) = compileResult(name, "int32", "Future<int32>")
+    /** 帧值类型结果的 `return await` 必须编译成功并写出生成帧的 class，不能因类型识别错误失配。 */
+    private fun assertLowered(name: String, context: String, type: String = "int32") {
+        val (result, output) = compileResult(name, type, "Future<$type>")
         assertTrue(result is JasperCompiler.CompileResult.Success, "$context: $result")
         Files.walk(output).use { paths ->
             assertTrue(paths.anyMatch { it.toString().endsWith("_Coroutine.class") }, "$context: no generated frame")
@@ -66,22 +66,19 @@ class AwaitFrontendTest {
     }
 
     /**
-     * Future<int32> 的等待结果是 int32：第十三片起 `return await` 降级为生成帧（类型失配
-     * 会编译失败）；非 int32 结果仍拒绝代码生成，而非透传 Future。
+     * Future<T> 的等待结果是 T：`return await` 降级为生成帧（类型失配会编译失败）；帧值类型以外的
+     * 结果仍拒绝代码生成，而非透传 Future。
      */
     @Test
-    fun `future await identifies result type and lowers int32 returns`() {
+    fun `future await identifies result type and lowers value type returns`() {
         assertLowered("int", "int32")
-        val message = compile("int64", "int64", "Future<int64>")
-        assertTrue(message.contains("non-blocking await lowering is not implemented yet"), message)
-        assertFalse(message.contains("Return type mismatch"), message)
+        assertLowered("wide", "int64", "int64")
     }
 
     /** 泛型解包保留结果类型，错误的返回声明仍须得到类型诊断。 */
     @Test
     fun `future await does not erase its result type`() {
         val message = compile("wrong-result", "bool", "std.Future<int32>")
-        assertTrue(message.contains("non-blocking await lowering is not implemented yet"), message)
         assertTrue(message.contains("Return type mismatch"), message)
     }
 

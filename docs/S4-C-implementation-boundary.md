@@ -1319,3 +1319,47 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
 - 运行时变异 9 组全部被抓：不换算、Deadline 也写 Parent、帮助传播写原值、`TaskRunner` 不换算 Parent、聚合不解除、`detachFromParent` 空操作、
   不绑定父引用、`within` 用普通子令牌；另加「`TaskRunner` 无条件用令牌首因」，共 9 组。
 - JBMC：N/A（构建虚拟机未装），无替代形式验证。
+
+## S4-C 第二十一片：帧值类型（LANG-CONT-VALUE-TYPES-01）
+
+此前生成帧只接受 int32（局部另有 bool），`await Future<string>` 这类函数全部诊断。本片把帧值类型推广到
+int32 / int64 / float64 / bool / string。帧协议（分派循环、恢复门、异常路由、作用域登记）不变，只改字段、临时局部与
+结果的类型。
+
+### 已支持
+
+- 上述五种类型都可作参数、局部、`Future<T>` 参数、await 结果与返回值；生成类实现 `CoroutineTask<T>`，T 为源码返回类型。
+- 合成临时局部按真实类型分配：提升的 await 用 await 结果类型，try 体内 return 固定返回值用函数返回类型。
+- int32 隐式宽化到 int64 / float64 时（局部写入、清理内写入、return），写入帧字段与 `Future.complete` 之前显式转换，
+  装箱类型总是声明类型；否则下游拆箱才失败。
+- 恢复块按绑定局部的类型从 `FutureOutcome.value` 取值。
+- `++` / `--` 接受 int32 与 int64 局部；语句形式 `i++;` 此前连 int32 都诊断（只有 for 步进可用），本片在函数体与
+  finally / defer 中都接受。
+- 浮点与字符串字面量算作无副作用、不会抛出，`"x" + await f`、`1.5 + await f` 因此可以提升。float64 的 `/` 仍按「可能抛出」
+  保守处理（与整数除法共用一条规则）：其后同一表达式中的 await 诊断。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- await 绑定的声明类型与 await 结果类型不同（`var x: int64 = await futureOfInt32`、`x = await futureOfInt32`）：挂起边界不做隐式
+  转换，写成先绑定再宽化。同步路径的 `Future.get` 不受影响；
+- 引用类型的参数、局部、await 结果与返回值（含 `Future<Future<T>>`）；其它数值宽度（int8、float32 等）；float64 的 `++` / `--`；
+- 未写类型的非 await 局部声明同前。
+
+### 仍未支持
+
+引用类型作帧值（需要字段默认值与可空性规则，下一片）、处理体使用捕获参数、构造实参中的 await、finally / defer 中的 throw /
+挂起 / 跳出、for-in 与循环后置块、实例 / 接收者调用实参中的 await、实例分派、公开源码挂起调用 ABI 与显式挂起标记名称；帧二次类型检查不比对
+泛型实参（见下方等价变异），类型错误由源码函数的首轮检查负责。
+
+### 验收结果
+
+- `ValueTypeCoroutinePipelineTest`，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM 执行：每种类型跨挂起的值与装箱类型（含超出 int32 的 int64）、
+  宽化后装箱、提升临时局部类型、await 作静态调用实参、短路右侧 await bool 不触碰 gate、int64 循环与跨 int32 边界自减、try 体内 return
+  固定 string 返回值且清理恰好一次、清理内 `n++`、失败 / 取消通道、catch 处理块读 int64 局部并再次挂起；八例拒绝清单不写 class。
+- 固定种子 20261141 的 160 个随机函数（五种类型混用、直接 await 与提升 await、隐式宽化），生成时用 Kotlin 同宽度运算算出期望，
+  每个函数跑两次（输入预先完成 / 启动后完成），值与装箱类型完全一致；覆盖下限：每种返回类型 ≥ 15，提升 await ≥ 100。
+- 变异 12 组：10 组被抓（不宽化、恢复块固定 int32、提升临时局部固定 int32、return 临时局部固定 int32、声明 / 赋值绑定类型不校验、float64 可自增、
+  自增只认 int32、字符串字面量不算静默、清理内语句自增被拒）；结果 Future 与被等待 Future 的泛型实参固定为 int32 这 2 组存活，
+  是等价变异——泛型擦除后字节码相同，二次类型检查也不比对泛型实参。
+- 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物；既有模型、Lincheck 与全部协程测试随全量复跑。
+- `AwaitFrontendTest`、`LinearCoroutinePipelineTest` 里以 int64 作「未支持」载体的用例改为要求其能降级，未支持载体换成引用类型。

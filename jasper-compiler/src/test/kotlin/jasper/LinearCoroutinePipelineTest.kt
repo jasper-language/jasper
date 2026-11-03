@@ -488,12 +488,13 @@ class LinearCoroutinePipelineTest {
                     }
                 }
             """.trimIndent(),
-            "non-int32" to """
+            "non-value-type" to """
                 package demo;
                 import std.Future;
+                public class Box {}
                 public class P {
-                    public static function f(input: Future<int64>): int64 {
-                        var value: int64 = await input;
+                    public static function f(input: Future<Box>): Box {
+                        var value: Box = await input;
                         return value;
                     }
                 }

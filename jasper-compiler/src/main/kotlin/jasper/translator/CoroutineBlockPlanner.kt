@@ -39,14 +39,17 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
+//   - 帧值类型（参数、局部、await 结果、返回值）只接受 int32 / int64 / float64 / bool / string
+//     （[CoroutineBlockPlanner.isFrameValueType]）；await 绑定的声明类型必须等于 await 结果类型，
+//     不在挂起边界做隐式转换；引用类型与其它数值宽度拒绝；
 //   - for-in、循环后置块、match 一律拒绝；catch 处理体不得引用捕获参数
 //     （Error 不能成为帧字段），捕获类型须是无类型实参的具名类型；
 //   - finally 体与 defer 体是同步清理：不得含 await、return、throw、try、defer、带标签或跳出清理的
-//     break / continue；只接受 int32 / bool 局部声明、对局部的 `=` 赋值、int32 局部
+//     break / continue；只接受帧值类型的局部声明、对局部的 `=` 赋值、int32 / int64 局部
 //     `++` / `--`、调用语句、if/else、while 与块；
 //   - break / continue 的标签必须是某个外层循环的标签；未知标签与遮蔽外层同名标签的
 //     循环拒绝（不退回到最内层循环）；
-//   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 局部的 `++` / `--`；
+//   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 / int64 局部的 `++` / `--`；
 //   - 子表达式中的 await 只允许出现在一元 `+ - !`、二元运算与源码静态调用实参之下，
 //     先于它求值、未被提升的部分只能是字面量、局部读取与不会抛出的运算
 //     （否则提升会改变副作用或异常与挂起的先后，拒绝；短路运算的左操作数在分支前
@@ -157,9 +160,23 @@ data class CoroutineBlockPlan(
  *   检查，就能让不挂起的循环在回边处响应作用域取消。
  */
 object CoroutineBlockPlanner {
-    /** 本片允许的局部 / 参数值类型；帧字段直接使用该类型。 */
     private val INT = JasPrimitiveType("int32")
+    private val INT64 = JasPrimitiveType("int64")
+    private val FLOAT64 = JasPrimitiveType("float64")
     private val BOOL = JasPrimitiveType("bool")
+
+    /** 诊断里列出的帧值类型，与 [isFrameValueType] 同步。 */
+    const val FRAME_VALUE_TYPES = "int32, int64, float64, bool or string"
+
+    /**
+     * 帧值类型：可作参数、局部、await 结果与返回值，帧字段直接使用该类型。
+     * 为什么不含引用类型：字段需要默认值与可空性规则，单独一片定义，不在这里静默放行。
+     */
+    fun isFrameValueType(type: JasType?): Boolean =
+        type == INT || type == INT64 || type == FLOAT64 || type == BOOL || type == JasStringType
+
+    /** 可以 `++` / `--` 的局部类型（float64 的自增不在本片范围）。 */
+    private fun isIncrementable(type: JasType?) = type == INT || type == INT64
 
     /** 规划期间的拒绝；只在本对象内部抛出并收敛为 [CoroutineBlockPlan.reason]。 */
     private class Rejected(message: String) : RuntimeException(message)
@@ -195,12 +212,13 @@ object CoroutineBlockPlanner {
      * 规划函数体。
      *
      * [slotTypes] 是参数名到类型的映射（由发射器提供并已校验）；局部声明在此基础上
-     * 继续登记，名字必须全函数唯一（分支内局部也会成为帧字段）。
+     * 继续登记，名字必须全函数唯一（分支内局部也会成为帧字段）。[function] 的返回类型决定
+     * try 体内 return 固定返回值所用临时局部的类型。
      */
     fun plan(function: JasFunction, slotTypes: Map<String, JasType>): CoroutineBlockPlan {
         val statements = function.body?.statements
             ?: return CoroutineBlockPlan(emptyList(), emptyList(), "function body is required")
-        val state = State(slotTypes)
+        val state = State(slotTypes, requireNotNull(function.returnType))
         return try {
             val tail = state.lowerSequence(statements, state.open(null))
             if (tail != null) throw Rejected("every path must end with return or throw")
@@ -229,7 +247,7 @@ object CoroutineBlockPlanner {
     }
 
     /** 一次规划的可变状态；与单例分离，保证并发编译互不干扰。 */
-    private class State(parameters: Map<String, JasType>) {
+    private class State(parameters: Map<String, JasType>, private val returnType: JasType) {
         val types = LinkedHashMap(parameters)
         val locals = LinkedHashMap<String, JasType>()
         val closed = LinkedHashMap<Int, CoroutineBlock>()
@@ -275,11 +293,14 @@ object CoroutineBlockPlanner {
                 if (statement.name in types) throw Rejected("parameter and local names must be unique")
                 val await = directAwait(initializer)
                 val type = if (await != null) {
-                    if (statement.type != null && statement.type != INT) throw Rejected("await binding type must be int32")
-                    INT
+                    val result = awaitValueType(await)
+                    if (statement.type != null && statement.type != result) {
+                        throw Rejected("await binding type must equal the await result type")
+                    }
+                    result
                 } else {
-                    statement.type.takeIf { it == INT || it == BOOL }
-                        ?: throw Rejected("only explicitly typed int32 or bool local declarations are supported")
+                    statement.type.takeIf(::isFrameValueType)
+                        ?: throw Rejected("only explicitly typed $FRAME_VALUE_TYPES local declarations are supported")
                 }
                 types[statement.name] = type
                 locals[statement.name] = type
@@ -289,6 +310,7 @@ object CoroutineBlockPlanner {
                 is JasAssignment -> lowerAssignment(expression, block)
                 else -> lowerIncrement(expression, block)
             }
+            is JasStatementIncrement -> lowerIncrement(statement.increment, block)
             is JasIf -> lowerIf(statement, block)
             is JasWhile -> lowerWhile(statement, block, null)
             is JasDoWhile -> lowerDoWhile(statement, block, null)
@@ -308,11 +330,11 @@ object CoroutineBlockPlanner {
                 null
             }
             is JasReturn -> {
-                val value = statement.value ?: throw Rejected("return must carry an int32 value")
+                val value = statement.value ?: throw Rejected("return must carry a value")
                 val (end, rewritten) = hoist(value, block)
                 // 在 try 体内 return：返回值先于清理求值并固定下来，清理改写局部不影响已求出的值。
                 val result = if (tries.isEmpty() || rewritten is JasIntLiteral) rewritten else {
-                    val name = freshTemp(INT)
+                    val name = freshTemp(returnType)
                     end.assignments += name to rewritten
                     JasIdentifier(name)
                 }
@@ -339,22 +361,22 @@ object CoroutineBlockPlanner {
                 throw Rejected("only plain '=' assignments to locals are supported")
             }
             val await = directAwait(assignment.value)
-            if (await != null && locals.getValue(target.name) != INT) {
-                throw Rejected("await binding type must be int32")
+            if (await != null && locals.getValue(target.name) != awaitValueType(await)) {
+                throw Rejected("await binding type must equal the await result type")
             }
             return write(block, target.name, assignment.value, await)
         }
 
         /**
-         * `i++` / `i--`：只接受 int32 局部，改写为 `i = i + 1` / `i = i - 1` 的普通赋值；
-         * 生成帧随后经真实类型检查，改写结果与源码自增的 int32 回绕语义一致。
+         * `i++` / `i--`：只接受 int32 / int64 局部，改写为 `i = i + 1` / `i = i - 1` 的普通赋值；
+         * 生成帧随后经真实类型检查，改写结果与源码自增的回绕语义一致。
          */
         private fun lowerIncrement(expression: JasExpression, block: OpenBlock): OpenBlock {
             val increment = expression as? JasPostfixIncDec
                 ?: throw Rejected("only assignments to locals may appear as statements")
             val target = increment.target as? JasIdentifier
-            if (target == null || locals[target.name] != INT || increment.op !in setOf("++", "--")) {
-                throw Rejected("only '++' / '--' on int32 locals are supported")
+            if (target == null || !isIncrementable(locals[target.name]) || increment.op !in setOf("++", "--")) {
+                throw Rejected("only '++' / '--' on int32 or int64 locals are supported")
             }
             val op = if (increment.op == "++") "+" else "-"
             block.assignments += target.name to JasBinaryOp(JasIdentifier(target.name), op, JasIntLiteral(1, "1"))
@@ -368,7 +390,7 @@ object CoroutineBlockPlanner {
                 end.assignments += name to rewritten
                 return end
             }
-            if (await.awaitResultType != INT) throw Rejected("await result type must be int32")
+            awaitValueType(await)
             rejectNestedAwait(await.operand)
             val resume = open(name)
             close(block, CoroutineBlockExit.Suspend(await, name, resume.id))
@@ -596,8 +618,8 @@ object CoroutineBlockPlanner {
                         val initializer = statement.initializer
                             ?: throw Rejected("local '${statement.name}' must be initialized")
                         if (statement.name in types) throw Rejected("parameter and local names must be unique")
-                        val type = statement.type.takeIf { it == INT || it == BOOL }
-                            ?: throw Rejected("only explicitly typed int32 or bool local declarations are supported")
+                        val type = statement.type.takeIf(::isFrameValueType)
+                            ?: throw Rejected("only explicitly typed $FRAME_VALUE_TYPES local declarations are supported")
                         noAwait(initializer)
                         types[statement.name] = type
                         locals[statement.name] = type
@@ -612,12 +634,18 @@ object CoroutineBlockPlanner {
                         }
                         is JasPostfixIncDec -> {
                             val target = expression.target as? JasIdentifier
-                            if (target == null || locals[target.name] != INT || expression.op !in setOf("++", "--")) {
-                                throw Rejected("only '++' / '--' on int32 locals are supported")
+                            if (target == null || !isIncrementable(locals[target.name]) || expression.op !in setOf("++", "--")) {
+                                throw Rejected("only '++' / '--' on int32 or int64 locals are supported")
                             }
                         }
                         is JasCall -> noAwait(expression)
                         else -> throw Rejected("only assignments, increments and calls may appear as statements in $kind")
+                    }
+                    is JasStatementIncrement -> {
+                        val target = statement.increment.target as? JasIdentifier
+                        if (target == null || !isIncrementable(locals[target.name]) || statement.increment.op !in setOf("++", "--")) {
+                            throw Rejected("only '++' / '--' on int32 or int64 locals are supported")
+                        }
                     }
                     is JasIf -> {
                         noAwait(statement.condition)
@@ -721,10 +749,10 @@ object CoroutineBlockPlanner {
                     if (effectPending) {
                         throw Rejected("await after an operation that may fail or have side effects in the same expression")
                     }
-                    if (await.awaitResultType != INT) throw Rejected("await result type must be int32")
+                    val result = awaitValueType(await)
                     rejectNestedAwait(await.operand)
                     if (containsLocalWrite(await.operand)) throw Rejected("await operand must not write locals")
-                    val name = freshTemp(INT)
+                    val name = freshTemp(result)
                     val resume = open(name)
                     close(current, CoroutineBlockExit.Suspend(await, name, resume.id))
                     current = resume
@@ -824,14 +852,18 @@ object CoroutineBlockPlanner {
     private fun directAwait(expression: JasExpression): JasUnaryOp? =
         (expression as? JasUnaryOp)?.takeIf { it.op == "await" && it.awaitResultType != null }
 
-    /** 不会抛出、没有副作用的二元运算（int32 回绕算术、比较与布尔运算）。 */
+    /** await 结果类型；不是帧值类型时拒绝（帧字段放不下，也不能退回 any）。 */
+    private fun awaitValueType(await: JasUnaryOp): JasType = await.awaitResultType.takeIf(::isFrameValueType)
+        ?: throw Rejected("await result type must be $FRAME_VALUE_TYPES")
+
+    /** 不会抛出、没有副作用的二元运算（回绕算术、比较、布尔运算与帧值类型的字符串拼接）。 */
     private val SILENT_BINARY = setOf("+", "-", "*", "==", "!=", "<", "<=", ">", ">=", "&&", "||")
     private val SILENT_UNARY = setOf("+", "-", "!")
     private val SHORT_CIRCUIT = setOf("&&", "||")
 
     /** 表达式求值是否既无副作用也不会抛出：只含字面量、局部读取与 [SILENT_BINARY] / [SILENT_UNARY]。 */
     private fun isSilent(expression: JasExpression): Boolean = when (expression) {
-        is JasIntLiteral, is JasBoolLiteral, is JasIdentifier -> true
+        is JasIntLiteral, is JasFloatLiteral, is JasStringLiteral, is JasBoolLiteral, is JasIdentifier -> true
         is JasUnaryOp -> directAwait(expression) == null && expression.op in SILENT_UNARY && isSilent(expression.operand)
         is JasBinaryOp -> expression.op in SILENT_BINARY && isSilent(expression.left) && isSilent(expression.right)
         else -> false
@@ -887,6 +919,7 @@ object CoroutineBlockPlanner {
             null -> false
             is JasVariableStatement -> statement.name == name || inExpression(statement.initializer)
             is JasExpressionStatement -> inExpression(statement.expression)
+            is JasStatementIncrement -> inExpression(statement.increment)
             is JasReturn -> inExpression(statement.value)
             is JasThrow -> inExpression(statement.expression)
             is JasIf -> inExpression(statement.condition) || inBlock(statement.thenBody) || inBlock(statement.elseBody)

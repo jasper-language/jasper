@@ -3,7 +3,7 @@
 // ============================================================================
 // 职责：
 //   在类型检查与挂起效果分析完成之后、AST -> IR 之前，挑选属于「多挂起点、条件
-//   分支与 while 循环 int32 函数」的挂起函数，交给 LinearCoroutineEmitter 生成内部状态机类；其余
+//   分支与循环函数」的挂起函数，交给 LinearCoroutineEmitter 生成内部状态机类；其余
 //   真实挂起形态统一产生明确诊断，禁止把 Future 同步透传给后端。
 //
 // 所属层次：
@@ -139,7 +139,7 @@ object CoroutineLowering {
                 if (reportedAwaits.containsKey(await)) continue
                 errors += CompileError.Type(
                     "$UNSUPPORTED_PREFIX: await at this position is outside a supported " +
-                        "int32 coroutine function",
+                        "coroutine function",
                     line = await.sourceLine,
                     column = await.sourceColumn
                 )
