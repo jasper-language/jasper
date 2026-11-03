@@ -1298,6 +1298,7 @@ class TypeChecker(
      */
     private fun checkBoxedEquality(left: JasType?, right: JasType?, node: JasNode) {
         if (!isNullablePrimitive(left) && !isNullablePrimitive(right)) return
+        /** 取比较一侧的基本类型（含可空形式的内层）；其余类型返回 null，不属于本规则。 */
         fun primitiveOf(type: JasType?): JasType? = when {
             type is JasNullableType && type.inner is JasPrimitiveType -> type.inner
             type is JasPrimitiveType -> type
