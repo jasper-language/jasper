@@ -207,6 +207,7 @@ object CoroutineLowering {
             (overloads[key] ?: 0) > 1 -> "overloaded suspending functions are not supported"
             else -> LinearCoroutineEmitter.unsupportedReason(function, requireStatic)
                 ?: synchronousSuspendingCall(function, effects)
+                ?: ambiguousAwaitResult(function, usedTypeNames)
         }
         if (reason != null) {
             reportFunctionError(errors, source, ownerName, function, reason)
@@ -238,6 +239,31 @@ object CoroutineLowering {
         frames += GeneratedCoroutineFrame(source.packageName, ownerName, function.name, className, generated, source.imports)
         localFrames += generated
         return null
+    }
+
+    /**
+     * 查找 await 结果类型中会被解析到错误类的简单名。
+     *
+     * 做什么：await 结果类型可能来自别的文件的签名（简单名按那个文件的作用域书写），帧字段与恢复块
+     *   的 checkcast 却按本文件的作用域解析。该简单名在多个包里都有声明时返回拒绝原因。
+     * 为什么按「多个包声明同一简单名」拒绝而不追溯来源：结果类型可能经调用、字段或未写类型的局部
+     *   传到 await，AST 不记录书写作用域；同名时无法证明两边解析到同一个类，放行会把别的包的对象绑定
+     *   到本包的同名类，运行时才 ClassCastException。限定名（`Future<lib.Item>`）不受影响。
+     * 失败模式：纯检查；只有一个包声明时返回 null，未 import 的情形由帧的类型检查报未知类型。
+     */
+    private fun ambiguousAwaitResult(function: JasFunction, usedTypeNames: Set<String>): String? {
+        /** 类型（含类型实参）中出现的简单名。 */
+        fun simpleNames(type: JasType?): List<String> = when (type) {
+            is JasNamedType -> listOf(type.name).filter { '.' !in it } + type.typeArguments.flatMap(::simpleNames)
+            is JasNullableType -> simpleNames(type.inner)
+            else -> emptyList()
+        }
+        val declaredIn = usedTypeNames.groupingBy { it.substringAfterLast('.') }.eachCount()
+        val name = SuspendingAwaitScanner.scanFunction(function)
+            .flatMap { simpleNames(it.awaitResultType) }
+            .firstOrNull { (declaredIn[it] ?: 0) > 1 } ?: return null
+        return "await result type '$name' is declared in several packages; " +
+            "use the qualified name in the signature that produces the Future"
     }
 
     /**

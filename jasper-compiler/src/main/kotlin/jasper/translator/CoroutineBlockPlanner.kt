@@ -39,9 +39,10 @@
 //     内部错误）。
 //
 // 边界（本片刻意不做）：
-//   - 帧值类型（参数、局部、await 结果、返回值）只接受 int32 / int64 / float64 / bool / string
+//   - 帧值类型（参数、局部、await 结果、返回值）只接受 int32 / int64 / float64 / bool / string、
+//     具名引用类型及它们（string、具名引用类型）的可空形式
 //     （[CoroutineBlockPlanner.isFrameValueType]）；await 绑定的声明类型必须等于 await 结果类型，
-//     不在挂起边界做隐式转换；引用类型与其它数值宽度拒绝；
+//     不在挂起边界做隐式转换；数组、函数类型、any、可空数值与其它数值宽度拒绝；
 //   - for-in、循环后置块、match 一律拒绝；catch 处理体不得引用捕获参数
 //     （Error 不能成为帧字段），捕获类型须是无类型实参的具名类型；
 //   - finally 体与 defer 体是同步清理：不得含 await、return、throw、try、defer、带标签或跳出清理的
@@ -166,14 +167,29 @@ object CoroutineBlockPlanner {
     private val BOOL = JasPrimitiveType("bool")
 
     /** 诊断里列出的帧值类型，与 [isFrameValueType] 同步。 */
-    const val FRAME_VALUE_TYPES = "int32, int64, float64, bool or string"
+    const val FRAME_VALUE_TYPES = "int32, int64, float64, bool, string or a named reference type (string and named types may be nullable)"
+
+    /** 按基础类型或 string 处理的具名写法（检查器归一到内建类型）；帧不把它们当引用类型放行。 */
+    private val BUILTIN_ALIASES = setOf(
+        "Bool", "Boolean", "boolean", "bool", "String", "string", "java.lang.String", "Int", "int", "int32"
+    )
 
     /**
      * 帧值类型：可作参数、局部、await 结果与返回值，帧字段直接使用该类型。
-     * 为什么不含引用类型：字段需要默认值与可空性规则，单独一片定义，不在这里静默放行。
+     * 可空数值不在内：`FutureOutcome.value` 的 null 经拆箱会失败，需要单独的装箱规则。
      */
-    fun isFrameValueType(type: JasType?): Boolean =
+    fun isFrameValueType(type: JasType?): Boolean = isScalar(type) || isFrameReferenceType(type)
+
+    /** int32 / int64 / float64 / bool / string：比较与拼接不会进入用户代码。 */
+    private fun isScalar(type: JasType?) =
         type == INT || type == INT64 || type == FLOAT64 || type == BOOL || type == JasStringType
+
+    /** 帧字段保存引用本身（不复制）的类型：具名类型，及具名类型 / string 的可空形式。 */
+    private fun isFrameReferenceType(type: JasType?): Boolean = when (type) {
+        is JasNamedType -> type.name !in BUILTIN_ALIASES
+        is JasNullableType -> type.inner == JasStringType || isFrameReferenceType(type.inner)
+        else -> false
+    }
 
     /** 可以 `++` / `--` 的局部类型（float64 的自增不在本片范围）。 */
     private fun isIncrementable(type: JasType?) = type == INT || type == INT64
@@ -759,7 +775,7 @@ object CoroutineBlockPlanner {
                     return JasIdentifier(name)
                 }
                 if (!containsAwait(node)) {
-                    if (!isSilent(node)) effectPending = true
+                    if (!isSilent(node, types)) effectPending = true
                     return node
                 }
                 return when (node) {
@@ -768,8 +784,9 @@ object CoroutineBlockPlanner {
                         val left = visit(node.left)
                         val right = visit(node.right)
                         // 运算本身在两侧求值之后执行；可能抛出的运算对其后的 await 构成前序副作用。
-                        if (node.op !in SILENT_BINARY) effectPending = true
-                        node.copy(left = left, right = right)
+                        val lowered = node.copy(left = left, right = right)
+                        if (!isSilentBinary(lowered, types)) effectPending = true
+                        lowered
                     }
                     is JasUnaryOp -> {
                         if (node.op !in SILENT_UNARY) throw Rejected("await under unary '${node.op}' is not supported")
@@ -856,16 +873,36 @@ object CoroutineBlockPlanner {
     private fun awaitValueType(await: JasUnaryOp): JasType = await.awaitResultType.takeIf(::isFrameValueType)
         ?: throw Rejected("await result type must be $FRAME_VALUE_TYPES")
 
-    /** 不会抛出、没有副作用的二元运算（回绕算术、比较、布尔运算与帧值类型的字符串拼接）。 */
+    /** 操作数都是标量时不会抛出、没有副作用的二元运算（回绕算术、比较、布尔运算与字符串拼接）。 */
     private val SILENT_BINARY = setOf("+", "-", "*", "==", "!=", "<", "<=", ">", ">=", "&&", "||")
     private val SILENT_UNARY = setOf("+", "-", "!")
     private val SHORT_CIRCUIT = setOf("&&", "||")
 
-    /** 表达式求值是否既无副作用也不会抛出：只含字面量、局部读取与 [SILENT_BINARY] / [SILENT_UNARY]。 */
-    private fun isSilent(expression: JasExpression): Boolean = when (expression) {
-        is JasIntLiteral, is JasFloatLiteral, is JasStringLiteral, is JasBoolLiteral, is JasIdentifier -> true
-        is JasUnaryOp -> directAwait(expression) == null && expression.op in SILENT_UNARY && isSilent(expression.operand)
-        is JasBinaryOp -> expression.op in SILENT_BINARY && isSilent(expression.left) && isSilent(expression.right)
+    /**
+     * 表达式求值是否既无副作用也不会抛出：只含字面量、局部读取、`??` 与
+     * [SILENT_BINARY] / [SILENT_UNARY]。[types] 是局部 / 参数类型。
+     */
+    private fun isSilent(expression: JasExpression, types: Map<String, JasType>): Boolean = when (expression) {
+        is JasIntLiteral, is JasFloatLiteral, is JasStringLiteral, is JasBoolLiteral, JasNullLiteral, is JasIdentifier -> true
+        is JasUnaryOp -> directAwait(expression) == null && expression.op in SILENT_UNARY && isSilent(expression.operand, types)
+        is JasBinaryOp -> isSilentBinary(expression, types) && isSilent(expression.left, types) && isSilent(expression.right, types)
+        is JasNullCoalescing -> isSilent(expression.left, types) && isSilent(expression.right, types)
+        else -> false
+    }
+
+    /**
+     * 运算本身是否静默。为什么看操作数类型：引用类型的 `==` / `!=` 走 Objects.equals、字符串拼接走
+     * toString，都会进入用户代码，可能有副作用或抛出，不能被提升推迟到挂起之后。
+     */
+    private fun isSilentBinary(expression: JasBinaryOp, types: Map<String, JasType>): Boolean =
+        expression.op in SILENT_BINARY && isScalarOperand(expression.left, types) && isScalarOperand(expression.right, types)
+
+    /** 操作数是否可确定为标量（或 null 字面量）；未知的自由标识符按不是处理。 */
+    private fun isScalarOperand(expression: JasExpression, types: Map<String, JasType>): Boolean = when (expression) {
+        is JasIntLiteral, is JasFloatLiteral, is JasStringLiteral, is JasBoolLiteral, JasNullLiteral -> true
+        is JasIdentifier -> isScalar(types[expression.name])
+        is JasUnaryOp -> directAwait(expression) == null && isScalarOperand(expression.operand, types)
+        is JasBinaryOp -> isScalarOperand(expression.left, types) && isScalarOperand(expression.right, types)
         else -> false
     }
 
@@ -886,6 +923,7 @@ object CoroutineBlockPlanner {
         is JasCall -> containsLocalWrite(expression.target) || expression.args.any(::containsLocalWrite)
         is JasPropertyAccess -> containsLocalWrite(expression.target)
         is JasCastExpr -> containsLocalWrite(expression.expression)
+        is JasNullCoalescing -> containsLocalWrite(expression.left) || containsLocalWrite(expression.right)
         is JasArrayAccess -> containsLocalWrite(expression.target) || containsLocalWrite(expression.index)
         is JasNew -> expression.args.any(::containsLocalWrite)
         else -> false
@@ -906,6 +944,7 @@ object CoroutineBlockPlanner {
             is JasPropertyAccess -> inExpression(expression.target)
             is JasCastExpr -> inExpression(expression.expression)
             is JasInstanceOfExpr -> inExpression(expression.expression)
+            is JasNullCoalescing -> inExpression(expression.left) || inExpression(expression.right)
             is JasArrayAccess -> inExpression(expression.target) || inExpression(expression.index)
             is JasNew -> expression.args.any(::inExpression)
             is JasAssignment -> inExpression(expression.target) || inExpression(expression.value)
@@ -948,6 +987,7 @@ object CoroutineBlockPlanner {
             is JasCall -> listOf(expression.target) + expression.args
             is JasPropertyAccess -> listOf(expression.target)
             is JasCastExpr -> listOf(expression.expression)
+            is JasNullCoalescing -> listOf(expression.left, expression.right)
             is JasArrayAccess -> listOf(expression.target, expression.index)
             is JasNew -> expression.args
             is JasAssignment -> listOf(expression.target, expression.value)

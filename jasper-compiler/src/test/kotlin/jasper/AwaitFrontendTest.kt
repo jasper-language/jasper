@@ -16,11 +16,11 @@ class AwaitFrontendTest {
     fun `seeded await result types preserve the future argument`() {
         val seed = 20261025
         val random = Random(seed)
-        val types = listOf("int32", "int64", "bool", "string", "float64", "Future<int32>")
+        val types = listOf("int32", "int64", "bool", "string", "float64", "Future<int32>", "int32[]")
         repeat(12) { index ->
             val type = types[random.nextInt(types.size)]
             // 帧值类型的 `return await` 可降级：成功编译即证明结果类型按实参解包（帧经二次类型检查）。
-            if (type != "Future<int32>") {
+            if (type != "int32[]") {
                 assertLowered("seed-$index", "seed=$seed case=$index type=$type", type)
                 return@repeat
             }
@@ -85,9 +85,9 @@ class AwaitFrontendTest {
     /** 只解包一层：Future<Future<int32>> 的一次 await 不应得到 int32。 */
     @Test
     fun `nested future await unwraps exactly one layer`() {
-        val message = compile("nested", "Future<int32>", "Future<Future<int32>>")
-        assertTrue(message.contains("non-blocking await lowering is not implemented yet"), message)
-        assertFalse(message.contains("Return type mismatch"), message)
+        assertLowered("nested", "Future<Future<int32>>", "Future<int32>")
+        val message = compile("nested-wrong", "int32", "Future<Future<int32>>")
+        assertTrue(message.contains("Return type mismatch"), message)
     }
 
     /** 包身份参与识别，用户定义的同名 Future 仍是普通值。 */

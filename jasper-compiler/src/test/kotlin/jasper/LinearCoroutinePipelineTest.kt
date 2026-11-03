@@ -491,10 +491,9 @@ class LinearCoroutinePipelineTest {
             "non-value-type" to """
                 package demo;
                 import std.Future;
-                public class Box {}
                 public class P {
-                    public static function f(input: Future<Box>): Box {
-                        var value: Box = await input;
+                    public static function f(input: Future<int32[]>): int32[] {
+                        var value: int32[] = await input;
                         return value;
                     }
                 }

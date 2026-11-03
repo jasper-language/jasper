@@ -513,34 +513,16 @@ class ValueTypeCoroutinePipelineTest {
                     return value;
                 }
             """,
-            "reference-result" to """
-                public static function f(input: Future<Box>): int32 {
-                    var value: Box = await input;
+            "array-result" to """
+                public static function f(input: Future<int32[]>): int32 {
+                    var value: int32[] = await input;
                     return 1;
-                }
-            """,
-            "reference-return" to """
-                public static function f(input: Future<int32>): Box {
-                    var value: int32 = await input;
-                    return new Box();
-                }
-            """,
-            "reference-local" to """
-                public static function f(input: Future<int32>): int32 {
-                    var box: Box = new Box();
-                    return await input;
                 }
             """,
             "narrow-number" to """
                 public static function f(input: Future<float32>): float32 {
                     var value: float32 = await input;
                     return value;
-                }
-            """,
-            "nested-future" to """
-                public static function f(input: Future<Future<int64>>): int32 {
-                    var value: Future<int64> = await input;
-                    return 1;
                 }
             """,
             "float-increment" to """
@@ -556,7 +538,6 @@ class ValueTypeCoroutinePipelineTest {
             val source = """
                 package demo;
                 import std.Future;
-                public class Box {}
                 public class Program {
                 $body
                 }

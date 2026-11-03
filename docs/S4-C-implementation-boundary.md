@@ -1342,12 +1342,12 @@ int32 / int64 / float64 / bool / string。帧协议（分派循环、恢复门�
 
 - await 绑定的声明类型与 await 结果类型不同（`var x: int64 = await futureOfInt32`、`x = await futureOfInt32`）：挂起边界不做隐式
   转换，写成先绑定再宽化。同步路径的 `Future.get` 不受影响；
-- 引用类型的参数、局部、await 结果与返回值（含 `Future<Future<T>>`）；其它数值宽度（int8、float32 等）；float64 的 `++` / `--`；
+- 引用类型的参数、局部、await 结果与返回值（含 `Future<Future<T>>`，第二十二片起放开）；其它数值宽度（int8、float32 等）；float64 的 `++` / `--`；
 - 未写类型的非 await 局部声明同前。
 
 ### 仍未支持
 
-引用类型作帧值（需要字段默认值与可空性规则，下一片）、处理体使用捕获参数、构造实参中的 await、finally / defer 中的 throw /
+引用类型作帧值（第二十二片已支持）、处理体使用捕获参数、构造实参中的 await、finally / defer 中的 throw /
 挂起 / 跳出、for-in 与循环后置块、实例 / 接收者调用实参中的 await、实例分派、公开源码挂起调用 ABI 与显式挂起标记名称；帧二次类型检查不比对
 泛型实参（见下方等价变异），类型错误由源码函数的首轮检查负责。
 
@@ -1363,3 +1363,44 @@ int32 / int64 / float64 / bool / string。帧协议（分派循环、恢复门�
   是等价变异——泛型擦除后字节码相同，二次类型检查也不比对泛型实参。
 - 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，也未复跑 TLA+ 模型（模型不含值类型）；Lincheck、Jazzer 语料回放与全部协程测试随全量 gradle test 复跑。
 - `AwaitFrontendTest`、`LinearCoroutinePipelineTest` 里以 int64 作「未支持」载体的用例改为要求其能降级，未支持载体换成引用类型。
+
+## S4-C 第二十二片：帧引用类型（LANG-CONT-REF-TYPES-01）
+
+本片把帧值类型推广到具名引用类型（类、接口、枚举，可带类型实参，含 `Future<T>` 本身）及具名类型 / string 的可空形式。
+帧字段保存引用本身，不复制；帧协议（分派循环、恢复门、异常路由、作用域登记）不变。
+
+### 规则
+
+- **字段默认值**：可空局部构造时写 null；非空引用局部不写，字段保持 JVM 默认值。规划器要求局部先初始化再使用，该默认值不可观察。
+- **可空性**：await 绑定的声明类型仍须等于结果类型（`var b: Box? = await Future<Box>`、`var b: Base = await Future<Derived>` 都诊断，先绑定再赋值）；普通赋值与
+  return 走既有赋值兼容。`??` 可以出现在帧表达式里，右侧或左侧含 await 时诊断。
+- **求值顺序**：引用类型的 `==` / `!=` 走 `Objects.equals`，字符串拼接走 `String.valueOf`，都会进入用户代码，不算静默运算；它们之前不能有未提升的 await。
+  `a == await f`、`await s + a` 可以，用户代码在恢复后执行，与源码顺序一致；`(a == b) == await f`、`("x" + a) + await s`、`(a != null) == await f` 诊断。
+  局部读取本身仍是静默的，其值只由本帧写入。
+- **跨包名字**：await 结果类型可能带着别的文件书写的简单名，帧按本文件作用域解析。该简单名在多个包里都有声明时诊断（要求产出 Future 的签名写限定名），
+  否则对象会被绑定到本包的同名类、运行时才 ClassCastException。只有一个包声明但本文件没有 import 时，报未知类型。
+
+### 顺带修复
+
+字符串拼接的非 String 引用操作数此前直接调用 `append(String)`，同步路径同样产生 VerifyError；现在经 `String.valueOf(Object)`，与该发射函数的注释一致。
+
+### 已知缺口（未改）
+
+- 跨包同名诊断只在帧路径。同步路径的 `var got = Factory.make(); return got.name();` 在同样的同名布局下实测调用到了正确的类（一次探针，未作为测试入库，其它写法未覆盖）；帧路径的 await 结果类型因为要落成字段和 checkcast，才需要这条诊断。诊断偏保守：同名但实际解析一致的写法也会被拒绝，写限定名即可。
+- `x != null` 走 `Objects.equals(x, null)`，非 null 时会调用用户的 `equals(null)`。语义上要求用户 `equals` 对 null 返回 false，未改。
+- 帧字段在局部离开作用域后仍持有引用，直到被覆写或帧不可达；长循环中可能延长对象存活，不影响语义。
+
+### 仍未支持
+
+数组、函数类型、元组、`any`、可空数值（`int32?`：`FutureOutcome.value` 的 null 需要单独的拆箱规则）作帧值；处理体使用捕获参数；构造实参中的 await；
+finally / defer 中的 throw / 挂起 / 跳出；for-in 与循环后置块；实例 / 接收者调用实参中的 await；实例分派；调用语句作帧语句（目前写成带初始化的局部）；
+公开源码挂起调用 ABI 与显式挂起标记名称。
+
+### 验收结果
+
+- `ReferenceFrameCoroutinePipelineTest` 16 项，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM 执行：对象身份跨挂起保持、挂起期间外部修改经帧槽可见、null 与非 null 穿过挂起、
+  `??`、`string?`、泛型引用与嵌套 Future、子类经普通赋值与 return 宽化、分支与循环内重绑定、try 内 return 固定引用、用户 `equals` / `toString` 不早于恢复、失败 / 取消通道、跨包（已 import、未 import、同名、类型实参内同名、限定名）、十四例拒绝清单不写 class。
+- 固定种子 20261143 的 160 个随机函数 × 2 种完成时机，生成时用 Kotlin 模型算出期望，比对返回对象身份与每个对象的最终值；覆盖下限：含可空操作 ≥ 40，返回 null ≥ 10。
+- 变异 14 组：13 组被抓；`??` 的 await 遍历缺失存活，是等价变异（发射器 rewrite 的第二道拒绝同样诊断）。首轮「只查结果类型本身、不查类型实参」存活，补用例后被抓。
+- 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，也未复跑 TLA+ 模型；Lincheck、Jazzer 语料回放与全部协程测试随全量 gradle test 复跑。
+- 原以引用类型作「未支持」载体的用例（`ValueTypeCoroutinePipelineTest`、`LinearCoroutinePipelineTest`、`AwaitFrontendTest`）改为数组载体，`Future<Future<T>>` 的一次 await 改为要求能降级。

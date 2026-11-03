@@ -211,6 +211,7 @@ object LinearCoroutineEmitter {
             is JasPropertyAccess -> expression.copy(target = rewrite(expression.target))
             is JasCall -> JasCall(rewrite(expression.target), expression.args.map(::rewrite), expression.isSafe)
             is JasCastExpr -> expression.copy(expression = rewrite(expression.expression))
+            is JasNullCoalescing -> expression.copy(left = rewrite(expression.left), right = rewrite(expression.right))
             is JasNew -> expression.copy(args = expression.args.map(::rewrite))
             else -> throw IllegalArgumentException("unsupported frame expression: ${expression.javaClass.simpleName}")
         }
@@ -389,7 +390,7 @@ object LinearCoroutineEmitter {
             constructorBody += assign(slots.getValue(parameter.name), JasIdentifier("arg$index"))
         }
         plan.locals.forEach { (name, type) ->
-            constructorBody += assign(slots.getValue(name), zeroValue(type))
+            zeroValue(type)?.let { constructorBody += assign(slots.getValue(name), it) }
         }
         constructorBody += assign("__dispatch", JasNew(
             JasNamedType(DISPATCH),
@@ -624,13 +625,18 @@ object LinearCoroutineEmitter {
     private fun isSupportedParameter(type: JasType?): Boolean =
         CoroutineBlockPlanner.isFrameValueType(type) || isFutureOfValue(type)
 
-    /** 局部字段在构造器里的初值：规划器要求局部先初始化再使用，这个值不可观察。 */
-    private fun zeroValue(type: JasType): JasExpression = when (type) {
+    /**
+     * 局部字段在构造器里的初值：规划器要求局部先初始化再使用，这个值不可观察。
+     * 非空引用类型没有可写的源码初值，返回 null 表示不写（字段保持 JVM 默认值，同样不可观察）。
+     */
+    private fun zeroValue(type: JasType): JasExpression? = when (type) {
         BOOL -> JasBoolLiteral(false)
         INT64 -> JasCastExpr(JasIntLiteral(0, "0"), INT64)
         FLOAT64 -> JasFloatLiteral(0.0, "0.0")
         JasStringType -> JasStringLiteral("")
-        else -> JasIntLiteral(0, "0")
+        INT -> JasIntLiteral(0, "0")
+        is JasNullableType -> JasNullLiteral
+        else -> null
     }
 
     /** 参数名到（规范化后）类型；供块规划器校验局部写入目标与名字唯一性。 */
