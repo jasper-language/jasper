@@ -7,9 +7,13 @@
 //   - 作用域到期被任一检查点（帧自身、launch、子任务体开始前）观察时，经帧的作用域子令牌
 //     唤醒并取消挂起中的全部帧（原因 Deadline）；
 //   - launchWithDeadline 的帧自身期限只取消它自己，不触发普通组兄弟级联；
-//   - 挂起中到期而无检查点时帧保持挂起（本片无计时器，边界如实锁定）；
-//   - 固定种子 20261125 的 300 轮随机事件序列，与独立 oracle 逐步比对状态、原因、业务段与
-//     清理次数、settled 与 close 聚合。
+//   - 挂起中到期而无检查点、计时器尚未触发时帧保持挂起；计时器触发（LANG-S4-TIMER-01）即唤醒
+//     并回收挂起帧，不需要任何输入或其他检查点；
+//   - 固定种子 20261125 的 600 轮随机事件序列（含计时器触发事件），与独立 oracle 逐步比对状态、
+//     原因、业务段与清理次数、settled 与 close 聚合。
+//
+// 作用域一律用宿主驱动计时器（TaskGroup.withDeadlineTimer + DeadlineTimer(false)），由测试显式
+//   fireDueAt：线程计时器会在测试线程之外异步触发，破坏逐步比对的确定性。
 //
 // 所属层次：compiler 模块端到端测试层；Kotlin 只提供确定性队列执行器（JDK 动态代理实现
 //   std.Executor）、单调时钟上的过去 / 未来截止点与 oracle，截止检查与传播全部在生成帧与
@@ -106,6 +110,7 @@ private object FrameDeadlineRuntime {
     private val runnable by lazy { type("std.Runnable") }
     private val task by lazy { type("std.CoroutineTask") }
     private val deadline by lazy { type("std.Deadline") }
+    private val timer by lazy { type("std.DeadlineTimer") }
     private val frame by lazy { type("demo.Program_calculate_Coroutine") }
     private val program by lazy { type("demo.Program") }
     private val settledField by lazy { future.getDeclaredField("settled").apply { isAccessible = true } }
@@ -142,7 +147,19 @@ private object FrameDeadlineRuntime {
     fun cleaned(): Int = program.getMethod("cleaned").invoke(null) as Int
 
     fun newFuture(): Any = future.getConstructor().newInstance()
-    fun newGroup(): Any = group.getConstructor(Boolean::class.javaPrimitiveType).newInstance(false)
+    /** 宿主驱动计时器的普通组：到期只在检查点或测试调用 [fire] 时观察。 */
+    fun newGroup(): Any = group.getMethod("withDeadlineTimer", Boolean::class.javaPrimitiveType, timer)
+        .invoke(null, false, timer.getConstructor(Boolean::class.javaPrimitiveType).newInstance(false))
+    /** 在当前单调时刻触发作用域计时器的到期登记项，返回 fireDueAt 的等待值。 */
+    fun fire(target: Any): Long {
+        val owned = group.getMethod("deadlineTimer").invoke(target)
+        return timer.getMethod("fireDueAt", Long::class.javaPrimitiveType).invoke(owned, System.nanoTime()) as Long
+    }
+    /** 让作用域计时器下一次 arm 抛平台异常（等价于计时线程启动失败）。 */
+    fun breakNextArm(target: Any) {
+        val owned = group.getMethod("deadlineTimer").invoke(target)
+        timer.getDeclaredField("wakeup").apply { isAccessible = true }.set(owned, FirstReleaseFails())
+    }
     fun newFrame(executor: QueueExecutor, result: Any, first: Any, second: Any, kept: Int): Any =
         frame.getConstructor(executorType, future, future, future, intType)
             .newInstance(executor.proxy, result, first, second, kept)
@@ -225,7 +242,7 @@ class FrameDeadlineCoroutinePipelineTest {
         assertEquals(1, rt.business())
         rt.restrict(scope.group, rt.past())
         scope.executor.drain()
-        // 本片无计时器：挂起中到期、没有检查点时帧保持挂起。
+        // 计时器尚未触发、也没有其他检查点：帧保持挂起。
         assertEquals("Pending", scope.outcome(0))
         rt.complete(scope.first[0], 5)
         scope.executor.drain()
@@ -234,6 +251,41 @@ class FrameDeadlineCoroutinePipelineTest {
         assertEquals(1, rt.cleaned())
         assertTrue(rt.isSettled(scope.results[0]))
         assertEquals("cancel:Deadline", rt.close(scope.group))
+    }
+
+    /** 计时器触发是检查点：输入永不完成、没有其他检查点，到期也会唤醒并回收全部挂起帧。 */
+    @Test
+    fun `timer firing wakes suspended frames without any other checkpoint`() {
+        rt.reset()
+        val scope = Scope(2)
+        scope.launch(0)
+        scope.launch(1)
+        rt.restrict(scope.group, rt.past())
+        scope.executor.drain()
+        assertEquals("Pending", scope.outcome(0))
+        assertEquals(0L, rt.fire(scope.group), "one entry fired; loop again")
+        scope.executor.drain()
+        assertEquals("Cancelled(Deadline)", scope.outcome(0))
+        assertEquals("Cancelled(Deadline)", scope.outcome(1))
+        assertEquals(2, rt.business())
+        assertEquals(2, rt.cleaned())
+        assertTrue(rt.isSettled(scope.results[0]) && rt.isSettled(scope.results[1]))
+        assertEquals(-1L, rt.fire(scope.group), "nothing left armed")
+        assertEquals("cancel:Deadline", rt.close(scope.group))
+    }
+
+    /** 登记失败（注入同 DeadlineTimerTest）不得留下 close 永远等待的帧：结果以 schedule 失败终结并 settled。 */
+    @Test
+    fun `arming failure settles the launched frame so close cannot hang`() {
+        rt.reset()
+        val scope = Scope(1)
+        rt.breakNextArm(scope.group)
+        rt.launchWithDeadline(scope.group, scope.frames[0], rt.later())
+        scope.executor.drain()
+        assertEquals("Failed", scope.outcome(0))
+        assertTrue(rt.isSettled(scope.results[0]))
+        assertEquals(0, rt.business())
+        assertEquals("std.TaskGroupFailure", rt.close(scope.group))
     }
 
     @Test
@@ -294,8 +346,8 @@ class FrameDeadlineCoroutinePipelineTest {
     fun `seeded event sequences agree with the frame deadline oracle`() {
         val seed = 20261125L
         val random = Random(seed)
-        val coverage = IntArray(4)
-        repeat(300) { round ->
+        val coverage = IntArray(5)
+        repeat(600) { round ->
             rt.reset()
             val size = 2 + random.nextInt(3)
             val scope = Scope(size)
@@ -325,6 +377,8 @@ class FrameDeadlineCoroutinePipelineTest {
                     }
                     2 -> if (random.nextInt(3) == 0) {
                         events += "expire"; rt.restrict(scope.group, rt.past()); model.expired = true
+                        // 一部分到期紧接着由计时器触发观察（没有任何其他检查点）。
+                        if (random.nextInt(3) == 0) { events += "tick"; rt.fire(scope.group); model.timerFired() }
                     }
                     3, 4, 5, 6 -> {
                         val input = random.nextInt(2)
@@ -341,7 +395,8 @@ class FrameDeadlineCoroutinePipelineTest {
                         }
                     }
                     7 -> if (random.nextInt(4) == 0) { events += "groupCancel"; rt.cancelGroup(scope.group); model.groupCancel() }
-                    else -> Unit
+                    // 计时器触发较稀：太频繁会抢在「挂起中到期、恢复时观察」之前唤醒帧。
+                    else -> if (random.nextInt(6) == 0) { events += "tick"; rt.fire(scope.group); model.timerFired() }
                 }
                 scope.executor.drain()
                 check()
@@ -358,8 +413,10 @@ class FrameDeadlineCoroutinePipelineTest {
             if (model.ownExpiredCount > 0) coverage[1]++
             if (model.resumedIntoExpiry) coverage[2]++
             if (model.wokenByRelay) coverage[3]++
+            if (model.wokenByTimer) coverage[4]++
         }
-        // 覆盖下限：作用域到期、帧自身到期、挂起中到期于恢复时观察、到期由别处观察并唤醒挂起帧。
+        // 覆盖下限：作用域到期、帧自身到期、挂起中到期于恢复时观察、到期由别处观察并唤醒挂起帧、
+        // 计时器触发唤醒挂起帧。
         coverage.forEachIndexed { index, count -> assertTrue(count >= 20, "coverage[$index] = $count below 20") }
     }
 }
@@ -391,6 +448,7 @@ private class Oracle(size: Int) {
     var ownExpiredCount = 0
     var resumedIntoExpiry = false
     var wokenByRelay = false
+    var wokenByTimer = false
     private val woken = ArrayDeque<Int>()
 
     fun outcome(i: Int): String = status[i] + (reason[i]?.let { "($it)" } ?: "")
@@ -409,6 +467,18 @@ private class Oracle(size: Int) {
                 if (why == "Deadline") wokenByRelay = true
             }
         }
+    }
+
+    /**
+     * 计时器触发：作用域截止点已过则以 Deadline 取消作用域（检查点语义，先到的原因保留）；帧自身期限
+     * 已过的在 launch 检查点上早已取消，这里不会再有新的自身到期。
+     */
+    fun timerFired() {
+        if (expired && rootReason == null && order.any { status[it] == "Pending" && (phase[it] == WAIT_A || phase[it] == WAIT_B) }) {
+            wokenByTimer = true
+        }
+        if (expired) cancelRoot("Deadline")
+        settle()
     }
 
     /** TaskGroup.cancel：不是检查点，只以 Explicit 取消作用域并唤醒挂起帧。 */

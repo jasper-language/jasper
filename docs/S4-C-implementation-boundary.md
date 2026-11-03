@@ -1079,7 +1079,7 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 
 ### 仍不支持（后续切片）
 
-- 到期不会唤醒正在挂起等待的帧或阻塞调用（无计时器）；只在上述检查点观察。
+- 本片到期只在上述检查点观察；计时唤醒见后文「计时唤醒」。
 - 生成帧挂起点入口的截止检查见后文「生成帧截止检查点」；`ScopeExit`、嵌套作用域 `Parent` 链接同上节。
 - 帧内（源码层）设定 / 查询期限的语言形态未提供。
 
@@ -1128,7 +1128,7 @@ Jasper 运行时 `catch (java.lang.Throwable)` 会把它当平台失败吞掉，
 
 ### 仍不支持（后续切片）
 
-- 到期本身不是检查点：挂起中的帧在作用域或自身期限到期后，若没有任何检查点观察到，会一直挂起（无计时器）。
+- 本片到期本身不是检查点；计时唤醒见后文「计时唤醒」（经作用域计时器登记的期限到期时自动运行一次检查点）。
 - `ScopeExit`、嵌套作用域 `Parent`、帧内（源码层）设定 / 查询期限的语言形态同前。
 - 帧自身因被等待的 Future 取消而发布 Cancelled 时仍记 Explicit。
 
@@ -1150,3 +1150,54 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
 - 变异 4 组均被抓：后端回退 2 项失败、去掉挂起点入口检查 1 项、去掉分派入口检查 4 项、去掉作用域传播 4 项。
 - TLA+ `FrameDeadlineCheckpoint`（两帧，普通组 4992 / 监督组 4872 个不同状态，含回收活性）通过；变异配置
   `_nosuspendcheck` 违反 NoSuspendAfterExpiry、`_norelay` 违反 CancelledScopeHasNoPending。
+
+## 计时唤醒（LANG-S4-TIMER-01）
+
+### 已支持
+
+- `std.DeadlineTimer`（纯 Jasper 运行时）：登记「令牌 + 截止点」，到期时对令牌执行一次检查点 `pollReasonAt`。
+  计时器不改取消语义：首因稳定、先父后己、帮助传播全部来自令牌，它只是「在到期时刻自动运行的检查点」。
+- 每个 `TaskGroup` 最多拥有一个计时器，首次登记时才创建，不设期限的作用域没有计时器开销。`restrictDeadline`、`spawnWithDeadline`、`launchWithDeadline` 登记；
+  没有任何其他检查点时，作用域到期也会取消根令牌，经既有回调唤醒挂起中的帧（`ScopeCancellationRelay`）与在
+  `onCancel` 上等待的阻塞调用。子任务 / 帧自身期限到期只取消它自己，不触发普通组级联。
+- 线程模型：最多一个守护线程，登记表为空即退出，下次登记再启动；「退出」与「新登记」在同一把锁下判定，登记项
+  不会无人服务。令牌先被取消时登记撤销（`TimerDisarm`），`close` 在全部子任务 settled 后 `shutdown`，之后登记
+  为空操作。
+- 登记失败（计时线程启动失败）：`arm` 以平台异常传播。`spawnWithDeadline` / `launchWithDeadline` 把它作为
+  `schedule` 失败发布，子任务 Failed 且 settled，`close` 不会永远等待；`restrictDeadline` 的异常传给调用方，
+  令牌已收紧，到期仍在检查点观察。
+- 宿主驱动模式：`new DeadlineTimer(false)` + `TaskGroup.withDeadlineTimer(supervisor, timer)`，从不启动线程，由
+  宿主在自己的时刻调用 `fireDueAt(now)`，与线程模式共用登记、撤销、到期判定代码。
+
+### 仍不支持（后续切片）
+
+- 只登记显式设定的期限：`CancellationToken` 自己设定的期限（不经 `TaskGroup`）不会自动计时，只在检查点观察；
+  调用方可自行 `timer.arm`。
+- 不抢占：运行中的业务段或未在 `onCancel` 上等待的阻塞调用（例如 `sleep`、无取消回调的平台 I/O）在到期时不会被
+  打断，只有令牌被取消；帧在下一个检查点观察。`Future.get` 等运行时阻塞的可取消性按各自既有语义。
+- 登记表为线性表、每次扫描 O(n)；堆结构留给有负载证据之后。计时精度取决于操作系统调度，不承诺实时性。
+- `fireDueAt` 的前置条件是同一时刻只有一个调用者，未在运行时强制。
+- `ScopeExit`、嵌套作用域 `Parent`、帧内（源码层）设定 / 查询期限的语言形态同前。
+
+### 验收结果
+
+- `DeadlineTimerTest`：端到端 4 项（线程计时器、真实时钟：作用域到期唤醒阻塞任务体、子任务期限不波及兄弟、取消先到
+  撤销登记且线程退出、空闲退出后重启与 shutdown 拒绝登记）；不设期限的作用域不创建计时器 1 项；登记失败注入 1 项；种子 20261129 的 300 轮随机事件
+  （时钟从 `Long.MAX_VALUE` 附近起步，覆盖回绕）按精确 oracle 逐步判定原因、有效登记数、累计触发数与 `fireDueAt`
+  返回值（五类覆盖下限各 > 20）。
+- `FrameDeadlineCoroutinePipelineTest` 增至 8 项：计时器触发唤醒并回收挂起帧；登记失败注入；种子 20261125 随机序列
+  增至 600 轮并加入计时器触发事件（五类覆盖下限各 ≥ 20）。
+- `DeadlineTimerLincheckTest`（真实插桩，40 × 400，两线程交错登记、取消与触发）通过，并在开发中抓到两处不可
+  线性化结果：先入表后注册撤销回调、快照不查令牌是否已取消，现均已修正；计时线程「退出 / 新登记」竞争由
+  TLA+ 覆盖（Lincheck 不管理被测代码自建线程）。`DeadlineTimerFuzzTest` 覆盖引导 61 秒 356133 次无失败，
+  274 条语料入库。
+- TLA+ `DeadlineTimer` 8149 个不同状态（含不丢到期与线程终将退出两条活性）通过；变异配置 `_exitoutsidelock` 违反
+  活性（登记项无人服务）、`_nosnapcheck` 违反 NoStaleFire。
+- 运行时变异 6 组被抓：`spawn` 登记移出 try 1 项失败、`launch` 登记移出 try 1 项、改回立即创建计时器 1 项、
+  `restrictDeadline` 不登记 4 项、取消不撤销 2 项、触发不执行检查点 5 项。「触发后保留登记项」未被抓，为等价变异
+  （登记令牌的自身截止点不晚于登记时刻，触发必取消令牌，下一次快照按令牌已取消移出，不会二次触发）。
+- S4 模型 19 组（含本片 `DeadlineTimer`）全部复跑通过。
+- `CancellationReasonLincheckTest` 单次调用的事件量贴近 Lincheck 上限：在 `close` 里多做一次计时器 `shutdown`
+  就会触发 `ManagedStrategy` 内部 `check` 失败（机制见 Deadline 运行时子片）。延迟创建计时器后该路径不增加
+  事件；今后在作用域路径上加锁操作可能再次碰到，届时需要先拆分用例，不得放宽。
+- JBMC：N/A（构建虚拟机未装），无替代形式验证，由 TLA+ / Lincheck / Jazzer 覆盖协议与边界。

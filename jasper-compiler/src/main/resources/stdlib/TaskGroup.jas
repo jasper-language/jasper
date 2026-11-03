@@ -22,8 +22,11 @@ package std;
 //   与每个挂起点入口。作用域到期取消根令牌（全部子任务得到 Deadline 原因，close 报 Deadline）；
 //   子任务自身期限到期只取消该子任务。到期不是业务失败，不触发普通组的兄弟级联。
 //   每个生成帧持有根令牌的子令牌，令牌取消经 ScopeCancellationRelay 以首个原因取消帧的结果
-//   Future——任何检查点观察到的作用域到期都会唤醒挂起中的帧。计时唤醒（无检查点时到期）
-//   留给后续切片。
+//   Future——任何检查点观察到的作用域到期都会唤醒挂起中的帧。
+//   计时唤醒：作用域拥有一个 DeadlineTimer（首次登记时才创建，不设期限的作用域不付出任何代价），
+//   restrictDeadline 与带显式期限的 spawn / launch 把「令牌 + 截止点」登记给它，到期时计时线程对该令牌执行一次检查点——没有任何其他检查点时，
+//   挂起中的帧与在 onCancel 上等待的阻塞调用也会在到期后被唤醒。close 在全部子任务 settled 后
+//   shutdown 计时器。
 //
 // 依赖方向：
 //   TaskGroup -> Executor / Future / CancellationToken；这些下层不知道 TaskGroup，
@@ -128,6 +131,7 @@ public class TaskGroup {
     private var aggregateSuppressed: int32;
     private var aggregateCancelled: bool;
     private var aggregateReason: CancellationReason;
+    private var timer: DeadlineTimer?;
 
     /**
      * 做什么：创建普通组或监督组。
@@ -147,6 +151,22 @@ public class TaskGroup {
         this.aggregateSuppressed = 0;
         this.aggregateCancelled = false;
         this.aggregateReason = CancellationReason.Explicit;
+        this.timer = null;
+    }
+
+    /**
+     * 做什么：创建使用指定计时器的普通组或监督组。
+     * 什么时候用：宿主驱动计时（new DeadlineTimer(false)，由宿主事件循环或确定性测试调用
+     *   fireDueAt）时。
+     * 前置条件：timer 非 null、未 shutdown，且只交给这一个作用域——close 会 shutdown 它
+     *   （已 shutdown 的计时器拒绝登记，到期只在检查点观察）。
+     * 失败模式：同构造器。
+     * 为什么用静态工厂而不是构造参数：常用路径（自带线程计时器）保持 new TaskGroup(bool) 不变。
+     */
+    public static function withDeadlineTimer(supervisorScope: bool, timer: DeadlineTimer): TaskGroup {
+        var group: TaskGroup = new TaskGroup(supervisorScope);
+        group.timer = timer;
+        return group;
     }
 
     /** 做什么：判断是否监督组。前置条件：无；失败模式：不会失败。 */
@@ -203,14 +223,22 @@ public class TaskGroup {
         // 因此这里不再另存一份序列号，避免两份顺序来源漂移。
         this.children.add(erased);
         var token: CancellationToken = this.rootToken.createChild();
+        var armTimer: DeadlineTimer? = null;
         if (deadline != null) {
             // 检查器的空值收窄不作用于实参位置，判空后显式转换。
             token.restrictDeadline(cast deadline as Deadline);
+            armTimer = this.timerLocked();
         }
         this.mutex.release();
 
         var runner: TaskRunner<T> = new TaskRunner<T>(this, body, future, token);
         try {
+            // 锁外登记：令牌已取消时撤销回调会同步执行。登记放在 try 内：子任务已进入 children，
+            // 计时线程启动失败若逃出这里，Future 永不终结，close 会永远等待。
+            if (deadline != null) {
+                var owned: DeadlineTimer = cast armTimer as DeadlineTimer;
+                owned.arm(token, cast deadline as Deadline);
+            }
             executor.schedule(runner);
         } catch (rejected: java.lang.Throwable) {
             // 调度拒绝是「任务从未开始」的失败：Future 必须先进入终态，再标记 settled，
@@ -280,8 +308,10 @@ public class TaskGroup {
         }
         this.children.add(erased);
         var token: CancellationToken = this.rootToken.createChild();
+        var armTimer: DeadlineTimer? = null;
         if (deadline != null) {
             token.restrictDeadline(cast deadline as Deadline);
+            armTimer = this.timerLocked();
         }
         this.mutex.release();
 
@@ -292,6 +322,11 @@ public class TaskGroup {
         // 入口检查处直接回收，与 spawn 的令牌语义一致。
         token.onCancel(new ScopeCancellationRelay(erased));
         try {
+            // 登记放在 try 内，理由同 spawnWithin：计时线程启动失败不得留下 close 永远等待的子任务。
+            if (deadline != null) {
+                var owned: DeadlineTimer = cast armTimer as DeadlineTimer;
+                owned.arm(token, cast deadline as Deadline);
+            }
             task.start();
         } catch (rejected: java.lang.Throwable) {
             // 生成帧的调度门已为绑定结果发布失败并标记 settled；这里再兜底一次，
@@ -318,6 +353,8 @@ public class TaskGroup {
     public function close(): void {
         this.mutex.acquireUninterruptibly();
         this.closed = true;
+        // closed 已置位，之后不会再创建计时器（spawn / launch 拒绝，restrictDeadline 不再登记）。
+        var ownedTimer: DeadlineTimer? = this.timer;
         var snapshot: MutableList<Future<any>> = new MutableList<Future<any>>();
         for (child in this.children) {
             snapshot.add(child);
@@ -326,6 +363,11 @@ public class TaskGroup {
 
         for (child in snapshot) {
             child.awaitTaskSettled();
+        }
+        // 全部子任务已 settled、入口已封闭：之后到期没有可唤醒的对象，收回计时线程。
+        if (ownedTimer != null) {
+            var stopping: DeadlineTimer = cast ownedTimer as DeadlineTimer;
+            stopping.shutdown();
         }
 
         this.mutex.acquireUninterruptibly();
@@ -383,11 +425,51 @@ public class TaskGroup {
      * 做什么：把作用域截止点收紧为 min(当前, deadline)；已创建与之后创建的子任务都受其约束。
      * 什么时候用：进入作用域后设定期限（契约 §2：作用域设定 Deadline）。
      * 前置条件：deadline 非 null。
-     * 失败模式：不会失败；更晚的 deadline 不改变任何东西。
-     * 为什么不立即取消：到期只在检查点观察；子令牌经父引用实时看到收紧后的期限。
+     * 失败模式：更晚的 deadline 不改变任何东西；计时线程启动失败时以平台异常传播（令牌已收紧，
+     *   到期仍在检查点观察）。作用域 close 之后只收紧、不再登记。
+     * 为什么不立即取消：到期在检查点观察；子令牌经父引用实时看到收紧后的期限。计时器在到期时刻
+     *   自动执行一次检查点，因此即使没有任何任务经过检查点，到期也会取消根令牌并唤醒挂起帧。
+     * 为什么先收紧再登记：计时器触发时检查点按令牌的截止点判定，登记早于收紧会在旧截止点上空检查。
      */
     public function restrictDeadline(deadline: Deadline): void {
         this.rootToken.restrictDeadline(deadline);
+        this.mutex.acquireUninterruptibly();
+        if (this.closed) {
+            this.mutex.release();
+            return;
+        }
+        var owned: DeadlineTimer = this.timerLocked();
+        this.mutex.release();
+        owned.arm(this.rootToken, deadline);
+    }
+
+    /**
+     * 做什么：返回作用域的计时器，首次需要时创建。
+     * 前置条件：调用方持有 this.mutex 且作用域未 close。
+     * 失败模式：分配失败时以平台异常出现。
+     * 为什么延迟创建：多数作用域不设期限，不应为信号量与登记表付出代价。
+     * 为什么公开：Jasper 当前没有包内可见性；调用方不应直接使用。
+     */
+    public function timerLocked(): DeadlineTimer {
+        var existing: DeadlineTimer? = this.timer;
+        if (existing != null) {
+            return cast existing as DeadlineTimer;
+        }
+        var created: DeadlineTimer = new DeadlineTimer(true);
+        this.timer = created;
+        return created;
+    }
+
+    /**
+     * 做什么：返回作用域的计时器；从未登记时创建一个空计时器。
+     * 什么时候用：测试与诊断观察计时线程与登记项。
+     * 前置条件：无；失败模式：不会失败。
+     */
+    public function deadlineTimer(): DeadlineTimer {
+        this.mutex.acquireUninterruptibly();
+        var owned: DeadlineTimer = this.timerLocked();
+        this.mutex.release();
+        return owned;
     }
 
     /** 做什么：返回作用域有效截止点；未设定时返回 null。前置条件：无；失败模式：不会失败。 */
