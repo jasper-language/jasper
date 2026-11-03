@@ -24,6 +24,8 @@
 //   finally 体，复用清理区域，同块多个 defer 因此后声明先执行。
 //   `throw E` 先在当前块求值 E（其中的 await 与 return 值一样提升），随后在段内抛出并结束
 //   路径；离开区域的清理与 catch 匹配由发射器的异常路由按 `$region` 完成，块上不登记清理。
+//   调用语句（S4-C 第二十三片）在当前块按源码顺序求值、丢弃结果，实参中的 await 与局部写入
+//   一样提升；`await f;` 按提升规则挂起，结果写入不再被读取的合成临时局部。
 //   生成帧用 `__phase` 记录下一块编号，按编号顺序排列的 `if` 段
 //   包在分派循环里：前向跳转在同一趟内顺序走完，回到循环头时开启新一趟。
 //
@@ -50,7 +52,9 @@
 //     `++` / `--`、调用语句、if/else、while 与块；
 //   - break / continue 的标签必须是某个外层循环的标签；未知标签与遮蔽外层同名标签的
 //     循环拒绝（不退回到最内层循环）；
-//   - 三段式 for 的步进段只接受对局部的 `=` 赋值或 int32 / int64 局部的 `++` / `--`；
+//   - 三段式 for 的初始化段与步进段接受的语句形式同普通语句（步进段不含声明）；
+//   - 表达式语句只接受对局部的 `=` 赋值、int32 / int64 局部的 `++` / `--`、调用与直接 await；
+//     其它表达式（`new T()`、`a + 1`）与对字段 / 下标的赋值拒绝；
 //   - 子表达式中的 await 只允许出现在一元 `+ - !`、二元运算与源码静态调用实参之下，
 //     先于它求值、未被提升的部分只能是字面量、局部读取与不会抛出的运算
 //     （否则提升会改变副作用或异常与挂起的先后，拒绝；短路运算的左操作数在分支前
@@ -94,8 +98,8 @@ sealed class CoroutineBlockExit {
  * 一个基本块。
  *
  * [resumeBinding] 非空表示这是某个挂起点的恢复块：入口先消费完成快照（取消/失败
- * 直接发布终态并结束），成功值写入该局部；[assignments] 是按源码顺序的局部写入；
- * [exit] 是唯一出口。
+ * 直接发布终态并结束），成功值写入该局部；[assignments] 是按源码顺序的局部写入，名字为
+ * [CoroutineBlockPlanner.EFFECT_TARGET] 的项只求值、丢弃结果（调用语句）；[exit] 是唯一出口。
  */
 data class CoroutineBlock(
     val id: Int,
@@ -202,6 +206,12 @@ object CoroutineBlockPlanner {
 
     /** 当前所在清理区域编号的合成 int32 局部（0 = 不在区域内）；只在有 try/finally 时登记。 */
     const val REGION_LOCAL = "\$region"
+
+    /**
+     * 块内工作项的目标名：只求值、丢弃结果。含 `$`，不会与源码局部冲突，也不登记为帧局部。
+     * 为什么放进 [CoroutineBlock.assignments] 而不另开列表：调用语句与局部写入必须保持源码相对顺序。
+     */
+    const val EFFECT_TARGET = "\$effect"
 
     /** 正在构造、尚未确定出口的块。 */
     private class OpenBlock(val id: Int, val resumeBinding: String?) {
@@ -324,7 +334,8 @@ object CoroutineBlockPlanner {
             }
             is JasExpressionStatement -> when (val expression = statement.expression) {
                 is JasAssignment -> lowerAssignment(expression, block)
-                else -> lowerIncrement(expression, block)
+                is JasCall -> lowerCallStatement(expression, block)
+                else -> if (directAwait(expression) != null) hoist(expression, block).first else lowerIncrement(expression, block)
             }
             is JasStatementIncrement -> lowerIncrement(statement.increment, block)
             is JasIf -> lowerIf(statement, block)
@@ -384,12 +395,22 @@ object CoroutineBlockPlanner {
         }
 
         /**
+         * 调用语句：结果丢弃，其余规则与局部写入右侧的调用相同——实参中的 await 按求值顺序提升，
+         * 调用在恢复后恰好执行一次，且只接受源码静态调用（[requireStaticSourceCallee]）。
+         */
+        private fun lowerCallStatement(call: JasCall, block: OpenBlock): OpenBlock {
+            val (end, rewritten) = hoist(call, block)
+            end.assignments += EFFECT_TARGET to rewritten
+            return end
+        }
+
+        /**
          * `i++` / `i--`：只接受 int32 / int64 局部，改写为 `i = i + 1` / `i = i - 1` 的普通赋值；
          * 生成帧随后经真实类型检查，改写结果与源码自增的回绕语义一致。
          */
         private fun lowerIncrement(expression: JasExpression, block: OpenBlock): OpenBlock {
             val increment = expression as? JasPostfixIncDec
-                ?: throw Rejected("only assignments to locals may appear as statements")
+                ?: throw Rejected("only assignments to locals, increments, calls and direct awaits may appear as statements")
             val target = increment.target as? JasIdentifier
             if (target == null || !isIncrementable(locals[target.name]) || increment.op !in setOf("++", "--")) {
                 throw Rejected("only '++' / '--' on int32 or int64 locals are supported")

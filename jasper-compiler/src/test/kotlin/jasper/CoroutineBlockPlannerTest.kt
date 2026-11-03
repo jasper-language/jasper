@@ -265,8 +265,9 @@ class CoroutineBlockPlannerTest {
             "for-in" to function(decl("v", lit(0)), JasForInStatement("x", id("base"), block(set("v", await("input")))), JasReturn(id("v"))),
             "for-suffix" to function(decl("v", lit(0)),
                 JasForStatement(null, id("flag"), null, block(set("v", await("input"))), LoopSuffix(onBreak = block())), JasReturn(id("v"))),
-            "for-call-update" to function(decl("v", lit(0)),
-                JasForStatement(null, id("flag"), JasCall(id("g"), emptyList()), block(set("v", await("input")))), JasReturn(id("v"))),
+            // 调用作步进段自第二十三片起支持；其余表达式仍拒绝。
+            "for-new-update" to function(decl("v", lit(0)),
+                JasForStatement(null, id("flag"), JasNew(JasNamedType("Error"), emptyList()), block(set("v", await("input")))), JasReturn(id("v"))),
             "increment-bool" to function(decl("b", JasBoolLiteral(true), bool), JasExpressionStatement(JasPostfixIncDec(id("b"), "++")),
                 JasReturn(lit(0))),
             "loop-suffix" to function(decl("v", lit(0)),
@@ -1688,5 +1689,30 @@ class CoroutineBlockPlannerTest {
         assertTrue(throwPrograms > 150, "generator too weak: only $throwPrograms programs with throw")
         assertTrue(caughtThrows > 40, "generator too weak: only $caughtThrows rounds caught a thrown error and continued")
         assertTrue(escapedThrows > 40, "generator too weak: only $escapedThrows thrown errors escaped after cleanups")
+    }
+
+    @Test
+    fun `call statements keep source order with local writes and hoist their awaits`() {
+        val first = mixCall(lit(1), lit(2))
+        val hoisted = mixCall(id("base"), await("input"))
+        val plan = CoroutineBlockPlanner.plan(function(
+            decl("x", lit(1)),
+            JasExpressionStatement(first),
+            set("x", lit(2)),
+            JasExpressionStatement(hoisted),
+            JasExpressionStatement(await("input")),
+            JasReturn(id("x"))
+        ), parameters)
+        assertWellFormed(plan, "call statements")
+        assertEquals(listOf("x", CoroutineBlockPlanner.EFFECT_TARGET, "x"), plan.blocks[0].assignments.map { it.first })
+        assertEquals(first, plan.blocks[0].assignments[1].second)
+        // 实参中的 await 在调用之前挂起，调用落在恢复块；裸 await 另占一个挂起点，结果写入不被读取的临时局部。
+        val suspend = plan.blocks[0].exit as CoroutineBlockExit.Suspend
+        val call = plan.blocks[suspend.resume].assignments.single()
+        assertEquals(CoroutineBlockPlanner.EFFECT_TARGET, call.first)
+        assertEquals(listOf<JasExpression>(id("base"), id(suspend.binding)), (call.second as JasCall).args)
+        assertEquals(2, plan.suspensionCount)
+        assertTrue(plan.locals.none { it.first == CoroutineBlockPlanner.EFFECT_TARGET })
+        assertTrue(plan.blocks.last().assignments.isEmpty())
     }
 }

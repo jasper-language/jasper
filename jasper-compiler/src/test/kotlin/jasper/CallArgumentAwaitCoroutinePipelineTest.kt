@@ -179,6 +179,9 @@ class CallArgumentAwaitCoroutinePipelineTest {
             rt.assertStillPending(result, "initializer argument await")
             assertEquals(0, rt.calls(), "call ran before its awaited argument")
             rt.complete(gate, 2)
+            // 恢复在工作线程上执行：固定 sleep 在高负载下会抢跑，先有界等待调用发生，再断言恰好一次。
+            val resumed = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (rt.calls() < 1 && System.nanoTime() < resumed) Thread.sleep(1)
             rt.assertStillPending(result, "while condition argument await")
             assertEquals(1, rt.calls(), "initializer call must run exactly once after the resume")
             rt.complete(input, 5)

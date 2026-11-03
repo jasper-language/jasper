@@ -1404,3 +1404,45 @@ finally / defer 中的 throw / 挂起 / 跳出；for-in 与循环后置块；实
 - 变异 14 组：13 组被抓；`??` 的 await 遍历缺失存活，是等价变异（发射器 rewrite 的第二道拒绝同样诊断）。首轮「只查结果类型本身、不查类型实参」存活，补用例后被抓。
 - 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，也未复跑 TLA+ 模型；Lincheck、Jazzer 语料回放与全部协程测试随全量 gradle test 复跑。
 - 原以引用类型作「未支持」载体的用例（`ValueTypeCoroutinePipelineTest`、`LinearCoroutinePipelineTest`、`AwaitFrontendTest`）改为数组载体，`Future<Future<T>>` 的一次 await 改为要求能降级。
+
+## S4-C 第二十三片：调用语句与裸 await（LANG-CONT-CALL-STMT-01）
+
+本片让调用语句和 `await f;` 成为帧语句。此前调用只能写成带初始化的局部，返回 `void` 的函数在帧里根本无法调用。帧协议（分派循环、恢复门、异常路由、作用域登记）不变。
+
+### 规则
+
+- **调用语句**：在当前块按源码相对顺序求值，结果丢弃，恢复时不重放。抛出走段内异常路由，与其它段内抛出相同。可以出现在语句位置和三段式 for 的初始化段、步进段。
+- **实参中的 await**：沿用局部写入右侧的提升规则。`Program.note(await s);` 先挂起，调用在恢复后恰好执行一次；只接受源码静态调用，前面不能有未提升的副作用。
+- **裸 await**：`await f;` 占一个挂起点，结果写入不再被读取的合成临时局部，失败 / 取消与其它 await 相同。结果类型仍须是帧值类型。
+
+### 顺带修复
+
+未限定地调用同类静态函数（`sibling();`、`var x: int32 = sibling();`）此前能通过编译，运行时 `NoSuchMethodError`：检查器按「未知外部函数」放行，名字被绑定到帧类自身。现在发射器改写为 `Owner.sibling()`。该调用目标若是挂起函数，诊断。只有实例成员同名时诊断。
+
+### 明确诊断的形态（不写 class，不退化为同步求值）
+
+- `?.`：帧内一律诊断（见下方已知缺口）；
+- 实例 / 接收者调用实参中的 await（`box.set(await f);`）、接收者中的 await（`(await f).bump();`）、未限定同类调用实参中的 await（写成 `Program.g(await f);`）；
+- 同步调用挂起函数，包括调用语句、for 步进段、`??` 操作数与未限定的同类调用；
+- 其它表达式语句（`new Box(1);`、`await f + 1;`）与对字段 / 下标的赋值；
+- finally / defer 中的 await、处理体引用捕获参数，同前。
+
+### 已知缺口（未改）
+
+- **`?.` 在 IR 路径未实现（同步路径同样）**：`b?.get()` 被发射成普通调用，实测接收者为 null 时抛 `NullPointerException`；`b?.get() ?? 0` 在操作数是基本类型时产生 `VerifyError`。帧内先诊断，同步路径单独修复。
+- **同名解析**：类内未限定调用与顶层函数同名时解析到顶层函数，同类静态函数被遮蔽。同步路径与帧一致（一次探针），是否调整属于名字解析规则，本片未动。
+- 未限定同类调用在检查器里没有签名：实参类型错误由帧的二次检查（改写为 `Owner.g` 后）报告，同步路径不报告。
+
+### 仍未支持
+
+数组、函数类型、元组、`any`、可空数值作帧值；`Future<Unit>` 的裸 await；处理体使用捕获参数；构造实参中的 await；finally / defer 中的 throw / 挂起 / 跳出；for-in 与循环后置块；实例 / 接收者调用实参中的 await；对字段 / 下标的赋值；`new` 语句；实例分派；公开源码挂起调用 ABI 与显式挂起标记名称。
+
+### 验收结果
+
+- `CallStatementCoroutinePipelineTest`，经真实 ANTLR 解析、标准库 + 用户源码编译与 JVM 执行：调用与挂起的先后、恰好一次、六种返回类型丢弃后操作数栈平衡、参数与局部接收者、帧内完成另一个 Future、静态调用实参中的 await、四种结果类型的裸 await、循环内裸 await、for 初始化 / 步进段、调用抛出经 catch / finally / defer、未捕获抛出发布 Failure、裸 await 的失败 / 取消通道、取消后挂起点之后的调用不执行；未限定同类调用（含 private，含局部初始化与 finally 位置）。
+- 固定种子 20261145 的 160 个随机函数 × 2 种完成时机（输入预先完成 / 启动后完成），生成时同步构造 Kotlin 模型，比对返回值与完整调用轨迹；语句含调用、提升 await、裸 await、if/else、for 步进调用、try/finally、try/catch 与 defer。覆盖下限：调用 ≥ 500，挂起点 ≥ 300，被捕获的调用抛出 ≥ 40。
+- 拒绝清单 18 例，全部不写 class。
+- `CoroutineBlockPlannerTest` 新增形状测试：调用与局部写入保持源码顺序、实参 await 使调用落在恢复块、效果目标不登记为帧局部。原 `for-call-update` 拒绝用例改为 `for-new-update`，调用作步进段转为正向用例。
+- 变异 10 组全部被抓：调用被丢弃、裸 await 不挂起、实参 await 不提升、调用排到局部写入之后、帧内放行 `?.`、同类调用不改写、只有实例同名成员不诊断、同类挂起调用不诊断、for 步进与 `??` 内调用不查挂起。
+- `CallArgumentAwaitCoroutinePipelineTest` 的一处断言在高负载下被固定 50ms sleep 抢跑（本片首次协程回归时暴露，代码路径未改），改为先有界等待调用发生，断言值不变。
+- 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，也未复跑 TLA+ 模型；Lincheck、Jazzer 语料回放与全部协程测试随全量 gradle test 复跑。

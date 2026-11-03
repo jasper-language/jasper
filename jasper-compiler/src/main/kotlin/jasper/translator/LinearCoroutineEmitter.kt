@@ -135,13 +135,21 @@ object LinearCoroutineEmitter {
      *   `start` 订阅自身结果 Future 后只请求第一次恢复。
      * 什么时候用：compiler 已确认 [unsupportedReason] 返回 null 后调用。
      * 前置条件：className 是合法 Java 标识符；function 未脱离原 AST 上下文完成类型检查。
+     *   成员函数须传 [ownerName] 与 [ownerMembers]：生成帧是另一个类，未限定地调用同类静态函数
+     *   要改写为 `Owner.g(...)`。
      * 失败模式：形态不支持或表达式无法安全改写时抛 IllegalArgumentException；
      *   不会返回部分类，也不会修改传入的 function。
      * 为什么生成 Runnable/Action 而不是新语言 ABI：这两个是既有标准库协议，JVM
      *   执行器与 Future.onComplete 已稳定支持，可在不新增关键字/公开调用约定的
      *   前提下先验证状态机与恢复桥。
      */
-    fun emit(function: JasFunction, className: String, requireStatic: Boolean = true): JasClass {
+    fun emit(
+        function: JasFunction,
+        className: String,
+        requireStatic: Boolean = true,
+        ownerName: String? = null,
+        ownerMembers: List<JasDeclaration> = emptyList()
+    ): JasClass {
         unsupportedReason(function, requireStatic)?.let { reason ->
             throw IllegalArgumentException("unsupported linear coroutine: $reason")
         }
@@ -181,6 +189,21 @@ object LinearCoroutineEmitter {
         fun jump(target: Int) = assign("__phase", JasIntLiteral(target.toLong(), target.toString()))
 
         /**
+         * 未限定地调用同类静态函数：改写为 `Owner.g`。为什么：检查器按「未知外部函数」放行这种调用
+         * （resolvedFunction 为空），同步路径由后端绑定到所在类；帧是另一个类，不改写就会链接到帧类
+         * 自身，运行时 NoSuchMethodError。resolvedFunction 非空说明解析到了顶层函数，与同步路径一致，
+         * 不改写。同名的只有实例成员时没有接收者可用，诊断。
+         */
+        fun siblingTarget(call: JasCall): JasExpression? {
+            val target = call.target as? JasIdentifier ?: return null
+            if (ownerName == null || target.name in slots || call.resolvedFunction != null) return null
+            val named = ownerMembers.filterIsInstance<JasFunction>().filter { it.name == target.name }
+            if (named.isEmpty()) return null
+            require(named.any { "static" in it.modifiers }) { "instance member call '${target.name}' is not supported" }
+            return JasPropertyAccess(JasIdentifier(ownerName), target.name)
+        }
+
+        /**
          * 把源码表达式改写成帧内表达式。
          *
          * 已绑定局部/参数 -> 帧字段；自由标识符（类型名、静态函数名）保持原样，
@@ -208,8 +231,14 @@ object LinearCoroutineEmitter {
                     else -> throw IllegalArgumentException("unsupported unary operator ${expression.op}")
                 }
             }
-            is JasPropertyAccess -> expression.copy(target = rewrite(expression.target))
-            is JasCall -> JasCall(rewrite(expression.target), expression.args.map(::rewrite), expression.isSafe)
+            is JasPropertyAccess -> {
+                requireNotSafe(expression.isSafe)
+                expression.copy(target = rewrite(expression.target))
+            }
+            is JasCall -> {
+                requireNotSafe(expression.isSafe)
+                JasCall(siblingTarget(expression) ?: rewrite(expression.target), expression.args.map(::rewrite))
+            }
             is JasCastExpr -> expression.copy(expression = rewrite(expression.expression))
             is JasNullCoalescing -> expression.copy(left = rewrite(expression.left), right = rewrite(expression.right))
             is JasNew -> expression.copy(args = expression.args.map(::rewrite))
@@ -324,7 +353,9 @@ object LinearCoroutineEmitter {
         val segments = plan.blocks.map { block ->
             val code = mutableListOf<JasStatement>()
             block.resumeBinding?.let { code += consumeOutcome(block.id, it) }
-            block.assignments.forEach { (name, value) -> code += assignLocal(name, rewrite(value)) }
+            block.assignments.forEach { (name, value) ->
+                code += if (name == CoroutineBlockPlanner.EFFECT_TARGET) statement(rewrite(value)) else assignLocal(name, rewrite(value))
+            }
             block.cleanups.forEach { code += cleanupCode.getValue(it) }
             when (val exit = block.exit) {
                 is CoroutineBlockExit.Goto -> code += jump(exit.target)
@@ -619,6 +650,14 @@ object LinearCoroutineEmitter {
             it.sourceLine = function.sourceLine
             it.sourceColumn = function.sourceColumn
         }
+    }
+
+    /**
+     * `?.` 在帧内诊断。为什么：当前 IR 路径不处理安全访问，会按普通访问发射，接收者为 null 时
+     * 抛 NullPointerException（同步路径同样，单独修复）；帧不把这个差异悄悄带进状态机。
+     */
+    private fun requireNotSafe(isSafe: Boolean) {
+        require(!isSafe) { "safe access '?.' is not supported in coroutine frames" }
     }
 
     /** 参数只接受帧值类型或帧值类型的 Future；短名 Future 由同一文件 import 解析。 */

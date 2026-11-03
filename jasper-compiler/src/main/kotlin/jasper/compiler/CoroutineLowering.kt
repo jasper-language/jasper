@@ -23,7 +23,7 @@
 //
 // 设计边界：
 //   - 支持范围以 LinearCoroutineEmitter / CoroutineBlockPlanner 为准：局部声明、
-//     局部赋值、if/else、while / do-while / 三段式 for、无标签 break/continue、return，
+//     局部赋值、调用语句、if/else、while / do-while / 三段式 for、无标签 break/continue、return，
 //     await 可在局部写入右侧、条件与 return 值中（按求值顺序提升为临时局部）；for-in、
 //     异常/defer、实例 / 接收者调用实参中的 await、对其它挂起函数的同步调用等全部
 //     诊断，而不是退化为同步求值；
@@ -173,7 +173,7 @@ object CoroutineLowering {
             if (member is JasFunction) {
                 lowerFunction(
                     source, ownerName, member, requireStatic, effects, overloads,
-                    usedTypeNames, frames, localFrames, errors, reportedAwaits
+                    usedTypeNames, frames, localFrames, errors, reportedAwaits, members
                 )
             } else {
                 member
@@ -198,7 +198,8 @@ object CoroutineLowering {
         frames: MutableList<GeneratedCoroutineFrame>,
         localFrames: MutableList<JasClass>,
         errors: MutableList<CompileError>,
-        reportedAwaits: IdentityHashMap<JasUnaryOp, Boolean>
+        reportedAwaits: IdentityHashMap<JasUnaryOp, Boolean>,
+        ownerMembers: List<JasDeclaration> = emptyList()
     ): JasFunction? {
         if (effects[function] != SuspensionEffect.SUSPENDING) return function
 
@@ -206,7 +207,7 @@ object CoroutineLowering {
         val reason = when {
             (overloads[key] ?: 0) > 1 -> "overloaded suspending functions are not supported"
             else -> LinearCoroutineEmitter.unsupportedReason(function, requireStatic)
-                ?: synchronousSuspendingCall(function, effects)
+                ?: synchronousSuspendingCall(function, effects, ownerMembers)
                 ?: ambiguousAwaitResult(function, usedTypeNames)
         }
         if (reason != null) {
@@ -227,7 +228,7 @@ object CoroutineLowering {
         }
 
         val generated = try {
-            LinearCoroutineEmitter.emit(function, className, requireStatic)
+            LinearCoroutineEmitter.emit(function, className, requireStatic, ownerName, ownerMembers)
         } catch (error: IllegalArgumentException) {
             reportFunctionError(
                 errors, source, ownerName, function,
@@ -273,20 +274,30 @@ object CoroutineLowering {
      *   本身是 SUSPENDING，返回拒绝原因。
      * 为什么必须拒绝：被发射的挂起函数原声明会被生成帧替代，同步调用既没有可链接目标，
      *   也会把挂起语义退化为同步求值；本片没有「调用挂起函数」的帧间协议，只能诊断。
+     * 为什么按名字找同类函数：未限定的同类调用没有 resolvedFunction（检查器按外部函数放行）。
      * 失败模式：纯检查；发射器不支持的表达式不在此深入，由发射器自身拒绝。
      */
-    private fun synchronousSuspendingCall(function: JasFunction, effects: SuspensionEffects): String? {
+    private fun synchronousSuspendingCall(
+        function: JasFunction,
+        effects: SuspensionEffects,
+        ownerMembers: List<JasDeclaration>
+    ): String? {
         /** 深度优先返回首个被调函数为 SUSPENDING 的调用；无则 null。 */
         fun find(expression: JasExpression?): JasCall? = when (expression) {
             is JasCall -> {
                 val callee = expression.resolvedFunction
-                if (callee != null && effects[callee] == SuspensionEffect.SUSPENDING) expression
+                val suspends = if (callee != null) effects[callee] == SuspensionEffect.SUSPENDING else {
+                    val name = (expression.target as? JasIdentifier)?.name
+                    ownerMembers.any { it is JasFunction && it.name == name && effects[it] == SuspensionEffect.SUSPENDING }
+                }
+                if (suspends) expression
                 else find(expression.target) ?: expression.args.firstNotNullOfOrNull(::find)
             }
             is JasBinaryOp -> find(expression.left) ?: find(expression.right)
             is JasUnaryOp -> find(expression.operand)
             is JasPropertyAccess -> find(expression.target)
             is JasCastExpr -> find(expression.expression)
+            is JasNullCoalescing -> find(expression.left) ?: find(expression.right)
             is JasNew -> expression.args.firstNotNullOfOrNull(::find)
             else -> null
         }
@@ -311,6 +322,7 @@ object CoroutineLowering {
             is JasForStatement -> statement.init?.let(::search)
                 ?: find(statement.condition)
                 ?: (statement.update as? JasAssignment)?.let { find(it.value) }
+                ?: find(statement.update)
                 ?: statement.body.statements.firstNotNullOfOrNull(::search)
             is JasBlock -> statement.statements.firstNotNullOfOrNull(::search)
             is JasLabeledStatement -> search(statement.statement)
@@ -321,7 +333,7 @@ object CoroutineLowering {
             else -> null
         }
         val call = function.body?.statements.orEmpty().firstNotNullOfOrNull(::search) ?: return null
-        val name = call.resolvedFunction?.name ?: "<unknown>"
+        val name = call.resolvedFunction?.name ?: (call.target as? JasIdentifier)?.name ?: "<unknown>"
         return "synchronous call to suspending function '$name' is not supported"
     }
 
