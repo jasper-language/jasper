@@ -208,6 +208,12 @@ class DeferCoroutinePipelineTest {
             }
         }
 
+        /** 有界等待工作线程执行到第 [expected] 次标记：固定 sleep 在高负载下会抢在帧之前断言次数。 */
+        fun awaitMarks(expected: Int) {
+            val deadline = System.nanoTime() + 30_000_000_000L
+            while (marks() < expected && System.nanoTime() < deadline) Thread.sleep(1)
+        }
+
         /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
         fun assertStillPending(target: Any, mode: String) {
             Thread.sleep(50)
@@ -253,6 +259,7 @@ class DeferCoroutinePipelineTest {
             rt.assertStillPending(result, "input await inside the loop body")
             assertEquals(0, rt.marks(), "defer ran while suspended")
             rt.complete(input, 4)
+            rt.awaitMarks(3)
             rt.assertStillPending(result, "gate await after the loop")
             assertEquals(3, rt.marks(), "loop-body defer must run once per row")
             rt.complete(gate, 5)
@@ -383,6 +390,7 @@ class DeferCoroutinePipelineTest {
             val outerOnly = rt.newFuture()
             marksBefore = rt.marks()
             rt.start(outerOnly, rt.newFuture().also { rt.complete(it, 1) }, gate, 1, -1)
+            rt.awaitMarks(marksBefore + 3)
             rt.assertStillPending(outerOnly, "suspended on gate")
             rt.future.getMethod("cancel").invoke(outerOnly)
             rt.awaitSettled(outerOnly)

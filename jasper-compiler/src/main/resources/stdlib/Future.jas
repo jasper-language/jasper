@@ -171,9 +171,17 @@ public class FutureFailureError extends Error {
  * 为什么独立类型：取消不是业务异常，也不应被 TaskGroup 当作 primary 业务失败聚合。
  */
 public class FutureCancelledError extends Error {
-    /** 做什么：构造取消错误。前置条件：message 非 null；失败模式：不会失败。 */
-    public constructor(message: string) {
+    private var reasonValue: CancellationReason;
+
+    /** 做什么：构造取消错误。前置条件：message 与 reason 非 null；失败模式：不会失败。 */
+    public constructor(message: string, reason: CancellationReason) {
         super(message);
+        this.reasonValue = reason;
+    }
+
+    /** 做什么：返回被等待 Future 的首个取消原因。前置条件：无；失败模式：不会失败。 */
+    public function reason(): CancellationReason {
+        return this.reasonValue;
     }
 }
 
@@ -266,6 +274,7 @@ public class Future<T> {
         var observedStatus: FutureStatus = this.statusValue;
         var observedValue: any = this.valueValue;
         var observedFailure: Failure? = this.failureValue;
+        var observedReason: CancellationReason? = this.reasonValue;
         this.mutex.release();
         if (observedStatus == FutureStatus.Completed) {
             return cast observedValue as T;
@@ -276,7 +285,7 @@ public class Future<T> {
             }
             throw new FutureFailureError(observedFailure.message());
         }
-        throw new FutureCancelledError("future was cancelled");
+        throw new FutureCancelledError("future was cancelled", cast observedReason as CancellationReason);
     }
 
     /**

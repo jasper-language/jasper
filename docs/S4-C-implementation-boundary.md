@@ -1043,9 +1043,8 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 - `ScopeExit`：已接入，见后文「作用域异常退出」。
 - `Deadline`：截止点与检查点已接入（见下节「Deadline 运行时子片」），生成帧分派入口与挂起点入口的截止检查
   见「生成帧截止检查点」；到期唤醒挂起中的帧（计时器）尚未实现。
-- 生成帧：结果被作用域取消时原因正确（由 TaskGroup 写入）；帧自身因被等待的 Future 取消而发布 Cancelled
-  时仍按 `cancel()` 记 Explicit；帧内（清理代码中）查询取消原因的语言形态尚未提供。
-  `FutureCancelledError` 不带原因。
+- 生成帧：结果被作用域取消时原因正确（由 TaskGroup 写入）；帧因被等待的 Future 取消时的原因与
+  `FutureCancelledError.reason()` 见后文 `LANG-S4-AWAIT-REASON-01`；帧内（清理代码中）查询取消原因的语言形态尚未提供。
 
 ### 验收结果
 
@@ -1229,7 +1228,7 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
 - 被压制的失败只有数量，没有内容（契约的 suppressed 明细要等诊断 / Trace）。
 - 非所有者调用不被拒绝：所有者检查同 `close`，未实现；在本作用域子任务内调用会等待自己。
 - 不可中断的外部阻塞可能让 `closeAbruptly` 一直阻塞，同 `close`。
-- 嵌套作用域 `Parent`、帧自身因等待的 Future 取消时的原因、帧内（源码层）查询原因的语言形态同前。
+- 嵌套作用域 `Parent`、帧内（源码层）查询原因的语言形态同前。
 
 ### 验收结果
 
@@ -1244,4 +1243,35 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
 - TLA+ `ScopeExitClose`（两子任务，普通组 1708 / 监督组 2032 个不同状态，含终止活性）通过；变异配置 `_selfthrow` 违反
   `AbruptSilencesClose`、`_nojoin` 违反 `AbruptReturnsAfterJoin`。
 - 运行时变异 8 组全部被抓；其中「冻结后仍置标志」首轮未被抓，已补断言。
+- JBMC：N/A（构建虚拟机未装），无替代形式验证。
+
+## 帧因被等待 Future 取消时的原因（LANG-S4-AWAIT-REASON-01）
+
+### 已支持
+
+- 生成帧恢复块消费到 Cancelled 快照时记下 `FutureOutcome.cancellationReason()`，展开清理后以 `cancelWith(该原因)` 发布，
+  不再固定 `Explicit`；没有 catch 区域、有 catch 但类型不匹配、处理块内再次等待三条路径一致。与「挂起点失败保留原
+  Failure」同理：超时取消穿过等待链后仍是 `Deadline`，`TaskGroup.close` 报告同一原因。
+- 首因稳定不变：作用域取消先于帧发布时结果已是根原因，帧的 `cancelWith` 是空操作。处理块接住取消后待发布原因被清除，
+  其后结果只取决于处理块之后发生的事。
+- `FutureCancelledError` 带 `reason()`：同步 `Future.get` 与帧内抛出路径都写入被等待 Future 的首个原因。构造器由
+  `(message)` 改为 `(message, reason)`，与 `CancellationException` 同形。
+
+### 仍不支持（后续切片）
+
+- 生成帧处理体不能使用捕获参数（第十八片的既有诊断），所以帧内 `catch (e: FutureCancelledError)` 还读不到 `e.reason()`；
+  同步代码可以。
+- `TaskRunner` 不特殊处理 `FutureCancelledError`：`spawn` 任务体里 `get()` 抛出且未捕获时发布 `Failed`（kind=error）并触发
+  普通组级联，而生成帧未捕获时发布 `Cancelled`。两条路径的这一差异是既有行为，本片未改。
+- 嵌套作用域 `Parent`、帧内（源码层）查询自身取消原因的语言形态同前。
+
+### 验收结果
+
+- `AwaitCancelReasonCoroutinePipelineTest`：端到端 6 项（三条发射路径 × 全部原因、已取消输入、处理块接住后由门决定结果、帧链与
+  `close`、作用域先取消、同步 `get`），种子 20261133 的 600 轮随机事件按精确 oracle 判定（各类覆盖下限 ≥ 20）。
+- `AwaitCancelReasonFuzzTest` 与属性测试共用 oracle：覆盖引导 61 秒 1479637 次无失败，15 条语料入库。
+- TLA+ `FrameAwaitCancelReason`（两帧成链 + 作用域并发取消）162 个不同状态，含回收活性；变异配置 `_fixedexplicit` 违反
+  `ReasonHasSource`。
+- 变异：发布固定 Explicit 5 项失败；`get` 固定 Explicit 1 项失败。发射器抛出错误所带的原因当前不可观察，处理块清除待发布原因
+  为等价变异，两者已登记为未区分。
 - JBMC：N/A（构建虚拟机未装），无替代形式验证。

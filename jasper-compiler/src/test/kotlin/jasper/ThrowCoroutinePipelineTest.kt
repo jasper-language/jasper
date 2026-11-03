@@ -319,6 +319,12 @@ class ThrowCoroutinePipelineTest {
             }
         }
 
+        /** 有界等待工作线程执行到第 [expected] 次标记：固定 sleep 在高负载下会抢在帧之前断言次数。 */
+        fun awaitMarks(expected: Int) {
+            val deadline = System.nanoTime() + 30_000_000_000L
+            while (marks() < expected && System.nanoTime() < deadline) Thread.sleep(1)
+        }
+
         /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
         fun assertStillPending(target: Any, mode: String) {
             Thread.sleep(50)
@@ -394,6 +400,7 @@ class ThrowCoroutinePipelineTest {
             rt.startRun(result, input, gate, 2, 0)
             rt.assertStillPending(result, "input await inside the inner try")
             rt.complete(input, -1)
+            rt.awaitMarks(marksBefore + 4)
             rt.assertStillPending(result, "gate await after both rows recovered")
             assertEquals(4, rt.marks() - marksBefore, "each row runs the handler and the inner cleanup once")
             assertEquals(232, rt.last())

@@ -232,7 +232,8 @@ object LinearCoroutineEmitter {
 
         /**
          * 恢复块入口：消费终态快照。成功取 int32 结果写入绑定；失败记为待发布的原 Failure；
-         * 取消记为待发布的 Cancelled，而不是伪装成业务失败。没有 catch 区域时两者都跳出分派
+         * 取消记为待发布的 Cancelled 并记下被等待 Future 的首个原因（与保留原 Failure 同理，
+         * 超时不会在帧边界变成 Explicit），而不是伪装成业务失败。没有 catch 区域时两者都跳出分派
          * 循环，先展开清理再发布；有 catch 区域时先记下同样的待发布终态，再抛出
          * FutureFailureError（消息取自原 Failure，与 get() 一致）/ FutureCancelledError：被 catch
          * 匹配时待发布终态被清除，未被匹配时发布的仍是原 Failure / Cancelled，与没有 catch 时相同。
@@ -246,8 +247,13 @@ object LinearCoroutineEmitter {
             /** 抛出 std 错误；生成帧可位于任意用户包，类型名必须限定。 */
             fun raise(type: String, message: JasExpression) =
                 JasThrow(JasNew(JasNamedType(type), listOf(message)))
-            val onCancelled = if (!hasCatch) JasBreakStatement(null)
-                else raise(FUTURE_CANCELLED_ERROR, JasStringLiteral("future was cancelled"))
+            val onCancelled = if (!hasCatch) JasBreakStatement(null) else JasThrow(JasNew(
+                JasNamedType(FUTURE_CANCELLED_ERROR),
+                listOf(
+                    JasStringLiteral("future was cancelled"),
+                    JasCastExpr(field("__cancelReason"), JasNamedType(CANCELLATION_REASON))
+                )
+            ))
             val onFailed = if (!hasCatch) listOf(JasBreakStatement(null)) else listOf(
                 JasIf(JasBinaryOp(failure, "==", JasNullLiteral), JasBlock(listOf(
                     raise(FUTURE_FAILURE_ERROR, JasStringLiteral("future failed without a failure snapshot"))
@@ -258,6 +264,7 @@ object LinearCoroutineEmitter {
                 JasVariableStatement(readyName, JasNamedType(FUTURE_OUTCOME),
                     JasCastExpr(field("__outcome"), JasNamedType(FUTURE_OUTCOME)), false),
                 JasIf(invoke(ready, "isCancelled"), JasBlock(listOf(
+                    assign("__cancelReason", invoke(ready, "cancellationReason")),
                     assign("__abort", JasIntLiteral(2, "2")),
                     onCancelled
                 )), null),
@@ -344,6 +351,7 @@ object LinearCoroutineEmitter {
             JasProperty("__outcome", JasNullableType(JasNamedType(FUTURE_OUTCOME)), listOf("private"), null, null),
             JasProperty("__abort", INT, listOf("private"), null, null),
             JasProperty("__pending", JasNullableType(JasNamedType(FAILURE)), listOf("private"), null, null),
+            JasProperty("__cancelReason", JasNullableType(JasNamedType(CANCELLATION_REASON)), listOf("private"), null, null),
             JasProperty("__result", resultFuture, listOf("private"), null, null),
             JasProperty("__dispatch", JasNamedType(DISPATCH), listOf("private"), null, null),
             JasProperty("__token", JasNamedType(CANCELLATION_TOKEN), listOf("private"), null, null)
@@ -357,6 +365,7 @@ object LinearCoroutineEmitter {
             assign("__outcome", JasNullLiteral),
             assign("__abort", JasIntLiteral(0, "0")),
             assign("__pending", JasNullLiteral),
+            assign("__cancelReason", JasNullLiteral),
             assign("__result", JasIdentifier("output")),
             assign("__token", JasNew(JasNamedType(CANCELLATION_TOKEN), emptyList()))
         )
@@ -464,7 +473,8 @@ object LinearCoroutineEmitter {
             }
             route += JasIf(caught, JasBlock(listOf(
                 assign("__abort", JasIntLiteral(0, "0")),
-                assign("__pending", JasNullLiteral)
+                assign("__pending", JasNullLiteral),
+                assign("__cancelReason", JasNullLiteral)
             )), null)
             return JasWhile(JasBoolLiteral(true), JasBlock(listOf(
                 JasVariableStatement("__caught", BOOL, JasBoolLiteral(false), false),
@@ -508,7 +518,8 @@ object LinearCoroutineEmitter {
                 statement(invoke(field("__result"), "fail", JasCastExpr(field("__pending"), JasNamedType(FAILURE))))
             )), null),
             JasIf(JasBinaryOp(field("__abort"), "==", JasIntLiteral(2, "2")), JasBlock(listOf(
-                statement(invoke(field("__result"), "cancel"))
+                statement(invoke(field("__result"), "cancelWith",
+                    JasCastExpr(field("__cancelReason"), JasNamedType(CANCELLATION_REASON))))
             )), null)
         )
         // 只有结果已终结且不在任何清理区域内时才关闭调度门、标记 settled。为什么要看区域：挂起点

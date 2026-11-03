@@ -240,6 +240,12 @@ class TryCatchCoroutinePipelineTest {
             }
         }
 
+        /** 有界等待工作线程执行到第 [expected] 次标记：固定 sleep 在高负载下会抢在帧之前断言次数。 */
+        fun awaitMarks(expected: Int) {
+            val deadline = System.nanoTime() + 30_000_000_000L
+            while (marks() < expected && System.nanoTime() < deadline) Thread.sleep(1)
+        }
+
         /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
         fun assertStillPending(target: Any, mode: String) {
             Thread.sleep(50)
@@ -303,6 +309,7 @@ class TryCatchCoroutinePipelineTest {
             rt.start(result, input, gate, 2, 0)
             rt.assertStillPending(result, "input await inside the inner try")
             rt.fail(input, rt.failure("input failed"))
+            rt.awaitMarks(marksBefore + 4)
             rt.assertStillPending(result, "gate await after both rows recovered")
             assertEquals(4, rt.marks() - marksBefore, "each row must run the failure handler and the inner cleanup once")
             assertEquals(232, rt.last())
@@ -331,6 +338,7 @@ class TryCatchCoroutinePipelineTest {
             val result = rt.newFuture()
             val marksBefore = rt.marks()
             rt.start(result, rt.newFuture().also { rt.cancel(it) }, gate, 1, 0)
+            rt.awaitMarks(marksBefore + 1)
             rt.assertStillPending(result, "gate await inside the cancellation handler")
             assertEquals(1, rt.marks() - marksBefore)
             assertEquals(4, rt.last() % 10)
@@ -406,6 +414,7 @@ class TryCatchCoroutinePipelineTest {
             val inHandler = rt.newFuture()
             marksBefore = rt.marks()
             rt.start(inHandler, rt.newFuture().also { rt.cancel(it) }, gate, 1, 0)
+            rt.awaitMarks(marksBefore + 1)
             rt.assertStillPending(inHandler, "suspended in the cancellation handler")
             assertEquals(1, rt.marks() - marksBefore)
             rt.cancel(inHandler)
