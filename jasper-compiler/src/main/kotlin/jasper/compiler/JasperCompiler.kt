@@ -144,7 +144,9 @@ class JasperCompiler {
         val ir: jasper.translator.TranslationResult,
         val annotationIndex: AnnotationIndex = AnnotationIndex.EMPTY,
         val suspensionEffects: jasper.checker.SuspensionEffects =
-            jasper.checker.SuspensionEffectAnalysis.analyzeSources(listOf(ast))
+            jasper.checker.SuspensionEffectAnalysis.analyzeSources(listOf(ast)),
+        // 协程降级之前的 AST：模块接口按它固化，生成帧不属于接口。
+        val declaredAst: jasper.ast.JasSourceFile = ast
     )
 
     /**
@@ -278,65 +280,7 @@ class JasperCompiler {
     fun compileAllToDir(sources: Map<String, String>, outputDir: Path): CompileResult {
         return try {
             val results = compileAll(sources)
-            val allIrFiles = mutableListOf<IrFile>()
-            val mergedCallNames = mutableMapOf<IrSimpleFunctionSymbol, String>()
-            val mergedCtorTypes = mutableMapOf<IrConstructorSymbol, String>()
-            val mergedSuperClasses = mutableMapOf<String, String>()
-            val mergedInterfaces = mutableMapOf<String, List<String>>()
-            val mergedIfaceDeclNames = mutableSetOf<String>()
-            val mergedStaticFields = mutableSetOf<IrFieldSymbol>()
-            val mergedStaticFunctions = mutableSetOf<IrSimpleFunctionSymbol>()
-            val mergedSyntheticStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
-            // 函数/形参描述符与静态函数符号必须一起合并：translateAll 产出的符号身份
-            // 跨文件共享，任一集合漏并都会让后端把 `A.f()` 的声明或调用降级成实例形态。
-            val mergedFunctionDescriptors = mutableMapOf<IrSimpleFunctionSymbol, String>()
-            val mergedParameterDescriptors = mutableMapOf<IrValueSymbol, String>()
-            val mergedMemberSignatures = mutableMapOf<String, Map<String, MemberMethodSignature>>()
-            val mergedMemberCallKeys = mutableMapOf<IrSimpleFunctionSymbol, String>()
-            val mergedPlatformStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
-
-            // 逐个文件把 IR 与各类索引汇入「合并容器」。
-            for ((_, pipeline) in results) {
-                val tr = pipeline.ir
-                allIrFiles.addAll(tr.irFiles)
-                // Map 类索引用 putAll（后写覆盖先写，即 last-writer-wins）。
-                mergedCallNames.putAll(tr.callNames)
-                mergedCtorTypes.putAll(tr.constructorTypes)
-                mergedSuperClasses.putAll(tr.classSuperclassNames)
-                mergedInterfaces.putAll(tr.classInterfaceNames)
-                // 集合类索引用 addAll（去重并集，不涉及覆盖语义）。
-                mergedIfaceDeclNames.addAll(tr.interfaceDeclNames)
-                mergedStaticFields.addAll(tr.staticFieldSymbols)
-                mergedStaticFunctions.addAll(tr.staticFunctionSymbols)
-                mergedFunctionDescriptors.putAll(tr.functionDescriptors)
-                mergedParameterDescriptors.putAll(tr.parameterDescriptors)
-                mergedSyntheticStaticCallOwners.putAll(tr.syntheticStaticCallOwners)
-                mergedMemberSignatures.putAll(tr.memberSignaturesByType)
-                mergedMemberCallKeys.putAll(tr.memberCallKeys)
-                mergedPlatformStaticCallOwners.putAll(tr.platformStaticCallOwners)
-            }
-
-            // 后端只需要一个 TypeMapper；取第一个成功 pipeline 的，缺失则新建空实例。
-            val typeMapper = results.values.firstOrNull()?.ir?.typeMapper ?: TypeMapper()
-            val mergedResult = TranslationResult(
-                irFiles = allIrFiles,
-                callNames = mergedCallNames,
-                constructorTypes = mergedCtorTypes,
-                classSuperclassNames = mergedSuperClasses,
-                classInterfaceNames = mergedInterfaces,
-                interfaceDeclNames = mergedIfaceDeclNames,
-                staticFieldSymbols = mergedStaticFields,
-                staticFunctionSymbols = mergedStaticFunctions,
-                syntheticStaticCallOwners = mergedSyntheticStaticCallOwners,
-                functionDescriptors = mergedFunctionDescriptors,
-                parameterDescriptors = mergedParameterDescriptors,
-                memberSignaturesByType = mergedMemberSignatures,
-                memberCallKeys = mergedMemberCallKeys,
-                platformStaticCallOwners = mergedPlatformStaticCallOwners
-            )
-
-            val backend = JvmIrBackend(typeMapper)
-            backend.generate(mergedResult, outputDir)
+            generateAll(results, outputDir)
 
             // 多文件：按输入顺序归并各文件 AST 的 throws 元信息写入同一 manifest。
             // 失败由本方法的 catch(Exception) 兜底为 CompileError.Internal，不静默。
@@ -348,6 +292,73 @@ class JasperCompiler {
         } catch (e: Exception) {
             CompileResult.Error(listOf(CompileError.Internal(e.message ?: "Unknown error", e)))
         }
+    }
+
+    /**
+     * 把多文件 pipeline 合并后交给后端写 class；合并策略见 [compileAllToDir]。
+     * 什么时候用：[compileAllToDir] 与 [compileToJaso]。
+     * 失败模式：后端异常原样抛出，由调用方兜底。
+     */
+    private fun generateAll(results: Map<String, CompilePipeline>, outputDir: Path) {
+        val allIrFiles = mutableListOf<IrFile>()
+        val mergedCallNames = mutableMapOf<IrSimpleFunctionSymbol, String>()
+        val mergedCtorTypes = mutableMapOf<IrConstructorSymbol, String>()
+        val mergedSuperClasses = mutableMapOf<String, String>()
+        val mergedInterfaces = mutableMapOf<String, List<String>>()
+        val mergedIfaceDeclNames = mutableSetOf<String>()
+        val mergedStaticFields = mutableSetOf<IrFieldSymbol>()
+        val mergedStaticFunctions = mutableSetOf<IrSimpleFunctionSymbol>()
+        val mergedSyntheticStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
+        // 函数/形参描述符与静态函数符号必须一起合并：translateAll 产出的符号身份
+        // 跨文件共享，任一集合漏并都会让后端把 `A.f()` 的声明或调用降级成实例形态。
+        val mergedFunctionDescriptors = mutableMapOf<IrSimpleFunctionSymbol, String>()
+        val mergedParameterDescriptors = mutableMapOf<IrValueSymbol, String>()
+        val mergedMemberSignatures = mutableMapOf<String, Map<String, MemberMethodSignature>>()
+        val mergedMemberCallKeys = mutableMapOf<IrSimpleFunctionSymbol, String>()
+        val mergedPlatformStaticCallOwners = mutableMapOf<IrSimpleFunctionSymbol, String>()
+
+        // 逐个文件把 IR 与各类索引汇入「合并容器」。
+        for ((_, pipeline) in results) {
+            val tr = pipeline.ir
+            allIrFiles.addAll(tr.irFiles)
+            // Map 类索引用 putAll（后写覆盖先写，即 last-writer-wins）。
+            mergedCallNames.putAll(tr.callNames)
+            mergedCtorTypes.putAll(tr.constructorTypes)
+            mergedSuperClasses.putAll(tr.classSuperclassNames)
+            mergedInterfaces.putAll(tr.classInterfaceNames)
+            // 集合类索引用 addAll（去重并集，不涉及覆盖语义）。
+            mergedIfaceDeclNames.addAll(tr.interfaceDeclNames)
+            mergedStaticFields.addAll(tr.staticFieldSymbols)
+            mergedStaticFunctions.addAll(tr.staticFunctionSymbols)
+            mergedFunctionDescriptors.putAll(tr.functionDescriptors)
+            mergedParameterDescriptors.putAll(tr.parameterDescriptors)
+            mergedSyntheticStaticCallOwners.putAll(tr.syntheticStaticCallOwners)
+            mergedMemberSignatures.putAll(tr.memberSignaturesByType)
+            mergedMemberCallKeys.putAll(tr.memberCallKeys)
+            mergedPlatformStaticCallOwners.putAll(tr.platformStaticCallOwners)
+        }
+
+        // 后端只需要一个 TypeMapper；取第一个成功 pipeline 的，缺失则新建空实例。
+        val typeMapper = results.values.firstOrNull()?.ir?.typeMapper ?: TypeMapper()
+        val mergedResult = TranslationResult(
+            irFiles = allIrFiles,
+            callNames = mergedCallNames,
+            constructorTypes = mergedCtorTypes,
+            classSuperclassNames = mergedSuperClasses,
+            classInterfaceNames = mergedInterfaces,
+            interfaceDeclNames = mergedIfaceDeclNames,
+            staticFieldSymbols = mergedStaticFields,
+            staticFunctionSymbols = mergedStaticFunctions,
+            syntheticStaticCallOwners = mergedSyntheticStaticCallOwners,
+            functionDescriptors = mergedFunctionDescriptors,
+            parameterDescriptors = mergedParameterDescriptors,
+            memberSignaturesByType = mergedMemberSignatures,
+            memberCallKeys = mergedMemberCallKeys,
+            platformStaticCallOwners = mergedPlatformStaticCallOwners
+        )
+
+        val backend = JvmIrBackend(typeMapper)
+        backend.generate(mergedResult, outputDir)
     }
 
     /**
@@ -367,6 +378,54 @@ class JasperCompiler {
         merged.putAll(StdLib.sources())
         merged.putAll(sources)
         return compileAllToDir(merged, outputDir)
+    }
+
+    /**
+     * 把 [sources] 编译成一个未签名的 Managed `.jaso`，写到 [outputFile]。
+     *
+     * 做什么：校验元数据 → 带标准库编译 → 从源码固化接口 → 生成 class → 只把模块自己的
+     *   class 打进镜像（std 属于运行时，不随模块分发，版本由 core.runtime 约束）。
+     * 什么时候用：命令行 `--emit jaso`。
+     * 前置条件：sources 是一个模块的全部严格模式源文件，且只有一个包。
+     * 失败模式：不抛异常，统一返回 CompileResult；失败时不写输出文件。
+     */
+    fun compileToJaso(sources: Map<String, String>, options: JasoModuleOptions, outputFile: Path): CompileResult {
+        var temp: Path? = null
+        return try {
+            val stdlib = StdLib.sources()
+            val problems = JasoManifestText.validate(options).toMutableList()
+            if (sources.isEmpty()) problems += CompileError.Symbol("A .jaso module needs at least one source file", "sources")
+            for (file in sources.keys) {
+                if (modeForFilename(file) != SourceMode.Strict) problems += CompileError.Symbol("Script unit '$file' cannot be part of a module", file)
+                if (file in stdlib) problems += CompileError.Symbol("Source file name '$file' is taken by the standard library", file)
+            }
+            if (problems.isNotEmpty()) throw CompileException(problems)
+
+            val results = compileAll(stdlib + sources)
+            val plan = JasoExports.plan(sources.keys.map { results.getValue(it).declaredAst }, options.requires)
+            val module = plan.module ?: throw CompileException(plan.errors)
+            val tempDir = Files.createTempDirectory("jasper-jaso").also { temp = it }
+            generateAll(results, tempDir)
+
+            val tempFile = tempDir.toFile()
+            val classes = tempFile.walkTopDown().filter { it.isFile && it.name.endsWith(".class") }
+                .associate { it.relativeTo(tempFile).invariantSeparatorsPath to it.readBytes() }
+                .filterKeys { !it.startsWith("std/") }
+            for (symbol in module.exports) {
+                val owner = symbol.substringBeforeLast('.').replace('.', '/') + ".class"
+                check(owner in classes) { "exported '$symbol' has no class '$owner' in the module image" }
+            }
+            val bytes = JasoWriter.assemble(JasoManifestText.render(options, module.exports), classes, module.exports, module.importText)
+            outputFile.toAbsolutePath().parent?.let { Files.createDirectories(it) }
+            Files.write(outputFile, bytes)
+            CompileResult.Success("Module ${options.name} ${options.version}: ${classes.size} classes, ${module.exports.size} exports, ${bytes.size} bytes written to $outputFile")
+        } catch (e: CompileException) {
+            CompileResult.Error(e.errors)
+        } catch (e: Exception) {
+            CompileResult.Error(listOf(CompileError.Internal(e.message ?: "Unknown error", e)))
+        } finally {
+            temp?.toFile()?.deleteRecursively()
+        }
     }
 
     /**
@@ -534,6 +593,7 @@ class JasperCompiler {
         }
 
         // 生成类先注册再二次类型检查，最后把新源文件按原文件名对回 parsed。
+        val declared = parsed.toMap()
         val loweredSources = finalizeCoroutineLowering(lowering, symbolTable)
         parsed.keys.forEachIndexed { index, filename ->
             parsed[filename] = loweredSources[index]
@@ -566,7 +626,7 @@ class JasperCompiler {
                 platformStaticCallOwners = translated.platformStaticCallOwners
             )
             pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir,
-                annotationIndexes[filename] ?: AnnotationIndex.EMPTY, suspensionEffects)
+                annotationIndexes[filename] ?: AnnotationIndex.EMPTY, suspensionEffects, declared.getValue(filename))
         }
         return pipelines
     }
@@ -886,8 +946,13 @@ class JasperCompiler {
  * 失败模式：无参数、源文件不存在或编译失败，均打印到 stderr 并以退出码 1 结束；
  * 成功打印摘要并以默认退出码 0 结束。
  * 为什么直接 System.exit：作为命令行进程顶层入口，需要把成败反映到退出码。
+ *
+ * 另有模块模式：`jasperc --emit jaso -o <文件> --name <名> --version <x.y.z> [选项] <源文件>...`，见 [emitJasoMain]。
  */
 fun main(args: Array<String>) {
+    if (args.firstOrNull() == "--emit") {
+        System.exit(emitJasoMain(args.toList()))
+    }
     // 参数校验：至少一个源文件路径。
     if (args.isEmpty()) {
         System.err.println("Usage: jasperc <source-file> [-d <output-dir>]")
@@ -920,6 +985,80 @@ fun main(args: Array<String>) {
         is JasperCompiler.CompileResult.Error -> {
             System.err.println("Compilation failed: ${result.message}")
             System.exit(1)
+        }
+    }
+}
+
+private const val EMIT_USAGE = "Usage: jasperc --emit jaso -o <file> --name <name> --version <x.y.z> " +
+    "[--description <text>] [--publisher <name>] [--runtime <range>] [--depends <dep>]... " +
+    "[--requires <capability>]... [--lifecycle plugin|system] <source-file>..."
+
+/**
+ * `--emit jaso` 的命令行：解析参数，编译一个模块，返回退出码。
+ *
+ * 做什么：`--depends` 与 `--requires` 可重复；其余选项至多一次；不以 `--` 开头的参数是源文件。
+ * 什么时候用：[main] 见到第一个参数是 `--emit` 时。
+ * 前置条件：无。
+ * 失败模式：用法错误与读文件失败返回 2；编译失败返回 1；打印到 stderr。
+ */
+internal fun emitJasoMain(args: List<String>): Int {
+    val single = mutableMapOf<String, String>()
+    val depends = mutableListOf<String>()
+    val requires = mutableListOf<String>()
+    val files = mutableListOf<String>()
+    val singleOptions = setOf("--emit", "-o", "--name", "--version", "--description", "--publisher", "--runtime", "--lifecycle")
+    var i = 0
+    while (i < args.size) {
+        val a = args[i]
+        when {
+            a in singleOptions || a == "--depends" || a == "--requires" -> {
+                val value = args.getOrNull(i + 1)
+                if (value == null || (a in singleOptions && single.put(a, value) != null)) {
+                    System.err.println(EMIT_USAGE)
+                    return 2
+                }
+                if (a == "--depends") depends += value
+                if (a == "--requires") requires += value
+                i += 2
+            }
+            a.startsWith("-") -> {
+                System.err.println(EMIT_USAGE)
+                return 2
+            }
+            else -> {
+                files += a
+                i++
+            }
+        }
+    }
+    val output = single["-o"]
+    val name = single["--name"]
+    val version = single["--version"]
+    if (single["--emit"] != "jaso" || output == null || name == null || version == null || files.isEmpty()) {
+        System.err.println(EMIT_USAGE)
+        return 2
+    }
+    val sources = LinkedHashMap<String, String>()
+    for (f in files) {
+        val path = Paths.get(f)
+        if (!path.toFile().isFile) {
+            System.err.println("Error: source file not found: $f")
+            return 2
+        }
+        sources[f] = String(Files.readAllBytes(path), Charsets.UTF_8)
+    }
+    val options = JasoModuleOptions(
+        name, version, single["--description"], single["--publisher"],
+        single["--runtime"] ?: JasoManifestText.DEFAULT_RUNTIME, depends, requires, single["--lifecycle"]
+    )
+    return when (val result = JasperCompiler().compileToJaso(sources, options, Paths.get(output))) {
+        is JasperCompiler.CompileResult.Success -> {
+            println(result.message)
+            0
+        }
+        is JasperCompiler.CompileResult.Error -> {
+            System.err.println(result.message)
+            1
         }
     }
 }

@@ -1,5 +1,6 @@
 //! 差分表生成器：种子固定，输出逐字节可复现。
-//! 用法：`jaso-diff <向量目录> <输出目录>`，产出六张 TSV：
+//! 用法：`jaso-diff check-emit <目录>` 核对 Jasper 编译器写出的文件，见 `check_emit`；
+//! `jaso-diff <向量目录> <输出目录>` 产出六张 TSV：
 //! * `diff-files.tsv`：向量 + 字节变异（重算摘要，可重签）→ 一致性判定结果
 //! * `diff-load.tsv`：完整文件（十六进制，清单随机）→ 一致性判定结果，专门走到信任之后的装载步骤
 //! * `diff-targeted.tsv`：完整文件（十六进制），各规则边界两侧的定向用例 → 一致性判定结果
@@ -17,6 +18,7 @@ use jaso::{PlatformField, Target, digest_of, signed_digest_of, signed_message, A
 use sha2::{Digest, Sha512};
 use std::fmt::Write as _;
 use std::path::Path;
+use std::process::ExitCode;
 
 /// SplitMix64：标准、短、跨平台确定。
 struct Rng(u64);
@@ -607,8 +609,11 @@ fn targeted(dir: &Path, key: [u8; 32]) -> String {
     out
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    if args[1] == "check-emit" {
+        return check_emit(Path::new(&args[2]), development_signer().public_key());
+    }
     let dir = Path::new(&args[1]);
     let out = Path::new(&args[2]);
     let key = development_signer().public_key();
@@ -620,4 +625,44 @@ fn main() {
     std::fs::write(out.join("diff-targeted.tsv"), targeted(dir, key)).unwrap();
     std::fs::write(out.join("diff-platforms.tsv"), platforms(key)).unwrap();
     std::fs::write(out.join("diff-signatures.tsv"), signatures(key, &mut rng)).unwrap();
+    ExitCode::SUCCESS
+}
+
+/// `check-emit <目录>`：核对 Jasper 编译器写出的文件（JB-L2）。
+/// 每个 `<名>.jaso` 须通过结构读取；用参考构建器按解析结果重建须逐字节相同；
+/// 用开发密钥签名后按一致性上下文判定，结果须等于 `<名>.expect`。
+fn check_emit(dir: &Path, key: [u8; 32]) -> ExitCode {
+    let signer = development_signer();
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jaso"))
+        .collect();
+    names.sort();
+    let mut failed = 0;
+    for path in &names {
+        let bytes = std::fs::read(path).unwrap();
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let f = match Jaso::parse(&bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("{stem}\trejected\t{}", e.code().name());
+                failed += 1;
+                continue;
+            }
+        };
+        let builder = Builder::from_file(&f, 0).expect("文件能重建");
+        let same = builder.finish().unwrap() == bytes;
+        let signed = builder.finish_signed(&signer).unwrap();
+        let got = expect_line(check(&signed, key));
+        let want = std::fs::read_to_string(path.with_extension("expect")).unwrap();
+        let ok = same && got == want.trim();
+        println!("{stem}\tbytes_equal={same}\tsigned={got}\texpected={}", want.trim());
+        if !ok {
+            failed += 1;
+        }
+    }
+    println!("check-emit: {} files, {failed} failed", names.len());
+    if failed == 0 && !names.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }
