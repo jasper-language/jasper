@@ -1361,5 +1361,5 @@ int32 / int64 / float64 / bool / string。帧协议（分派循环、恢复门�
 - 变异 12 组：10 组被抓（不宽化、恢复块固定 int32、提升临时局部固定 int32、return 临时局部固定 int32、声明 / 赋值绑定类型不校验、float64 可自增、
   自增只认 int32、字符串字面量不算静默、清理内语句自增被拒）；结果 Future 与被等待 Future 的泛型实参固定为 int32 这 2 组存活，
   是等价变异——泛型擦除后字节码相同，二次类型检查也不比对泛型实参。
-- 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物；既有模型、Lincheck 与全部协程测试随全量复跑。
+- 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，也未复跑 TLA+ 模型（模型不含值类型）；Lincheck、Jazzer 语料回放与全部协程测试随全量 gradle test 复跑。
 - `AwaitFrontendTest`、`LinearCoroutinePipelineTest` 里以 int64 作「未支持」载体的用例改为要求其能降级，未支持载体换成引用类型。
