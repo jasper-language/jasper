@@ -28,7 +28,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /** 一次编译、全类复用的运行时；清理与处理块计数在每轮开始前清零。 */
-private object AwaitReasonRuntime {
+internal object AwaitReasonRuntime {
     private val source = """
         package demo;
         import std.CancellationReason;
@@ -120,7 +120,7 @@ private object AwaitReasonRuntime {
     }
     private fun type(name: String): Class<*> = loader.loadClass(name)
     val future by lazy { type("std.Future") }
-    private val group by lazy { type("std.TaskGroup") }
+    val group by lazy { type("std.TaskGroup") }
     private val executorType by lazy { type("std.Executor") }
     private val runnable by lazy { type("std.Runnable") }
     private val task by lazy { type("std.CoroutineTask") }

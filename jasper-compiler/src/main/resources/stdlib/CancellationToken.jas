@@ -12,6 +12,9 @@ package std;
 //   createChild() 建立根令牌到子令牌的单向链接：父取消传播到子，子取消不反传。
 //   子令牌自己仍可独立取消；父令牌不知道子的存在。父取消传播时子令牌沿用父的原因
 //   （同一作用域内的取消源是同一个），子令牌若已先因别的原因取消则保留自己的原因。
+//   createScopeChild() 建立跨作用域链接（任务令牌到嵌套作用域根令牌）：传播规则相同，只是原因
+//   按取消源表换算——父的 Deadline 仍是 Deadline（到期的作用范围含后代，清理代码要能区分超时），
+//   其余一律是 Parent（取消的来源在作用域之外）。换算只在 inheritedReason 一处。
 //
 // 截止点（S4 契约 §2 / §4）：
 //   每个令牌可带自己的截止点（ownDeadline），有效截止点 = min(自身, 父的有效截止点)，
@@ -38,7 +41,7 @@ package std;
  * 失败模式：纯枚举，无失败路径。
  * 各值含义：
  *   - Explicit：调用方直接取消（Future.cancel / TaskGroup.cancel / CancellationToken.cancel）；
- *   - Parent：父任务取消跨任务传播到子任务（嵌套作用域链接由后续切片使用）；
+ *   - Parent：外层任务的取消经 createScopeChild 传入嵌套作用域；
  *   - Deadline：截止时间到期，由检查点 pollDeadline 发现（契约 §4 称 DeadlineExceeded；
  *     到期唤醒挂起任务的计时由后续切片接入）；
  *   - ScopeExit：作用域异常退出时取消未完成子任务（由后续切片使用）；
@@ -98,6 +101,8 @@ public class CancellationToken {
     // 截止点相关：父引用由 createChild 绑定一次；ownDeadline 只会被 restrictDeadline 收紧。
     private var parentToken: CancellationToken?;
     private var ownDeadline: Deadline?;
+    // 仅 createScopeChild 在令牌发布前写一次；非 null 表示本令牌是嵌套作用域的根，值是父上的传播回调。
+    private var scopeLink: ChildCancellation?;
 
     /**
      * 做什么：创建一个未取消的根令牌。
@@ -113,6 +118,7 @@ public class CancellationToken {
         this.handlers = new MutableList<Action<CancellationToken>>();
         this.parentToken = null;
         this.ownDeadline = null;
+        this.scopeLink = null;
     }
 
     /**
@@ -245,6 +251,63 @@ public class CancellationToken {
         // 竞争窗口由 onCancel 的同一把锁消除。
         this.onCancel(new ChildCancellation(child));
         return child;
+    }
+
+    /**
+     * 做什么：派生嵌套作用域的根令牌：父取消按 inheritedReason 换算原因后传给它，截止点沿父链收紧。
+     * 什么时候用：TaskGroup.within 把作用域挂到外层任务令牌下时。
+     * 前置条件：无。
+     * 失败模式：同 createChild；父已取消时返回的令牌已取消。
+     * 为什么另有入口而不是 createChild 加参数：同一作用域内的子令牌沿用根的原因是常用路径，
+     *   跨作用域才换算，两个入口让调用点直接说明它属于哪种。
+     * 为什么先写 scopeLink 再绑定父：bindParent 的解锁与 onCancel 的加锁把这次写入发布给之后
+     *   任何持锁读取本令牌或触发父回调的线程。
+     */
+    public function createScopeChild(): CancellationToken {
+        var child: CancellationToken = new CancellationToken();
+        var link: ChildCancellation = new ChildCancellation(child);
+        child.scopeLink = link;
+        child.bindParent(this);
+        this.onCancel(link);
+        return child;
+    }
+
+    /**
+     * 做什么：把父的首个原因换算为本令牌应记录的原因：同一作用域内不变；跨作用域时 Deadline 不变，其余为 Parent。
+     * 什么时候用：ChildCancellation 的回调传播与 pollReasonAt 的帮助传播——两条路径写同一个值，
+     *   本令牌的首因才不依赖谁先到。
+     * 前置条件：parentReason 非 null。
+     * 失败模式：不会失败。
+     * 为什么公开：Jasper 当前没有包内可见性；调用方不应直接使用。
+     */
+    public function inheritedReason(parentReason: CancellationReason): CancellationReason {
+        if (this.scopeLink == null || parentReason == CancellationReason.Deadline) {
+            return parentReason;
+        }
+        return CancellationReason.Parent;
+    }
+
+    /**
+     * 做什么：解除 createScopeChild 建立的传播回调；其他令牌上是空操作，重复调用幂等。
+     * 什么时候用：嵌套作用域回收完全部子任务之后（TaskGroup 的聚合路径）。
+     * 前置条件：本令牌下已没有需要取消的任务。
+     * 失败模式：不会失败；与父取消竞争时回调可能已在运行，结果只是把已回收的作用域标为取消。
+     * 为什么需要：外层任务可以长期运行、反复开嵌套作用域；回调留在父上会让它一直持有已结束的作用域。
+     */
+    public function detachFromParent(): void {
+        var link: ChildCancellation? = this.scopeLink;
+        var parent: CancellationToken? = this.parentToken;
+        if (link != null && parent != null) {
+            var owner: CancellationToken = cast parent as CancellationToken;
+            owner.removeHandler(cast link as ChildCancellation);
+        }
+    }
+
+    /** 做什么：移除一个尚未触发的回调。前置条件：无；失败模式：已触发或未注册时为空操作。 */
+    private function removeHandler(handler: Action<CancellationToken>): void {
+        this.mutex.acquireUninterruptibly();
+        this.handlers.remove(handler);
+        this.mutex.release();
     }
 
     /**
@@ -396,9 +459,9 @@ public class CancellationToken {
             }
             if (parentReason != null) {
                 // 帮助传播：父已取消但其回调可能仍在别的线程里逐个传给子令牌。这里直接以父的
-                // 首个原因取消自己（与 ChildCancellation 写的是同一个值，重复调用幂等），保证
+                // 首个原因换算后取消自己（与 ChildCancellation 写的是同一个值，重复调用幂等），保证
                 // 检查点返回时「祖先已取消 ⇒ 本令牌已取消」，不依赖另一线程的回调进度。
-                return this.settleWith(cast parentReason as CancellationReason);
+                return this.settleWith(this.inheritedReason(cast parentReason as CancellationReason));
             }
         }
         if (alreadyCancelled) {
@@ -432,7 +495,7 @@ public class CancellationToken {
  * 父令牌到子令牌的传播动作。
  *
  * 做什么：作为 Action<CancellationToken> 注册到父令牌，在父取消时以父的原因取消子令牌。
- * 什么时候用：CancellationToken.createChild 内部使用。
+ * 什么时候用：CancellationToken.createChild / createScopeChild 内部使用。
  * 前置条件：child 非 null。
  * 失败模式：child.cancel 幂等；子回调失败由父取消批次汇总。
  * 为什么用具体类：回调只需要一个动作，具体类比在令牌里内嵌匿名逻辑更易审计。
@@ -446,7 +509,7 @@ public class ChildCancellation implements Action<CancellationToken> {
     }
 
     /**
-     * 做什么：父令牌取消时以父的首个原因取消子令牌。
+     * 做什么：父令牌取消时以父的首个原因（跨作用域时按 inheritedReason 换算）取消子令牌。
      * 什么时候用：由父令牌 cancelWith 触发（回调在父令牌已置位之后执行，原因已确定）。
      * 前置条件：child 已构造；parent 已取消。
      * 失败模式：子令牌已取消时保留子的原因并返回；子回调失败向父批次传播但不阻断其他子令牌。
@@ -454,6 +517,6 @@ public class ChildCancellation implements Action<CancellationToken> {
      *   选 Parent 是因为它是「父传播」语义下唯一不说谎的默认。
      */
     public function accept(parent: CancellationToken): void {
-        this.child.cancelWith(parent.reasonOr(CancellationReason.Parent));
+        this.child.cancelWith(this.child.inheritedReason(parent.reasonOr(CancellationReason.Parent)));
     }
 }

@@ -1039,7 +1039,7 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 
 ### 尚未接入（后续切片）
 
-- `Parent`：嵌套作用域 / 跨任务令牌链接尚不存在（TaskGroup 仍为单层）。
+- `Parent`：本片时嵌套作用域尚不存在；已由后文「嵌套作用域 Parent 链接」实现。
 - `ScopeExit`：已接入，见后文「作用域异常退出」。
 - `Deadline`：截止点与检查点已接入（见下节「Deadline 运行时子片」），生成帧分派入口与挂起点入口的截止检查
   见「生成帧截止检查点」；到期唤醒挂起中的帧（计时器）尚未实现。
@@ -1274,4 +1274,48 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
   `ReasonHasSource`。
 - 变异：发布固定 Explicit 5 项失败；`get` 固定 Explicit 1 项失败。发射器抛出错误所带的原因当前不可观察，处理块清除待发布原因
   为等价变异，两者已登记为未区分。
+- JBMC：N/A（构建虚拟机未装），无替代形式验证。
+
+## 嵌套作用域 Parent 链接（LANG-S4-NESTED-01）
+
+### 已支持
+
+- `TaskGroup.within(token, supervisor)`：在任务体内用收到的令牌打开内层作用域，内层根令牌由
+  `CancellationToken.createScopeChild` 派生。作用域之间只经令牌链相连，取消单个外层任务只波及它自己打开的作用域。
+- 取消向下，原因按取消源表换算（`inheritedReason` 一处，回调传播与检查点帮助传播共用）：外层 `Deadline` 仍是
+  `Deadline`，其余（`Explicit` / `SiblingFailed` / `ScopeExit` / `Parent`）在内层都是 `Parent`。同一作用域内的子令牌沿用根的
+  原因不变。内层已先因自身原因取消时保留自己的原因。
+- 取消不向上：内层 `cancel`、内层失败级联、内层自身期限到期都不碰外层令牌。
+- 结果走普通通道：内层 `close` 抛出的 `TaskGroupFailure` 穿出任务体，外层发布为这一个子任务的失败（kind=error，内层被压制数
+  只留在消息里，不展开），普通组据此级联；抛出的 `CancellationException` 发布为取消。
+- `TaskRunner` 发布取消时把内层报告的 `Parent` 换成任务令牌的首因：它只是外层这次取消的回声，外层任务的结果仍是 `Explicit` /
+  `SiblingFailed` / `ScopeExit` / `Deadline`。其他原因是内层的真实来源（内层自己取消或到期），照常发布；因此内层先到期、外层后取消时，
+  任务结果是 `Deadline`，而它的令牌可能是别的原因。只有这条路径读令牌，普通任务的取消路径不多加一次锁。
+- 截止点沿令牌链取更严格，内层不能延长外层；外层到期由外层的计时器触发并经令牌传入内层，无需任何检查点。
+- 生成帧可登记到嵌套作用域：外层取消唤醒挂起帧，结果 `Cancelled(Parent)`，清理恰好一次。
+- 回收后解除链接：内层聚合路径在全部子任务 settled 后调用 `detachFromParent`，长期运行的外层任务反复开嵌套作用域不会让回调
+  累积在外层令牌上。解除后外层取消不再到达已结束的作用域；普通作用域不走这条路径，不多加一次锁。
+
+### 仍不支持（后续切片）
+
+- **外层不登记内层**：任务体忘记关闭内层作用域时，外层 `close` 不会等它，内层子任务可以活过外层任务。这是结构化保证的缺口，
+  当前靠调用方在任务体内 `close` / `closeAbruptly`；语言层 `TaskGroup.run(scope)` 形状的入口仍未提供（同 `closeAbruptly`）。
+- 生成帧在源码层拿不到自己的令牌，协程函数体内还不能打开嵌套作用域（测试经反射把帧登记到内层）；同步 `TaskBody` 可以。
+- 解除链接与外层取消竞争时，已在运行的回调仍可能把已回收的作用域标为取消；聚合已冻结，可观察结果不变，只是根令牌的
+  `isCancelled` 为真。解除后对该作用域令牌做检查点仍沿父引用帮助传播（oracle 同此语义）。
+- 帧内（源码层）查询自身取消原因的语言形态同前。
+
+### 验收结果
+
+- `NestedScopeTest`：端到端 11 项（显式取消、计时器到期、兄弟失败与异常退出、单个任务、不向上与失败上报、内层原因先到、进入时已取消、
+  三层链、回调窗口内的帮助传播、解除链接、生成帧）；种子 20261135 的 1000 轮随机事件驱动真实令牌树（7 个令牌、两道作用域
+  边界），每步与单线程精确 oracle 比对全部原因与有效截止点，五类覆盖下限各 > 20。首轮 300 轮时 `helped` 覆盖只有 12，加轮数，下限未动。
+- `CancellationReasonLincheckTest` 贴近 Lincheck 事件上限：`TaskRunner` 无条件读令牌（多一次加锁）时再次触发 `ManagedStrategy.kt:298`，改为只对 `Parent` 读令牌后通过，用例未放宽。
+- `NestedScopeLincheckTest`（真实插桩，3 线程固定场景：外层取消 / 内层取消 / 叶子检查点）：用 `EpsilonVerifier`，判定在 `@Validate`
+  中（首因只能是自身来源或父原因换算、传播到底）——不是线性化证明。
+- `NestedScopeFuzzTest` 覆盖引导（maxDuration 60 秒，未记录执行次数）无失败，160 条语料入库。
+- TLA+ `NestedScopeCancel`（令牌链 R→T⇒N→C，14969 个不同状态，含 `CancelReachesInner` / `OuterTerminates` 活性）通过；变异配置
+  `_nomap`、`_rawhelp` 违反 `CrossingMaps`，`_rawresult` 违反 `OuterNeverParent`。
+- 运行时变异 9 组全部被抓：不换算、Deadline 也写 Parent、帮助传播写原值、`TaskRunner` 不换算 Parent、聚合不解除、`detachFromParent` 空操作、
+  不绑定父引用、`within` 用普通子令牌；另加「`TaskRunner` 无条件用令牌首因」，共 9 组。
 - JBMC：N/A（构建虚拟机未装），无替代形式验证。

@@ -1,12 +1,19 @@
 package std;
 
 // ============================================================================
-// TaskGroup.jas —— 单层结构化并发作用域
+// TaskGroup.jas —— 结构化并发作用域
 // ============================================================================
 // 职责：
 //   持有同一作用域内创建的全部子任务，提供 spawn/close、普通组失败级联取消与
-//   监督组的 B 策略失败聚合。子任务的生命周期只有一层：不在此文件实现嵌套作用域，
-//   以免把父子注册表扩张成难以审计的树。
+//   监督组的 B 策略失败聚合。作用域只登记自己这一层的子任务，不维护父子注册表：嵌套作用域
+//   是任务体内用 within(令牌) 打开的另一个 TaskGroup，与外层只经令牌链接相连。
+//
+// 嵌套（S4 草案 §4.1、§5.3）：
+//   - 取消向下：外层任务令牌取消传入内层根令牌，Deadline 保持，其余原因为 Parent；
+//   - 取消不向上：内层取消、内层子失败级联都不碰外层令牌；
+//   - 结果向上走普通通道：内层 close 抛出的 TaskGroupFailure / CancellationException 穿出任务体，由
+//     外层 TaskRunner 作为这个子任务的失败 / 取消发布，不展开内层的全部失败；
+//   - 截止点沿令牌链取更严格，内层不能延长外层。
 //
 // 失败传播（已裁决语义）：
 //   - 普通组：首个业务失败立即取消其余未终止子任务，close 仍等待全部执行体退出；
@@ -140,6 +147,7 @@ public class TaskGroup {
     private var timer: DeadlineTimer?;
     private var abruptExit: bool;
     private var abruptCallbackFailures: int32;
+    private var nestedScope: bool;
 
     /**
      * 做什么：创建普通组或监督组。
@@ -162,6 +170,7 @@ public class TaskGroup {
         this.timer = null;
         this.abruptExit = false;
         this.abruptCallbackFailures = 0;
+        this.nestedScope = false;
     }
 
     /**
@@ -176,6 +185,22 @@ public class TaskGroup {
     public static function withDeadlineTimer(supervisorScope: bool, timer: DeadlineTimer): TaskGroup {
         var group: TaskGroup = new TaskGroup(supervisorScope);
         group.timer = timer;
+        return group;
+    }
+
+    /**
+     * 做什么：在外层任务内打开嵌套作用域：根令牌是 token 的跨作用域子令牌。
+     * 什么时候用：TaskBody.run 中用收到的令牌打开内层作用域。
+     * 前置条件：token 是当前任务的令牌；调用方在任务体结束前 close 或 closeAbruptly（外层不登记内层，
+     *   忘记关闭时外层 close 不会等它）。
+     * 失败模式：同构造器；token 已取消时返回的作用域已取消，语义同已取消作用域。
+     * 为什么接收令牌而不是外层 TaskGroup：取消单个外层任务只应波及它自己打开的作用域；
+     *   作用域之间的唯一联系是令牌链，TaskGroup 不必相互认识。
+     */
+    public static function within(token: CancellationToken, supervisorScope: bool): TaskGroup {
+        var group: TaskGroup = new TaskGroup(supervisorScope);
+        group.rootToken = token.createScopeChild();
+        group.nestedScope = true;
         return group;
     }
 
@@ -453,6 +478,10 @@ public class TaskGroup {
             var stopping: DeadlineTimer = cast ownedTimer as DeadlineTimer;
             stopping.shutdown();
         }
+        // 全部子任务已回收：外层令牌不必再持有这个作用域。普通作用域不走这里，不多加一次锁。
+        if (this.nestedScope) {
+            this.rootToken.detachFromParent();
+        }
 
         this.mutex.acquireUninterruptibly();
         if (!this.aggregationDone) {
@@ -700,7 +729,7 @@ public class TaskRunner<T> implements Runnable {
      * 做什么：执行任务体并发布终态。
      * 什么时候用：执行器线程调用一次。
      * 前置条件：Future 初始为 Pending。
-     * 失败模式：CancellationException 发布 Cancelled；业务 Error 与平台 Throwable 转成 Failure；finally
+     * 失败模式：CancellationException 发布 Cancelled（Parent 换成令牌首因）；业务 Error 与平台 Throwable 转成 Failure；finally
      *   都会标记 settled，保证作用域关闭不会漏 join。
      * 为什么先看令牌再看返回值：执行体可能在取消后仍正常返回一个值，此时可观察语义
      *   必须是 Cancelled，而不是把迟到结果伪装成成功。
@@ -724,7 +753,14 @@ public class TaskRunner<T> implements Runnable {
                     }
                 } catch (cancelled: CancellationException) {
                     // 取消是独立终态，不写业务 Failure，也不触发兄弟失败级联；原因取自异常本身。
-                    this.future.cancelWith(cancelled.reason());
+                    // 例外是 Parent：它来自内层 close，只是外层这次取消的回声，本任务的结果报令牌的首因。
+                    // 其他原因是内层的真实来源（内层自己取消或到期），照常发布。只有这条路径才读令牌，
+                    // 普通任务的取消路径不多加一次锁。
+                    var published: CancellationReason = cancelled.reason();
+                    if (published == CancellationReason.Parent) {
+                        published = this.token.reasonOr(published);
+                    }
+                    this.future.cancelWith(published);
                 }
             } catch (error: Error) {
                 var failure: Failure = new Failure(error.message(), "error");
