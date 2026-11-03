@@ -168,6 +168,22 @@ public class CancellationToken {
     }
 
     /**
+     * 做什么：把取消错误带来的原因换算成任务结果要发布的原因：Parent 换成本令牌的首个原因（未取消时
+     *   仍是 Parent），其余原因原样返回。
+     * 什么时候用：任务体或生成帧因未捕获的 CancellationException / FutureCancelledError 结束时。
+     * 前置条件：reason 非 null。
+     * 失败模式：不会失败。
+     * 为什么只换 Parent：Parent 只是外层这次取消的回声，本任务应报外层的真实原因；其他原因是真实来源
+     *   （内层自己取消或到期、被等待 Future 的首因），照常发布。只有 Parent 才读令牌，其余路径不多加一次锁。
+     */
+    public function reportedReason(reason: CancellationReason): CancellationReason {
+        if (reason == CancellationReason.Parent) {
+            return this.reasonOr(reason);
+        }
+        return reason;
+    }
+
+    /**
      * 做什么：以 Explicit 原因请求取消；等价于 cancelWith(CancellationReason.Explicit)。
      * 什么时候用：调用方主动取消。
      * 前置条件：无。

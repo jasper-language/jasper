@@ -729,8 +729,10 @@ public class TaskRunner<T> implements Runnable {
      * 做什么：执行任务体并发布终态。
      * 什么时候用：执行器线程调用一次。
      * 前置条件：Future 初始为 Pending。
-     * 失败模式：CancellationException 发布 Cancelled（Parent 换成令牌首因）；业务 Error 与平台 Throwable 转成 Failure；finally
-     *   都会标记 settled，保证作用域关闭不会漏 join。
+     * 失败模式：未捕获的 CancellationException 与 FutureCancelledError 发布 Cancelled（Parent 换成令牌首因）；
+     *   其他业务 Error 与平台 Throwable 转成 Failure；finally 都会标记 settled，保证作用域关闭不会漏 join。
+     * 为什么 FutureCancelledError 发布取消：等待的 Future 被取消不是业务失败，普通组不因此取消兄弟；与生成帧
+     *   同一语义。任务体 catch 之后可以正常完成；清理代码抛出的业务错误取代传播中的取消，仍发布 Failure。
      * 为什么先看令牌再看返回值：执行体可能在取消后仍正常返回一个值，此时可观察语义
      *   必须是 Cancelled，而不是把迟到结果伪装成成功。
      * 为什么用嵌套 try 而不是并列 catch：当前编译器只为「每个 try 的第一个 catch」
@@ -753,14 +755,9 @@ public class TaskRunner<T> implements Runnable {
                     }
                 } catch (cancelled: CancellationException) {
                     // 取消是独立终态，不写业务 Failure，也不触发兄弟失败级联；原因取自异常本身。
-                    // 例外是 Parent：它来自内层 close，只是外层这次取消的回声，本任务的结果报令牌的首因。
-                    // 其他原因是内层的真实来源（内层自己取消或到期），照常发布。只有这条路径才读令牌，
-                    // 普通任务的取消路径不多加一次锁。
-                    var published: CancellationReason = cancelled.reason();
-                    if (published == CancellationReason.Parent) {
-                        published = this.token.reasonOr(published);
-                    }
-                    this.future.cancelWith(published);
+                    this.future.cancelWith(this.token.reportedReason(cancelled.reason()));
+                } catch (awaited: FutureCancelledError) {
+                    this.future.cancelWith(this.token.reportedReason(awaited.reason()));
                 }
             } catch (error: Error) {
                 var failure: Failure = new Failure(error.message(), "error");

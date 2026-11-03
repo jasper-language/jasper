@@ -1261,8 +1261,7 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
 
 - 生成帧处理体不能使用捕获参数（第十八片的既有诊断），所以帧内 `catch (e: FutureCancelledError)` 还读不到 `e.reason()`；
   同步代码可以。
-- `TaskRunner` 不特殊处理 `FutureCancelledError`：`spawn` 任务体里 `get()` 抛出且未捕获时发布 `Failed`（kind=error）并触发
-  普通组级联，而生成帧未捕获时发布 `Cancelled`。两条路径的这一差异是既有行为，本片未改。
+- `TaskRunner` 不特殊处理 `FutureCancelledError`：本片当时的行为，已由 `LANG-S4-AWAIT-CANCEL-PUBLISH-01` 改为发布 `Cancelled`（见文末）。
 - 嵌套作用域 `Parent`、帧内（源码层）查询自身取消原因的语言形态同前。
 
 ### 验收结果
@@ -1446,3 +1445,35 @@ finally / defer 中的 throw / 挂起 / 跳出；for-in 与循环后置块；实
 - 变异 10 组全部被抓：调用被丢弃、裸 await 不挂起、实参 await 不提升、调用排到局部写入之后、帧内放行 `?.`、同类调用不改写、只有实例同名成员不诊断、同类挂起调用不诊断、for 步进与 `??` 内调用不查挂起。
 - `CallArgumentAwaitCoroutinePipelineTest` 的一处断言在高负载下被固定 50ms sleep 抢跑（本片首次协程回归时暴露，代码路径未改），改为先有界等待调用发生，断言值不变。
 - 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，也未复跑 TLA+ 模型；Lincheck、Jazzer 语料回放与全部协程测试随全量 gradle test 复跑。
+
+## S4 未捕获的被等待取消发布 Cancelled（LANG-S4-AWAIT-CANCEL-PUBLISH-01）
+
+按 2026-11-03 暂定裁决（`S4-coroutine-context.md` §11）统一 spawn 任务体与生成帧：等待的 Future 被取消不是业务失败。此前 `spawn` 任务体未捕获时发布 `Failed` 并触发普通组级联，生成帧经挂起点时发布 `Cancelled`。
+
+### 规则
+
+- **任务体（`TaskRunner`）**：未捕获的 `FutureCancelledError` 与 `CancellationException` 走同一条路径，发布 `Cancelled`，原因经 `CancellationToken.reportedReason` 换算。
+- **换算**：`Parent` 换成任务令牌的首因（令牌未取消时仍是 `Parent`），其余原因原样。这是嵌套作用域已有的规则，现在收敛到一处。
+- **生成帧**：段内同步抛出的 `FutureCancelledError`（例如 `other.get()`、`throw new FutureCancelledError(...)`）与 `CancellationException`（例如段内调用的 `inner.close()`）此前记为 `Failure("error")`，现在记为待发布的取消，先展开清理再发布；发布时同样换算。
+- **普通组**：取消不触发级联；`close` 没有失败时抛 `CancellationException`，原因取根令牌首因，否则取创建序最早的取消子任务。这条聚合规则未改，但此前走到这里的是 `TaskGroupFailure`。
+- **显式 catch**：捕获后继续执行、可以正常完成；令牌已取消时迟到的返回值仍发布 `Cancelled`（既有规则）。
+- **清理抛出**：业务错误取代传播中的取消，发布 `Failed` 并照常级联。清理抛出取消错误时同理取代正在传播的异常（含业务失败），与 JVM `finally` 语义一致。
+
+### 行为变化
+
+源码显式 `throw new FutureCancelledError(...)` 也按类型走取消通道，不再发布 `Failure("error")`；帧内未捕获的 `CancellationException` 同样由失败改为取消（裁决字面只说 `FutureCancelledError`，这里与 `TaskRunner` 对齐）。
+
+### 仍不支持
+
+帧内处理体读取 `e.reason()`（捕获参数的既有诊断）。
+
+### 验收结果
+
+- `AwaitedCancelPublishTest`：五种原因逐一发布、普通组后续兄弟照常完成、catch 后正常完成并读到 `reason()`、清理错误取代取消且照常级联、`Parent` 换算（令牌未取消 / 已取消 / 非 Parent 不换）、真实线程上阻塞在 `get()` 的任务体被唤醒且兄弟不受影响；经真实编译的生成帧：段内 `get()` 未捕获 / 捕获、显式抛出取消错误、段内 `CancellationException`、清理错误取代取消（无 catch 与有 catch 区域两条路径）、`Parent` 换算、`launch` 的帧不影响兄弟帧。
+- 固定种子 20261147 的 600 个脚本驱动真实 TaskGroup（普通组与监督组、内联执行器），每个子任务的状态 / 原因 / 失败 / 捕获原因 / 清理次数与 `close` 结果都和 Kotlin oracle 比对。覆盖下限：未捕获取消、业务失败级联、清理错误各超过 100，`Parent` 换算至少 40。
+- TLA+ `TaskAwaitCancelPublish`：含活性通过；`_asfailure` 违反 `AwaitCancelNoCascade`，`_noparentmap` 违反 `ReasonMapped`。首版把令牌置位与写结果建成同一步，`_noparentmap` 抓不到，拆开后才抓到。`run-s4-models.sh` 全部配置复跑通过。
+- Lincheck：任务体发布与作用域取消竞争，真实插桩（固定场景 + EpsilonVerifier，非线性化证明）。
+- Jazzer：`JAZZER_FUZZ=1` 跑 61 秒 201087 次无失败，82 条语料入库，与属性测试共用 oracle。
+- 变异 10 组全部被抓：TaskRunner 不接 FutureCancelledError、不换算 Parent、所有原因都换令牌首因、取消也级联、帧不认两种取消错误（2 组）、帧发布不换算、帧不记录错误所带原因、展开与路由时清理错误被吞（2 组）。
+- 既有测试无需改动。
+- JBMC：N/A（构建虚拟机未装），无替代形式验证，由 TLA+ / Lincheck / Jazzer 覆盖协议与边界。

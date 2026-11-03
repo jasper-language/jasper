@@ -82,6 +82,7 @@ object LinearCoroutineEmitter {
     private const val CANCELLATION_REASON = "std.CancellationReason"
     private const val FUTURE_FAILURE_ERROR = "std.FutureFailureError"
     private const val FUTURE_CANCELLED_ERROR = "std.FutureCancelledError"
+    private const val CANCELLATION_EXCEPTION = "std.CancellationException"
     private const val THROWABLE = "java.lang.Throwable"
     private const val ERROR = "std.Error"
 
@@ -457,17 +458,31 @@ object LinearCoroutineEmitter {
         /** 平台异常转成待发布的 Failure。 */
         fun platformFailure(error: String) =
             JasNew(JasNamedType(FAILURE), listOf(invoke(JasIdentifier(error), "toString"), JasStringLiteral("platform")))
+        /** 段内或清理抛出的取消错误 [error]（类型 [type]）记为待发布的 Cancelled，原因取自错误本身。 */
+        fun abortCancelled(error: String, type: String) = JasBlock(listOf(
+            assign("__cancelReason", invoke(JasCastExpr(JasIdentifier(error), JasNamedType(type)), "reason")),
+            assign("__abort", JasIntLiteral(2, "2"))
+        ))
         /**
-         * 段内或清理抛出的 [error] 记为待发布的失败：std.Error 记为 Failure(message, "error")，其余平台
-         * 异常记为 Failure(toString, "platform")。为什么区分：与 TaskGroup.spawn 子任务体的约定一致，
-         * 等待者按 kind 区分业务错误与平台故障，源码 throw 的错误消息原样可见。
+         * 段内或清理抛出的 [error] 记为待发布的终态：FutureCancelledError / CancellationException 记为
+         * Cancelled，其他 std.Error 记为 Failure(message, "error")，其余平台异常记为
+         * Failure(toString, "platform")。为什么这样分：与 TaskRunner 的约定一致——等待的 Future 被取消不是
+         * 业务失败，普通组不因此取消兄弟；等待者按 kind 区分业务错误与平台故障，源码 throw 的错误消息原样可见。
          */
         fun abortThrown(error: String) = listOf(JasIf(
-            JasInstanceOfExpr(JasIdentifier(error), JasNamedType(ERROR)),
-            JasBlock(abortFailure(JasNew(JasNamedType(FAILURE), listOf(
-                invoke(JasCastExpr(JasIdentifier(error), JasNamedType(ERROR)), "message"), JasStringLiteral("error")
-            )))),
-            JasBlock(abortFailure(platformFailure(error)))
+            JasInstanceOfExpr(JasIdentifier(error), JasNamedType(FUTURE_CANCELLED_ERROR)),
+            abortCancelled(error, FUTURE_CANCELLED_ERROR),
+            JasBlock(listOf(JasIf(
+                JasInstanceOfExpr(JasIdentifier(error), JasNamedType(CANCELLATION_EXCEPTION)),
+                abortCancelled(error, CANCELLATION_EXCEPTION),
+                JasBlock(listOf(JasIf(
+                    JasInstanceOfExpr(JasIdentifier(error), JasNamedType(ERROR)),
+                    JasBlock(abortFailure(JasNew(JasNamedType(FAILURE), listOf(
+                        invoke(JasCastExpr(JasIdentifier(error), JasNamedType(ERROR)), "message"), JasStringLiteral("error")
+                    )))),
+                    JasBlock(abortFailure(platformFailure(error)))
+                )))
+            )))
         ))
         /**
          * 有 catch 区域时的分派：段内抛出（含挂起点失败 / 取消转成的错误）先记下待发布终态
@@ -565,8 +580,9 @@ object LinearCoroutineEmitter {
                 statement(invoke(field("__result"), "fail", JasCastExpr(field("__pending"), JasNamedType(FAILURE))))
             )), null),
             JasIf(JasBinaryOp(field("__abort"), "==", JasIntLiteral(2, "2")), JasBlock(listOf(
-                statement(invoke(field("__result"), "cancelWith",
-                    JasCastExpr(field("__cancelReason"), JasNamedType(CANCELLATION_REASON))))
+                // 与 TaskRunner 同一换算：Parent 换成令牌首因，其余原样。
+                statement(invoke(field("__result"), "cancelWith", invoke(field("__token"), "reportedReason",
+                    JasCastExpr(field("__cancelReason"), JasNamedType(CANCELLATION_REASON)))))
             )), null)
         )
         // 只有结果已终结且不在任何清理区域内时才关闭调度门、标记 settled。为什么要看区域：挂起点
