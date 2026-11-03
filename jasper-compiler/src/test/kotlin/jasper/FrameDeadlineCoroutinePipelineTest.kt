@@ -187,6 +187,8 @@ private object FrameDeadlineRuntime {
         } else thrown.javaClass.name
     }
 
+    fun closeAbruptly(target: Any): Int = group.getMethod("closeAbruptly").invoke(target) as Int
+
     fun complete(target: Any, value: Int) { future.getMethod("complete", Any::class.java).invoke(target, value) }
     fun fail(target: Any) {
         val snapshot = failure.getConstructor(String::class.java, String::class.java).newInstance("boom", "error")
@@ -251,6 +253,33 @@ class FrameDeadlineCoroutinePipelineTest {
         assertEquals(1, rt.cleaned())
         assertTrue(rt.isSettled(scope.results[0]))
         assertEquals("cancel:Deadline", rt.close(scope.group))
+    }
+
+    /** 作用域异常退出：挂起中的帧被 ScopeExit 唤醒、展开清理后回收；输入永不完成也不会挂住退出；晚到输入不复活。 */
+    @Test
+    fun `abrupt close wakes suspended frames and runs their cleanup`() {
+        rt.reset()
+        val scope = Scope(2)
+        scope.launch(0)
+        scope.launch(1)
+        assertEquals(2, rt.business())
+        val dropped = java.util.concurrent.atomic.AtomicInteger(-1)
+        val closer = kotlin.concurrent.thread(isDaemon = true) { dropped.set(rt.closeAbruptly(scope.group)) }
+        val limit = System.nanoTime() + 30_000_000_000L
+        while (closer.isAlive && System.nanoTime() < limit) scope.executor.drain()
+        closer.join(1_000)
+        assertTrue(!closer.isAlive, "closeAbruptly must return once the frames are reclaimed")
+        assertEquals(0, dropped.get())
+        assertEquals("Cancelled(ScopeExit)", scope.outcome(0))
+        assertEquals("Cancelled(ScopeExit)", scope.outcome(1))
+        assertEquals(2, rt.business(), "no business segment after the scope exits")
+        assertEquals(2, rt.cleaned(), "cleanup of both suspended frames must run")
+        assertTrue(rt.isSettled(scope.results[0]) && rt.isSettled(scope.results[1]))
+        rt.complete(scope.first[0], 5)
+        scope.executor.drain()
+        assertEquals("Cancelled(ScopeExit)", scope.outcome(0))
+        assertEquals(2, rt.business(), "late input must not revive the frame")
+        assertEquals("ok", rt.close(scope.group))
     }
 
     /** 计时器触发是检查点：输入永不完成、没有其他检查点，到期也会唤醒并回收全部挂起帧。 */

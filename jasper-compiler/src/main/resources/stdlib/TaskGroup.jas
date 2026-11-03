@@ -28,6 +28,12 @@ package std;
 //   挂起中的帧与在 onCancel 上等待的阻塞调用也会在到期后被唤醒。close 在全部子任务 settled 后
 //   shutdown 计时器。
 //
+// 退出路径（S4 契约 §5）：
+//   - close：作用域正常结束——只等待，不取消，抛出聚合结果；
+//   - closeAbruptly：所有者已有在途异常——封闭入口、以 ScopeExit 取消未完成子任务、等待回收，
+//     不抛任何东西（否则掩盖在途异常），被压制的子失败数作为返回值。此后的 close 只完成回收，
+//     不再抛出，`defer close` 路径不会二次抛错。
+//
 // 依赖方向：
 //   TaskGroup -> Executor / Future / CancellationToken；这些下层不知道 TaskGroup，
 //   因此运行时模块之间没有环。
@@ -132,6 +138,8 @@ public class TaskGroup {
     private var aggregateCancelled: bool;
     private var aggregateReason: CancellationReason;
     private var timer: DeadlineTimer?;
+    private var abruptExit: bool;
+    private var abruptCallbackFailures: int32;
 
     /**
      * 做什么：创建普通组或监督组。
@@ -152,6 +160,8 @@ public class TaskGroup {
         this.aggregateCancelled = false;
         this.aggregateReason = CancellationReason.Explicit;
         this.timer = null;
+        this.abruptExit = false;
+        this.abruptCallbackFailures = 0;
     }
 
     /**
@@ -345,12 +355,86 @@ public class TaskGroup {
      * 什么时候用：作用域正常结束或异常退出前的 finally 中。
      * 前置条件：调用方接受等待已经启动的子任务；不可中断的外部阻塞可能让 close 阻塞。
      * 失败模式：未处理失败抛 TaskGroupFailure，仅有取消抛 CancellationException；首次聚合冻结。
+     *   聚合前已经 closeAbruptly 时只完成回收，不抛出。
      *   CancellationException 的原因：作用域根令牌已取消时取其首个原因；否则取创建序最早的
      *   已取消子任务的原因（子任务被单独取消），与 primary 的确定性顺序规则一致。
      * 为什么先复制子任务列表：等待期间不持锁，允许任务完成回调正常推进，也避免
      *   把长阻塞放进临界区。
      */
     public function close(): void {
+        this.joinAndAggregateHoldingLock();
+        var abrupt: bool = this.abruptExit;
+        var decided: Failure? = this.aggregatePrimary;
+        var decidedSuppressed: int32 = this.aggregateSuppressed;
+        var decidedCancelled: bool = this.aggregateCancelled;
+        var decidedReason: CancellationReason = this.aggregateReason;
+        this.mutex.release();
+
+        if (abrupt) {
+            return;
+        }
+        if (decided == null) {
+            if (decidedCancelled) {
+                throw new CancellationException("TaskGroup cancelled", decidedReason);
+            }
+            return;
+        }
+        var message: string = decided.message();
+        if (decidedSuppressed > 0) {
+            message = message + " (+" + decidedSuppressed + " suppressed)";
+        }
+        throw new TaskGroupFailure(message, decidedSuppressed);
+    }
+
+    /**
+     * 做什么：作用域异常退出——封闭入口，以 ScopeExit 取消未完成子任务，等待全部回收，
+     *   返回被压制的问题数（未确认的子失败数 + 取消回调失败数）。
+     * 什么时候用：所有者已有在途异常时（catch 中调用后重新抛出）；正常结束用 close。
+     * 前置条件：同 close；不得在本作用域的子任务内调用（会等待自己）；同一协调线程驱动。
+     * 失败模式：不抛业务失败与取消——在途异常是 primary（契约 §5），错误不是值，子失败只能以
+     *   数量留下。不可中断的外部阻塞可能让本方法阻塞，同 close。
+     * 为什么作用域已取消时原因不变：首因稳定；到期或显式取消先发生时，子任务的原因如实是它们。
+     * 为什么聚合已冻结时不再取消：此时全部子任务已 settled，根令牌再写 ScopeExit 只会污染
+     *   已报告的原因；重复调用返回同一结果。
+     * 为什么在聚合内外都用同一个标志：标志只在聚合前写，聚合与读取都持锁，因此并发的 close
+     *   要么先冻结并照常抛出，要么看到标志而不抛，不存在把 ScopeExit 当外部取消抛出的窗口。
+     */
+    public function closeAbruptly(): int32 {
+        this.mutex.acquireUninterruptibly();
+        this.closed = true;
+        var decidedAlready: bool = this.aggregationDone;
+        if (!decidedAlready) {
+            this.abruptExit = true;
+        }
+        this.mutex.release();
+
+        if (!decidedAlready) {
+            try {
+                this.cancelBecause(CancellationReason.ScopeExit);
+            } catch (dispatch: CallbackDispatchError) {
+                // 取消已送达全部子任务（cancelBecause 汇总后才抛）；继续等待回收，不掩盖在途异常。
+                this.mutex.acquireUninterruptibly();
+                this.abruptCallbackFailures = this.abruptCallbackFailures + dispatch.failureCount();
+                this.mutex.release();
+            }
+        }
+        this.joinAndAggregateHoldingLock();
+        var dropped: int32 = this.aggregateSuppressed + this.abruptCallbackFailures;
+        if (this.aggregatePrimary != null) {
+            dropped = dropped + 1;
+        }
+        this.mutex.release();
+        return dropped;
+    }
+
+    /**
+     * 做什么：封闭入口、等待全部子任务 settled、收回计时器，并在首次到达时冻结聚合结果。
+     * 什么时候用：close 与 closeAbruptly 的共同部分；只有如何报告结果不同。
+     * 前置条件 / 失败模式：同 close，但本方法不抛聚合结果。返回时持有 this.mutex，由调用方读取结果后释放。
+     * 为什么持锁返回：冻结与读取在同一临界区，close 路径不多一次加锁——CancellationReasonLincheckTest
+     *   的单次调用事件量贴近 Lincheck 上限，也不必为读几个已冻结的字段再竞争一次。
+     */
+    private function joinAndAggregateHoldingLock(): void {
         this.mutex.acquireUninterruptibly();
         this.closed = true;
         // closed 已置位，之后不会再创建计时器（spawn / launch 拒绝，restrictDeadline 不再登记）。
@@ -402,23 +486,6 @@ public class TaskGroup {
             this.aggregateCancelled = cancelled;
             this.aggregateReason = reason;
         }
-        var decided: Failure? = this.aggregatePrimary;
-        var decidedSuppressed: int32 = this.aggregateSuppressed;
-        var decidedCancelled: bool = this.aggregateCancelled;
-        var decidedReason: CancellationReason = this.aggregateReason;
-        this.mutex.release();
-
-        if (decided == null) {
-            if (decidedCancelled) {
-                throw new CancellationException("TaskGroup cancelled", decidedReason);
-            }
-            return;
-        }
-        var message: string = decided.message();
-        if (decidedSuppressed > 0) {
-            message = message + " (+" + decidedSuppressed + " suppressed)";
-        }
-        throw new TaskGroupFailure(message, decidedSuppressed);
     }
 
     /**
@@ -489,7 +556,7 @@ public class TaskGroup {
 
     /**
      * 做什么：以指定原因取消根令牌与全部未终态子任务。
-     * 什么时候用：cancel（Explicit）与普通组首个失败级联（SiblingFailed）。
+     * 什么时候用：cancel（Explicit）、普通组首个失败级联（SiblingFailed）与 closeAbruptly（ScopeExit）。
      * 前置条件：reason 非 null。
      * 失败模式：通知全部尝试后汇总回调错误；取消不代表执行体已退出，仍应 close join。
      * 为什么同时取消根令牌与 Future：令牌负责协作检查，Future 负责让等待者立即

@@ -1040,7 +1040,7 @@ continue 跨出循环内的 try/finally 时执行其 finally；return / break / 
 ### 尚未接入（后续切片）
 
 - `Parent`：嵌套作用域 / 跨任务令牌链接尚不存在（TaskGroup 仍为单层）。
-- `ScopeExit`：作用域异常退出时取消未完成子任务的路径尚未实现（close 只等待）。
+- `ScopeExit`：已接入，见后文「作用域异常退出」。
 - `Deadline`：截止点与检查点已接入（见下节「Deadline 运行时子片」），生成帧分派入口与挂起点入口的截止检查
   见「生成帧截止检查点」；到期唤醒挂起中的帧（计时器）尚未实现。
 - 生成帧：结果被作用域取消时原因正确（由 TaskGroup 写入）；帧自身因被等待的 Future 取消而发布 Cancelled
@@ -1201,3 +1201,47 @@ translator 把没有声明签名的平台调用的 IR 类型记为 Unit，后端
   就会触发 `ManagedStrategy` 内部 `check` 失败（机制见 Deadline 运行时子片）。延迟创建计时器后该路径不增加
   事件；今后在作用域路径上加锁操作可能再次碰到，届时需要先拆分用例，不得放宽。
 - JBMC：N/A（构建虚拟机未装），无替代形式验证，由 TLA+ / Lincheck / Jazzer 覆盖协议与边界。
+
+## 作用域异常退出（LANG-S4-SCOPEEXIT-01）
+
+### 已支持
+
+- `TaskGroup.closeAbruptly(): int32`（纯 Jasper 运行时）：所有者已有在途异常时调用。封闭入口，以 `ScopeExit` 取消
+  未完成子任务（首因稳定：作用域已因到期、显式取消或兄弟失败而取消时，原因不变），等待全部子任务真实退出，返回
+  被压制的问题数（未确认的子失败数 + 取消回调失败数）。不抛业务失败与取消：在途异常是 primary（契约 §5），错误不是
+  值，子失败只能以数量留下。挂起中的帧经既有 `ScopeCancellationRelay` 被唤醒、展开清理后回收。
+- 典型写法：`try { ... } catch (error: Error) { group.closeAbruptly(); throw error; } finally { group.close(); }`。
+  其后的 `close` 只完成回收、不再抛出，`defer close` 路径不会掩盖在途异常。
+- 并发的 `close`：聚合持锁冻结一次。先冻结者决定结果——`close` 先冻结则照常抛出，之后的 `closeAbruptly` 不再取消
+  （根令牌不写 `ScopeExit`）、不改写其后 `close` 的行为，返回冻结时的未观察失败数；`closeAbruptly` 先置标志则 `close`
+  不抛，不存在把自身 `ScopeExit` 当外部取消抛出的窗口。
+- `close` 的行为不变：作用域正常结束只等待、不取消（契约 §1、§5「作用域正常结束」）。
+
+### 与草案的差异
+
+草案 `S4-coroutine-context-v0-draft.md` §5.4 / §6 把两种退出合并到 `close` 一个入口（`close` 总是取消未完成子任务）；
+已裁决的契约 `S4-coroutine-context.md` §1、§5 区分「正常结束：等待」与「父作用域业务异常：请求取消」。本片按契约实现
+为两个入口。错误不能作为参数，所以无法用 `close(error)` 的形状把在途异常传进去。
+
+### 仍不支持（后续切片）
+
+- 语言层的自动选择：没有 `TaskGroup.run(scope)` 形状的入口，由调用方在 `catch` 中显式调用；忘记调用时 `close` 仍只等待。
+- 被压制的失败只有数量，没有内容（契约的 suppressed 明细要等诊断 / Trace）。
+- 非所有者调用不被拒绝：所有者检查同 `close`，未实现；在本作用域子任务内调用会等待自己。
+- 不可中断的外部阻塞可能让 `closeAbruptly` 一直阻塞，同 `close`。
+- 嵌套作用域 `Parent`、帧自身因等待的 Future 取消时的原因、帧内（源码层）查询原因的语言形态同前。
+
+### 验收结果
+
+- `ScopeExitTest`：端到端 5 项（真实线程池：未完成子任务得 ScopeExit 且真实退出、入口封闭、重复调用；在途异常穿过
+  `closeAbruptly` 与 `finally close`；被压制数与确认、首因稳定；聚合已冻结；回调失败计数且不跳过回收），种子 20261131
+  的 300 轮随机事件按单线程精确 oracle 判定（五类覆盖下限各 > 20）。
+- `FrameDeadlineCoroutinePipelineTest` 增 1 项：两个挂起帧输入永不完成时被唤醒、各执行一次清理、不再执行业务段、晚到
+  输入不复活。
+- `ScopeExitLincheckTest`（真实插桩，3 线程固定场景：退出 / 三个执行段 / 显式取消）：退出阻塞到段执行完，不存在顺序
+  规格，用 `EpsilonVerifier`，检查死锁、意外异常与结果判定——不是线性化证明。`ScopeExitFuzzTest` 覆盖引导（maxDuration 60 秒，未记录执行次数）
+  无失败，165 条语料入库。
+- TLA+ `ScopeExitClose`（两子任务，普通组 1708 / 监督组 2032 个不同状态，含终止活性）通过；变异配置 `_selfthrow` 违反
+  `AbruptSilencesClose`、`_nojoin` 违反 `AbruptReturnsAfterJoin`。
+- 运行时变异 8 组全部被抓；其中「冻结后仍置标志」首轮未被抓，已补断言。
+- JBMC：N/A（构建虚拟机未装），无替代形式验证。
