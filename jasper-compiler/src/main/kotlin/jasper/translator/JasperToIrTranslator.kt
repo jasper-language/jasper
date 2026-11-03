@@ -2968,6 +2968,18 @@ class JasperToIrTranslator {
     }
 
     private fun translateCall(expr: JasCall, ctx: TranslationContext): IrExpression {
+        val safeTarget = expr.target as? JasPropertyAccess
+        if (safeTarget != null && safeTarget.isSafe) {
+            val platformName = safeTarget.property.takeIf { expr.resolvedFunction == null }
+            return translateSafeAccess(safeTarget.target, ctx, platformName) { receiver ->
+                JasCall(JasPropertyAccess(receiver, safeTarget.property), expr.args).also {
+                    it.resolvedFunction = expr.resolvedFunction
+                    it.inferredTypeArgs = expr.inferredTypeArgs
+                    it.platformStaticOwner = expr.platformStaticOwner
+                    it.varargCall = expr.varargCall
+                }
+            }
+        }
         val name = when (expr.target) {
             is JasIdentifier -> expr.target.name
             is JasPropertyAccess -> expr.target.property
@@ -3435,6 +3447,9 @@ class JasperToIrTranslator {
      *   就会生成「对一个值为 null 的变量做 GETFIELD」——正是 Q17 探针 NPE 的来源。
      */
     private fun translatePropertyAccess(expr: JasPropertyAccess, ctx: TranslationContext): IrExpression {
+        if (expr.isSafe) {
+            return translateSafeAccess(expr.target, ctx) { receiver -> JasPropertyAccess(receiver, expr.property) }
+        }
         // 枚举常量优先识别：`Color.Red` 的形态与「类名.静态字段」完全相同，但 IR 表示不同
         // （IrGetEnumValue 对应 IrEnumEntry）。若不先分流，会落入字段路径并生成对类名
         // 求值的 GETFIELD——正是 `INTERNAL: Index -1 out of bounds` 的来源。
@@ -3673,6 +3688,8 @@ class JasperToIrTranslator {
      * 为什么需要：后端用「变量名」作为局部槽的键（见 [TranslationContext.tempIdCounter] 注释）；
      *   固定名字会让同函数内不同元素类型的临时变量互相污染，生成 C12 的非法字节码。
      */
+    private val platformMethodResolver = jasper.compiler.PlatformMethodResolver()
+
     private fun nextTempName(ctx: TranslationContext, prefix: String): Name =
         Name.identifier("$prefix\$${ctx.tempIdCounter++}")
 
@@ -4073,12 +4090,28 @@ class JasperToIrTranslator {
 
     private fun translateNullCoalescing(expr: JasNullCoalescing, ctx: TranslationContext): IrExpression {
         val leftExpr = translateExpression(expr.left, ctx)
-        val rightExpr = translateExpression(expr.right, ctx)
-        val resultType = rightExpr.type
+        // 左侧是基本类型就不可能为 null：右侧永不求值（与「左非 null 不求右」一致），
+        // 也不能对基本类型做 null 判断。
+        if (isPrimitiveIrType(leftExpr.type)) return leftExpr
+        val translatedRight = translateExpression(expr.right, ctx)
+        // 结果类型与检查器 `??` 规则一致：`int32? ?? 0` 是 int32，`int32? ?? 1L` 是 int64，
+        // `int32? ?? null值` 仍可空，`any ?? 0` 仍是 any（右侧装箱）；两个分支都要落到这个描述符。
+        val leftInner = typeMapper.primitiveOfBoxed(leftExpr.type) ?: leftExpr.type
+        val leftIsBoxed = isPrimitiveIrType(leftInner)
+        val rightIsPrimitive = isPrimitiveIrType(translatedRight.type)
+        val resultType = when {
+            leftIsBoxed && rightIsPrimitive -> widerPrimitive(leftInner, translatedRight.type)
+            leftIsBoxed && expr.right is JasNullLiteral -> leftExpr.type
+            leftIsBoxed -> translatedRight.type
+            rightIsPrimitive -> leftExpr.type
+            else -> translatedRight.type
+        }
+        val rightExpr = castToDeclared(resultType, translatedRight)
         val block = IrNodeFactory.createBlock(0, 0, resultType, null)
         val tempSymbol = IrVariableSymbolImpl()
         val tempVar = IrNodeFactory.createVariable(
-            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("tmp$"),
+            // 后端以变量名为局部槽的键：`a ?? b ?? c` 嵌套时固定名字会让内外两层共用一个槽。
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "coalesce"),
             leftExpr.type, tempSymbol, true, false, false
         )
         tempVar.initializer = leftExpr
@@ -4090,11 +4123,89 @@ class JasperToIrTranslator {
             leftExpr.type,
             IrNodeFactory.createGetValue(0, 0, leftExpr.type, tempSymbol, null)
         )
-        irWhen.branches.add(IrNodeFactory.createBranch(
-            0, 0, notNullCheck,
-            IrNodeFactory.createGetValue(0, 0, leftExpr.type, tempSymbol, null)
-        ))
+        val tempRead = IrNodeFactory.createGetValue(0, 0, leftExpr.type, tempSymbol, null)
+        // 包装类 → 结果基本类型分两步：先按自己的包装类拆箱，再数值拓宽；一步 CAST 会把
+        // Integer 强转成 Long 而 ClassCastException。
+        val leftValue = when {
+            !leftIsBoxed || resultType.isMarkedNullable() -> tempRead
+            else -> castToDeclared(resultType, castToDeclared(leftInner, tempRead))
+        }
+        irWhen.branches.add(IrNodeFactory.createBranch(0, 0, notNullCheck, leftValue))
         irWhen.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), rightExpr))
+        (block.statements as MutableList<IrStatement>).add(irWhen)
+        return block
+    }
+
+    private fun isPrimitiveIrType(type: IrType): Boolean {
+        val desc = typeMapper.jvmDescriptorFromIrType(type)
+        return desc.length == 1 && desc != "V"
+    }
+
+    /** 两个基本类型取 `int32 -> int64 -> float64` 方向上更宽者；检查器已拒绝其它组合。 */
+    private fun widerPrimitive(left: IrType, right: IrType): IrType {
+        val rank = "BSCIJFD"
+        val leftRank = rank.indexOf(typeMapper.jvmDescriptorFromIrType(left))
+        val rightRank = rank.indexOf(typeMapper.jvmDescriptorFromIrType(right))
+        return if (rightRank > leftRank) right else left
+    }
+
+    /**
+     * 平台成员调用的 IR 类型记为 Unit，真实返回类型由后端解析（见 JvmIrBackend.receiverJvmDescriptor）。
+     * `?.` 必须在翻译期就知道结果是否有值、要不要装箱，所以这里用同一个解析器取真实返回类型，
+     * 并包一层 CAST 让后续节点看到它。解析不到（平台 void 或未知成员）时保持 Unit，只在语句位置有意义。
+     */
+    private fun withPlatformReturnType(value: IrExpression, memberName: String?): IrExpression {
+        if (memberName == null || value !is IrCall || typeMapper.jvmDescriptorFromIrType(value.type) != "V") return value
+        val receiver = value.getValueArgument(0) ?: return value
+        val args = (1 until value.valueArgumentsCount).mapNotNull { value.getValueArgument(it) }
+        val returnDesc = platformMethodResolver
+            .resolve(typeMapper.jvmInternalNameFromIrType(receiver.type), memberName, args.map { typeMapper.jvmDescriptorFromIrType(it.type) })
+            ?.returnDescriptor
+        if (returnDesc == null || returnDesc == "V") return value
+        val returnType = typeMapper.irTypeFromDescriptor(returnDesc)
+        return IrTypeOperatorCallImpl(0, 0, returnType, IrTypeOperator.CAST, returnType, value)
+    }
+
+    /**
+     * `a?.b` / `a?.m(args)`：接收者只求值一次写入合成局部；为 null 时结果为 null，实参不求值。
+     *
+     * 为什么借一个合成局部再走普通成员路径：字段 / 重载 / 集合 / 内建 string 成员的解析都以
+     * 接收者 AST 与其 IR 类型为输入，改写成 `tmp.b` 后共用同一条路径，不产生第二套成员解析。
+     * 结果可空：基本类型结果装箱（`int32?` 的 JVM 表示）；无返回值的调用只在语句位置有意义。
+     */
+    private fun translateSafeAccess(
+        receiverAst: JasExpression,
+        ctx: TranslationContext,
+        memberName: String? = null,
+        access: (JasIdentifier) -> JasExpression
+    ): IrExpression {
+        val receiver = translateExpression(receiverAst, ctx)
+        val receiverType = typeMapper.nonNull(receiver.type)
+        val tempName = nextTempName(ctx, "safe").asString()
+        val tempSymbol = IrVariableSymbolImpl()
+        val tempVar = IrNodeFactory.createVariable(
+            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(tempName),
+            receiverType, tempSymbol, false, false, false
+        )
+        tempVar.initializer = receiver
+        ctx.symbols[tempName] = tempSymbol
+        ctx.varTypes[tempName] = receiverType
+        val value = withPlatformReturnType(translateExpression(access(JasIdentifier(tempName)), ctx), memberName)
+        ctx.symbols.remove(tempName)
+        ctx.varTypes.remove(tempName)
+        val isVoid = typeMapper.jvmDescriptorFromIrType(value.type) == "V"
+        val resultType = if (isVoid) value.type else typeMapper.nullable(value.type)
+        val notNull = IrTypeOperatorCallImpl(
+            0, 0, typeMapper.boolType(), IrTypeOperator.IMPLICIT_NOTNULL, receiverType,
+            IrNodeFactory.createGetValue(0, 0, receiverType, tempSymbol, null)
+        )
+        val irWhen = IrNodeFactory.createWhen(0, 0, resultType, IrStatementOrigin.ELVIS)
+        irWhen.branches.add(IrNodeFactory.createBranch(0, 0, notNull, if (isVoid) value else castToDeclared(resultType, value)))
+        if (!isVoid) {
+            irWhen.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), typeMapper.nullConst()))
+        }
+        val block = IrNodeFactory.createBlock(0, 0, resultType, null)
+        (block.statements as MutableList<IrStatement>).add(tempVar)
         (block.statements as MutableList<IrStatement>).add(irWhen)
         return block
     }
@@ -4103,10 +4214,17 @@ class JasperToIrTranslator {
         val cond = translateExpression(expr.condition, ctx)
         val thenExpr = translateExpression(expr.thenExpr, ctx)
         val elseExpr = translateExpression(expr.elseExpr, ctx)
-        val resultType = thenExpr.type
+        // 一侧是 null 字面量：另一侧的基本类型要装箱，结果才放得下 null。
+        val resultType = when {
+            expr.thenExpr is JasNullLiteral -> typeMapper.nullable(elseExpr.type)
+            expr.elseExpr is JasNullLiteral -> typeMapper.nullable(thenExpr.type)
+            else -> thenExpr.type
+        }
         val irWhen = IrNodeFactory.createWhen(0, 0, resultType, IrStatementOrigin.WHEN)
-        irWhen.branches.add(IrNodeFactory.createBranch(0, 0, cond, thenExpr))
-        irWhen.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), elseExpr))
+        val thenValue = if (expr.elseExpr is JasNullLiteral) castToDeclared(resultType, thenExpr) else thenExpr
+        val elseValue = if (expr.thenExpr is JasNullLiteral) castToDeclared(resultType, elseExpr) else elseExpr
+        irWhen.branches.add(IrNodeFactory.createBranch(0, 0, cond, thenValue))
+        irWhen.branches.add(IrNodeFactory.createBranch(0, 0, typeMapper.trueConst(), elseValue))
         return irWhen
     }
 

@@ -221,10 +221,19 @@ class TypeMapper {
     fun jvmDescriptorFromIrType(type: IrType): String {
         val name = irTypeClassName(type)
         if (name != null) {
-            return classNameToJvmDescriptor(name)
+            val desc = classNameToJvmDescriptor(name)
+            return if (type.isMarkedNullable()) boxedDescriptor(desc) else desc
         }
         return "Ljava/lang/Object;"
     }
+
+    /**
+     * 做什么：基本类型描述符 → 包装类描述符（`I` → `Ljava/lang/Integer;`）；其余描述符原样返回。
+     * 什么时候用：可空基本类型（`int32?`）的唯一 JVM 表示——基本类型放不下 null。
+     *   IR 与 Jas 两套入口都经过这里，保证字段 / 参数 / 局部 / 调用点的描述符一致。
+     */
+    private fun boxedDescriptor(desc: String): String =
+        primitiveBoxedInternalNames[desc]?.let { "L$it;" } ?: desc
 
     /**
      * 做什么：IR 类型 → 方法**返回**描述符；与 [jvmDescriptorFromIrType] 相同，语义上强调返回位。
@@ -249,8 +258,12 @@ class TypeMapper {
         val name = irTypeClassName(type)
         if (name != null) {
             if (isTypeVariableLike(name)) return "java/lang/Object"
-            return if (name.startsWith("[")) eraseArrayDescriptor(name)
-            else jvmInternalName(builtinTypes[name.lowercase()] ?: name)
+            if (name.startsWith("[")) return eraseArrayDescriptor(name)
+            if (type.isMarkedNullable()) {
+                val desc = boxedDescriptor(classNameToJvmDescriptor(name))
+                if (desc.startsWith("Ljava/lang/") && desc in BOXED_DESCRIPTORS) return desc.substring(1, desc.length - 1)
+            }
+            return jvmInternalName(builtinTypes[name.lowercase()] ?: name)
         }
         return "java/lang/Object"
     }
@@ -592,7 +605,11 @@ class TypeMapper {
     fun irArrayElementType(arrayType: IrType): IrType {
         val desc = jvmDescriptorFromIrType(arrayType)
         if (!desc.startsWith("[")) return type("kotlin.Any")
-        val elemDesc = desc.substring(1)
+        return irTypeFromDescriptor(desc.substring(1))
+    }
+
+    /** 做什么：JVM 描述符 → IR 类型（如 `I` → kotlin.Int，`Ljava/lang/String;` → java/lang/String）。 */
+    fun irTypeFromDescriptor(elemDesc: String): IrType {
         return when (elemDesc) {
             "I" -> intType()
             "J" -> longType()
@@ -649,7 +666,7 @@ class TypeMapper {
             is JasStringType -> "Ljava/lang/String;"
             is JasAnyType -> "Ljava/lang/Object;"
             is JasArrayType -> "[" + jvmDescriptorFromType(type.inner)
-            is JasNullableType -> jvmDescriptorFromType(type.inner)
+            is JasNullableType -> boxedDescriptor(jvmDescriptorFromType(type.inner))
             is JasNonNullType -> jvmDescriptorFromType(type.inner)
             is JasFunctionType -> "Ljava/lang/Object;"
             is JasTupleType -> "Ljava/lang/Object;"
@@ -697,7 +714,10 @@ class TypeMapper {
             is JasStringType -> "java/lang/String"
             is JasAnyType -> "java/lang/Object"
             is JasArrayType -> "java/lang/Object"
-            is JasNullableType -> jvmInternalNameFromType(type.inner)
+            is JasNullableType -> {
+                val boxed = boxedDescriptor(jvmDescriptorFromType(type.inner))
+                if (boxed in BOXED_DESCRIPTORS) boxed.substring(1, boxed.length - 1) else jvmInternalNameFromType(type.inner)
+            }
             is JasNonNullType -> jvmInternalNameFromType(type.inner)
             is JasFunctionType -> "java/lang/Object"
             is JasTupleType -> "java/lang/Object"
@@ -851,7 +871,7 @@ class TypeMapper {
                 val mapped = builtinTypes[name.lowercase()] ?: name
                 // 数组名已是描述符，泛型签名里数组不参与实参展开。
                 if (mapped.startsWith("[")) return mapped
-                val desc = jvmDescriptor(mapped)
+                val desc = jvmDescriptor(mapped).let { if (type.isMarkedNullable()) boxedDescriptor(it) else it }
                 if (desc.startsWith("L") && desc.endsWith(";")) {
                     // 只对引用类型展开泛型实参；基本类型描述符没有 <> 形式。
                     val internal = desc.substring(1, desc.length - 1)
@@ -908,6 +928,19 @@ class TypeMapper {
         "S" to "java/lang/Short",
         "C" to "java/lang/Character"
     )
+
+    private val BOXED_DESCRIPTORS = primitiveBoxedInternalNames.values.map { "L$it;" }.toSet()
+
+    /**
+     * 做什么：可空基本类型 / 包装类的 IR 类型 → 对应基本类型的 IR 类型；其余返回 null。
+     * 为什么按描述符判断：`(int32?)[]` 的元素类型由数组描述符反推，只留下 `java/lang/Integer`，
+     *   不带可空标记，但 JVM 表示与语义都和 `int32?` 相同。
+     */
+    fun primitiveOfBoxed(type: IrType): IrType? {
+        val desc = jvmDescriptorFromIrType(type)
+        val primitive = primitiveBoxedInternalNames.entries.firstOrNull { "L${it.value};" == desc }?.key ?: return null
+        return irTypeFromDescriptor(primitive)
+    }
 
     /**
      * 做什么：IR 类型参数 → JVM 签名里的「类型参数声明」片段（`名字:上界签名`）。

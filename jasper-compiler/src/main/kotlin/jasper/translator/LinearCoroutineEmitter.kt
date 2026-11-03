@@ -232,14 +232,8 @@ object LinearCoroutineEmitter {
                     else -> throw IllegalArgumentException("unsupported unary operator ${expression.op}")
                 }
             }
-            is JasPropertyAccess -> {
-                requireNotSafe(expression.isSafe)
-                expression.copy(target = rewrite(expression.target))
-            }
-            is JasCall -> {
-                requireNotSafe(expression.isSafe)
-                JasCall(siblingTarget(expression) ?: rewrite(expression.target), expression.args.map(::rewrite))
-            }
+            is JasPropertyAccess -> expression.copy(target = rewrite(expression.target))
+            is JasCall -> JasCall(siblingTarget(expression) ?: rewrite(expression.target), expression.args.map(::rewrite))
             is JasCastExpr -> expression.copy(expression = rewrite(expression.expression))
             is JasNullCoalescing -> expression.copy(left = rewrite(expression.left), right = rewrite(expression.right))
             is JasNew -> expression.copy(args = expression.args.map(::rewrite))
@@ -666,14 +660,6 @@ object LinearCoroutineEmitter {
             it.sourceLine = function.sourceLine
             it.sourceColumn = function.sourceColumn
         }
-    }
-
-    /**
-     * `?.` 在帧内诊断。为什么：当前 IR 路径不处理安全访问，会按普通访问发射，接收者为 null 时
-     * 抛 NullPointerException（同步路径同样，单独修复）；帧不把这个差异悄悄带进状态机。
-     */
-    private fun requireNotSafe(isSafe: Boolean) {
-        require(!isSafe) { "safe access '?.' is not supported in coroutine frames" }
     }
 
     /** 参数只接受帧值类型或帧值类型的 Future；短名 Future 由同一文件 import 解析。 */

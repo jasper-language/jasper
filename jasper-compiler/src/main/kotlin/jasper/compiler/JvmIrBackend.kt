@@ -1920,12 +1920,24 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // 否则 `System.nanoTime() - 1L` 会选 ISUB 而产出无法校验的字节码。
                         val desc0 = receiverJvmDescriptor(arg0)
                         val desc1 = receiverJvmDescriptor(arg1)
-                        val wider = binaryOpWiderDesc(desc0, desc1)
-                        generateIrExpression(mv, arg0, ctx, owner)
-                        widenIfNeeded(mv, desc0, wider)
-                        generateIrExpression(mv, arg1, ctx, owner)
-                        widenIfNeeded(mv, desc1, wider)
-                        emitCompare(mv, irName, wider)
+                        // 可空基本类型与基本类型比较：基本类型一侧装成对方的包装类再走 Objects.equals，
+                        // 这样 null 与任何值都不相等，值相等时也不会因包装类不同而误判。
+                        if (desc0 in BOXED_TO_PRIMITIVE && isPrimitiveDesc(desc1) ||
+                            desc1 in BOXED_TO_PRIMITIVE && isPrimitiveDesc(desc0)
+                        ) {
+                            generateIrExpression(mv, arg0, ctx, owner)
+                            emitBoxingIfNeeded(mv, desc0, desc1)
+                            generateIrExpression(mv, arg1, ctx, owner)
+                            emitBoxingIfNeeded(mv, desc1, desc0)
+                            emitCompare(mv, irName, "Ljava/lang/Object;")
+                        } else {
+                            val wider = binaryOpWiderDesc(desc0, desc1)
+                            generateIrExpression(mv, arg0, ctx, owner)
+                            widenIfNeeded(mv, desc0, wider)
+                            generateIrExpression(mv, arg1, ctx, owner)
+                            widenIfNeeded(mv, desc1, wider)
+                            emitCompare(mv, irName, wider)
+                        }
                     }
                     "&&" -> {
                         // 短路与：第一个为假立即得 0（不再求值右侧，副作用也被跳过）；
@@ -2381,7 +2393,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         //   目标基本 + 源引用     → CHECKCAST 到包装类再调 xxxValue 拆箱。
                         val argument = expr.argument
                         generateIrExpression(mv, argument, ctx, owner)
-                        val srcDesc = typeMapper.jvmDescriptorFromIrType(argument.type)
+                        // 平台调用的 IR 类型是 Unit，源描述符要取真实返回类型。
+                        val srcDesc = receiverJvmDescriptor(argument)
                         val dstDesc = typeMapper.jvmDescriptorFromIrType(expr.typeOperand)
                         if (dstDesc.startsWith("L") || dstDesc.startsWith("[")) {
                             if (isPrimitiveDesc(srcDesc)) {
@@ -2900,6 +2913,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private fun isPrimitiveDesc(desc: String): Boolean =
         desc.length == 1 && desc[0] in "IJFDBSCZ"
 
+    // 包装类描述符 → 基本类型描述符：可空基本类型（`int32?`）的 JVM 表示就是这些包装类。
+    private val BOXED_TO_PRIMITIVE = mapOf(
+        "Ljava/lang/Integer;" to "I",
+        "Ljava/lang/Long;" to "J",
+        "Ljava/lang/Float;" to "F",
+        "Ljava/lang/Double;" to "D",
+        "Ljava/lang/Boolean;" to "Z",
+        "Ljava/lang/Byte;" to "B",
+        "Ljava/lang/Short;" to "S",
+        "Ljava/lang/Character;" to "C"
+    )
+
     /**
      * Primitive-to-primitive numeric conversion used by `cast` lowering.
      * Boolean/byte/short/char all live on the JVM stack as ints, so
@@ -2953,6 +2978,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 「擦除到引用」目标；更具体的引用目标（如 List）不在这里处理，由调用点的
     // 描述符与 IR 类型对齐保证。byte/short/char 不在表内（它们以 int 形式装箱）。
     private fun emitBoxingIfNeeded(mv: MethodVisitor, fromDesc: String, toDesc: String) {
+        // 可空基本类型的目标是具体包装类：`int32` 写入 `int64?` 要先拓宽，再装成目标包装类。
+        val boxedTarget = BOXED_TO_PRIMITIVE[toDesc]
+        if (boxedTarget != null && isPrimitiveDesc(fromDesc)) {
+            emitNumericConversion(mv, fromDesc, boxedTarget)
+            boxTopOfStack(mv, boxedTarget)
+            return
+        }
         if (toDesc == "Ljava/lang/Object;" || toDesc == "Ljava/io/Serializable;") {
             when (fromDesc) {
                 "I" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", false)

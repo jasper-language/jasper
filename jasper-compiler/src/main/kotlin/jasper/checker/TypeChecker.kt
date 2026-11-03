@@ -1256,6 +1256,85 @@ class TypeChecker(
      *   这是「上下文相关推断」的最小落点，不改变其它表达式的既有行为（默认 null）。
      */
     private fun inferExpression(expr: JasExpression, env: TypeEnvironment, expected: JasType? = null): JasType? {
+        val type = inferExpressionCore(expr, env, expected)
+        val isSafeAccess = (expr is JasPropertyAccess && expr.isSafe) ||
+            (expr is JasCall && (expr.target as? JasPropertyAccess)?.isSafe == true)
+        return if (isSafeAccess) safeAccessResult(type) else type
+    }
+
+    /** `?.` 的结果：接收者可能为 null，所以结果可空；已可空 / any / 无返回值保持原样。 */
+    private fun safeAccessResult(type: JasType?): JasType? = when (type) {
+        null, is JasNullableType, is JasAnyType, is JasUnitType -> type
+        else -> JasNullableType(type)
+    }
+
+    /** `?.` 按接收者的非空内层类型解析成员；基本类型没有成员，类型名不是值，都不能作接收者。 */
+    private fun safeReceiverType(target: JasPropertyAccess, env: TypeEnvironment): JasType? {
+        val type = inferExpression(target.target, env)
+        if (!target.isSafe) return type
+        if (isTypeNameReference(target.target, env)) {
+            error("Safe access '?.' requires a value receiver, not type name", target)
+        }
+        val inner = if (type is JasNullableType) type.inner else type
+        if (inner is JasPrimitiveType) {
+            error("Safe access '?.' is not available on ${typeDisplayName(type!!)}; use '??' to supply a default", target)
+        }
+        return inner
+    }
+
+    /** 基本类型的可空形式：JVM 上是包装类，不能直接参与算术、排序比较或作条件。 */
+    private fun isNullablePrimitive(type: JasType?): Boolean =
+        type is JasNullableType && type.inner is JasPrimitiveType
+
+    private fun rejectNullablePrimitiveOperand(type: JasType?, op: String, node: JasNode) {
+        if (isNullablePrimitive(type)) {
+            error("Operator '$op' cannot be applied to nullable ${typeDisplayName(type!!)}; use '??' to supply a default", node)
+        }
+    }
+
+    /**
+     * 可空基本类型的 `==` / `!=` 按包装类比较：Integer(3) 与 Long(3) 不相等，所以两侧基本类型必须相同，
+     * 或基本类型一侧能拓宽到可空一侧的内层（后端先拓宽再装箱）；其余组合编译期拒绝，不留静默恒假。
+     */
+    private fun checkBoxedEquality(left: JasType?, right: JasType?, node: JasNode) {
+        if (!isNullablePrimitive(left) && !isNullablePrimitive(right)) return
+        fun primitiveOf(type: JasType?): JasType? = when {
+            type is JasNullableType && type.inner is JasPrimitiveType -> type.inner
+            type is JasPrimitiveType -> type
+            else -> null
+        }
+        val leftPrimitive = primitiveOf(left) ?: return
+        val rightPrimitive = primitiveOf(right) ?: return
+        if (canonicalTypeName(leftPrimitive) == canonicalTypeName(rightPrimitive)) return
+        val widensIntoBoxed = (left !is JasNullableType && isNumericWidening(leftPrimitive, rightPrimitive)) ||
+            (right !is JasNullableType && isNumericWidening(rightPrimitive, leftPrimitive))
+        if (!widensIntoBoxed) {
+            error("Cannot compare ${typeDisplayName(left!!)} with ${typeDisplayName(right!!)}; use '??' to supply a default first", node)
+        }
+    }
+
+    /**
+     * `??` 的结果类型。左可空：右可落到内层则取内层（右本身可空则结果仍可空）；内层能拓宽到右侧基本类型
+     * 则取右侧；否则诊断——此前不校验右侧，`int32? ?? "x"` 会把字符串当 int32 用。
+     * 左非可空：左恒不为 null，维持左类型。
+     */
+    private fun nullCoalescingType(left: JasType?, right: JasType?, node: JasNode): JasType? {
+        if (left == null) return right ?: JasAnyType
+        if (left !is JasNullableType) return left
+        val inner = left.inner
+        if (right == null) return left
+        val rightInner = if (right is JasNullableType) right.inner else right
+        return when {
+            typesCompatible(rightInner, inner) -> if (right is JasNullableType) left else inner
+            right !is JasNullableType && isNumericWidening(inner, right) -> right
+            else -> {
+                error("Type mismatch in '??': cannot use ${typeDisplayName(right)} as ${typeDisplayName(inner)}", node)
+                inner
+            }
+        }
+    }
+
+    private fun inferExpressionCore(expr: JasExpression, env: TypeEnvironment, expected: JasType? = null): JasType? {
         // 返回 null 表示「无法推断」（多数由 warn 记录）；调用方普遍以 ?: JasAnyType 兜底。
         return when (expr) {
             is JasIntLiteral -> {
@@ -1307,6 +1386,12 @@ class TypeChecker(
             is JasBinaryOp -> {
                 val leftType = inferExpression(expr.left, env)
                 val rightType = inferExpression(expr.right, env)
+                val isConcat = expr.op == "+" && (leftType is JasStringType || rightType is JasStringType)
+                if (expr.op != "==" && expr.op != "!=" && !isConcat) {
+                    rejectNullablePrimitiveOperand(leftType, expr.op, expr)
+                    rejectNullablePrimitiveOperand(rightType, expr.op, expr)
+                }
+                if (expr.op == "==" || expr.op == "!=") checkBoxedEquality(leftType, rightType, expr)
                 // 比较/逻辑运算符结果恒为 bool；其余（算术等）取一侧类型兜底 int32。
                 when (expr.op) {
                     "&&", "||" -> JasPrimitiveType("bool")
@@ -1318,6 +1403,7 @@ class TypeChecker(
             is JasUnaryOp -> {
                 expr.awaitResultType = null
                 val operandType = inferExpression(expr.operand, env)
+                if (expr.op != "await") rejectNullablePrimitiveOperand(operandType, expr.op, expr)
                 when (expr.op) {
                     "!" -> JasPrimitiveType("bool")
                     "await" -> {
@@ -1349,7 +1435,7 @@ class TypeChecker(
                 // 推断 target」之前分流：否则 `A.f` 会被当成对类名的属性访问，落入
                 // 「类名不能访问实例成员」的错误路径，而正确的语义是静态调用（Q19 C22）。
                 val staticTarget = expr.target
-                if (staticTarget is JasPropertyAccess && isTypeNameReference(staticTarget.target, env)) {
+                if (staticTarget is JasPropertyAccess && !staticTarget.isSafe && isTypeNameReference(staticTarget.target, env)) {
                     return inferStaticMemberCall(expr, staticTarget, argTypes)
                 }
                 // 全限定平台类名（java.lang.Integer.parseInt）不是单段 JasIdentifier 类型名。
@@ -1448,7 +1534,7 @@ class TypeChecker(
                     // 统一做 arity/类型重载决议；返回 null 表示该名字不是函数成员
                     // （例如字段里存的是函数值），交回下面的函数值调用路径。
                     if (expr.target is JasPropertyAccess) {
-                        val receiverType = inferExpression(expr.target.target, env)
+                        val receiverType = safeReceiverType(expr.target, env)
                         // string 的内建方法不来自成员声明，必须在具名类型重载解析之前分流。
                         // `byteLength()` 返回 UTF-8 编码后的字节数（int32）；参数个数是
                         // 编译期可判定的，多给实参直接报错，避免后端生成不存在的方法调用。
@@ -1505,7 +1591,10 @@ class TypeChecker(
                         }
                     }
                     // callee 不是简单标识符（如函数值/lambda 变量）：按函数类型逐参校验。
-                    val targetType = inferExpression(expr.target, env)
+                    val targetType = when (val callee = expr.target) {
+                        is JasPropertyAccess -> inferExpressionCore(callee, env)
+                        else -> inferExpression(callee, env)
+                    }
                     val memberVararg = if (targetType is JasFunctionType) {
                         resolveVarargCall(targetType.paramTypes, targetType.varargs, argTypes)
                     } else null
@@ -1552,11 +1641,11 @@ class TypeChecker(
                 //   不存在字段的访问（假符号 + Unit 描述符），最终产出非法字节码
                 //   （ClassFormatError / NoSuchFieldError，Q19 C23）。any 接收者的成员集合
                 //   不可知，仍按宽松处理（保持既有动态调用语义）。
-                val targetType = inferExpression(expr.target, env)
+                val targetType = safeReceiverType(expr, env)
                 // 「类名.字段」与「值.字段」是两种不同语义：前者只能访问静态字段。
                 // 先单独处理，否则会把类名当成一个值为 null 的变量，导致实例字段被静默放行，
                 // 直到运行期才以 NPE 的形式暴露（JDBC #8 / R2DBC #18 / JPA #10）。
-                if (isTypeNameReference(expr.target, env)) {
+                if (!expr.isSafe && isTypeNameReference(expr.target, env)) {
                     val typeName = (expr.target as JasIdentifier).name
                     // 枚举常量（`Color.Red`）的静态类型就是枚举类型本身。必须先于字段/成员
                     // 索引识别：常量不是 JasProperty，SymbolTable 不会为它建成员索引，否则
@@ -1685,10 +1774,15 @@ class TypeChecker(
             is JasMethodReference -> JasFunctionType(emptyList(), JasAnyType)
             is JasTernaryExpr -> {
                 // 三元表达式：条件只推断不求 bool（宽松）；结果取 then/else 中先能推断出的一侧。
-                inferExpression(expr.condition, env)
+                rejectNullablePrimitiveOperand(inferExpression(expr.condition, env), "?:", expr)
                 val thenType = inferExpression(expr.thenExpr, env)
                 val elseType = inferExpression(expr.elseExpr, env)
-                thenType ?: elseType ?: JasAnyType
+                // 一侧是 null 字面量时结果可空，否则 `c ? 1 : null` 会被当成非空 int32 使用。
+                when {
+                    expr.elseExpr is JasNullLiteral && thenType != null -> safeAccessResult(thenType)
+                    expr.thenExpr is JasNullLiteral && elseType != null -> safeAccessResult(elseType)
+                    else -> thenType ?: elseType ?: JasAnyType
+                }
             }
             is JasCastExpr -> {
                 // 强制转型的目标类型是显式类型引用；校验可见性与类型实参个数。
@@ -1704,11 +1798,7 @@ class TypeChecker(
                 // `a ?: b`：左值可空则结果为其非空内层类型；左值非空则维持其类型。
                 val leftType = inferExpression(expr.left, env)
                 val rightType = inferExpression(expr.right, env)
-                when (leftType) {
-                    is JasNullableType -> leftType.inner
-                    null -> rightType ?: JasAnyType
-                    else -> leftType
-                }
+                nullCoalescingType(leftType, rightType, expr)
             }
             is JasStringTemplate -> JasStringType
             is JasDictLiteral -> inferDictLiteral(expr, env, expected)
@@ -1716,7 +1806,10 @@ class TypeChecker(
                 // 赋值兼容性：右值类型必须可赋给左值（目标）类型；结果类型为目标类型。
                 // 先推断目标再带期望类型推断右值：数组字面量赋值 `a = [x, y]` 需要知道
                 // a 的数组元素类型，才能逐元素校验并让翻译器生成正确的 aastore 描述符。
-                val targetType = inferExpression(expr.target, env)
+                if (expr.target is JasPropertyAccess && expr.target.isSafe) {
+                    error("Safe access '?.' cannot be an assignment target", expr)
+                }
+                val targetType = if (expr.target is JasPropertyAccess) inferExpressionCore(expr.target, env) else inferExpression(expr.target, env)
                 val valueType = inferExpression(expr.value, env, targetType)
                 if (valueType != null && targetType != null && !typesCompatible(valueType, targetType)) {
                     error("Type mismatch: cannot assign ${typeDisplayName(valueType)} to ${typeDisplayName(targetType)}", expr)
@@ -2748,7 +2841,19 @@ class TypeChecker(
             }
         }
         // 规范化后同名视为兼容（如 int32/Int、string/String、map 别名）。
-        if (canonicalTypeName(actual) == canonicalTypeName(expected)) return true
+        // 无法归一的类型（可空、数组、函数等）名字是 null，不能因「都是 null」就算兼容，
+        // 否则 `Foo?` 可赋给 `Bar?`、`int32?` 可赋给 `string?`。
+        if (canonicalTypeName(actual)?.let { it == canonicalTypeName(expected) } == true) return true
+        // 基本类型的可空形式是不同的包装类（Integer 不是 Long），不做隐式拓宽；
+        // 必须先于 numericWidening，它的名字归一会穿过 `?`。需要时写 `x ?? 0` 取值后再拓宽。
+        if (actual is JasNullableType && expected is JasNullableType &&
+            actual.inner is JasPrimitiveType && expected.inner is JasPrimitiveType &&
+            canonicalTypeName(actual.inner) != canonicalTypeName(expected.inner)
+        ) {
+            return false
+        }
+        // `any` 目标接受任何值，包括 null（`return null` 写到 any 位置是既有语义）。
+        if (expected is JasAnyType) return true
         // Nullability: assigning nullable to non-null is rejected
         // 可空性：可空值不能赋给非可空目标（此处直接拒绝，先于 any 兜底）。
         if (actual is JasNullableType && expected !is JasNullableType) {
@@ -2766,8 +2871,10 @@ class TypeChecker(
         // Numeric widening conversions
         // 数值拓宽：int32 -> int64 -> float64 等按 numericWidening 表放行。
         if (isNumericWidening(actual, expected)) return true
-        // 两侧都可空：比较内层类型。
+        // 两侧都可空：比较内层类型。内层是未声明的名字（未代入的方法类型形参 `T`、平台类型）时
+        // 成员集合与子类型关系都不可知，按宽松处理，与非可空路径对未知类型的态度一致。
         if (actual is JasNullableType && expected is JasNullableType) {
+            if (actual.inner is JasNamedType && !isDeclaredTypeName(actual.inner.name)) return true
             return typesCompatible(actual.inner, expected.inner)
         }
         // 目标可空、实际非空：拿实际类型与目标内层比较（非空可赋给可空）。

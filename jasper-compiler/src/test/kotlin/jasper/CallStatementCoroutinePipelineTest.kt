@@ -670,6 +670,69 @@ class CallStatementCoroutinePipelineTest {
     }
 
     @Test
+    fun `safe access runs in frames and skips the member on null`() {
+        val source = helpers + """
+            public class Tagged {
+                public function name(): string { return "tag"; }
+            }
+            public class Program {
+                public static var trace: string = "";
+                public static function log(): string { var t: string = Program.trace; Program.trace = ""; return t; }
+                public static function pass(b: Box?): Box? { Program.trace = Program.trace + "pass;"; return b; }
+                public static function tick(n: int32): int32 { Program.trace = Program.trace + "tick;"; return n; }
+                public static function statement(input: Future<int32>, box: Box?): int32 {
+                    Program.pass(box)?.bump();
+                    return await input;
+                }
+                public static function initializer(input: Future<int32>, box: Box?): int32 {
+                    var n: int32 = box?.get() ?? 40;
+                    return n + await input;
+                }
+                public static function afterAwait(input: Future<int32>, box: Box?): int32 {
+                    var a: int32 = await input;
+                    return a + (box?.get() ?? Program.tick(40));
+                }
+                public static function inFinally(input: Future<int32>, box: Box?): int32 {
+                    try {
+                        return await input;
+                    } finally {
+                        box?.bump();
+                    }
+                }
+                public static function text(input: Future<int32>, tag: Tagged?): string? {
+                    await input;
+                    return tag?.name();
+                }
+            }
+        """.trimIndent()
+        compile("safe-access", source).use { loader ->
+            val runtime = Runtime(loader)
+            try {
+                val box = runtime.box(1)
+                assertEquals(5, runtime.runSuspended("statement", listOf(5), box))
+                assertEquals("pass;", runtime.log())
+                assertEquals(2, runtime.boxValue(box))
+                assertEquals(5, runtime.runSuspended("statement", listOf(5), null))
+                assertEquals("pass;", runtime.log())
+                assertEquals(47, runtime.runSuspended("initializer", listOf(5), runtime.box(42)))
+                assertEquals(45, runtime.runSuspended("initializer", listOf(5), null))
+                assertEquals(9, runtime.runSuspended("afterAwait", listOf(5), runtime.box(4)))
+                assertEquals("", runtime.log())
+                assertEquals(45, runtime.runSuspended("afterAwait", listOf(5), null))
+                assertEquals("tick;", runtime.log())
+                val cleaned = runtime.box(1)
+                assertEquals(3, runtime.runSuspended("inFinally", listOf(3), cleaned))
+                assertEquals(2, runtime.boxValue(cleaned))
+                assertEquals(3, runtime.runSuspended("inFinally", listOf(3), null))
+                assertEquals("tag", runtime.runSuspended("text", listOf(1), loader.loadClass("demo.Tagged").getConstructor().newInstance()))
+                assertEquals(null, runtime.runSuspended("text", listOf(1), null))
+            } finally {
+                runtime.shutdown()
+            }
+        }
+    }
+
+    @Test
     fun `unsupported statement shapes are diagnosed and write no class`() {
         val cases = mapOf(
             "instance-argument-await" to """
@@ -696,27 +759,6 @@ class CallStatementCoroutinePipelineTest {
                 public static function f(box: Box?, input: Future<int32>): int32 {
                     box?.set(await input);
                     return 1;
-                }
-            """,
-            "safe-call-statement" to """
-                public static function f(box: Box?, input: Future<int32>): int32 {
-                    box?.bump();
-                    return await input;
-                }
-            """,
-            "safe-call-initializer" to """
-                public static function f(box: Box?, input: Future<int32>): int32 {
-                    var n: int32 = box?.get() ?? 0;
-                    return n + await input;
-                }
-            """,
-            "safe-call-in-finally" to """
-                public static function f(box: Box?, input: Future<int32>): int32 {
-                    try {
-                        return await input;
-                    } finally {
-                        box?.bump();
-                    }
                 }
             """,
             "suspending-call-statement" to """
