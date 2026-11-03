@@ -1820,7 +1820,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         generateIrExpression(mv, arr, ctx, owner)
                         generateIrExpression(mv, idx, ctx, owner)
                         loadLocal(mv, rhsDesc, rhsSlot)
-                        mv.visitInsn(arrayStoreOpcode(rhsDesc))
+                        // 元素类型比 rhs 宽（int64[] 存 int32）时按元素类型拓宽并选存储指令：
+                        // 检查器允许隐式拓宽，指令若跟 rhs 走会在加载时 VerifyError。
+                        val elemDesc = typeMapper.jvmDescriptorFromIrType(arr.type).removePrefix("[")
+                        val numeric = setOf("B", "S", "C", "I", "J", "F", "D")
+                        if (elemDesc != rhsDesc && elemDesc in numeric && rhsDesc in numeric) {
+                            val stackDesc = if (rhsDesc == "B" || rhsDesc == "S" || rhsDesc == "C") "I" else rhsDesc
+                            widenIfNeeded(mv, stackDesc, elemDesc)
+                            mv.visitInsn(arrayStoreOpcode(elemDesc))
+                        } else {
+                            mv.visitInsn(arrayStoreOpcode(rhsDesc))
+                        }
                         loadLocal(mv, rhsDesc, rhsSlot)
                     }
                     "put" -> {

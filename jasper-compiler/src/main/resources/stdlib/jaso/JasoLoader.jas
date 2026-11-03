@@ -1,0 +1,362 @@
+package std.jaso;
+
+// ============================================================================
+// JasoLoader.jas —— L1 装载的第 1–6 步（规范第 12.2 节）与一致性判定（第 14 节）
+// ============================================================================
+// 职责：在结构读取之上判定信任、平台、运行时版本、依赖与能力。这里不映射、不链接、
+//   不调用任何代码；第 7 步以后属于运行时装载（后续切片）。
+//
+// 能力是请求不是授权：清单里写了能力不等于得到，调用者授予的集合才算数。
+// ============================================================================
+
+/** 一个受信发布者。 */
+public class JasoPublisher {
+    public var name: string;
+    public var namespace: string;
+    public var key: byte[];
+
+    /** 做什么：name 与清单 core.publisher 比对，namespace 是可签发的模块名前缀，key 是 Ed25519 公钥。 */
+    public constructor(name: string, namespace: string, key: byte[]) {
+        this.name = name;
+        this.namespace = namespace;
+        this.key = key;
+    }
+}
+
+/**
+ * 受信发布者表 + 信任模式。
+ * 失败模式：构造时任一公钥不是合法曲线点抛 trust.key（配置错误不能放行）。
+ */
+public class JasoTrustPolicy {
+    private var publishers: JasoPublisher[];
+    private var enforce: bool;
+
+    /** 做什么：校验并建立策略。enforce 为假是开发模式：未签名放行，调用方必须记审计。 */
+    public constructor(publishers: JasoPublisher[], enforce: bool) {
+        var i: int32 = 0;
+        while (i < publishers.length) {
+            if (!Ed25519.validKey(publishers[i].key)) {
+                throw new JasoError("trust.key");
+            }
+            i = i + 1;
+        }
+        this.publishers = publishers;
+        this.enforce = enforce;
+    }
+
+    /**
+     * 做什么：第 2 步。按规范顺序：未签名 → 发布者 → 公钥 → 命名空间 → 验签。
+     * 开发模式只放宽未签名；带签名的文件在任何模式下都要全部通过。
+     */
+    public function verify(file: JasoFile): void {
+        if (file.signatureOffset < 0) {
+            if (this.enforce) {
+                throw new JasoError("trust.unsigned");
+            }
+            return;
+        }
+        var declared: string? = file.manifest.publisher;
+        if (declared == null) {
+            throw new JasoError("trust.publisher");
+        }
+        var publisher: JasoPublisher? = null;
+        var i: int32 = 0;
+        while (i < this.publishers.length) {
+            if (this.publishers[i].name == declared) {
+                publisher = this.publishers[i];
+                break;
+            }
+            i = i + 1;
+        }
+        if (publisher == null) {
+            throw new JasoError("trust.publisher");
+        }
+        var b: byte[] = file.data;
+        var at: int32 = file.signatureOffset;
+        if (!JasoBytes.equal(publisher.key, 0, b, at + 8, 32)) {
+            throw new JasoError("trust.key");
+        }
+        if (!file.manifest.name.startsWith(publisher.namespace)) {
+            throw new JasoError("trust.namespace");
+        }
+        if (!Ed25519.verifyStrict(publisher.key, JasoTrustPolicy.signedMessage(b, at), JasoBytes.copy(b, at + 40, at + 104))) {
+            throw new JasoError("signature.invalid");
+        }
+    }
+
+    /** 做什么：被签名的消息：域分隔串 + 0 + 摘要（digest 字段与签名值都按全零计算）。 */
+    private static function signedMessage(b: byte[], at: int32): byte[] {
+        var sha: java.security.MessageDigest = java.security.MessageDigest.getInstance("SHA-256");
+        sha.update(b, 0, 40);
+        sha.update(new byte[32], 0, 32);
+        sha.update(b, 72, at + 40 - 72);
+        sha.update(new byte[64], 0, 64);
+        sha.update(b, at + 104, b.length - at - 104);
+        var digest: byte[] = sha.digest();
+        var domain: string = "jaso.signature.v1";
+        var message: byte[] = new byte[domain.length + 1 + 32];
+        var i: int32 = 0;
+        while (i < domain.length) {
+            message[i] = (byte) domain.codePointAt(i);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 32) {
+            message[domain.length + 1 + i] = digest[i];
+            i = i + 1;
+        }
+        return message;
+    }
+}
+
+/** 平台不符的细节：第一个不符的字段、宿主值、文件值。 */
+public class JasoMismatch {
+    public var field: string;
+    public var expected: string;
+    public var actual: string;
+
+    /** 做什么：由字段构造。 */
+    public constructor(field: string, expected: string, actual: string) {
+        this.field = field;
+        this.expected = expected;
+        this.actual = actual;
+    }
+}
+
+/** 宿主平台（规范第 12.2 节第 3 步比较的字段）。 */
+public class JasoHostPlatform {
+    public var isa: int32;
+    public var isaExt: JasoStrings;
+    public var target: int32;
+    public var pointerBytes: int32;
+    public var floatAbi: int32;
+    public var abi: string;
+
+    /** 做什么：由字段构造。 */
+    public constructor(isa: int32, isaExt: JasoStrings, target: int32, pointerBytes: int32, floatAbi: int32, abi: string) {
+        this.isa = isa;
+        this.isaExt = isaExt;
+        this.target = target;
+        this.pointerBytes = pointerBytes;
+        this.floatAbi = floatAbi;
+        this.abi = abi;
+    }
+
+    /**
+     * 做什么：与平台记录比较；相符返回 null，否则返回第一个不符的字段。
+     * 比较顺序：isa、isa_ext、target、abi、float_abi、pointer_bytes。
+     */
+    public function mismatch(p: JasoPlatform): JasoMismatch? {
+        if (p.isa != this.isa) {
+            return new JasoMismatch("isa", JasoHostPlatform.isaName(this.isa), JasoHostPlatform.isaName(p.isa));
+        }
+        var missing: string? = this.firstMissingExt(p.isaExt);
+        if (missing != null) {
+            return new JasoMismatch("isa_ext", "-", missing);
+        }
+        if (p.target != this.target) {
+            return new JasoMismatch("target", JasoHostPlatform.targetName(this.target), JasoHostPlatform.targetName(p.target));
+        }
+        if (p.abi != this.abi) {
+            return new JasoMismatch("abi", this.abi, p.abi);
+        }
+        if (p.floatAbi != this.floatAbi) {
+            return new JasoMismatch("float_abi", JasoHostPlatform.floatName(this.floatAbi), JasoHostPlatform.floatName(p.floatAbi));
+        }
+        if (p.pointerBytes != this.pointerBytes) {
+            return new JasoMismatch("pointer_bytes", "" + this.pointerBytes, "" + p.pointerBytes);
+        }
+        return null;
+    }
+
+    /** 做什么：文件记号里第一个宿主没有的；都有返回 null。 */
+    private function firstMissingExt(ext: string): string? {
+        if (ext == "") {
+            return null;
+        }
+        var data: byte[] = ext.getBytes("UTF-8");
+        var start: int32 = 0;
+        var i: int32 = 0;
+        while (i <= data.length) {
+            if (i == data.length || (data[i] & 255) == 44) {
+                var token: string = JasoBytes.text(data, start, i);
+                if (!this.isaExt.contains(token)) {
+                    return token;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /** 做什么：指令集名字。 */
+    private static function isaName(isa: int32): string {
+        var names: string[] = ["none", "x86_64", "aarch64", "riscv64", "riscv32"];
+        return names[isa];
+    }
+
+    /** 做什么：目标环境名字。 */
+    private static function targetName(target: int32): string {
+        var names: string[] = ["", "jasper-os", "jvm", "host"];
+        return names[target];
+    }
+
+    /** 做什么：浮点约定名字。 */
+    private static function floatName(floatAbi: int32): string {
+        var names: string[] = ["none", "soft", "hard"];
+        return names[floatAbi];
+    }
+}
+
+/**
+ * 一次装载的宿主上下文。
+ *
+ * 做什么：check 执行规范第 12.2 节第 1–6 步，第一处失败抛 JasoError；通过时返回文件
+ *   与选中的镜像由调用方接着做链接。
+ * 为什么 Native / Managed 两个宿主平台分开：同一进程可以同时是 JVM 托管宿主和原生宿主，
+ *   按文件种类选用，与一致性上下文的定义相同；没有的一侧传 null，对应文件必然不符。
+ */
+public class JasoLoader {
+    private var nativeHost: JasoHostPlatform?;
+    private var managedHost: JasoHostPlatform?;
+    private var runtimeVersion: JasoVersion;
+    private var loadedNames: JasoStrings;
+    private var loadedVersions: JasoVersion[];
+    private var granted: JasoStrings;
+
+    /** 做什么：由宿主事实构造；loadedVersions 与 loadedNames 下标一一对应。 */
+    public constructor(nativeHost: JasoHostPlatform?, managedHost: JasoHostPlatform?, runtimeVersion: JasoVersion, loadedNames: JasoStrings, loadedVersions: JasoVersion[], granted: JasoStrings) {
+        this.nativeHost = nativeHost;
+        this.managedHost = managedHost;
+        this.runtimeVersion = runtimeVersion;
+        this.loadedNames = loadedNames;
+        this.loadedVersions = loadedVersions;
+        this.granted = granted;
+    }
+
+    /** 做什么：第 1–6 步；policy 的构造错误由调用方先行暴露。 */
+    public function check(file: JasoFile, policy: JasoTrustPolicy): JasoImage {
+        policy.verify(file);
+        var image: JasoImage = this.select(file);
+        var manifest: JasoManifest = file.manifest;
+        var runtime: JasoVersionRange? = manifest.runtime;
+        if (runtime != null && !runtime.contains(this.runtimeVersion)) {
+            throw new JasoError("dependency.runtime");
+        }
+        var i: int32 = 0;
+        while (i < manifest.dependencyCount) {
+            if (!this.satisfied(manifest.dependencies[i])) {
+                throw new JasoError("dependency.unsatisfied");
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < manifest.requires.size()) {
+            if (!this.granted.contains(manifest.requires.get(i))) {
+                throw new JasoError("capability.denied");
+            }
+            i = i + 1;
+        }
+        return image;
+    }
+
+    /** 做什么：第 3 步：第一个相符的镜像；都不符时报告镜像 0 第一个不符的字段。 */
+    public function select(file: JasoFile): JasoImage {
+        var host: JasoHostPlatform? = file.kind == 2 ? this.managedHost : this.nativeHost;
+        if (host == null) {
+            throw new JasoError("platform.mismatch");
+        }
+        var first: JasoMismatch? = null;
+        var i: int32 = 0;
+        while (i < file.images.length) {
+            var difference: JasoMismatch? = host.mismatch(file.images[i].platform);
+            if (difference == null) {
+                return file.images[i];
+            }
+            if (first == null) {
+                first = difference;
+            }
+            i = i + 1;
+        }
+        if (first != null) {
+            throw new JasoError("platform.mismatch", first.field, first.expected, first.actual);
+        }
+        throw new JasoError("platform.mismatch");
+    }
+
+    /** 做什么：依赖是否被已装入模块满足。 */
+    private function satisfied(dependency: JasoDependency): bool {
+        var i: int32 = 0;
+        while (i < this.loadedNames.size()) {
+            if (this.loadedNames.get(i) == dependency.name) {
+                var range: JasoVersionRange? = dependency.range;
+                if (range == null || range.contains(this.loadedVersions[i])) {
+                    return true;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+/**
+ * 规范第 14 节的固定一致性上下文。
+ *
+ * 做什么：check 给出 `ok` 或码名，与 `.expect` 文件直接比较。
+ * 什么时候用：一致性向量与跨实现差分测试；生产装载用 JasoLoader 并传自己的上下文。
+ * 失败模式：只把 JasoError 变成码名；其它异常（实现缺陷）照常抛出，不被吞掉。
+ */
+public class JasoConformance {
+    /** 做什么：按一致性上下文判定 data；devKey 是向量旁公开的开发用公钥。 */
+    public static function check(data: byte[], devKey: byte[]): string {
+        try {
+            var file: JasoFile = JasoFile.read(data);
+            var publishers: JasoPublisher[] = [new JasoPublisher("jasper.dev", "jaso-", devKey)];
+            var policy: JasoTrustPolicy = new JasoTrustPolicy(publishers, true);
+            JasoConformance.loader().check(file, policy);
+            return "ok";
+        } catch (error: JasoError) {
+            return error.code();
+        }
+    }
+
+    /** 做什么：同 check，但平台不符时带上字段、宿主值、文件值（制表符分隔）。 */
+    public static function detail(data: byte[], devKey: byte[]): string {
+        try {
+            var file: JasoFile = JasoFile.read(data);
+            var publishers: JasoPublisher[] = [new JasoPublisher("jasper.dev", "jaso-", devKey)];
+            JasoConformance.loader().check(file, new JasoTrustPolicy(publishers, true));
+            return "ok";
+        } catch (error: JasoError) {
+            if (error.field() == "") {
+                return error.code();
+            }
+            return error.code() + "\t" + error.field() + "\t" + error.expected() + "\t" + error.actual();
+        }
+    }
+
+    /** 做什么：结构读取的结果（不看宿主上下文）：`ok` 或码名。 */
+    public static function structural(data: byte[]): string {
+        try {
+            JasoFile.read(data);
+            return "ok";
+        } catch (error: JasoError) {
+            return error.code();
+        }
+    }
+
+    /** 做什么：固定上下文的装载器：x86_64 / jasper-os / 硬浮点 / c.v1；jvm.52；运行时 0.1.0；已装 jaso-base 1.2.0；授予 log、alloc。 */
+    private static function loader(): JasoLoader {
+        var nativeHost: JasoHostPlatform = new JasoHostPlatform(1, new JasoStrings(), 1, 8, 2, "c.v1");
+        var managedHost: JasoHostPlatform = new JasoHostPlatform(0, new JasoStrings(), 2, 0, 0, "jvm.52");
+        var loaded: JasoStrings = new JasoStrings();
+        loaded.append("jaso-base");
+        var granted: JasoStrings = new JasoStrings();
+        granted.append("log");
+        granted.append("alloc");
+        var versions: JasoVersion[] = [new JasoVersion(1, 2, 0)];
+        return new JasoLoader(nativeHost, managedHost, new JasoVersion(0, 1, 0), loaded, versions, granted);
+    }
+}

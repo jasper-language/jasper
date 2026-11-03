@@ -1,0 +1,4 @@
+core.name = jam-imse
+core.depends = a@>=0.0,sime
+core.depends =  0.
+core.depends =.version = 

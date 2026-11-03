@@ -1,0 +1,2 @@
+cre.depends = a@>=2. b
+core.requires = =/pend.dea@>=1.0,ny

@@ -1,0 +1,506 @@
+package std.jaso;
+
+// ============================================================================
+// Ed25519.jas —— RFC 8032 Ed25519 严格验签（只验不签）
+// ============================================================================
+// 职责：判定公钥编码是否合法曲线点，并按严格规则验证签名。
+//
+// 严格规则（与 ed25519-dalek 3.0 的 verify_strict 一致，规范第 10 节）：
+//   1. S 必须 < 群阶 L（拒绝可延展的非规范标量）；
+//   2. R 与 A 都必须能解码为曲线点，且都不能是小阶点；
+//   3. 计算 R' = [S]B - [k]A，k = SHA-512(R ‖ A ‖ M) mod L，R' 的规范编码必须与
+//      签名里的 R **逐字节相等**（因此非规范的 R 编码一律被拒，也不做乘余因子）。
+//
+// 为什么用 Jasper 实现而不引第三方库：JVM 8 没有内置 Ed25519；运行时要在 class 52
+//   的 Jasper 程序里验签，平台只需提供 SHA-512（java.security.MessageDigest，JDK 1.4 起）。
+//   域运算采用公有领域 TweetNaCl 的 16 肢 × 16 位表示：实现短，便于逐行审计。
+//
+// 非恒定时间无妨：验签的全部输入都是公开数据。
+// ============================================================================
+
+/** 无状态验签入口。 */
+public class Ed25519 {
+    /** 做什么：32 字节编码能否解码为曲线点（等价于参考实现的「公钥合法」）。 */
+    public static function validKey(key: byte[]): bool {
+        if (key.length != 32) {
+            return false;
+        }
+        var point: int64[][] = Ed25519.newPoint();
+        return Ed25519.unpackNegative(point, key);
+    }
+
+    /**
+     * 做什么：严格验证 signature 是否 key 对 message 的签名。
+     * 前置条件：无；长度不对或编码非法都返回 false，不抛异常。
+     */
+    public static function verifyStrict(key: byte[], message: byte[], signature: byte[]): bool {
+        if (key.length != 32 || signature.length != 64) {
+            return false;
+        }
+        if (!Ed25519.scalarCanonical(signature)) {
+            return false;
+        }
+        var encodedR: byte[] = JasoBytes.copy(signature, 0, 32);
+        var negativeR: int64[][] = Ed25519.newPoint();
+        if (!Ed25519.unpackNegative(negativeR, encodedR) || Ed25519.smallOrder(negativeR)) {
+            return false;
+        }
+        var negativeA: int64[][] = Ed25519.newPoint();
+        if (!Ed25519.unpackNegative(negativeA, key) || Ed25519.smallOrder(negativeA)) {
+            return false;
+        }
+
+        var sha: java.security.MessageDigest = java.security.MessageDigest.getInstance("SHA-512");
+        sha.update(encodedR, 0, 32);
+        sha.update(key, 0, 32);
+        sha.update(message, 0, message.length);
+        var k: int32[] = Ed25519.reduce(sha.digest());
+
+        var result: int64[][] = Ed25519.newPoint();
+        Ed25519.scalarMult(result, negativeA, k);
+        var s: int32[] = new int32[32];
+        var i: int32 = 0;
+        while (i < 32) {
+            s[i] = signature[32 + i] & 255;
+            i = i + 1;
+        }
+        var base: int64[][] = Ed25519.basePoint();
+        var sB: int64[][] = Ed25519.newPoint();
+        Ed25519.scalarMult(sB, base, s);
+        Ed25519.add(result, sB);
+        var encoded: int32[] = Ed25519.packPoint(result);
+        i = 0;
+        while (i < 32) {
+            if (encoded[i] != (encodedR[i] & 255)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：signature[32..64] 的小端标量是否 < L。 */
+    private static function scalarCanonical(signature: byte[]): bool {
+        var order: int32[] = Ed25519.groupOrder();
+        var i: int32 = 31;
+        while (i >= 0) {
+            var c: int32 = signature[32 + i] & 255;
+            if (c < order[i]) {
+                return true;
+            }
+            if (c > order[i]) {
+                return false;
+            }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /** 做什么：群阶 L 的小端字节。 */
+    private static function groupOrder(): int32[] {
+        return [
+            237, 211, 245, 92, 26, 99, 18, 88, 214, 156, 247, 162, 222, 249, 222, 20,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16
+        ];
+    }
+
+    /** 做什么：把 16 个 int32 常量放进域元素。 */
+    private static function gf(v: int32[]): int64[] {
+        var out: int64[] = new int64[16];
+        var i: int32 = 0;
+        while (i < v.length) {
+            out[i] = v[i];
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：曲线常数 d。 */
+    private static function curveD(): int64[] {
+        return Ed25519.gf([30883, 4953, 19914, 30187, 55467, 16705, 2637, 112, 59544, 30585, 16505, 36039, 65139, 11119, 27886, 20995]);
+    }
+
+    /** 做什么：曲线常数 2d。 */
+    private static function curveD2(): int64[] {
+        return Ed25519.gf([61785, 9906, 39828, 60374, 45398, 33411, 5274, 224, 53552, 61171, 33010, 6542, 64743, 22239, 55772, 9222]);
+    }
+
+    /** 做什么：sqrt(-1) mod p。 */
+    private static function sqrtM1(): int64[] {
+        return Ed25519.gf([41136, 18958, 6951, 50414, 58488, 44335, 6150, 12099, 55207, 15867, 153, 11085, 57099, 20417, 9344, 11139]);
+    }
+
+    /** 做什么：基点 B 的扩展坐标。 */
+    private static function basePoint(): int64[][] {
+        var x: int64[] = Ed25519.gf([54554, 36645, 11616, 51542, 42930, 38181, 51040, 26924, 56412, 64982, 57905, 49316, 21502, 52590, 14035, 8553]);
+        var y: int64[] = Ed25519.gf([26200, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214]);
+        var p: int64[][] = Ed25519.newPoint();
+        Ed25519.set(p[0], x);
+        Ed25519.set(p[1], y);
+        p[2][0] = 1;
+        Ed25519.mul(p[3], x, y);
+        return p;
+    }
+
+    /** 做什么：四个域元素组成的点（X, Y, Z, T），初值全零。 */
+    private static function newPoint(): int64[][] {
+        return [new int64[16], new int64[16], new int64[16], new int64[16]];
+    }
+
+    /** 做什么：o = a。 */
+    private static function set(o: int64[], a: int64[]): void {
+        var i: int32 = 0;
+        while (i < 16) {
+            o[i] = a[i];
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：进位传播，把各肢收回约 16 位。最高肢的进位按 2^256 ≡ 38 折回。 */
+    private static function carry(o: int64[]): void {
+        var i: int32 = 0;
+        while (i < 16) {
+            o[i] = o[i] + 65536;
+            var c: int64 = o[i] >> 16;
+            if (i < 15) {
+                o[i + 1] = o[i + 1] + c - 1;
+            } else {
+                o[0] = o[0] + 38 * (c - 1);
+            }
+            o[i] = o[i] - (c << 16);
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：bit = 1 时交换 p、q。 */
+    private static function select(p: int64[], q: int64[], bit: int32): void {
+        var mask: int64 = 0 - bit;
+        var i: int32 = 0;
+        while (i < 16) {
+            var t: int64 = mask & (p[i] ^ q[i]);
+            p[i] = p[i] ^ t;
+            q[i] = q[i] ^ t;
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：规范编码（完全约简到 [0, p)），返回 32 个 0..255 的值。 */
+    private static function pack(n: int64[]): int32[] {
+        var t: int64[] = new int64[16];
+        var m: int64[] = new int64[16];
+        Ed25519.set(t, n);
+        Ed25519.carry(t);
+        Ed25519.carry(t);
+        Ed25519.carry(t);
+        var round: int32 = 0;
+        while (round < 2) {
+            m[0] = t[0] - 65517;
+            var i: int32 = 1;
+            while (i < 15) {
+                m[i] = t[i] - 65535 - ((m[i - 1] >> 16) & 1);
+                m[i - 1] = m[i - 1] & 65535;
+                i = i + 1;
+            }
+            m[15] = t[15] - 32767 - ((m[14] >> 16) & 1);
+            var borrow: int32 = (int32) ((m[15] >> 16) & 1);
+            m[14] = m[14] & 65535;
+            Ed25519.select(t, m, 1 - borrow);
+            round = round + 1;
+        }
+        var out: int32[] = new int32[32];
+        var j: int32 = 0;
+        while (j < 16) {
+            out[2 * j] = (int32) (t[j] & 255);
+            out[2 * j + 1] = (int32) ((t[j] >> 8) & 255);
+            j = j + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：a、b 模 p 是否相等。 */
+    private static function sameElement(a: int64[], b: int64[]): bool {
+        var x: int32[] = Ed25519.pack(a);
+        var y: int32[] = Ed25519.pack(b);
+        var i: int32 = 0;
+        while (i < 32) {
+            if (x[i] != y[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：规范编码最低位（「负」的定义）。 */
+    private static function parity(a: int64[]): int32 {
+        return Ed25519.pack(a)[0] & 1;
+    }
+
+    /** 做什么：o = a + b。 */
+    private static function addE(o: int64[], a: int64[], b: int64[]): void {
+        var i: int32 = 0;
+        while (i < 16) {
+            o[i] = a[i] + b[i];
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：o = a - b。 */
+    private static function subE(o: int64[], a: int64[], b: int64[]): void {
+        var i: int32 = 0;
+        while (i < 16) {
+            o[i] = a[i] - b[i];
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：o = a * b（o 可与 a、b 相同）。 */
+    private static function mul(o: int64[], a: int64[], b: int64[]): void {
+        var t: int64[] = new int64[31];
+        var i: int32 = 0;
+        while (i < 16) {
+            var j: int32 = 0;
+            while (j < 16) {
+                t[i + j] = t[i + j] + a[i] * b[j];
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 15) {
+            t[i] = t[i] + 38 * t[i + 16];
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 16) {
+            o[i] = t[i];
+            i = i + 1;
+        }
+        Ed25519.carry(o);
+        Ed25519.carry(o);
+    }
+
+    /** 做什么：o = a^(p-2)，即模逆。 */
+    private static function invert(o: int64[], a: int64[]): void {
+        var c: int64[] = new int64[16];
+        Ed25519.set(c, a);
+        var e: int32 = 253;
+        while (e >= 0) {
+            Ed25519.mul(c, c, c);
+            if (e != 2 && e != 4) {
+                Ed25519.mul(c, c, a);
+            }
+            e = e - 1;
+        }
+        Ed25519.set(o, c);
+    }
+
+    /** 做什么：o = a^((p-5)/8)，解码时开平方用。 */
+    private static function pow2523(o: int64[], a: int64[]): void {
+        var c: int64[] = new int64[16];
+        Ed25519.set(c, a);
+        var e: int32 = 250;
+        while (e >= 0) {
+            Ed25519.mul(c, c, c);
+            if (e != 1) {
+                Ed25519.mul(c, c, a);
+            }
+            e = e - 1;
+        }
+        Ed25519.set(o, c);
+    }
+
+    /** 做什么：p = p + q（扩展坐标统一加法；p、q 可为同一个点，结果最后才写入）。 */
+    private static function add(p: int64[][], q: int64[][]): void {
+        var a: int64[] = new int64[16];
+        var b: int64[] = new int64[16];
+        var c: int64[] = new int64[16];
+        var d: int64[] = new int64[16];
+        var e: int64[] = new int64[16];
+        var f: int64[] = new int64[16];
+        var g: int64[] = new int64[16];
+        var h: int64[] = new int64[16];
+        var t: int64[] = new int64[16];
+        Ed25519.subE(a, p[1], p[0]);
+        Ed25519.subE(t, q[1], q[0]);
+        Ed25519.mul(a, a, t);
+        Ed25519.addE(b, p[0], p[1]);
+        Ed25519.addE(t, q[0], q[1]);
+        Ed25519.mul(b, b, t);
+        Ed25519.mul(c, p[3], q[3]);
+        Ed25519.mul(c, c, Ed25519.curveD2());
+        Ed25519.mul(d, p[2], q[2]);
+        Ed25519.addE(d, d, d);
+        Ed25519.subE(e, b, a);
+        Ed25519.subE(f, d, c);
+        Ed25519.addE(g, d, c);
+        Ed25519.addE(h, b, a);
+        Ed25519.mul(p[0], e, f);
+        Ed25519.mul(p[1], h, g);
+        Ed25519.mul(p[2], g, f);
+        Ed25519.mul(p[3], e, h);
+    }
+
+    /** 做什么：点的规范压缩编码。 */
+    private static function packPoint(p: int64[][]): int32[] {
+        var zi: int64[] = new int64[16];
+        var tx: int64[] = new int64[16];
+        var ty: int64[] = new int64[16];
+        Ed25519.invert(zi, p[2]);
+        Ed25519.mul(tx, p[0], zi);
+        Ed25519.mul(ty, p[1], zi);
+        var out: int32[] = Ed25519.pack(ty);
+        out[31] = out[31] ^ (Ed25519.parity(tx) << 7);
+        return out;
+    }
+
+    /**
+     * 做什么：p = [s]q，s 是 32 个 0..255 的小端值；q 被用作工作区、调用后不可再用。
+     * 为什么逐位双倍加：验签没有秘密数据，用最短的写法便于审计。
+     */
+    private static function scalarMult(p: int64[][], q: int64[][], s: int32[]): void {
+        var i: int32 = 0;
+        while (i < 4) {
+            var j: int32 = 0;
+            while (j < 16) {
+                p[i][j] = 0;
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        p[1][0] = 1;
+        p[2][0] = 1;
+        var bitIndex: int32 = 255;
+        while (bitIndex >= 0) {
+            var bit: int32 = (s[bitIndex >> 3] >> (bitIndex & 7)) & 1;
+            Ed25519.swap(p, q, bit);
+            Ed25519.add(q, p);
+            Ed25519.add(p, p);
+            Ed25519.swap(p, q, bit);
+            bitIndex = bitIndex - 1;
+        }
+    }
+
+    /** 做什么：bit = 1 时交换两点。 */
+    private static function swap(p: int64[][], q: int64[][], bit: int32): void {
+        var i: int32 = 0;
+        while (i < 4) {
+            Ed25519.select(p[i], q[i], bit);
+            i = i + 1;
+        }
+    }
+
+    /**
+     * 做什么：解码 32 字节并取负，写入 r；不是曲线点返回 false。
+     * 为什么取负：验签要算 -[k]A，解码时顺手取负最省。
+     * 接受非规范的 y（>= p，按模 p 处理）与「x = 0 但符号位为 1」，
+     *   和参考实现的解压一致；小阶点由 smallOrder 另行拒绝。
+     */
+    private static function unpackNegative(r: int64[][], encoded: byte[]): bool {
+        var t: int64[] = new int64[16];
+        var check: int64[] = new int64[16];
+        var num: int64[] = new int64[16];
+        var den: int64[] = new int64[16];
+        var den2: int64[] = new int64[16];
+        var den4: int64[] = new int64[16];
+        var den6: int64[] = new int64[16];
+        r[2][0] = 1;
+        var i: int32 = 0;
+        while (i < 16) {
+            r[1][i] = (encoded[2 * i] & 255) + ((encoded[2 * i + 1] & 255) << 8);
+            i = i + 1;
+        }
+        r[1][15] = r[1][15] & 32767;
+        Ed25519.mul(num, r[1], r[1]);
+        Ed25519.mul(den, num, Ed25519.curveD());
+        Ed25519.subE(num, num, r[2]);
+        Ed25519.addE(den, r[2], den);
+        Ed25519.mul(den2, den, den);
+        Ed25519.mul(den4, den2, den2);
+        Ed25519.mul(den6, den4, den2);
+        Ed25519.mul(t, den6, num);
+        Ed25519.mul(t, t, den);
+        Ed25519.pow2523(t, t);
+        Ed25519.mul(t, t, num);
+        Ed25519.mul(t, t, den);
+        Ed25519.mul(t, t, den);
+        Ed25519.mul(r[0], t, den);
+        Ed25519.mul(check, r[0], r[0]);
+        Ed25519.mul(check, check, den);
+        if (!Ed25519.sameElement(check, num)) {
+            Ed25519.mul(r[0], r[0], Ed25519.sqrtM1());
+        }
+        Ed25519.mul(check, r[0], r[0]);
+        Ed25519.mul(check, check, den);
+        if (!Ed25519.sameElement(check, num)) {
+            return false;
+        }
+        if (Ed25519.parity(r[0]) == ((encoded[31] & 255) >> 7)) {
+            var zero: int64[] = new int64[16];
+            Ed25519.subE(r[0], zero, r[0]);
+        }
+        Ed25519.mul(r[3], r[0], r[1]);
+        return true;
+    }
+
+    /** 做什么：[8]p 是否单位元（p 取负不改变阶）。 */
+    private static function smallOrder(p: int64[][]): bool {
+        var q: int64[][] = Ed25519.newPoint();
+        var i: int32 = 0;
+        while (i < 4) {
+            Ed25519.set(q[i], p[i]);
+            i = i + 1;
+        }
+        Ed25519.add(q, q);
+        Ed25519.add(q, q);
+        Ed25519.add(q, q);
+        var zero: int64[] = new int64[16];
+        return Ed25519.sameElement(q[0], zero) && Ed25519.sameElement(q[1], q[2]);
+    }
+
+    /** 做什么：把 64 字节小端数约简到 [0, L)，返回 32 个 0..255 的值。 */
+    private static function reduce(wide: byte[]): int32[] {
+        var x: int64[] = new int64[64];
+        var order: int32[] = Ed25519.groupOrder();
+        var i: int32 = 0;
+        while (i < 64) {
+            x[i] = wide[i] & 255;
+            i = i + 1;
+        }
+        i = 63;
+        while (i >= 32) {
+            var carry: int64 = 0;
+            var j: int32 = i - 32;
+            while (j < i - 12) {
+                x[j] = x[j] + carry - 16 * x[i] * order[j - (i - 32)];
+                carry = (x[j] + 128) >> 8;
+                x[j] = x[j] - (carry << 8);
+                j = j + 1;
+            }
+            x[j] = x[j] + carry;
+            x[i] = 0;
+            i = i - 1;
+        }
+        var top: int64 = 0;
+        var k: int32 = 0;
+        while (k < 32) {
+            x[k] = x[k] + top - (x[31] >> 4) * order[k];
+            top = x[k] >> 8;
+            x[k] = x[k] & 255;
+            k = k + 1;
+        }
+        k = 0;
+        while (k < 32) {
+            x[k] = x[k] - top * order[k];
+            k = k + 1;
+        }
+        var out: int32[] = new int32[32];
+        k = 0;
+        while (k < 32) {
+            x[k + 1] = x[k + 1] + (x[k] >> 8);
+            out[k] = (int32) (x[k] & 255);
+            k = k + 1;
+        }
+        return out;
+    }
+}

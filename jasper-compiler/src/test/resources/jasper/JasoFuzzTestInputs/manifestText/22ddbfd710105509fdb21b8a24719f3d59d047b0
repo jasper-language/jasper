@@ -1,0 +1,4 @@
+core.name = jasoie
+core.depends = a@>=1.0,<2.0, b
+core.requires = log
+web. y

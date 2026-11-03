@@ -1,0 +1,5 @@
+co.name =jaso-a
+core.version = 1.0.0
+core.abi = ntime
+core.depends = a@>=g
+web.x . y

@@ -1,0 +1,4 @@
+core.name = ja-osco
+are.sion = 1.0.0
+core.abi = c.v1
+core.depends =1.0= y

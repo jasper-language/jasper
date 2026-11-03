@@ -1,0 +1,243 @@
+package std.jaso;
+
+// ============================================================================
+// JasoBytes.jas —— 小端字段读取与文本切片工具
+// ============================================================================
+// 职责：把 byte[] 按无符号小端读成整数、比较切片、判断字符集与空白。u32 一律放进
+//   int64，这样偏移与长度的加法不可能回绕，规范要求的「检查式运算」自然成立。
+//
+// 前置条件：所有读取函数的偏移由调用方先证明在界内；越界是实现缺陷而不是输入错误，
+//   fuzz 测试会把它当失败抓出来。
+//
+// 字符集判断都按字节：清单是已校验的 UTF-8，多字节序列的字节都 >= 0x80，
+//   不会命中任何 ASCII 分隔符或字符集，因此无需先解码。
+// ============================================================================
+
+/** 无状态工具集。 */
+public class JasoBytes {
+    /** 做什么：读无符号字节。 */
+    public static function u8(b: byte[], o: int32): int32 {
+        return b[o] & 255;
+    }
+
+    /** 做什么：读小端 u16。 */
+    public static function u16(b: byte[], o: int32): int32 {
+        return (b[o] & 255) | ((b[o + 1] & 255) << 8);
+    }
+
+    /** 做什么：读小端 u32，结果在 0 ..= 2^32-1。 */
+    public static function u32(b: byte[], o: int32): int64 {
+        var low: int64 = JasoBytes.u16(b, o);
+        var high: int64 = JasoBytes.u16(b, o + 2);
+        return low | (high << 16);
+    }
+
+    /** 做什么：读小端 u64 的位模式；最高位为 1 时结果为负，调用方按无符号解释。 */
+    public static function u64(b: byte[], o: int32): int64 {
+        return JasoBytes.u32(b, o) | (JasoBytes.u32(b, o + 4) << 32);
+    }
+
+    /** 做什么：[lo, hi) 是否全为零。 */
+    public static function allZero(b: byte[], lo: int32, hi: int32): bool {
+        var i: int32 = lo;
+        while (i < hi) {
+            if (b[i] != 0) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：两段字节是否相等。 */
+    public static function equal(a: byte[], ao: int32, b: byte[], bo: int32, n: int32): bool {
+        var i: int32 = 0;
+        while (i < n) {
+            if (a[ao + i] != b[bo + i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：复制 [lo, hi)。 */
+    public static function copy(b: byte[], lo: int32, hi: int32): byte[] {
+        var out: byte[] = new byte[hi - lo];
+        var i: int32 = lo;
+        while (i < hi) {
+            out[i - lo] = b[i];
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：把 [lo, hi) 按 UTF-8 解码；调用方已证明它是合法 UTF-8。 */
+    public static function text(b: byte[], lo: int32, hi: int32): string {
+        var s: string = new java.lang.String(b, lo, hi - lo, "UTF-8");
+        return s;
+    }
+
+    /** 做什么：c 是否小写字母或数字。 */
+    public static function lowerOrDigit(c: int32): bool {
+        return (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+    }
+
+    /**
+     * 做什么：[lo, hi) 是否 1 ..= max 字节且每字节是小写字母、数字或 extra 中的字符。
+     * 什么时候用：规范里所有 `[a-z0-9...]` 形式的名字。
+     */
+    public static function nameOk(b: byte[], lo: int32, hi: int32, extra: string, max: int32): bool {
+        if (hi <= lo || hi - lo > max) {
+            return false;
+        }
+        var i: int32 = lo;
+        while (i < hi) {
+            var c: int32 = b[i] & 255;
+            if (!JasoBytes.lowerOrDigit(c) && !JasoBytes.inSet(c, extra)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：导出名字符集 `[A-Za-z0-9_.$]`，1 ..= 128 字节。 */
+    public static function symbolOk(b: byte[], lo: int32, hi: int32): bool {
+        if (hi <= lo || hi - lo > 128) {
+            return false;
+        }
+        var i: int32 = lo;
+        while (i < hi) {
+            var c: int32 = b[i] & 255;
+            var upper: bool = c >= 65 && c <= 90;
+            if (!JasoBytes.lowerOrDigit(c) && !upper && c != 95 && c != 46 && c != 36) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：ASCII 字符 c 是否在 set 中；set 只含 ASCII，下标即字节位置。 */
+    private static function inSet(c: int32, set: string): bool {
+        var i: int32 = 0;
+        while (i < set.length) {
+            if (set.codePointAt(i) == c) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /**
+     * 做什么：[lo, hi) 是否合法 UTF-8。
+     * 为什么手写：拒绝规则（过长编码、代理区、超过 U+10FFFF、截断）必须与参考实现
+     *   逐字节一致，手写判定不受平台解码器宽松模式影响，且不分配。
+     */
+    public static function validUtf8(b: byte[], lo: int32, hi: int32): bool {
+        var i: int32 = lo;
+        while (i < hi) {
+            var c: int32 = b[i] & 255;
+            if (c < 128) {
+                i = i + 1;
+                continue;
+            }
+            var n: int32 = 0;
+            var low: int32 = 128;
+            var high: int32 = 191;
+            if (c >= 194 && c <= 223) {
+                n = 1;
+            } else if (c >= 224 && c <= 239) {
+                n = 2;
+                if (c == 224) {
+                    low = 160;
+                }
+                if (c == 237) {
+                    high = 159;
+                }
+            } else if (c >= 240 && c <= 244) {
+                n = 3;
+                if (c == 240) {
+                    low = 144;
+                }
+                if (c == 244) {
+                    high = 143;
+                }
+            } else {
+                return false;
+            }
+            if (hi - i <= n) {
+                return false;
+            }
+            var first: int32 = b[i + 1] & 255;
+            if (first < low || first > high) {
+                return false;
+            }
+            var j: int32 = 2;
+            while (j <= n) {
+                var next: int32 = b[i + j] & 255;
+                if (next < 128 || next > 191) {
+                    return false;
+                }
+                j = j + 1;
+            }
+            i = i + n + 1;
+        }
+        return true;
+    }
+
+    /**
+     * 做什么：[lo, hi) 开头空白字符的字节数；开头不是空白时为 0。
+     * 什么时候用：清单的修剪。「空白」取 Unicode White_Space（与参考实现一致，
+     *   已记入规范勘误）。前置条件：所在文本是合法 UTF-8。
+     */
+    public static function leadingSpace(b: byte[], lo: int32, hi: int32): int32 {
+        var c: int32 = b[lo] & 255;
+        if ((c >= 9 && c <= 13) || c == 32) {
+            return 1;
+        }
+        if (c == 194 && hi - lo >= 2) {
+            return JasoBytes.space2(b[lo + 1] & 255) ? 2 : 0;
+        }
+        if (c >= 225 && c <= 227 && hi - lo >= 3) {
+            return JasoBytes.space3(c, b[lo + 1] & 255, b[lo + 2] & 255) ? 3 : 0;
+        }
+        return 0;
+    }
+
+    /** 做什么：[lo, hi) 结尾空白字符的字节数；结尾不是空白时为 0。前置条件同上。 */
+    public static function trailingSpace(b: byte[], lo: int32, hi: int32): int32 {
+        var c: int32 = b[hi - 1] & 255;
+        if ((c >= 9 && c <= 13) || c == 32) {
+            return 1;
+        }
+        if (hi - lo >= 2 && (b[hi - 2] & 255) == 194 && JasoBytes.space2(c)) {
+            return 2;
+        }
+        if (hi - lo >= 3 && JasoBytes.space3(b[hi - 3] & 255, b[hi - 2] & 255, c)) {
+            return 3;
+        }
+        return 0;
+    }
+
+    /** 做什么：C2 xx 是否 U+0085 或 U+00A0。 */
+    private static function space2(second: int32): bool {
+        return second == 133 || second == 160;
+    }
+
+    /** 做什么：三字节序列是否 U+1680、U+2000..200A、U+2028、U+2029、U+202F、U+205F、U+3000。 */
+    private static function space3(a: int32, b: int32, c: int32): bool {
+        if (a == 225) {
+            return b == 154 && c == 128;
+        }
+        if (a == 226) {
+            if (b == 128) {
+                return (c >= 128 && c <= 138) || c == 168 || c == 169 || c == 175;
+            }
+            return b == 129 && c == 159;
+        }
+        return a == 227 && b == 128 && c == 128;
+    }
+}

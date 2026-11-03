@@ -1,0 +1,16 @@
+# 差分表生成器：用 `.jaso` 参考实现（Rust）判定一批变异输入，写出 Jasper 读取器测试比对的期望表。
+# Generates the expected tables for the differential tests of the Jasper `.jaso` reader.
+[package]
+name = "jaso-diff"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+jaso = { git = "https://github.com/jasper-language/jasper-os", rev = "af5318973284ab0922516d128e0cdb299f072f22", features = ["pack"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false }
+curve25519-dalek = { version = "=5.0.0", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }

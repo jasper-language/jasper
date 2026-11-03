@@ -1,0 +1,4 @@
+core.name =-
+core.version= 0.0.0
+core.abi= c1
+core.stage= runtime

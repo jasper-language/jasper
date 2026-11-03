@@ -84,3 +84,18 @@
 - **全表共同未覆盖**：JVM 运行期行为（JIT、内存模型、类初始化竞争）、反射与动态代理、未建模的并发（编译器多线程编译、运行期多线程访问）、Android / D8 与 GraalVM 原生镜像工具链本身、非 JVM 后端。
 - **状态语义**：本表全部为 `tested`——只表示所列命令在固定输入或固定种子下真实执行并通过；不是形式证明，不随机扩展输入空间。属性测试的种子写在测试源码中，失败消息包含种子、轮次与最小化后的反例。
 
+
+| `LANG-JASO-READER-01` | `.jaso` format 1 读取器（Jasper 写的 `std.jaso`）对规范第 12.1 节结构读取与第 12.2 节第 1–6 步，给出与 Rust 参考实现相同的结果：68 个一致性向量逐字相等、51 个错误码全覆盖、码表编号与规范一致；变异输入、随机清单（含解析出的内容）、定向边界用例、平台不符的字段与取值、Ed25519 严格验签（小阶点、非规范标量与编码）全部一致；任意输入只得到稳定码名，不抛其它异常。 | `jasper-compiler/src/main/resources/stdlib/jaso/{JasoError,JasoBytes,Ed25519,JasoManifest,JasoFile,JasoLoader}.jas`；`jasper-compiler/src/test/kotlin/jasper/{JasoReaderTest,JasoDifferentialTest}.kt`；`verification/jaso-diff`；`verification/smt/jaso-arith.smt2` | Jasper 源码对应链，逐步见下方 `LANG-JASO-READER-01` 验证链明细 | `tested`（第 1 步算术事实为 `proved`，范围见明细） | `./gradlew :jasper-compiler:test --tests 'jasper.Jaso*' -x lincheckTest --no-daemon`；`Z3=<z3> bash verification/run-jaso-smt.sh` | 向量来源提交 af53189（`jaso-vectors/SOURCE`）。只覆盖读取与装载判定，不覆盖写文件、链接运行、`jasper.import` 内容。差分表是有限样本，不是等价证明；Z3 只证明所列算术事实，域运算的肢界 2^18 是假设，未证明每次运算都保持。 |
+
+### `LANG-JASO-READER-01` 验证链明细
+
+源码身份：本登记所在提交的 `stdlib/jaso/*.jas`。
+
+| 步 | 规格 / 范围 | 工具与版本 | 命令 | 结果 |
+|---|---|---|---|---|
+| 1 Z3 | 取整到页、扩展内容起点、段边界不回绕且可转 int32、表长不回绕、u32/u64 组合、域乘法在肢界 2^18 下不溢出（8 条，另 1 条故意写错的健全性检查） | Z3 4.16.0 | `Z3=<z3> bash verification/run-jaso-smt.sh` | 8 条 unsat，健全性检查 sat。TLA+ 不适用：读取器是无状态纯函数，没有协议 |
+| 2 性质测试 | 种子 20261151 的 Rust 差分表（变异文件 6000、随机清单文件 600、清单文本 3000、验签 1245、定向 20、平台 8）；种子 20261152 随机字节 3000 轮；种子 20261153 UTF-8 判定 40000 轮对 JDK 严格解码；与 JDK Ed25519 对比 40 轮 | Kotlin 固定种子（未用 jqwik，无收缩） | `--tests 'jasper.JasoDifferentialTest'` | 全部一致。变异 41 组 40 被抓，首轮 16 组存活，据此补了定向用例与差分工具；「页重叠按字节算」为等价变异（vaddr 已要求页对齐） |
+| 3 字节码校验 | `std.jaso` 全部 class 版本 52；子 JVM `-Xverify:all -Xcheck:jni` 加载本次编译全部 class | JDK 21 | 同上 | 通过。Miri 不适用：JVM 无未定义行为概念，此为替代证据 |
+| 4 Jazzer | `wholeFile`（修好长度与摘要）、`manifestText` 各 60 秒，语料入库 | jazzer-junit 0.30.0 | `JAZZER_FUZZ=1 JAZZER_INSTRUMENTATION_INCLUDES='std.jaso.**' ./gradlew :jasper-compiler:cleanTest :jasper-compiler:test --tests 'jasper.JasoFuzzTest.<入口>' -x lincheckTest --no-daemon` | 136220 次（cov 1472）与 846936 次（cov 499），无失败。必须带插桩范围：默认只插桩测试所在包，首次未带时 cov 仅 19，该次不算证据 |
+| 5 JBMC | — | 未安装 | — | `N/A`：工具不可用。替代证据为第 1、2、4 步，不等价于有界证明 |
+| 6 Lincheck | — | — | — | `N/A`：读取器没有静态可变状态，每次调用只用自己新建的对象，无并发协议可检。替代证据为 4 线程并发调用结果与单线程一致的测试 |

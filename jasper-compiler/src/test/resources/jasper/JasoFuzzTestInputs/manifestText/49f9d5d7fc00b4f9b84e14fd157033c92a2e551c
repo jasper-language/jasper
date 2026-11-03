@@ -1,0 +1,5 @@
+core.name = jaso-a
+core.version = 1.0.0
+core.abi = 1runtime
+core.depends = a@>=1.0,<2.0core. log
+web.xy = 

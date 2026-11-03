@@ -1,0 +1,2 @@
+e.v= ruime
+core.depends = a@>=0.0,v@>=0.0,<2.0,>2=

@@ -1,0 +1,6 @@
+core.name = jaso-a
+ccore.depends = a@>
+core.requires = log
+web.x =oep.0,<2.0, b
+core.requires = log
+web.x = y

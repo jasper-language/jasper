@@ -1,0 +1,4 @@
+core.name = je0.0
+core.abi = c.v1
+core.stage = runtime
+core.depends = a@>=0.0,<2.0,ge .y

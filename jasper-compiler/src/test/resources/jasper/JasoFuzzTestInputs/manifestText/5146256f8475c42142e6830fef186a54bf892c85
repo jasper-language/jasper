@@ -1,0 +1,18 @@
+co.name = j2.0, b2.0, b
+core.requires =e
+c.depends = a@>b
+co.name =
+core.requires =e
+c.depends = a@>= j0.0, b
+core.requires =e
+c.depends = a@>b
+co.name = j2.0, b2.0, b
+core.requires =e
+c.depends = a@>b
+co.name =
+core.requires =e
+c.dependscce = a@>= j0.0, b
+core.requires =e
+c.v=p= runtime
+core.dep.dre.requires
+cen, db

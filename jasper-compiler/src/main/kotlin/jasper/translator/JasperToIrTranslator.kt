@@ -2892,7 +2892,8 @@ class JasperToIrTranslator {
                 val right = translateExpression(expr.right, ctx)
                 val resultType = when (expr.op) {
                     "==", "!=", "<", ">", "<=", ">=" -> typeMapper.boolType()
-                    else -> left.type
+                    "<<", ">>", ">>>" -> left.type
+                    else -> promotedArithmeticType(left.type, right.type)
                 }
                 val stubSymbol = IrSimpleFunctionSymbolImpl()
                 ctx.callNames[stubSymbol] = expr.op
@@ -2904,6 +2905,23 @@ class JasperToIrTranslator {
                 return call
             }
         }
+    }
+
+    /**
+     * 算术与位运算结果的 IR 类型：两侧都是数值时取较宽者（后端按同一规则生成指令），否则保持左操作数类型。
+     * 只看左操作数时 `var x: int64 = 4 + y` 的结果被当成 int，赋值前多插一条 I2L，类校验失败。
+     */
+    private fun promotedArithmeticType(left: IrType, right: IrType): IrType {
+        /** 数值宽度的序；非数值类型为 -1。 */
+        fun rank(type: IrType): Int = when (typeMapper.jvmDescriptorFromIrType(type)) {
+            "B", "S", "C", "I" -> 0
+            "J" -> 1
+            "F" -> 2
+            "D" -> 3
+            else -> -1
+        }
+        val leftRank = rank(left)
+        return if (leftRank >= 0 && rank(right) > leftRank) right else left
     }
 
     private fun translateUnaryOp(expr: JasUnaryOp, ctx: TranslationContext): IrExpression {

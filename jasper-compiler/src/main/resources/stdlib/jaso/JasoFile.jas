@@ -1,0 +1,904 @@
+package std.jaso;
+
+// ============================================================================
+// JasoFile.jas —— `.jaso` format 1 的结构读取（规范第 3–11 节与第 12.1 节）
+// ============================================================================
+// 职责：不信任任何字段地校验一个文件，按规范规定的检查顺序报告第一处违例，
+//   成功后给出已证明在界内的视图。不解释扩展内容，不做信任与平台判定。
+//
+// 与谁协作：JasoLoader 在此之上做 L1 装载的信任、平台、运行时、依赖、能力检查。
+//
+// 为什么 u32 字段都放 int64：所有 偏移 + 长度 的求和在 int64 上不可能回绕；
+//   文件长度受 JVM 数组限制（< 2^31），一旦证明落在文件内，就能安全转成 int32。
+// ============================================================================
+
+/** 段目录项（规范第 5 节）。 */
+public class JasoSection {
+    public var kind: int64;
+    public var flags: int64;
+    public var fileOffset: int64;
+    public var fileSize: int64;
+    public var vaddr: int64;
+    public var memSize: int64;
+    public var reserved: int64;
+
+    /** 做什么：从 o 处读 32 字节；调用方已证明在界内。 */
+    public constructor(b: byte[], o: int32) {
+        this.kind = JasoBytes.u32(b, o);
+        this.flags = JasoBytes.u32(b, o + 4);
+        this.fileOffset = JasoBytes.u32(b, o + 8);
+        this.fileSize = JasoBytes.u32(b, o + 12);
+        this.vaddr = JasoBytes.u32(b, o + 16);
+        this.memSize = JasoBytes.u32(b, o + 20);
+        this.reserved = JasoBytes.u64(b, o + 24);
+    }
+
+    /** 做什么：内容起点；只在 bounds 校验之后调用。 */
+    public function start(): int32 {
+        return (int32) this.fileOffset;
+    }
+
+    /** 做什么：内容终点；只在 bounds 校验之后调用。 */
+    public function end(): int32 {
+        return (int32) (this.fileOffset + this.fileSize);
+    }
+
+    /** 做什么：内容长度；只在 bounds 校验之后调用。 */
+    public function size(): int32 {
+        return (int32) this.fileSize;
+    }
+}
+
+/** 一条已校验的平台记录（规范第 6.1 节）。 */
+public class JasoPlatform {
+    public var isa: int32;
+    public var pointerBytes: int32;
+    public var floatAbi: int32;
+    public var target: int32;
+    public var isaExt: string;
+    public var abi: string;
+
+    /** 做什么：由已校验字段构造。 */
+    public constructor(isa: int32, pointerBytes: int32, floatAbi: int32, target: int32, isaExt: string, abi: string) {
+        this.isa = isa;
+        this.pointerBytes = pointerBytes;
+        this.floatAbi = floatAbi;
+        this.target = target;
+        this.isaExt = isaExt;
+        this.abi = abi;
+    }
+
+    /**
+     * 做什么：解析并校验 b[o, o+64)。
+     * 失败模式：任一取值或一致性规则不满足抛 platform.malformed。
+     */
+    public static function parse(b: byte[], o: int32): JasoPlatform {
+        var isaValue: int32 = JasoBytes.u16(b, o);
+        var width: int32 = JasoBytes.u8(b, o + 2);
+        var floatValue: int32 = JasoBytes.u8(b, o + 3);
+        var targetValue: int32 = JasoBytes.u16(b, o + 4);
+        var managed: bool = isaValue == 0;
+        var valid: bool = isaValue <= 4
+            && floatValue <= 2
+            && targetValue >= 1 && targetValue <= 3
+            && JasoBytes.allZero(b, o + 6, o + 8)
+            && JasoBytes.allZero(b, o + 56, o + 64)
+            && managed == (targetValue == 2)
+            && managed == (width == 0)
+            && managed == (floatValue == 0)
+            && (managed || width == JasoPlatform.pointerOf(isaValue));
+        if (!valid) {
+            throw new JasoError("platform.malformed");
+        }
+        var extEnd: int32 = JasoPlatform.paddedEnd(b, o + 8, o + 40);
+        var abiEnd: int32 = JasoPlatform.paddedEnd(b, o + 40, o + 56);
+        if (!JasoPlatform.isaExtOk(b, o + 8, extEnd) || !JasoBytes.nameOk(b, o + 40, abiEnd, "._", 16)) {
+            throw new JasoError("platform.malformed");
+        }
+        return new JasoPlatform(isaValue, width, floatValue, targetValue, JasoBytes.text(b, o + 8, extEnd), JasoBytes.text(b, o + 40, abiEnd));
+    }
+
+    /** 做什么：指令集的指针宽度。 */
+    public static function pointerOf(isa: int32): int32 {
+        return isa == 4 ? 4 : 8;
+    }
+
+    /** 做什么：NUL 填充字段的内容终点；第一个零字节之后有非零字节时拒绝。 */
+    private static function paddedEnd(b: byte[], lo: int32, hi: int32): int32 {
+        var end: int32 = lo;
+        while (end < hi && b[end] != 0) {
+            end = end + 1;
+        }
+        if (!JasoBytes.allZero(b, end, hi)) {
+            throw new JasoError("platform.malformed");
+        }
+        return end;
+    }
+
+    /** 做什么：isa_ext：空，或逗号分隔、互不相同、每个 ≤ 15 字节的 `[a-z0-9_]` 记号。 */
+    private static function isaExtOk(b: byte[], lo: int32, hi: int32): bool {
+        if (hi == lo) {
+            return true;
+        }
+        var start: int32 = lo;
+        var i: int32 = lo;
+        while (i <= hi) {
+            if (i == hi || (b[i] & 255) == 44) {
+                if (!JasoBytes.nameOk(b, start, i, "_", 15)) {
+                    return false;
+                }
+                var earlier: int32 = lo;
+                var j: int32 = lo;
+                while (j < start) {
+                    if ((b[j] & 255) == 44) {
+                        if (j - earlier == i - start && JasoBytes.equal(b, earlier, b, start, i - start)) {
+                            return false;
+                        }
+                        earlier = j + 1;
+                    }
+                    j = j + 1;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+/** 一个导出项。 */
+public class JasoExport {
+    public var name: string;
+    public var value: int64;
+    public var kind: int64;
+
+    /** 做什么：由已校验字段构造。 */
+    public constructor(name: string, value: int64, kind: int64) {
+        this.name = name;
+        this.value = value;
+        this.kind = kind;
+    }
+}
+
+/** 一个扩展段（规范第 9 节）。 */
+public class JasoExtension {
+    public var name: string;
+    public var version: int64;
+    public var critical: bool;
+    public var contentStart: int32;
+    public var contentEnd: int32;
+
+    /** 做什么：由已校验字段构造；内容以偏移表示，不复制。 */
+    public constructor(name: string, version: int64, critical: bool, contentStart: int32, contentEnd: int32) {
+        this.name = name;
+        this.version = version;
+        this.critical = critical;
+        this.contentStart = contentStart;
+        this.contentEnd = contentEnd;
+    }
+}
+
+/**
+ * 一个镜像（规范第 6.2、7、8 节）。
+ *
+ * 做什么：保存平台记录与认领的目录区间，校验自己的段、导出、重定位或代码。
+ * 前置条件：镜像索引与段归属已由 JasoFile 校验。
+ */
+public class JasoImage {
+    /** 1 原生，2 托管。 */
+    public var kind: int32;
+    public var platform: JasoPlatform;
+    public var imageSize: int64;
+    public var first: int32;
+    public var count: int32;
+    public var exports: JasoExport[];
+    /** 托管：代码段载荷的起止偏移；原生为 0。 */
+    public var payloadStart: int32;
+    public var payloadEnd: int32;
+    private var data: byte[];
+    private var sections: JasoSection[];
+
+    /** 做什么：由已校验的索引项构造。 */
+    public constructor(kind: int32, platform: JasoPlatform, imageSize: int64, first: int32, count: int32, data: byte[], sections: JasoSection[]) {
+        this.kind = kind;
+        this.platform = platform;
+        this.imageSize = imageSize;
+        this.first = first;
+        this.count = count;
+        this.data = data;
+        this.sections = sections;
+        this.exports = new JasoExport[0];
+        this.payloadStart = 0;
+        this.payloadEnd = 0;
+    }
+
+    /** 做什么：镜像内种类为 kind 的段数。 */
+    private function countOf(kind: int32): int32 {
+        var n: int32 = 0;
+        var i: int32 = this.first;
+        while (i < this.first + this.count) {
+            if (this.sections[i].kind == kind) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /** 做什么：镜像内第一个种类为 kind 的段；没有返回 null。 */
+    private function sectionOf(kind: int32): JasoSection? {
+        var i: int32 = this.first;
+        while (i < this.first + this.count) {
+            if (this.sections[i].kind == kind) {
+                return this.sections[i];
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /** 做什么：第 5 步：组成 → 各段 → 页重叠 → 导出 → 重定位（托管：代码 → 导出）。 */
+    public function check(): void {
+        var segs: int32 = this.countOf(2);
+        var exps: int32 = this.countOf(3);
+        var rels: int32 = this.countOf(4);
+        var codes: int32 = this.countOf(9);
+        var composed: bool = this.kind == 1
+            ? (segs >= 1 && exps <= 1 && rels <= 1 && codes == 0)
+            : (codes == 1 && exps <= 1 && segs == 0 && rels == 0);
+        if (!composed) {
+            throw new JasoError("image.index");
+        }
+        if (this.kind == 1) {
+            this.checkSegments();
+            this.checkExports();
+            this.checkRelocs();
+        } else {
+            this.checkCode();
+            this.checkExports();
+        }
+    }
+
+    /** 做什么：逐段校验，然后任意两段不得共用一页。 */
+    private function checkSegments(): void {
+        var i: int32 = this.first;
+        while (i < this.first + this.count) {
+            var d: JasoSection = this.sections[i];
+            if (d.kind == 2) {
+                this.checkSegment(d);
+            }
+            i = i + 1;
+        }
+        i = this.first;
+        while (i < this.first + this.count) {
+            var a: JasoSection = this.sections[i];
+            var j: int32 = i + 1;
+            while (j < this.first + this.count) {
+                var b: JasoSection = this.sections[j];
+                if (a.kind == 2 && b.kind == 2
+                    && a.vaddr < JasoImage.pageEnd(b) && b.vaddr < JasoImage.pageEnd(a)) {
+                    throw new JasoError("image.overlap");
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：段占用的页范围终点。 */
+    private static function pageEnd(d: JasoSection): int64 {
+        return d.vaddr + JasoImage.roundUp(d.memSize);
+    }
+
+    /** 做什么：向上取整到页。 */
+    private static function roundUp(n: int64): int64 {
+        return ((n + 4095) >> 12) << 12;
+    }
+
+    /** 做什么：规范第 7.1 节。 */
+    private function checkSegment(d: JasoSection): void {
+        var flags: int64 = d.flags;
+        if ((flags & (0 - 8)) != 0 || (flags & 1) == 0) {
+            throw new JasoError("image.segment");
+        }
+        if ((flags & 2) != 0 && (flags & 4) != 0) {
+            throw new JasoError("image.wx");
+        }
+        if ((d.vaddr & 4095) != 0 || d.memSize == 0 || d.memSize < d.fileSize) {
+            throw new JasoError("image.segment");
+        }
+        if (d.vaddr + JasoImage.roundUp(d.memSize) > this.imageSize) {
+            throw new JasoError("image.segment");
+        }
+    }
+
+    /** 做什么：[off, off+len) 是否整个落在某个可执行性为 executable 的段内（按 mem_size）。 */
+    private function inSegment(off: int64, len: int64, executable: bool): bool {
+        var i: int32 = this.first;
+        while (i < this.first + this.count) {
+            var d: JasoSection = this.sections[i];
+            if (d.kind == 2 && ((d.flags & 4) != 0) == executable
+                && off >= d.vaddr && off + len <= d.vaddr + d.memSize) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /** 做什么：规范第 7.2 节与第 8 节的导出表。 */
+    private function checkExports(): void {
+        var section: JasoSection? = this.sectionOf(3);
+        if (section == null) {
+            return;
+        }
+        var b: byte[] = this.data;
+        var lo: int32 = section.start();
+        var size: int64 = section.fileSize;
+        if (size < 4) {
+            throw new JasoError("image.exports");
+        }
+        var entries: int64 = JasoBytes.u32(b, lo);
+        if (entries > 1024 || 4 + entries * 16 > size) {
+            throw new JasoError("image.exports");
+        }
+        var n: int32 = (int32) entries;
+        var namesStart: int64 = 4 + entries * 16;
+        var table: JasoExport[] = new JasoExport[n];
+        var i: int32 = 0;
+        while (i < n) {
+            var o: int32 = lo + 4 + i * 16;
+            var nameOffset: int64 = JasoBytes.u32(b, o);
+            var nameLen: int64 = JasoBytes.u32(b, o + 4);
+            var value: int64 = JasoBytes.u32(b, o + 8);
+            var exportKind: int64 = JasoBytes.u32(b, o + 12);
+            if (nameLen == 0 || nameLen > 128 || nameOffset + nameLen > size || nameOffset < namesStart) {
+                throw new JasoError("image.exports");
+            }
+            var nameLo: int32 = lo + (int32) nameOffset;
+            var nameHi: int32 = nameLo + (int32) nameLen;
+            if (!JasoBytes.symbolOk(b, nameLo, nameHi)) {
+                throw new JasoError("image.exports");
+            }
+            var name: string = JasoBytes.text(b, nameLo, nameHi);
+            var j: int32 = 0;
+            while (j < i) {
+                if (table[j].name == name) {
+                    throw new JasoError("image.exports");
+                }
+                j = j + 1;
+            }
+            if (this.kind == 1) {
+                if (exportKind != 1) {
+                    throw new JasoError("image.exports");
+                }
+                if (!this.inSegment(value, 1, true)) {
+                    throw new JasoError("image.export_range");
+                }
+            } else if (exportKind != 2 || value != 0) {
+                throw new JasoError("image.exports");
+            }
+            table[i] = new JasoExport(name, value, exportKind);
+            i = i + 1;
+        }
+        this.exports = table;
+    }
+
+    /** 做什么：规范第 7.3 节的重定位表。 */
+    private function checkRelocs(): void {
+        var section: JasoSection? = this.sectionOf(4);
+        if (section == null) {
+            return;
+        }
+        var b: byte[] = this.data;
+        var lo: int32 = section.start();
+        var size: int64 = section.fileSize;
+        if (size < 4) {
+            throw new JasoError("image.reloc");
+        }
+        var entries: int64 = JasoBytes.u32(b, lo);
+        if (4 + entries * 16 != size) {
+            throw new JasoError("image.reloc");
+        }
+        var width: int64 = this.platform.pointerBytes;
+        var want: int64 = width == 4 ? 2 : 1;
+        var n: int32 = (int32) entries;
+        var i: int32 = 0;
+        while (i < n) {
+            var o: int32 = lo + 4 + i * 16;
+            var offset: int64 = JasoBytes.u32(b, o);
+            var relocKind: int64 = JasoBytes.u32(b, o + 4);
+            var addend: int64 = JasoBytes.u64(b, o + 8);
+            if (relocKind != want) {
+                throw new JasoError("image.reloc");
+            }
+            // addend 是 u64：位模式为负即大于任何 image_size。
+            if ((offset & (width - 1)) != 0 || addend < 0 || addend >= this.imageSize
+                || !this.inSegment(offset, width, false)) {
+                throw new JasoError("image.reloc_range");
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：规范第 8 节的代码段。 */
+    private function checkCode(): void {
+        var section: JasoSection? = this.sectionOf(9);
+        if (section == null) {
+            throw new JasoError("image.code");
+        }
+        var b: byte[] = this.data;
+        var lo: int32 = section.start();
+        if (section.fileSize <= 8 || JasoBytes.u32(b, lo) != 1 || JasoBytes.u32(b, lo + 4) != 0) {
+            throw new JasoError("image.code");
+        }
+        this.payloadStart = lo + 8;
+        this.payloadEnd = section.end();
+    }
+
+    /** 做什么：导出表是否含 name。 */
+    public function hasExport(name: string): bool {
+        var i: int32 = 0;
+        while (i < this.exports.length) {
+            if (this.exports[i].name == name) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+/**
+ * 校验通过的 `.jaso` 文件。
+ *
+ * 做什么：read 按规范第 12.1 节的顺序校验并产出视图。
+ * 什么时候用：装载器的第一步；工具只想看结构时也可单独用。
+ * 失败模式：第一处违例抛 JasoError；对任意输入不抛其它异常（由 fuzz 守护）。
+ * 不做什么：完整性校验只证明文件未被改动，来源可信与否由 JasoLoader 判定。
+ */
+public class JasoFile {
+    public var data: byte[];
+    /** 1 Native，2 Managed，3 Hybrid。 */
+    public var kind: int32;
+    /** 0 表示 any。 */
+    public var arch: int32;
+    /** 0 runtime，1 boot，2 build。 */
+    public var stage: int32;
+    public var manifest: JasoManifest;
+    public var images: JasoImage[];
+    public var extensions: JasoExtension[];
+    /** 签名段起点；未签名为 -1。 */
+    public var signatureOffset: int32;
+
+    /** 做什么：只由 read 调用，全部校验通过后才构造。 */
+    private constructor(data: byte[], kind: int32, arch: int32, stage: int32, manifest: JasoManifest, images: JasoImage[], extensions: JasoExtension[], signatureOffset: int32) {
+        this.data = data;
+        this.kind = kind;
+        this.arch = arch;
+        this.stage = stage;
+        this.manifest = manifest;
+        this.images = images;
+        this.extensions = extensions;
+        this.signatureOffset = signatureOffset;
+    }
+
+    /** 做什么：解析并完整校验。 */
+    public static function read(b: byte[]): JasoFile {
+        JasoFile.checkHeader(b);
+        var moduleKind: int32 = JasoBytes.u16(b, 10);
+        var archValue: int32 = JasoBytes.u16(b, 12);
+        var stageValue: int32 = JasoBytes.u8(b, 14);
+
+        // 2. 段目录的位置与项数，然后逐项
+        var sectionCount: int64 = JasoBytes.u32(b, 20);
+        var dirOffset: int64 = JasoBytes.u32(b, 24);
+        if (sectionCount == 0 || sectionCount > 64 || dirOffset < 80 || dirOffset + sectionCount * 32 > b.length) {
+            throw new JasoError("section.dir");
+        }
+        var sections: JasoSection[] = JasoFile.readDirectory(b, (int32) dirOffset, (int32) sectionCount);
+
+        // 3. 必需段
+        var manifestSection: JasoSection = JasoFile.required(sections, 1);
+        var platformSection: JasoSection = JasoFile.required(sections, 6);
+        var imageSection: JasoSection = JasoFile.required(sections, 7);
+
+        // 4. 平台段，然后镜像索引（含段的归属）
+        var platforms: JasoPlatform[] = JasoFile.readPlatforms(b, platformSection);
+        var imageList: JasoImage[] = JasoFile.readImages(b, imageSection, sections, platforms, moduleKind, archValue);
+
+        // 5. 逐个镜像
+        var i: int32 = 0;
+        while (i < imageList.length) {
+            imageList[i].check();
+            i = i + 1;
+        }
+
+        // 6. 清单，然后 core.stage、core.abi 与平台、导出声明
+        var parsedManifest: JasoManifest = JasoManifest.parse(b, manifestSection.start(), manifestSection.end());
+        if (parsedManifest.stage != stageValue) {
+            throw new JasoError("manifest.stage");
+        }
+        i = 0;
+        while (i < imageList.length) {
+            if (imageList[i].platform.abi != parsedManifest.abi) {
+                throw new JasoError("platform.abi");
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < imageList.length) {
+            JasoFile.checkDeclaredExports(imageList[i], parsedManifest);
+            i = i + 1;
+        }
+
+        // 7. 扩展（按目录顺序），然后 Hybrid 的要求
+        var extensionList: JasoExtension[] = JasoFile.readExtensions(b, sections, moduleKind);
+
+        // 8. 签名段布局
+        var signatureAt: int32 = JasoFile.checkSignature(b, sections, (int32) dirOffset);
+        return new JasoFile(b, moduleKind, archValue, stageValue, parsedManifest, imageList, extensionList, signatureAt);
+    }
+
+    /** 做什么：第 1 步，头部。 */
+    private static function checkHeader(b: byte[]): void {
+        if (b.length < 80) {
+            throw new JasoError("format.truncated");
+        }
+        var magic: int32[] = [137, 74, 65, 83, 79, 13, 10, 26];
+        var i: int32 = 0;
+        while (i < 8) {
+            if ((b[i] & 255) != magic[i]) {
+                throw new JasoError("format.magic");
+            }
+            i = i + 1;
+        }
+        if (JasoBytes.u16(b, 8) != 1) {
+            throw new JasoError("version.unsupported");
+        }
+        var moduleKind: int32 = JasoBytes.u16(b, 10);
+        if (moduleKind < 1 || moduleKind > 3) {
+            throw new JasoError("format.kind");
+        }
+        if (JasoBytes.u16(b, 12) > 4) {
+            throw new JasoError("format.arch");
+        }
+        if (JasoBytes.u8(b, 14) > 2) {
+            throw new JasoError("format.stage");
+        }
+        if (b[15] != 0 || JasoBytes.u32(b, 16) != 80 || JasoBytes.u32(b, 32) != 0
+            || JasoBytes.u32(b, 36) != 0 || JasoBytes.u64(b, 72) != 0) {
+            throw new JasoError("format.header");
+        }
+        if (JasoBytes.u32(b, 28) != b.length) {
+            throw new JasoError("format.length");
+        }
+        var digest: byte[] = JasoFile.digestOf(b);
+        if (!JasoBytes.equal(digest, 0, b, 40, 32)) {
+            throw new JasoError("format.digest");
+        }
+    }
+
+    /** 做什么：整个文件的 SHA-256，digest 字段按全零计算。 */
+    public static function digestOf(b: byte[]): byte[] {
+        var sha: java.security.MessageDigest = java.security.MessageDigest.getInstance("SHA-256");
+        sha.update(b, 0, 40);
+        sha.update(new byte[32], 0, 32);
+        sha.update(b, 72, b.length - 72);
+        return sha.digest();
+    }
+
+    /** 做什么：第 2 步逐项：种类 → 字段 → 边界 → 按文件计数。 */
+    private static function readDirectory(b: byte[], dirOffset: int32, count: int32): JasoSection[] {
+        var out: JasoSection[] = new JasoSection[count];
+        var counts: int32[] = new int32[10];
+        var i: int32 = 0;
+        while (i < count) {
+            var d: JasoSection = new JasoSection(b, dirOffset + i * 32);
+            if (d.kind < 1 || d.kind > 9) {
+                throw new JasoError("section.unknown");
+            }
+            var sectionKind: int32 = (int32) d.kind;
+            var fieldsOk: bool = d.reserved == 0;
+            if (sectionKind == 8) {
+                fieldsOk = fieldsOk && d.flags <= 1 && d.vaddr == 0 && d.memSize == 0;
+            } else if (sectionKind != 2) {
+                fieldsOk = fieldsOk && d.flags == 0 && d.vaddr == 0 && d.memSize == 0;
+            }
+            if (!fieldsOk) {
+                throw new JasoError("section.dir");
+            }
+            if (d.fileOffset + d.fileSize > b.length || (d.fileOffset < 80 && d.fileSize > 0)) {
+                throw new JasoError("section.bounds");
+            }
+            counts[sectionKind] = counts[sectionKind] + 1;
+            if (counts[sectionKind] > JasoFile.maxPerFile(sectionKind)) {
+                throw new JasoError("section.duplicate");
+            }
+            out[i] = d;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：每种段在整个文件中的上限；属于镜像的段由组成规则另行限制。 */
+    private static function maxPerFile(kind: int32): int32 {
+        if (kind == 1 || kind == 5 || kind == 6 || kind == 7) {
+            return 1;
+        }
+        return kind == 8 ? 32 : 64;
+    }
+
+    /** 做什么：取必需段，缺失时拒绝。 */
+    private static function required(sections: JasoSection[], kind: int32): JasoSection {
+        var i: int32 = 0;
+        while (i < sections.length) {
+            if (sections[i].kind == kind) {
+                return sections[i];
+            }
+            i = i + 1;
+        }
+        throw new JasoError("section.missing");
+    }
+
+    /** 做什么：规范第 6.1 节。 */
+    private static function readPlatforms(b: byte[], d: JasoSection): JasoPlatform[] {
+        if (d.fileSize < 8) {
+            throw new JasoError("platform.malformed");
+        }
+        var lo: int32 = d.start();
+        var count: int64 = JasoBytes.u32(b, lo);
+        if (count == 0 || count > 16 || JasoBytes.u32(b, lo + 4) != 0 || d.fileSize != 8 + count * 64) {
+            throw new JasoError("platform.malformed");
+        }
+        var out: JasoPlatform[] = new JasoPlatform[(int32) count];
+        var i: int32 = 0;
+        while (i < out.length) {
+            out[i] = JasoPlatform.parse(b, lo + 8 + i * 64);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：规范第 6.2 节，顺序见第 12.1 节第 4 步。 */
+    private static function readImages(b: byte[], d: JasoSection, sections: JasoSection[], platforms: JasoPlatform[], kind: int32, arch: int32): JasoImage[] {
+        if (d.fileSize < 8) {
+            throw new JasoError("image.index");
+        }
+        var lo: int32 = d.start();
+        var count: int64 = JasoBytes.u32(b, lo);
+        if (count == 0 || count > 8 || JasoBytes.u32(b, lo + 4) != 0 || d.fileSize != 8 + count * 32) {
+            throw new JasoError("image.index");
+        }
+        var n: int32 = (int32) count;
+        var platformIndexes: int32[] = new int32[n];
+        var out: JasoImage[] = new JasoImage[n];
+        var allowed: int32 = kind == 2 ? 2 : 1;
+        var i: int32 = 0;
+        while (i < n) {
+            var o: int32 = lo + 8 + i * 32;
+            var imageKind: int32 = JasoBytes.u16(b, o);
+            var platformIndex: int32 = JasoBytes.u16(b, o + 2);
+            var first: int64 = JasoBytes.u32(b, o + 4);
+            var sectionCount: int64 = JasoBytes.u32(b, o + 8);
+            var imageSize: int64 = JasoBytes.u32(b, o + 12);
+            if (imageKind < 1 || imageKind > 2) {
+                throw new JasoError("image.index");
+            }
+            if (!JasoBytes.allZero(b, o + 16, o + 32) || platformIndex >= platforms.length) {
+                throw new JasoError("image.index");
+            }
+            if (sectionCount == 0 || first + sectionCount > sections.length) {
+                throw new JasoError("image.index");
+            }
+            var platform: JasoPlatform = platforms[platformIndex];
+            if ((platform.isa == 0) != (imageKind == 2)) {
+                throw new JasoError("image.index");
+            }
+            if (imageKind != allowed) {
+                throw new JasoError("image.kind");
+            }
+            var sizeOk: bool = imageKind == 1
+                ? ((imageSize & 4095) == 0 && imageSize >= 4096 && imageSize <= (64 << 20))
+                : imageSize == 0;
+            if (!sizeOk) {
+                throw new JasoError("image.size");
+            }
+            platformIndexes[i] = platformIndex;
+            out[i] = new JasoImage(imageKind, platform, imageSize, (int32) first, (int32) sectionCount, b, sections);
+            i = i + 1;
+        }
+        JasoFile.checkImagePairs(out, platformIndexes);
+        JasoFile.checkAssignment(out, sections);
+        if (arch != 0) {
+            i = 0;
+            while (i < n) {
+                if (out[i].platform.isa != arch) {
+                    throw new JasoError("platform.arch");
+                }
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    /** 做什么：两两比较：目录区间不重叠；共用平台记录的两项除区间外必须相同。 */
+    private static function checkImagePairs(images: JasoImage[], platformIndexes: int32[]): void {
+        var i: int32 = 0;
+        while (i < images.length) {
+            var j: int32 = i + 1;
+            while (j < images.length) {
+                var a: JasoImage = images[i];
+                var c: JasoImage = images[j];
+                if (a.first < c.first + c.count && c.first < a.first + a.count) {
+                    throw new JasoError("image.index");
+                }
+                if (platformIndexes[i] == platformIndexes[j] && (a.kind != c.kind || a.imageSize != c.imageSize)) {
+                    throw new JasoError("image.index");
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：属于镜像的段恰好落在一个区间内，属于文件的段不落在任何区间内。 */
+    private static function checkAssignment(images: JasoImage[], sections: JasoSection[]): void {
+        var s: int32 = 0;
+        while (s < sections.length) {
+            var k: int64 = sections[s].kind;
+            var owned: bool = k == 2 || k == 3 || k == 4 || k == 9;
+            var inside: bool = false;
+            var i: int32 = 0;
+            while (i < images.length) {
+                if (s >= images[i].first && s < images[i].first + images[i].count) {
+                    inside = true;
+                }
+                i = i + 1;
+            }
+            if (owned != inside) {
+                throw new JasoError("image.index");
+            }
+            s = s + 1;
+        }
+    }
+
+    /** 做什么：导出表与 core.exports 一一对应：无缺、无多、声明内不重名。 */
+    private static function checkDeclaredExports(image: JasoImage, manifest: JasoManifest): void {
+        var declared: JasoStrings = manifest.exports;
+        var i: int32 = 0;
+        while (i < declared.size()) {
+            var name: string = declared.get(i);
+            var j: int32 = 0;
+            while (j < i) {
+                if (declared.get(j) == name) {
+                    throw new JasoError("image.exports_mismatch");
+                }
+                j = j + 1;
+            }
+            if (!image.hasExport(name)) {
+                throw new JasoError("image.exports_mismatch");
+            }
+            i = i + 1;
+        }
+        if (declared.size() != image.exports.length) {
+            throw new JasoError("image.exports_mismatch");
+        }
+    }
+
+    /** 做什么：第 7 步，规范第 9 节。 */
+    private static function readExtensions(b: byte[], sections: JasoSection[], kind: int32): JasoExtension[] {
+        var count: int32 = 0;
+        var i: int32 = 0;
+        while (i < sections.length) {
+            if (sections[i].kind == 8) {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        var out: JasoExtension[] = new JasoExtension[count];
+        var filled: int32 = 0;
+        var hasImport: bool = false;
+        i = 0;
+        while (i < sections.length) {
+            var d: JasoSection = sections[i];
+            if (d.kind == 8) {
+                var e: JasoExtension = JasoFile.parseExtension(b, d);
+                var j: int32 = 0;
+                while (j < filled) {
+                    if (out[j].name == e.name) {
+                        throw new JasoError("extension.duplicate");
+                    }
+                    j = j + 1;
+                }
+                var known: bool = e.version == 1 && (e.name == "jasper.import" || e.name == "jasper.source");
+                if (known) {
+                    if (e.critical != (e.name == "jasper.import")) {
+                        throw new JasoError("extension.malformed");
+                    }
+                } else if (e.critical) {
+                    throw new JasoError("extension.critical");
+                }
+                if (e.name == "jasper.import" && e.version == 1) {
+                    hasImport = true;
+                }
+                out[filled] = e;
+                filled = filled + 1;
+            }
+            i = i + 1;
+        }
+        if (kind == 3 && !hasImport) {
+            throw new JasoError("extension.required");
+        }
+        return out;
+    }
+
+    /** 做什么：扩展段布局（规范第 9.1 节）。 */
+    private static function parseExtension(b: byte[], d: JasoSection): JasoExtension {
+        if (d.fileSize < 8) {
+            throw new JasoError("extension.malformed");
+        }
+        var lo: int32 = d.start();
+        var version: int64 = JasoBytes.u32(b, lo);
+        var nameLen: int32 = JasoBytes.u16(b, lo + 4);
+        if (version == 0 || nameLen == 0 || nameLen > 64 || JasoBytes.u16(b, lo + 6) != 0) {
+            throw new JasoError("extension.malformed");
+        }
+        var contentAt: int32 = ((8 + nameLen + 7) >> 3) << 3;
+        if (contentAt > d.fileSize || !JasoBytes.allZero(b, lo + 8 + nameLen, lo + contentAt)) {
+            throw new JasoError("extension.malformed");
+        }
+        var nameLo: int32 = lo + 8;
+        var nameHi: int32 = nameLo + nameLen;
+        if (!JasoBytes.nameOk(b, nameLo, nameHi, "_.-", 64) || JasoText.find(b, nameLo, nameHi, 46) < 0) {
+            throw new JasoError("extension.malformed");
+        }
+        return new JasoExtension(JasoBytes.text(b, nameLo, nameHi), version, (d.flags & 1) != 0, lo + contentAt, d.end());
+    }
+
+    /** 做什么：第 8 步，规范第 10 节；返回签名段起点，未签名返回 -1。 */
+    private static function checkSignature(b: byte[], sections: JasoSection[], dirOffset: int32): int32 {
+        var signature: JasoSection? = null;
+        var i: int32 = 0;
+        while (i < sections.length) {
+            if (sections[i].kind == 5) {
+                signature = sections[i];
+            }
+            i = i + 1;
+        }
+        if (signature == null) {
+            return -1;
+        }
+        var lo: int32 = signature.start();
+        if (signature.fileSize != 104 || signature.fileOffset + 104 != b.length) {
+            throw new JasoError("signature.section");
+        }
+        if (JasoBytes.u32(b, lo) != 1 || JasoBytes.u32(b, lo + 4) != 0) {
+            throw new JasoError("signature.section");
+        }
+        if (dirOffset + sections.length * 32 > lo) {
+            throw new JasoError("signature.section");
+        }
+        i = 0;
+        while (i < sections.length) {
+            var o: JasoSection = sections[i];
+            if (o.kind != 5 && o.fileSize > 0 && o.fileOffset + o.fileSize > signature.fileOffset) {
+                throw new JasoError("signature.section");
+            }
+            i = i + 1;
+        }
+        return lo;
+    }
+
+    /** 做什么：按名字与版本查扩展段；没有返回 null。 */
+    public function extension(name: string, version: int64): JasoExtension? {
+        var i: int32 = 0;
+        while (i < this.extensions.length) {
+            if (this.extensions[i].name == name && this.extensions[i].version == version) {
+                return this.extensions[i];
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+}

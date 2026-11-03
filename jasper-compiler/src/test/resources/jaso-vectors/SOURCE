@@ -1,0 +1,4 @@
+Conformance vectors copied unmodified from the jasper-language/jasper-os repository.
+Source commit: af5318973284ab0922516d128e0cdb299f072f22, directory jaso/vectors/.
+Do not edit by hand: copy them again from a newer commit and update this file.
+codes.tsv is the error code table of jaso/SPEC.md section 13 at the same commit.

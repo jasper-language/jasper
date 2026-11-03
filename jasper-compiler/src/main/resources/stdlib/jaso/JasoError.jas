@@ -1,0 +1,113 @@
+package std.jaso;
+
+// ============================================================================
+// JasoError.jas —— `.jaso` 读取与装载的结构化拒绝
+// ============================================================================
+// 职责：把规范第 13 节的稳定错误码带给调用方。码名是跨实现比较的唯一依据，
+//   编号只用于紧凑的二进制传输。平台不符额外带字段、宿主期望值与文件实际值。
+//
+// 为什么是异常：解析深处任何一条规则不满足都要立刻结束并报告第一处违例，
+//   用标准库「异常为主」的约定最直接；一致性入口 JasoConformance.check 再把它
+//   变回码名字符串。
+// ============================================================================
+
+import std.RecoverableError;
+
+/**
+ * 一次 `.jaso` 拒绝。
+ *
+ * 做什么：携带稳定码名；平台不符时另带第一个不符的字段与两侧取值。
+ * 什么时候用：JasoFile.read 与 JasoLoader.load 的所有失败路径。
+ * 失败模式：本类自身不失败；未知码名的 number() 返回 0，只有写错码名才会出现，
+ *   由向量测试比对码表防住。
+ */
+public class JasoError extends RecoverableError {
+    private var codeName: string;
+    private var fieldName: string;
+    private var expectedValue: string;
+    private var actualValue: string;
+
+    /** 做什么：不带细节的拒绝。 */
+    public constructor(code: string) {
+        super(code);
+        this.codeName = code;
+        this.fieldName = "";
+        this.expectedValue = "";
+        this.actualValue = "";
+    }
+
+    /** 做什么：带平台字段细节的拒绝（expected 是宿主值，actual 是文件值）。 */
+    public constructor(code: string, field: string, expected: string, actual: string) {
+        super(code + ": " + field + " expected " + expected + " actual " + actual);
+        this.codeName = code;
+        this.fieldName = field;
+        this.expectedValue = expected;
+        this.actualValue = actual;
+    }
+
+    /** 做什么：稳定码名，如 image.wx。 */
+    public function code(): string {
+        return this.codeName;
+    }
+
+    /** 做什么：不符的平台字段名；没有细节时为空串。 */
+    public function field(): string {
+        return this.fieldName;
+    }
+
+    /** 做什么：宿主期望值；没有细节时为空串。 */
+    public function expected(): string {
+        return this.expectedValue;
+    }
+
+    /** 做什么：文件实际值；没有细节时为空串。 */
+    public function actual(): string {
+        return this.actualValue;
+    }
+
+    /** 做什么：规范第 13 节的编号。 */
+    public function number(): int32 {
+        return JasoError.numberOf(this.codeName);
+    }
+
+    /**
+     * 做什么：码名到编号。
+     * 为什么用表而不是分散常量：码表整张与规范逐行对应，便于核对。
+     */
+    public static function numberOf(code: string): int32 {
+        var names: string[] = [
+            "format.truncated", "format.magic", "format.header", "format.length", "format.digest",
+            "format.kind", "format.arch", "format.stage", "version.unsupported",
+            "section.dir", "section.bounds", "section.unknown", "section.duplicate", "section.missing",
+            "manifest.utf8", "manifest.line", "manifest.key", "manifest.missing", "manifest.duplicate",
+            "manifest.value", "manifest.limit", "manifest.stage",
+            "platform.malformed", "platform.arch", "platform.abi", "platform.mismatch",
+            "image.index", "image.kind", "image.size", "image.segment", "image.wx", "image.overlap",
+            "image.exports", "image.export_range", "image.exports_mismatch", "image.reloc",
+            "image.reloc_range", "image.code",
+            "signature.section", "signature.invalid",
+            "trust.unsigned", "trust.publisher", "trust.key", "trust.namespace",
+            "capability.denied", "dependency.unsatisfied", "dependency.runtime",
+            "extension.malformed", "extension.critical", "extension.duplicate", "extension.required"
+        ];
+        var numbers: int32[] = [
+            101, 102, 103, 104, 105, 106, 107, 108, 201,
+            301, 302, 303, 304, 305,
+            401, 402, 403, 404, 405, 406, 407, 408,
+            501, 502, 503, 504,
+            601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612,
+            701, 702,
+            801, 802, 803, 804,
+            901, 1001, 1002,
+            1101, 1102, 1103, 1104
+        ];
+        var i: int32 = 0;
+        while (i < names.length) {
+            if (names[i] == code) {
+                return numbers[i];
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+}

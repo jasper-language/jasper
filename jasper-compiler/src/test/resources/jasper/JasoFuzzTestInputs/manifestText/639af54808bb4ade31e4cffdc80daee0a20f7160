@@ -1,0 +1,3 @@
+core.depends = a@>=5.0,2b,,=<4b,s
+
+c

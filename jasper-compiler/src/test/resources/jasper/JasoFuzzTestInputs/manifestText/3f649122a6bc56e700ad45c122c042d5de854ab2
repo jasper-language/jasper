@@ -1,0 +1,4 @@
+
+#
+#ime
+core.depends = a@>=0.0,vos a@>=0.0,>2.0,>#c

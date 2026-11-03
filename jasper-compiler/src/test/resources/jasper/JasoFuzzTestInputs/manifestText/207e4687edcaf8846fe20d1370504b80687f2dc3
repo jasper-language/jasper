@@ -1,0 +1,6 @@
+core.name = ja-msime
+core.depends = a@>=0.0,sime
+core.depends = .
+ c0or.name = ersie
+core.depends =a-msime
+core.  c

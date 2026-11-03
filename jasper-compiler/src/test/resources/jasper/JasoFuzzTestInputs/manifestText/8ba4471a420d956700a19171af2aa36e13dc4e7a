@@ -1,0 +1,4 @@
+core.name = jme
+core.depends = a@>=0.0,sime
+core.depends =  0.
+c 

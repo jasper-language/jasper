@@ -118,6 +118,23 @@ object StdLib {
     )
 
     /**
+     * `.jaso` 读取器的源文件清单（包 `std.jaso`），按翻译顺序排列。
+     *
+     * 为什么不并入 FILES：绝大多数程序不装载模块，把这近两千行并进去会拖慢每次编译；
+     * 需要它的入口（模块装载、一致性测试）显式调用 [jasoSources]。
+     *
+     * Source files of the `.jaso` reader, in translation order; compiled on demand.
+     */
+    val JASO_FILES: List<String> = listOf(
+        "jaso/JasoError.jas",
+        "jaso/JasoBytes.jas",
+        "jaso/Ed25519.jas",
+        "jaso/JasoManifest.jas",
+        "jaso/JasoFile.jas",
+        "jaso/JasoLoader.jas"
+    )
+
+    /**
      * 读出全部标准库源码，返回「合成文件名 -> 源码文本」的映射。
      *
      * 做什么：按 FILES 顺序逐个读取，保序返回（LinkedHashMap，迭代顺序即
@@ -134,6 +151,19 @@ object StdLib {
         // LinkedHashMap 保证迭代顺序 == FILES 顺序 == 翻译顺序。
         val out = LinkedHashMap<String, String>()
         for (file in FILES) {
+            out[file] = read(file)
+        }
+        return out
+    }
+
+    /**
+     * 读出 `.jaso` 读取器源码，返回「合成文件名 -> 源码文本」的映射；与 [sources] 同样保序、缺资源即失败。
+     *
+     * The `.jaso` reader sources keyed by their synthetic file name.
+     */
+    fun jasoSources(): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (file in JASO_FILES) {
             out[file] = read(file)
         }
         return out

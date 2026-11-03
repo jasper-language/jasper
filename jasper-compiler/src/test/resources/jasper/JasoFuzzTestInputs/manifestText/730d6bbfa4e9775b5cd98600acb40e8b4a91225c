@@ -1,0 +1,5 @@
+core.name = ja-msime
+core.depends = a@>=0.0,sime
+core.depends =  0.
+cor.name = ja-msime
+core.depends = a@>=0.0,si  c

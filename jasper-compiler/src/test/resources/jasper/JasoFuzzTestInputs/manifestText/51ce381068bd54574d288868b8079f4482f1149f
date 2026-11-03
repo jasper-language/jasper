@@ -1,0 +1,2 @@
+oe.vol =ru
+core.depends = a@>71.0,vosc5 =@>4.0,=

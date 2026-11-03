@@ -1,0 +1,4 @@
+core.name = ja-msime
+core.depends = a@>=5.0,sime
+core.depends = a@>=0.0,2b, 0.version b,< 0.
+.vrsion =  c

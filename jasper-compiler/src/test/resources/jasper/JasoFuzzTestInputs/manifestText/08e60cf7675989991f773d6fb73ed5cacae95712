@@ -1,0 +1,10 @@
+co.name = j2.0, b2.0, b
+core.requires =e
+c.depends = a@>b
+co.name =
+core.requires =e
+c.depends = a@>= 
+core.requires =e
+c.ds = a@>b
+core.requires =e
+c, bss or

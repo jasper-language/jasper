@@ -1,0 +1,701 @@
+package std.jaso;
+
+// ============================================================================
+// JasoManifest.jas —— 清单文本解析与版本区间（规范第 11 节）
+// ============================================================================
+// 职责：按行解析 `键 = 值`，第一处违例即报；各行都合法后按 core.name、core.version、
+//   core.abi、core.stage 的顺序查缺失。
+//
+// 为什么全程按字节切片：所有分隔符都是 ASCII，合法 UTF-8 的多字节序列不会与之混淆；
+//   不解码就不必担心字符串下标单位，只有存下来的值才解码一次。
+// ============================================================================
+
+/** 一个三段版本号。 */
+public class JasoVersion {
+    public var major: int64;
+    public var minor: int64;
+    public var patch: int64;
+
+    /** 做什么：由三段数字构造。 */
+    public constructor(major: int64, minor: int64, patch: int64) {
+        this.major = major;
+        this.minor = minor;
+        this.patch = patch;
+    }
+
+    /** 做什么：字典序比较，返回负、零、正。 */
+    public function compareTo(other: JasoVersion): int32 {
+        if (this.major != other.major) {
+            return this.major < other.major ? -1 : 1;
+        }
+        if (this.minor != other.minor) {
+            return this.minor < other.minor ? -1 : 1;
+        }
+        if (this.patch != other.patch) {
+            return this.patch < other.patch ? -1 : 1;
+        }
+        return 0;
+    }
+
+    /**
+     * 做什么：解析 [lo, hi) 的 `主.次[.修订]`；每段 1 ..= 9 位十进制。
+     * 失败模式：不合法返回 null；requirePatch 为真时必须写全三段。
+     */
+    public static function parse(b: byte[], lo: int32, hi: int32, requirePatch: bool): JasoVersion? {
+        var parts: int64[] = new int64[3];
+        var count: int32 = 0;
+        var start: int32 = lo;
+        var i: int32 = lo;
+        while (i <= hi) {
+            if (i == hi || (b[i] & 255) == 46) {
+                if (count == 3) {
+                    return null;
+                }
+                var value: int64 = JasoVersion.number(b, start, i);
+                if (value < 0) {
+                    return null;
+                }
+                parts[count] = value;
+                count = count + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (count < 2 || (requirePatch && count != 3)) {
+            return null;
+        }
+        return new JasoVersion(parts[0], parts[1], parts[2]);
+    }
+
+    /** 做什么：1 ..= 9 位十进制数；不合法返回 -1。 */
+    private static function number(b: byte[], lo: int32, hi: int32): int64 {
+        if (hi <= lo || hi - lo > 9) {
+            return -1;
+        }
+        var value: int64 = 0;
+        var i: int32 = lo;
+        while (i < hi) {
+            var c: int32 = b[i] & 255;
+            if (c < 48 || c > 57) {
+                return -1;
+            }
+            value = value * 10 + (c - 48);
+            i = i + 1;
+        }
+        return value;
+    }
+}
+
+/**
+ * 版本区间：1 ..= 4 个比较式，全部满足才算满足。
+ * 运算符编码：0 `>=`，1 `>`，2 `<=`，3 `<`，4 `=`。
+ */
+public class JasoVersionRange {
+    private var ops: int32[];
+    private var versions: JasoVersion[];
+    private var size: int32;
+
+    /** 做什么：空区间，只由 parse 填充。 */
+    private constructor() {
+        this.ops = new int32[4];
+        this.versions = new JasoVersion[4];
+        this.size = 0;
+    }
+
+    /** 做什么：解析 [lo, hi) 形如 `>=0.1,<0.2`；不合法返回 null。 */
+    public static function parse(b: byte[], lo: int32, hi: int32): JasoVersionRange? {
+        var range: JasoVersionRange = new JasoVersionRange();
+        var start: int32 = lo;
+        var i: int32 = lo;
+        while (i <= hi) {
+            if (i == hi || (b[i] & 255) == 44) {
+                if (!range.addComparator(b, start, i)) {
+                    return null;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return range;
+    }
+
+    /** 做什么：解析一个比较式并加入；运算符与版本之间不允许空白。 */
+    private function addComparator(b: byte[], rawLo: int32, rawHi: int32): bool {
+        var lo: int32 = JasoText.trimStart(b, rawLo, rawHi);
+        var hi: int32 = JasoText.trimEnd(b, lo, rawHi);
+        if (hi == lo) {
+            return false;
+        }
+        var first: int32 = b[lo] & 255;
+        var second: int32 = hi - lo >= 2 ? (b[lo + 1] & 255) : 0;
+        var op: int32 = 0;
+        var width: int32 = 1;
+        if (first == 62 && second == 61) {
+            op = 0;
+            width = 2;
+        } else if (first == 60 && second == 61) {
+            op = 2;
+            width = 2;
+        } else if (first == 62) {
+            op = 1;
+        } else if (first == 60) {
+            op = 3;
+        } else if (first == 61) {
+            op = 4;
+        } else {
+            return false;
+        }
+        if (this.size == 4) {
+            return false;
+        }
+        var version: JasoVersion? = JasoVersion.parse(b, lo + width, hi, false);
+        if (version == null) {
+            return false;
+        }
+        this.ops[this.size] = op;
+        this.versions[this.size] = version;
+        this.size = this.size + 1;
+        return true;
+    }
+
+    /** 做什么：version 是否满足全部比较式。 */
+    public function contains(version: JasoVersion): bool {
+        var i: int32 = 0;
+        while (i < this.size) {
+            var c: int32 = version.compareTo(this.versions[i]);
+            var op: int32 = this.ops[i];
+            var holds: bool = false;
+            if (op == 0) {
+                holds = c >= 0;
+            } else if (op == 1) {
+                holds = c > 0;
+            } else if (op == 2) {
+                holds = c <= 0;
+            } else if (op == 3) {
+                holds = c < 0;
+            } else {
+                holds = c == 0;
+            }
+            if (!holds) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+/** 一项依赖：模块名 + 可选区间。 */
+public class JasoDependency {
+    public var name: string;
+    public var range: JasoVersionRange?;
+
+    /** 做什么：由已校验的名字与区间构造。 */
+    public constructor(name: string, range: JasoVersionRange?) {
+        this.name = name;
+        this.range = range;
+    }
+}
+
+/** 按字节的修剪与切片工具。 */
+public class JasoText {
+    /** 做什么：跳过 [lo, hi) 开头的空白，返回新的起点。 */
+    public static function trimStart(b: byte[], lo: int32, hi: int32): int32 {
+        var at: int32 = lo;
+        while (at < hi) {
+            var n: int32 = JasoBytes.leadingSpace(b, at, hi);
+            if (n == 0) {
+                break;
+            }
+            at = at + n;
+        }
+        return at;
+    }
+
+    /** 做什么：去掉 [lo, hi) 结尾的空白，返回新的终点。 */
+    public static function trimEnd(b: byte[], lo: int32, hi: int32): int32 {
+        var at: int32 = hi;
+        while (at > lo) {
+            var n: int32 = JasoBytes.trailingSpace(b, lo, at);
+            if (n == 0) {
+                break;
+            }
+            at = at - n;
+        }
+        return at;
+    }
+
+    /** 做什么：[lo, hi) 中第一个 c 的位置；没有返回 -1。 */
+    public static function find(b: byte[], lo: int32, hi: int32, c: int32): int32 {
+        var i: int32 = lo;
+        while (i < hi) {
+            if ((b[i] & 255) == c) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /** 做什么：[lo, hi) 是否恰为 ASCII 串 s。 */
+    public static function same(b: byte[], lo: int32, hi: int32, s: string): bool {
+        if (hi - lo != s.length) {
+            return false;
+        }
+        var i: int32 = 0;
+        while (i < s.length) {
+            if ((b[lo + i] & 255) != s.codePointAt(i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：[lo, hi) 是否以 ASCII 串 s 开头。 */
+    public static function startsWith(b: byte[], lo: int32, hi: int32, s: string): bool {
+        return hi - lo >= s.length && JasoText.same(b, lo, lo + s.length, s);
+    }
+}
+
+/** 只增的字符串表。 */
+public class JasoStrings {
+    private var items: string[];
+    private var count: int32;
+
+    /** 做什么：空表。 */
+    public constructor() {
+        this.items = new string[8];
+        this.count = 0;
+    }
+
+    /** 做什么：追加一项。 */
+    public function append(value: string): void {
+        if (this.count == this.items.length) {
+            var grown: string[] = new string[this.count * 2];
+            var i: int32 = 0;
+            while (i < this.count) {
+                grown[i] = this.items[i];
+                i = i + 1;
+            }
+            this.items = grown;
+        }
+        this.items[this.count] = value;
+        this.count = this.count + 1;
+    }
+
+    /** 做什么：项数。 */
+    public function size(): int32 {
+        return this.count;
+    }
+
+    /** 做什么：第 i 项。 */
+    public function get(i: int32): string {
+        return this.items[i];
+    }
+
+    /** 做什么：是否含 value（线性查找，只用于有上限的表）。 */
+    public function contains(value: string): bool {
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.items[i] == value) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+/**
+ * 依赖名集合。
+ * 为什么不用线性查找：依赖个数的上限在整行解析完才检查（规范要求重名先于超限报告），
+ *   而清单在验签之前解析；线性查找会让一行几十万项的未签名文件耗费平方时间。
+ */
+public class JasoNameSet {
+    private var slots: string[];
+    private var used: int32;
+
+    /** 做什么：空集合。 */
+    public constructor() {
+        this.slots = new string[64];
+        this.used = 0;
+    }
+
+    /** 做什么：加入 name；已存在返回 false。 */
+    public function insert(name: string): bool {
+        if (this.used * 2 >= this.slots.length) {
+            this.grow();
+        }
+        return this.place(this.slots, name);
+    }
+
+    /** 做什么：开放定址写入一张表。 */
+    private function place(table: string[], name: string): bool {
+        var mask: int32 = table.length - 1;
+        var at: int32 = name.hashCode() & mask;
+        var existing: string? = table[at];
+        while (existing != null) {
+            if (existing == name) {
+                return false;
+            }
+            at = (at + 1) & mask;
+            existing = table[at];
+        }
+        table[at] = name;
+        this.used = this.used + 1;
+        return true;
+    }
+
+    /** 做什么：表长翻倍并重新散列。 */
+    private function grow(): void {
+        var old: string[] = this.slots;
+        var table: string[] = new string[old.length * 2];
+        this.used = 0;
+        var i: int32 = 0;
+        while (i < old.length) {
+            var name: string? = old[i];
+            if (name != null) {
+                this.place(table, name);
+            }
+            i = i + 1;
+        }
+        this.slots = table;
+    }
+}
+
+/**
+ * 校验通过的清单。
+ *
+ * 做什么：保存核心键；命名空间扩展键只校验键的形状并原样保留，由各框架读取。
+ * 失败模式：parse 抛 JasoError（manifest.*）。
+ */
+public class JasoManifest {
+    public var name: string;
+    public var version: JasoVersion;
+    public var abi: string;
+    /** 头部同一编码：0 runtime，1 boot，2 build。 */
+    public var stage: int32;
+    /** plugin 或 system。 */
+    public var lifecycle: string;
+    public var runtime: JasoVersionRange?;
+    public var host: string?;
+    public var description: string?;
+    public var publisher: string?;
+    public var requires: JasoStrings;
+    public var exports: JasoStrings;
+    /** 前 dependencyCount 项有效；上限 32 由解析器保证。 */
+    public var dependencies: JasoDependency[];
+    public var dependencyCount: int32;
+    public var extensionKeys: JasoStrings;
+    public var extensionValues: JasoStrings;
+
+    /** 做什么：只由解析器调用，必需键已全部就位，可选键随后写入。 */
+    public constructor(name: string, version: JasoVersion, abi: string, stage: int32) {
+        this.name = name;
+        this.version = version;
+        this.abi = abi;
+        this.stage = stage;
+        this.lifecycle = "plugin";
+        this.runtime = null;
+        this.host = null;
+        this.description = null;
+        this.publisher = null;
+        this.requires = new JasoStrings();
+        this.exports = new JasoStrings();
+        this.dependencies = new JasoDependency[0];
+        this.dependencyCount = 0;
+        this.extensionKeys = new JasoStrings();
+        this.extensionValues = new JasoStrings();
+    }
+
+    /**
+     * 做什么：解析 b[lo, hi) 的清单。
+     * 前置条件：lo、hi 在 b 内。
+     * 失败模式：第一处违例抛 JasoError。
+     */
+    public static function parse(b: byte[], lo: int32, hi: int32): JasoManifest {
+        if (!JasoBytes.validUtf8(b, lo, hi)) {
+            throw new JasoError("manifest.utf8");
+        }
+        var parser: JasoManifestParser = new JasoManifestParser(b);
+        var lineStart: int32 = lo;
+        while (lineStart < hi) {
+            var newline: int32 = JasoText.find(b, lineStart, hi, 10);
+            var lineEnd: int32 = newline < 0 ? hi : newline;
+            parser.line(lineStart, lineEnd);
+            lineStart = lineEnd + 1;
+        }
+        return parser.finish();
+    }
+}
+
+/** 清单的逐行解析状态。 */
+public class JasoManifestParser {
+    private var text: byte[];
+    private var name: string?;
+    private var version: JasoVersion?;
+    private var abi: string?;
+    private var stage: int32;
+    private var lifecycle: string?;
+    private var runtime: JasoVersionRange?;
+    private var runtimeSeen: bool;
+    private var host: string?;
+    private var description: string?;
+    private var publisher: string?;
+    private var requires: JasoStrings;
+    private var exports: JasoStrings;
+    private var dependencies: JasoDependency[];
+    private var dependencyCount: int32;
+    private var dependencySet: JasoNameSet;
+    private var extensionKeys: JasoStrings;
+    private var extensionValues: JasoStrings;
+
+    /** 做什么：准备解析 b 中的清单。 */
+    public constructor(b: byte[]) {
+        this.text = b;
+        this.name = null;
+        this.version = null;
+        this.abi = null;
+        this.stage = -1;
+        this.lifecycle = null;
+        this.runtime = null;
+        this.runtimeSeen = false;
+        this.host = null;
+        this.description = null;
+        this.publisher = null;
+        this.requires = new JasoStrings();
+        this.exports = new JasoStrings();
+        this.dependencies = new JasoDependency[32];
+        this.dependencyCount = 0;
+        this.dependencySet = new JasoNameSet();
+        this.extensionKeys = new JasoStrings();
+        this.extensionValues = new JasoStrings();
+    }
+
+    /** 做什么：处理一行；空行与 # 行忽略，没有 = 的行拒绝。 */
+    public function line(rawLo: int32, rawHi: int32): void {
+        var b: byte[] = this.text;
+        var lo: int32 = JasoText.trimStart(b, rawLo, rawHi);
+        var hi: int32 = JasoText.trimEnd(b, lo, rawHi);
+        if (hi == lo || (b[lo] & 255) == 35) {
+            return;
+        }
+        var eq: int32 = JasoText.find(b, lo, hi, 61);
+        if (eq < 0) {
+            throw new JasoError("manifest.line");
+        }
+        var keyHi: int32 = JasoText.trimEnd(b, lo, eq);
+        var valueLo: int32 = JasoText.trimStart(b, eq + 1, hi);
+        this.entry(lo, keyHi, valueLo, hi);
+    }
+
+    /** 做什么：按键分派。 */
+    private function entry(kl: int32, kh: int32, vl: int32, vh: int32): void {
+        var b: byte[] = this.text;
+        if (JasoText.same(b, kl, kh, "core.name")) {
+            JasoManifestParser.once(this.name != null);
+            this.name = JasoManifestParser.named(b, vl, vh, "._-", 64);
+        } else if (JasoText.same(b, kl, kh, "core.version")) {
+            JasoManifestParser.once(this.version != null);
+            var parsed: JasoVersion? = JasoVersion.parse(b, vl, vh, true);
+            if (parsed == null) {
+                throw new JasoError("manifest.value");
+            }
+            this.version = parsed;
+        } else if (JasoText.same(b, kl, kh, "core.abi")) {
+            JasoManifestParser.once(this.abi != null);
+            this.abi = JasoManifestParser.named(b, vl, vh, "._", 16);
+        } else if (JasoText.same(b, kl, kh, "core.stage")) {
+            JasoManifestParser.once(this.stage >= 0);
+            this.stage = JasoManifestParser.stageOf(b, vl, vh);
+        } else if (JasoText.same(b, kl, kh, "core.lifecycle")) {
+            JasoManifestParser.once(this.lifecycle != null);
+            if (JasoText.same(b, vl, vh, "plugin")) {
+                this.lifecycle = "plugin";
+            } else if (JasoText.same(b, vl, vh, "system")) {
+                this.lifecycle = "system";
+            } else {
+                throw new JasoError("manifest.value");
+            }
+        } else if (JasoText.same(b, kl, kh, "core.runtime")) {
+            JasoManifestParser.once(this.runtimeSeen);
+            var range: JasoVersionRange? = JasoVersionRange.parse(b, vl, vh);
+            if (range == null) {
+                throw new JasoError("manifest.value");
+            }
+            this.runtime = range;
+            this.runtimeSeen = true;
+        } else if (JasoText.same(b, kl, kh, "core.host")) {
+            JasoManifestParser.once(this.host != null);
+            this.host = JasoManifestParser.named(b, vl, vh, "._", 32);
+        } else if (JasoText.same(b, kl, kh, "core.description")) {
+            JasoManifestParser.once(this.description != null);
+            this.description = JasoBytes.text(b, vl, vh);
+        } else if (JasoText.same(b, kl, kh, "core.publisher")) {
+            JasoManifestParser.once(this.publisher != null);
+            this.publisher = JasoManifestParser.named(b, vl, vh, "._-", 64);
+        } else if (JasoText.same(b, kl, kh, "core.depends")) {
+            this.depends(vl, vh);
+        } else if (JasoText.same(b, kl, kh, "core.requires")) {
+            this.list(vl, vh, this.requires, false, 32);
+        } else if (JasoText.same(b, kl, kh, "core.exports")) {
+            this.list(vl, vh, this.exports, true, 256);
+        } else if (JasoText.startsWith(b, kl, kh, "core.")) {
+            throw new JasoError("manifest.key");
+        } else {
+            this.extensionEntry(kl, kh, vl, vh);
+        }
+    }
+
+    /** 做什么：单值键重复时拒绝。 */
+    private static function once(seen: bool): void {
+        if (seen) {
+            throw new JasoError("manifest.duplicate");
+        }
+    }
+
+    /** 做什么：按字符集校验取值并解码。 */
+    private static function named(b: byte[], lo: int32, hi: int32, extra: string, max: int32): string {
+        if (!JasoBytes.nameOk(b, lo, hi, extra, max)) {
+            throw new JasoError("manifest.value");
+        }
+        return JasoBytes.text(b, lo, hi);
+    }
+
+    /** 做什么：core.stage 的取值。 */
+    private static function stageOf(b: byte[], lo: int32, hi: int32): int32 {
+        if (JasoText.same(b, lo, hi, "runtime")) {
+            return 0;
+        }
+        if (JasoText.same(b, lo, hi, "boot")) {
+            return 1;
+        }
+        if (JasoText.same(b, lo, hi, "build")) {
+            return 2;
+        }
+        throw new JasoError("manifest.value");
+    }
+
+    /** 做什么：逗号分隔的名字表；上限在整行处理完之后才检查。 */
+    private function list(lo: int32, hi: int32, into: JasoStrings, symbols: bool, limit: int32): void {
+        var b: byte[] = this.text;
+        var start: int32 = lo;
+        var i: int32 = lo;
+        while (i <= hi) {
+            if (i == hi || (b[i] & 255) == 44) {
+                var tl: int32 = JasoText.trimStart(b, start, i);
+                var th: int32 = JasoText.trimEnd(b, tl, i);
+                var ok: bool = symbols ? JasoBytes.symbolOk(b, tl, th) : JasoBytes.nameOk(b, tl, th, "._", 64);
+                if (!ok) {
+                    throw new JasoError("manifest.value");
+                }
+                into.append(JasoBytes.text(b, tl, th));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (into.size() > limit) {
+            throw new JasoError("manifest.limit");
+        }
+    }
+
+    /**
+     * 做什么：一行 core.depends。逗号之后、去掉前导空白后以 < > = 开头的片段续接前一项的区间。
+     * 上限同样在整行处理完之后才检查，重名先于超限。
+     */
+    private function depends(lo: int32, hi: int32): void {
+        var b: byte[] = this.text;
+        var start: int32 = lo;
+        while (true) {
+            var end: int32 = JasoText.find(b, start, hi, 44);
+            if (end < 0) {
+                end = hi;
+            }
+            while (end < hi && this.continuesRange(end + 1, hi)) {
+                var next: int32 = JasoText.find(b, end + 1, hi, 44);
+                end = next < 0 ? hi : next;
+            }
+            this.dependency(start, end);
+            if (end >= hi) {
+                break;
+            }
+            start = end + 1;
+        }
+        if (this.dependencyCount > 32) {
+            throw new JasoError("manifest.limit");
+        }
+    }
+
+    /** 做什么：[lo, hi) 去掉前导空白后是否以 < > = 开头。 */
+    private function continuesRange(lo: int32, hi: int32): bool {
+        var at: int32 = JasoText.trimStart(this.text, lo, hi);
+        if (at >= hi) {
+            return false;
+        }
+        var c: int32 = this.text[at] & 255;
+        return c == 60 || c == 62 || c == 61;
+    }
+
+    /** 做什么：一项依赖 `名字[@区间]`；超过上限的项只查合法性与重名、只计数，行末会因超限拒绝。 */
+    private function dependency(rawLo: int32, rawHi: int32): void {
+        var b: byte[] = this.text;
+        var lo: int32 = JasoText.trimStart(b, rawLo, rawHi);
+        var hi: int32 = JasoText.trimEnd(b, lo, rawHi);
+        var at: int32 = JasoText.find(b, lo, hi, 64);
+        var nameHi: int32 = hi;
+        var range: JasoVersionRange? = null;
+        if (at >= 0) {
+            nameHi = JasoText.trimEnd(b, lo, at);
+            range = JasoVersionRange.parse(b, at + 1, hi);
+            if (range == null) {
+                throw new JasoError("manifest.value");
+            }
+        }
+        if (!JasoBytes.nameOk(b, lo, nameHi, "._-", 64)) {
+            throw new JasoError("manifest.value");
+        }
+        var depName: string = JasoBytes.text(b, lo, nameHi);
+        if (!this.dependencySet.insert(depName)) {
+            throw new JasoError("manifest.duplicate");
+        }
+        if (this.dependencyCount < 32) {
+            this.dependencies[this.dependencyCount] = new JasoDependency(depName, range);
+        }
+        this.dependencyCount = this.dependencyCount + 1;
+    }
+
+    /** 做什么：扩展键 `<命名空间>.<键>`，取第一个点分割。 */
+    private function extensionEntry(kl: int32, kh: int32, vl: int32, vh: int32): void {
+        var b: byte[] = this.text;
+        var dot: int32 = JasoText.find(b, kl, kh, 46);
+        if (dot < 0 || !JasoBytes.nameOk(b, kl, dot, "_-", 32) || !JasoBytes.nameOk(b, dot + 1, kh, "._-", 64)) {
+            throw new JasoError("manifest.key");
+        }
+        this.extensionKeys.append(JasoBytes.text(b, kl, kh));
+        this.extensionValues.append(JasoBytes.text(b, vl, vh));
+    }
+
+    /** 做什么：查缺失并产出清单。 */
+    public function finish(): JasoManifest {
+        var moduleName: string? = this.name;
+        var moduleVersion: JasoVersion? = this.version;
+        var moduleAbi: string? = this.abi;
+        if (moduleName == null || moduleVersion == null || moduleAbi == null || this.stage < 0) {
+            throw new JasoError("manifest.missing");
+        }
+        var m: JasoManifest = new JasoManifest(moduleName, moduleVersion, moduleAbi, this.stage);
+        m.lifecycle = this.lifecycle ?? "plugin";
+        m.runtime = this.runtime;
+        m.host = this.host;
+        m.description = this.description;
+        m.publisher = this.publisher;
+        m.requires = this.requires;
+        m.exports = this.exports;
+        m.dependencies = this.dependencies;
+        m.dependencyCount = this.dependencyCount;
+        m.extensionKeys = this.extensionKeys;
+        m.extensionValues = this.extensionValues;
+        return m;
+    }
+}

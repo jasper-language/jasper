@@ -1,0 +1,2 @@
+core.name = rime
+core.depends = @>=0.0,<2.corre.nc

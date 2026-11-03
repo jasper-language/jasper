@@ -1,0 +1,5 @@
+core.name = jaso-a
+core.version = 1.0.0
+core.abi = c.v0
+core.stage = runtime
+core.depends = a@>=1.0,<1.0.=: [y

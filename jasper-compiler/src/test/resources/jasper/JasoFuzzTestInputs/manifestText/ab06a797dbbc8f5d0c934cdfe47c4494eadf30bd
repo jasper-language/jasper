@@ -1,0 +1,3 @@
+core.name = ja-osme
+core.depends = a@>=0.0,<2.0, bpe= a@>=0.0,<2.0, b x.c 
+y
