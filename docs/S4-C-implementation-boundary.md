@@ -1370,7 +1370,7 @@ int32 / int64 / float64 / bool / string。帧协议（分派循环、恢复门�
 
 ### 规则
 
-- **字段默认值**：可空局部构造时写 null；非空引用局部不写，字段保持 JVM 默认值。规划器要求局部先初始化再使用，该默认值不可观察。
+- **字段默认值**：已由 LANG-CONT-REF-SLOT-01 取代（见本文末尾）。写本片时可空局部构造时写 null、string 局部写 `""`、非空引用局部不写。
 - **可空性**：await 绑定的声明类型仍须等于结果类型（`var b: Box? = await Future<Box>`、`var b: Base = await Future<Derived>` 都诊断，先绑定再赋值）；普通赋值与
   return 走既有赋值兼容。`??` 可以出现在帧表达式里，右侧或左侧含 await 时诊断。
 - **求值顺序**：引用类型的 `==` / `!=` 走 `Objects.equals`，字符串拼接走 `String.valueOf`，都会进入用户代码，不算静默运算；它们之前不能有未提升的 await。
@@ -1387,7 +1387,7 @@ int32 / int64 / float64 / bool / string。帧协议（分派循环、恢复门�
 
 - 跨包同名诊断只在帧路径。同步路径的 `var got = Factory.make(); return got.name();` 在同样的同名布局下实测调用到了正确的类（一次探针，未作为测试入库，其它写法未覆盖）；帧路径的 await 结果类型因为要落成字段和 checkcast，才需要这条诊断。诊断偏保守：同名但实际解析一致的写法也会被拒绝，写限定名即可。
 - `x != null` 走 `Objects.equals(x, null)`，非 null 时会调用用户的 `equals(null)`。语义上要求用户 `equals` 对 null 返回 false，未改。
-- 帧字段在局部离开作用域后仍持有引用，直到被覆写或帧不可达；长循环中可能延长对象存活，不影响语义。
+- 帧字段在局部离开作用域后仍持有引用：已由 LANG-CONT-REF-SLOT-01 修复（见本文末尾）。
 
 ### 仍未支持
 
@@ -1518,3 +1518,53 @@ finally / defer 中的 throw / 挂起 / 跳出；for-in 与循环后置块；实
 - `CallStatementCoroutinePipelineTest`：帧内语句、初始化、挂起后、`finally` 与引用结果的 `?.`；原 3 个 `?.` 拒绝用例转为这个正向用例，`box?.set(await input)` 仍在拒绝清单。
 - 变异 28 组全部被抓。「三元结果不可空」首轮存活，补两例拒绝后被抓；「不做空判断」首版变异自身编译不过，不算数，换写法重跑后被抓。
 - 帧协议未改，本片未新增 TLA+ / Lincheck / Jazzer 产物，未复跑 TLA+ 模型；Lincheck 与 Jazzer 语料回放随全量 gradle test 复跑。
+
+## 帧引用槽（LANG-CONT-REF-SLOT-01）
+
+落实用户 2026-11-04 的裁决：挂起帧中的引用字段不声明隐式业务默认值；跨挂起点存活的引用槽必须在首次读取前完成初始化；可空引用用「槽位有效标记 + null」表示显式空值，非空引用有效时不得为 null；槽位死亡后清除引用，不保证额外对象语义。
+
+帧协议（分派循环、恢复门、异常路由、作用域登记）不变。引用槽包括 string、具名引用类型和它们的可空形式；int32 / int64 / float64 / bool 不在内，构造时仍写零值。
+
+### 规则
+
+- **无隐式默认值**：引用字段一律声明为可空且不写初值，string 局部不再写 `""`。参数由构造器写入。
+- **有效性**：可空引用槽多一个 `__slotN_valid` 字段，写入时置 true，清除时置 false；null + true 是显式空值，null + false 是未初始化或已死亡。非空引用槽没有标记，null 即无效。
+- **首次读取前初始化（编译期）**：规划器在块表上做前向 must 分析，可能先读后写时诊断 `local 'x' may be read before it is initialized`，不写 class。合流取交集；catch 处理块与 finally 体只认进入区域时已写入的集合，不认 try 体中途写入的。
+- **写入检查（运行期）**：写入非空引用槽的值经 `std.FrameSlot.written`，null 抛 `std.FrameSlotError`，不会留下有效且为 null 的槽位。来源是平台调用、cast 和泛型擦除，用户程序可以走到。非空引用参数在第一段检查，失败发布到结果 Future，不同步抛给调用方。
+- **读取检查（运行期）**：引用槽的每次读取经 `std.FrameSlot.readNonNull` / `readNullable`。规划器和活跃性分析已保证走不到失败分支；走到说明编译器有缺陷，报告失败，不读出 null。
+- **死亡与清除**：「死亡」指从该点出发沿任何路径都不再读取，包括异常路由和展开。这比词法作用域结束更早，例如循环之后不再读的槽位。清除点有三处：
+  - 挂起块在操作数求值之后、注册回调之前；
+  - 块入口（前驱可能持有、本块已不活跃，catch 处理块的前驱是区域链内的所有块）；
+  - 帧回收时（结果已终结且区域为 0，在 `finish` 与 `markTaskSettled` 之前）全部清除。
+- **异常边**：块所在区域链上 finally 体提到的名字、catch 处理块入口活跃的名字，在整个块内都算活跃。挂起中的帧被取消后，finally 因此仍能读到它们。finally 体按「提到即活跃」保守处理。
+- **快照**：恢复块取走 `__outcome` 后立即清空，否则结果值比绑定的槽位活得更久。新快照只在之后注册回调时才会到来，自身结果回调写入的快照不会被消费（入口检查先跳出）。
+- **不进入用户代码**：检查用 `java.util.Objects.isNull`。引用的 `== null` 走 `Objects.equals`，会调用用户的 `equals(null)`（既有行为，见第二十二片）。
+
+### 技术取舍（裁决未写明，已按此实现，待用户确认时可改）
+
+- **FrameSlotError 可被捕获**：它继承 `std.Error`，走段内异常路由，`catch (e: FrameSlotError)` 或 `catch (e: Error)` 能捕获，未捕获时发布 `Failure(message, "error")`。读取检查的失败也走这条路。
+- **死亡按活跃性而不是词法作用域**：见上。「不保证额外对象语义」按字面处理：清除只保证帧不再持有，不承诺回收时机，也不提供析构或弱引用语义。
+- **string 算引用槽**：裁决说「引用字段」，string 在 JVM 上是引用，`""` 是隐式业务默认值，所以一并处理。
+
+### 顺带修复
+
+全限定类型名的静态调用此前不能由生成代码表达：标识符 `std.FrameSlot` 经检查器后在翻译器里解析不到静态成员，生成 `demo/void` 的非法调用。`declaredClassName` 现在接受含点的标识符。源码标识符不含点，只影响生成代码；源码里 `a.b.C.m()` 的既有问题（Q163、Q165）未动。
+
+### 已知缺口（未改）
+
+- 活跃性是保守的：finally 体提到的名字在整个区域内都算活跃，即使某条路径先覆写。两条分支都不读的值在分支块入口才清除，不在条件求值之后立刻清除。
+- `__pending`、`__cancelReason` 在回收前保留，它们只持有失败消息与原因，不持有业务对象；`__result` 按 Future 语义持有结果值。
+- 非挂起函数的局部不受影响，裁决只针对挂起帧。
+
+### 验收结果
+
+定点通过，等批次全量。
+
+- `FrameSlotCoroutinePipelineTest` 29 项，经真实解析、编译与 JVM 执行，反射读帧字段：构造后无默认值（含 string）、挂起时死槽为 null 且活槽保留、显式 null 跨挂起保持有效、从未读取的参数被清除、非空槽位写入 null（await 结果、参数、赋值）发布带槽位名的失败且可被 catch、finally 照常运行、finally / defer / catch 处理块（含外层区域）读的槽位在挂起和取消后仍可读、循环回边保留而循环后清除、单侧分支清除、覆写和 await 重绑定时旧值不跨挂起、进入处理块时清除只有 try 体读的槽位、回收后全部清除、不进入用户 `equals`、只被死槽持有的对象在挂起中可被 GC 回收、规划器拒绝 5 种先读后写的块表（不经检查器）、3 种源码形态不产帧。
+- 固定种子 20261180 的 200 个随机函数（嵌套分支、循环、try/finally），每三个里一个在随机挂起点让 Future 失败。每个挂起点用两个不依赖活跃性分析的判据：模型实际轨迹里下一次访问是读取的槽位必须有效；源码文本上之后再也不读的槽位必须已清除。另比对结果值与失败消息，回收后全部清除。覆盖下限：挂起点 ≥ 300，死槽与活槽观察各 ≥ 100，失败运行 ≥ 20。
+- 这组测试抓到 2 个实现缺陷：`FrameSlot` 首版用 `== null` 进入了用户 `equals`（既有的 `ReferenceFrameCoroutinePipelineTest` 抓到）；从未读取的引用参数一直持有到回收（变异存活后查出）。
+- 针对性回归：全部协程测试、`AwaitFrontendTest`、`S4RuntimeJasperTest`、`ScopeExitTest`、`JasoEmitTest`、`JasoImportTest`、`JasoPathTest`、StdLib 测试，共 855 项 0 失败（跑在最终代码上，只差头注释）。
+- 变异 32 组：30 组被抓，全部是断言失败。其中 12 组的结果来自修复参数缺陷之前（当时存活的 `live-no-handlers`、`live-no-outer-chain` 修复后重跑被抓，`live-no-block-cleanups` 是等价变异，代码已删除并替换为 `held-no-params`）；其余 18 组在定稿代码上只跑 `FrameSlotCoroutinePipelineTest`。存活 2 组是去掉读取检查（`read-no-nonnull-check`、`read-no-nullable-check`）：防御性检查，合法程序走不到失败分支；检查函数本身由直接调用测试覆盖。
+- TLA+ `FrameReferenceSlot`：主配置非空 + finally 读 59 个状态、可空 + finally 不读 89 个状态，均 No error（一个槽位、两个挂起点，规模小）。5 个变异配置（写默认值、不查写入、不清除、活跃性忽略 finally、自身回调的恢复也消费快照）各给出反例。
+- Jazzer `FrameSlotFuzzTest.slotChecks`：60 秒 126 万次，cov 10，无失败，语料只有 3 项未入库（函数只有几条分支）。
+- 本片未新增 Lincheck 目标：`FrameSlot` 无状态，帧字段由恢复门串行访问；清空快照与自身回调的交错由上面的 TLA+ 模型覆盖。

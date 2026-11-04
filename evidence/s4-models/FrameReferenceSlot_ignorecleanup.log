@@ -1,0 +1,125 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Warning: Please run the Java VM which executes TLC with a throughput optimized garbage collector by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 58 and seed -548775067707185720 with 1 worker on 8 cores with 1984MB heap and 64MB offheap memory [pid: 198325] (Linux 7.0.0-42-generic amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file verification/tla/FrameReferenceSlot.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module FrameReferenceSlot
+Starting... (2026-11-04 20:44:24)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-04 20:44:24.
+Error: Invariant NoFault is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pending = TRUE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "none"
+/\ entered = FALSE
+/\ valid = FALSE
+/\ pc = "ctor"
+/\ snap = "none"
+
+State 2: <First line 50, col 5 to line 56, col 57 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "obj"
+/\ entered = TRUE
+/\ valid = TRUE
+/\ pc = "suspended"
+/\ snap = "none"
+
+State 3: <AwaitedDone line 60, col 5 to line 63, col 75 of module FrameReferenceSlot>
+/\ pending = TRUE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "ok"
+/\ value = "obj"
+/\ entered = TRUE
+/\ valid = TRUE
+/\ pc = "suspended"
+/\ snap = "none"
+
+State 4: <Consume line 86, col 5 to line 91, col 58 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "ok"
+/\ value = "obj"
+/\ entered = TRUE
+/\ valid = TRUE
+/\ pc = "consuming"
+/\ snap = "ok"
+
+State 5: <ClearOutcome line 95, col 5 to line 98, col 80 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "obj"
+/\ entered = TRUE
+/\ valid = TRUE
+/\ pc = "body"
+/\ snap = "ok"
+
+State 6: <Body line 102, col 5 to line 108, col 68 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "none"
+/\ entered = TRUE
+/\ valid = FALSE
+/\ pc = "suspended2"
+/\ snap = "ok"
+
+State 7: <AwaitedDone line 60, col 5 to line 63, col 75 of module FrameReferenceSlot>
+/\ pending = TRUE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "ok"
+/\ value = "none"
+/\ entered = TRUE
+/\ valid = FALSE
+/\ pc = "suspended2"
+/\ snap = "ok"
+
+State 8: <Consume line 86, col 5 to line 91, col 58 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "none"
+/\ entered = TRUE
+/\ valid = FALSE
+/\ pc = "unwind"
+/\ snap = "ok"
+
+State 9: <Unwind line 112, col 5 to line 116, col 53 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = TRUE
+/\ fault = "read-invalid"
+/\ outcome = "none"
+/\ value = "none"
+/\ entered = TRUE
+/\ valid = FALSE
+/\ pc = "settled"
+/\ snap = "ok"
+
+77 states generated, 57 distinct states found, 9 states left on queue.
+The depth of the complete state graph search is 9.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 2).
+Finished in 00s at (2026-11-04 20:44:24)

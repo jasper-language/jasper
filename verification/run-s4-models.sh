@@ -10,7 +10,7 @@ if [[ ! -f "$jar" ]]; then
     exit 2
 fi
 mkdir -p evidence/s4-models build/tmp/s4-models
-for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregation_supervisor CleanupBudgetNesting CallbackDispatch ContinuationDispatch ContinuationResultBinding LinearCoroutineFrame BranchingCoroutineFrame LoopingCoroutineFrame TryFinallyCoroutineFrame TryCatchCoroutineFrame CancellationReasonPropagation DeadlinePropagation CoroutineScopeLaunch_normal CoroutineScopeLaunch_supervisor FrameDeadlineCheckpoint_normal FrameDeadlineCheckpoint_supervisor DeadlineTimer ScopeExitClose_normal ScopeExitClose_supervisor FrameAwaitCancelReason NestedScopeCancel TaskAwaitCancelPublish JasoModuleLifecycle JasoLoadPlan; do
+for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregation_supervisor CleanupBudgetNesting CallbackDispatch ContinuationDispatch ContinuationResultBinding LinearCoroutineFrame BranchingCoroutineFrame LoopingCoroutineFrame TryFinallyCoroutineFrame TryCatchCoroutineFrame CancellationReasonPropagation DeadlinePropagation CoroutineScopeLaunch_normal CoroutineScopeLaunch_supervisor FrameDeadlineCheckpoint_normal FrameDeadlineCheckpoint_supervisor DeadlineTimer ScopeExitClose_normal ScopeExitClose_supervisor FrameAwaitCancelReason NestedScopeCancel TaskAwaitCancelPublish JasoModuleLifecycle JasoLoadPlan FrameReferenceSlot FrameReferenceSlot_nullable; do
     model="$config"
     case "$config" in
         TaskGroupAggregation_*) model=TaskGroupAggregation ;;
@@ -18,6 +18,7 @@ for config in FutureStateMachine TaskGroupAggregation_normal TaskGroupAggregatio
         DeadlinePropagation_*) model=DeadlinePropagation ;;
         FrameDeadlineCheckpoint_*) model=FrameDeadlineCheckpoint ;;
         ScopeExitClose_*) model=ScopeExitClose ;;
+        FrameReferenceSlot_*) model=FrameReferenceSlot ;;
     esac
     java -cp "$jar" tlc2.TLC -workers 1 \
         -metadir "build/tmp/s4-models/$config" \

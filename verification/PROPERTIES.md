@@ -64,6 +64,7 @@
 | `LANG-S4-AWAIT-CANCEL-PUBLISH-01` | spawn 任务体与生成帧未捕获 `FutureCancelledError` / `CancellationException` 时发布 Cancelled，不写 Failure；原因沿用错误所带首因，`Parent` 换成令牌首因；普通组不级联；catch 之后可以正常完成；清理抛出的业务错误取代取消，发布 Failed 并级联。 | `jasper-compiler/src/main/resources/stdlib/TaskGroup.jas` 的 `TaskRunner.run`；`.../stdlib/CancellationToken.jas` 的 `reportedReason`；`jasper-compiler/src/main/kotlin/jasper/translator/LinearCoroutineEmitter.kt` 的 `abortThrown`；`verification/tla/TaskAwaitCancelPublish.tla`；`jasper-compiler/src/test/kotlin/jasper/AwaitedCancelPublishTest.kt` | FV-A：TLA+（`_asfailure`、`_noparentmap` 两组变异被抓）+ 手写用例 + 种子 20261147 的 600 个脚本 + Lincheck 固定场景（非线性化证明）+ Jazzer；JBMC N/A |
 | `LANG-NULL-SAFE-01` | `a?.b` / `a?.m(args)`：接收者恰好求值一次，为 null 时结果为 null 且实参不求值，结果类型可空，同步路径与生成帧一致。`T?`（`T` 为基本类型）的 JVM 表示是包装类，写入时装箱（必要时先拓宽）；`??` 分支都落到检查器给出的结果类型，左侧基本类型时右侧不求值。可空基本类型不能直接参与算术 / 排序 / 条件，包装类比较的基本类型不符时诊断，`int32?` 不隐式转 `int64?`，`Foo?` 不可赋给无关的已声明类型 `Bar?`。 | `jasper-compiler/src/main/kotlin/jasper/translator/JasperToIrTranslator.kt` 的 `translateSafeAccess`、`withPlatformReturnType`、`translateNullCoalescing`；`.../translator/TypeMapper.kt` 的 `boxedDescriptor`、`primitiveOfBoxed`；`.../checker/TypeChecker.kt` 的 `safeReceiverType`、`nullCoalescingType`、`checkBoxedEquality`；`.../compiler/JvmIrBackend.kt` 的 `emitBoxingIfNeeded`；`jasper-compiler/src/test/kotlin/jasper/SafeAccessPipelineTest.kt`；`CallStatementCoroutinePipelineTest` 的帧用例 | FV-B：端到端手写用例 + 拒绝清单 + 种子 20261149 的 160 个随机 `?.` 链 × 4 种链长，比对返回值与求值轨迹（Kotlin 模型，覆盖下限 null ≥ 60、值 ≥ 200、带轨迹 ≥ 100）；变异 28 组全部被抓（2 组首轮未算数：1 组变异自身编译不过，1 组存活后补拒绝用例）。 | `tested` | 构建虚拟机内 `./gradlew :jasper-compiler:test --tests '*SafeAccessPipelineTest' --no-daemon` |
 | `LANG-PLATFORM-BINOP-01` | 二元算术与比较的操作数是没有声明签名的平台调用（IR 类型记为 Unit）时，操作数描述符经平台解析器回填，按真实类型选指令与拓宽：`System.nanoTime() - 1L` 为 LSUB，直线与 if 体内都能编译并通过 JVM 校验。 | `jasper-compiler/src/main/kotlin/jasper/compiler/JvmIrBackend.kt` 的二元算术 / 比较分支与 `receiverJvmDescriptor`；`jasper-compiler/src/test/kotlin/jasper/PlatformCallBinaryOperandTest.kt` | FV-B：手写 3 种位置 + 种子 20261127 的 240 个函数 × 4 输入真实编译执行与 Kotlin 计算比对（int64 两种位置各 ≥ 20）；变异（回退为只看 IR 类型）2 项失败。 | `tested` | 构建虚拟机内 `./gradlew :jasper-compiler:test --tests 'jasper.PlatformCallBinaryOperandTest' --no-daemon` | 只覆盖解析器能解析的平台静态 / 成员调用；无法解析时仍按 IR 类型。 |
+| `LANG-CONT-REF-SLOT-01` | 生成帧引用槽（string、具名引用类型及其可空形式）无隐式默认值；每条路径上读取前已写入，否则诊断且不写 class；可空引用用有效标记 + null 表示显式空值；非空引用写入 null 抛 `FrameSlotError`，不存在有效且为 null 的槽位；不再被任何路径（含异常路由与展开）读取的槽位在下一次挂起前或块入口清除，finally 与 catch 处理块要读的保留；帧回收时全部清除，快照字段消费后清空；读写检查不进入用户代码。帧协议不变。 | `jasper-compiler/src/main/kotlin/jasper/translator/CoroutineSlotAnalysis.kt`；`.../translator/LinearCoroutineEmitter.kt` 的 `assignLocal`、`readLocal`、`clearSlot`；`.../translator/CoroutineBlockPlanner.kt` 的 `isReferenceSlot`、`CoroutineBlock.regions`；`.../translator/JasperToIrTranslator.kt` 的 `declaredClassName`；`jasper-compiler/src/main/resources/stdlib/FrameSlot.jas`；`verification/tla/FrameReferenceSlot.tla`；`jasper-compiler/src/test/kotlin/jasper/FrameSlotCoroutinePipelineTest.kt` | FV-B（Kotlin 变换）+ Jasper 源码验证链，见下方明细。 | `tested` | 构建虚拟机内 `./gradlew :jasper-compiler:test --tests 'jasper.FrameSlotCoroutinePipelineTest' -x lincheckTest --no-daemon`；定点通过，等批次全量 |
 
 ### `LANG-CONT-SCOPE-01` 的 Jasper 源码验证链
 
@@ -139,3 +140,18 @@
 | 6 Lincheck | `JasoModuleTable`：依赖者预订 + 提交 与 被依赖模块 stop 竞争，恰好一方成功且不变量成立。固定场景 + EpsilonVerifier，2000 次调用，不是线性化证明；另有真实线程：同名并发装载恰好一个成功（30 轮 8 线程）、load 与 stop 竞争（150 轮） | lincheck 2.39 | `./gradlew :jasper-compiler:lincheckTest --tests 'jasper.JasoModuleTableLincheckTest'` | 通过 |
 
 变异核查（不属于六步链，记录测试强度）：`JasoRuntime.jas`、`JasoExports`、继承成员解析共 47 组变异，首轮 39 组被抓、8 组存活。其中 7 组是用例经另一条路径得到相同码而放过（坏 class 名也被 JVM 拒绝、Array 实参个数、钩子形状、无绑定文件），补用例后重跑全部被抓；1 组仍存活：`inheritedPlatformOwner` 里「链上源码类声明了该成员」的判断，声明签名路径先命中，未找到能走到这里的输入，判断保留作防御。
+
+### `LANG-CONT-REF-SLOT-01` 验证链明细
+
+源码身份：引入本节的提交；`FrameSlot.jas`（全部）。工具在构建虚拟机内运行（JDK 21.0.12，Gradle 8.10）。
+
+| 步 | 工具 | 规格 / 范围 | 命令 | 假设 / 边界 | 结果 |
+|---|---|---|---|---|---|
+| 1 规格 | TLA+ TLC | `FrameReferenceSlot.tla`：NoImplicitDefault、NonNullValidNotNull、InvalidHoldsNothing、NoFault（读取有效、恢复只消费真实快照）、DeadCleared、SettledCleared；2 个主配置 | `TLA2TOOLS_JAR=<jar> bash verification/run-s4-models.sh`（本次单独跑 FrameReferenceSlot 各配置，日志在 `evidence/s4-models/`） | 一个槽位、两个挂起点、规模小；恢复门合并按原子步建模 | 59 / 89 个状态 No error；5 个变异配置各有反例。Z3：`N/A`，本片无算术约束，不变式是有限状态性质，由 TLC 检查 |
+| 2 性质 | Kotlin 固定种子 | 种子 20261180，200 个随机函数；判据见边界文档 | `--tests 'jasper.FrameSlotCoroutinePipelineTest'` | 只含 int32 累加、Box 与 Box? 槽位 | 通过 |
+| 3 字节码 | JVM 校验 | `N/A`（Miri 无对应）：测试经 URLClassLoader 加载生成帧与 `FrameSlot`，JVM 默认校验这些类；未单独加 `-Xverify:all` | 同上 | 仅覆盖测试加载到的类 | 替代证据：855 项定点回归无 VerifyError |
+| 4 fuzz | Jazzer 0.30.0 | `FrameSlotFuzzTest.slotChecks`：任意值、有效标记、名字 | `JAZZER_FUZZ=1 JAZZER_INSTRUMENTATION_INCLUDES='std.**' ./gradlew :jasper-compiler:cleanTest :jasper-compiler:test --tests 'jasper.FrameSlotFuzzTest' -x lincheckTest --no-daemon` | 60 秒；跑在参数修复之前，`FrameSlot.jas` 此后未改 | 1261077 次，cov 10，无失败 |
+| 5 有界证明 | JBMC | — | — | — | JBMC：发版时验证 |
+| 6 并发 | Lincheck | `N/A`：`FrameSlot` 无状态，帧字段由恢复门串行访问 | — | 串行性由 `ContinuationDispatch` 的模型与 Lincheck 负责；快照清空与自身回调的交错见第 1 步 | 替代证据：TLA+ 模型 |
+
+变异共 32 组，30 组被抓，存活 2 组为防御性读取检查，详见边界文档。

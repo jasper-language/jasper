@@ -42,6 +42,8 @@
 //     无期限令牌），每趟分派开头与每个挂起点入口先 pollReason，令牌已取消（作用域 / 自身到期、
 //     作用域取消）时以其首个原因取消自己的结果，再由随后的终结检查跳出分派循环展开清理；
 //     到期不唤醒挂起中的帧（无计时器），只在检查点观察；
+//   - 引用槽（用户 2026-11-04 裁决）：字段无隐式默认值，可空引用带有效标记，读写经 std.FrameSlot 检查，
+//     死亡后清除（CoroutineSlotAnalysis 给出清除点），帧回收时全部清除；
 //   - 不定义显式挂起标记，不改变公开函数 ABI，也不把生成帧冒充为可同步调用的
 //     普通函数；
 //   - 不实现 Future.get 阻塞等待；恢复只经 onComplete -> ContinuationDispatch。
@@ -83,6 +85,7 @@ object LinearCoroutineEmitter {
     private const val FUTURE_FAILURE_ERROR = "std.FutureFailureError"
     private const val FUTURE_CANCELLED_ERROR = "std.FutureCancelledError"
     private const val CANCELLATION_EXCEPTION = "std.CancellationException"
+    private const val FRAME_SLOT = "std.FrameSlot"
     private const val THROWABLE = "java.lang.Throwable"
     private const val ERROR = "std.Error"
 
@@ -166,6 +169,10 @@ object LinearCoroutineEmitter {
         val slotTypes = function.parameters.map { it.name to normalize(requireNotNull(it.type)) } + plan.locals
         val slots = slotTypes.withIndex().associate { it.value.first to "__slot${it.index}" }
         val slotType = slotTypes.toMap()
+        // 引用槽（用户 2026-11-04 裁决）：字段一律声明为可空且不写初值，没有隐式业务默认值。
+        // 可空引用另有有效标记，区分显式 null 与未初始化 / 已死亡；非空引用有效时不为 null，null 即无效。
+        val referenceSlots = slotTypes.filter { CoroutineBlockPlanner.isReferenceSlot(it.second) }.map { it.first }.toSet()
+        val deaths = CoroutineSlotAnalysis.deaths(plan, referenceSlots, function.parameters.map { it.name }.toSet())
 
         /** 生成当前帧字段引用。 */
         fun field(name: String) = JasPropertyAccess(JasIdentifier("this"), name)
@@ -183,9 +190,40 @@ object LinearCoroutineEmitter {
          */
         fun coerced(value: JasExpression, type: JasType) =
             if (type == INT64 || type == FLOAT64) JasCastExpr(value, type) else value
-        /** 写入源码局部 / 合成临时局部对应的帧字段。 */
-        fun assignLocal(name: String, value: JasExpression) =
-            assign(slots.getValue(name), coerced(value, slotType.getValue(name)))
+        /** std.FrameSlot 的静态调用；第一个实参是槽位的值，最后一个是诊断用的源码名字。 */
+        fun frameSlot(method: String, vararg args: JasExpression) =
+            JasCall(JasPropertyAccess(JasIdentifier(FRAME_SLOT), method), args.toList())
+        /** 可空引用槽的有效标记字段；非空引用槽与值类型没有。 */
+        fun validFlag(name: String) = slots.getValue(name) + "_valid"
+        /**
+         * 写入源码局部 / 合成临时局部对应的帧字段。非空引用写入 null 时抛 FrameSlotError（走段内异常路由，
+         * 不会留下「有效且为 null」的槽位）；可空引用连同有效标记一起写，值在标记之前求值完。
+         */
+        fun assignLocal(name: String, value: JasExpression): JasStatement {
+            val type = slotType.getValue(name)
+            return when {
+                name !in referenceSlots -> assign(slots.getValue(name), coerced(value, type))
+                type is JasNullableType -> JasBlock(listOf(
+                    assign(slots.getValue(name), value),
+                    assign(validFlag(name), JasBoolLiteral(true))
+                ))
+                else -> assign(slots.getValue(name), JasCastExpr(frameSlot("written", value, JasStringLiteral(name)), type))
+            }
+        }
+        /** 清除已死亡的引用槽。 */
+        fun clearSlot(name: String): List<JasStatement> = listOf(assign(slots.getValue(name), JasNullLiteral)) +
+            if (slotType.getValue(name) is JasNullableType) listOf(assign(validFlag(name), JasBoolLiteral(false))) else emptyList()
+        /** 读取槽位。值类型直接读字段；引用槽经读取检查，分析漏算时报告失败而不是读到 null。 */
+        fun readLocal(name: String): JasExpression {
+            val type = slotType.getValue(name)
+            val slot = field(slots.getValue(name))
+            return when {
+                name !in referenceSlots -> slot
+                type is JasNullableType -> JasCastExpr(
+                    frameSlot("readNullable", slot, field(validFlag(name)), JasStringLiteral(name)), type)
+                else -> JasCastExpr(frameSlot("readNonNull", slot, JasStringLiteral(name)), type)
+            }
+        }
         /** 生成 `__phase = target`。 */
         fun jump(target: Int) = assign("__phase", JasIntLiteral(target.toLong(), target.toString()))
 
@@ -214,7 +252,7 @@ object LinearCoroutineEmitter {
         fun rewrite(expression: JasExpression): JasExpression = when (expression) {
             is JasIdentifier -> {
                 require(expression.name != "this") { "instance receiver is not supported" }
-                slots[expression.name]?.let(::field) ?: expression
+                if (expression.name in slots) readLocal(expression.name) else expression
             }
             is JasIntLiteral, is JasFloatLiteral, is JasStringLiteral, is JasBoolLiteral,
             is JasCharLiteral, JasNullLiteral -> expression
@@ -301,6 +339,8 @@ object LinearCoroutineEmitter {
             return listOf(
                 JasVariableStatement(readyName, JasNamedType(FUTURE_OUTCOME),
                     JasCastExpr(field("__outcome"), JasNamedType(FUTURE_OUTCOME)), false),
+                // 快照持有结果值，不清除的话它比绑定的槽位活得更久。新快照只在之后注册回调时才会到来。
+                assign("__outcome", JasNullLiteral),
                 JasIf(invoke(ready, "isCancelled"), JasBlock(listOf(
                     assign("__cancelReason", invoke(ready, "cancellationReason")),
                     assign("__abort", JasIntLiteral(2, "2")),
@@ -310,7 +350,12 @@ object LinearCoroutineEmitter {
                     JasVariableStatement(failureName, JasNullableType(JasNamedType(FAILURE)),
                         invoke(ready, "failure"), false)
                 ) + abortFailure(failure) + onFailed), null),
-                assign(slots.getValue(binding), JasCastExpr(invoke(ready, "value"), slotType.getValue(binding)))
+                if (binding in referenceSlots) {
+                    val type = slotType.getValue(binding)
+                    assignLocal(binding, if (type is JasNullableType) JasCastExpr(invoke(ready, "value"), type) else invoke(ready, "value"))
+                } else {
+                    assign(slots.getValue(binding), JasCastExpr(invoke(ready, "value"), slotType.getValue(binding)))
+                }
             )
         }
 
@@ -325,7 +370,7 @@ object LinearCoroutineEmitter {
                 is JasAssignment -> assignLocal((expression.target as JasIdentifier).name, rewrite(expression.value))
                 is JasPostfixIncDec -> {
                     val name = (expression.target as JasIdentifier).name
-                    assignLocal(name, JasBinaryOp(field(slots.getValue(name)), if (expression.op == "++") "+" else "-", JasIntLiteral(1, "1")))
+                    assignLocal(name, JasBinaryOp(readLocal(name), if (expression.op == "++") "+" else "-", JasIntLiteral(1, "1")))
                 }
                 else -> statement(rewrite(expression))
             }
@@ -347,6 +392,13 @@ object LinearCoroutineEmitter {
         // 所有用户表达式先验证并转换；任何失败都在构造类之前抛出，不返回半成品 AST。
         val segments = plan.blocks.map { block ->
             val code = mutableListOf<JasStatement>()
+            // 非空引用参数由调用方传入，第一段先确认；放在这里而不是构造器：失败要发布到结果，不能同步抛给调用方。
+            if (block.id == 0) {
+                function.parameters.filter { it.name in referenceSlots && slotType[it.name] !is JasNullableType }.forEach {
+                    code += assignLocal(it.name, field(slots.getValue(it.name)))
+                }
+            }
+            deaths.onEntry[block.id]?.forEach { code += clearSlot(it) }
             block.resumeBinding?.let { code += consumeOutcome(block.id, it) }
             block.assignments.forEach { (name, value) ->
                 code += if (name == CoroutineBlockPlanner.EFFECT_TARGET) statement(rewrite(value)) else assignLocal(name, rewrite(value))
@@ -372,6 +424,7 @@ object LinearCoroutineEmitter {
                     code += checkpoint(block.id.toString())
                     code += JasIf(invoke(field("__result"), "isDone"), JasBlock(listOf(JasBreakStatement(null))), null)
                     code += jump(exit.resume)
+                    deaths.beforeSuspend[block.id]?.forEach { code += clearSlot(it) }
                     code += statement(invoke(JasIdentifier("__awaited${block.id}"), "onComplete", JasIdentifier("this")))
                     code += JasReturn(null)
                 }
@@ -400,7 +453,11 @@ object LinearCoroutineEmitter {
             JasProperty("__token", JasNamedType(CANCELLATION_TOKEN), listOf("private"), null, null)
         )
         slotTypes.forEach { (name, type) ->
-            properties += JasProperty(slots.getValue(name), type, listOf("private"), null, null)
+            val fieldType = if (name in referenceSlots && type !is JasNullableType) JasNullableType(type) else type
+            properties += JasProperty(slots.getValue(name), fieldType, listOf("private"), null, null)
+            if (name in referenceSlots && type is JasNullableType) {
+                properties += JasProperty(validFlag(name), BOOL, listOf("private"), null, null)
+            }
         }
 
         val constructorBody = mutableListOf<JasStatement>(
@@ -414,6 +471,7 @@ object LinearCoroutineEmitter {
         )
         function.parameters.forEachIndexed { index, parameter ->
             constructorBody += assign(slots.getValue(parameter.name), JasIdentifier("arg$index"))
+            if (slotType[parameter.name] is JasNullableType) constructorBody += assign(validFlag(parameter.name), JasBoolLiteral(true))
         }
         plan.locals.forEach { (name, type) ->
             zeroValue(type)?.let { constructorBody += assign(slots.getValue(name), it) }
@@ -601,7 +659,7 @@ object LinearCoroutineEmitter {
                 ))
             )),
             JasBlock(listOf(
-                JasIf(settleCondition, JasBlock(listOf(
+                JasIf(settleCondition, JasBlock(referenceSlots.flatMap(::clearSlot) + listOf(
                     statement(invoke(field("__dispatch"), "finish")),
                     statement(invoke(field("__result"), "markTaskSettled"))
                 )), null)
@@ -667,16 +725,14 @@ object LinearCoroutineEmitter {
         CoroutineBlockPlanner.isFrameValueType(type) || isFutureOfValue(type)
 
     /**
-     * 局部字段在构造器里的初值：规划器要求局部先初始化再使用，这个值不可观察。
-     * 非空引用类型没有可写的源码初值，返回 null 表示不写（字段保持 JVM 默认值，同样不可观察）。
+     * 值类型局部字段在构造器里的初值：规划器证明局部先写后读，这个值不可观察。
+     * 引用槽返回 null 表示不写：裁决要求不声明隐式业务默认值，未初始化由读取检查报告。
      */
     private fun zeroValue(type: JasType): JasExpression? = when (type) {
         BOOL -> JasBoolLiteral(false)
         INT64 -> JasCastExpr(JasIntLiteral(0, "0"), INT64)
         FLOAT64 -> JasFloatLiteral(0.0, "0.0")
-        JasStringType -> JasStringLiteral("")
         INT -> JasIntLiteral(0, "0")
-        is JasNullableType -> JasNullLiteral
         else -> null
     }
 

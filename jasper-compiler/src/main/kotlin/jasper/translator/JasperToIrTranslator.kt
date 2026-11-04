@@ -3594,6 +3594,8 @@ class JasperToIrTranslator {
      */
     private fun declaredClassName(target: JasExpression, ctx: TranslationContext): String? {
         if (target !is JasIdentifier) return null
+        // 含点的标识符只来自生成代码（协程帧调用 std.FrameSlot），源码标识符不含点；生成帧可位于任意包。
+        if ('.' in target.name) return target.name.replace('.', '/').takeIf { it in ctx.staticMemberFunctionSymbolsByType }
         if (ctx.symbols.containsKey(target.name)) return null
         if (target.name !in ctx.declaredTypeNames) return null
         return typeMapper.resolveNamedTypeName(target.name)

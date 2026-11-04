@@ -100,13 +100,15 @@ sealed class CoroutineBlockExit {
  * [resumeBinding] 非空表示这是某个挂起点的恢复块：入口先消费完成快照（取消/失败
  * 直接发布终态并结束），成功值写入该局部；[assignments] 是按源码顺序的局部写入，名字为
  * [CoroutineBlockPlanner.EFFECT_TARGET] 的项只求值、丢弃结果（调用语句）；[exit] 是唯一出口。
+ * [regions] 是块内任何位置可能所在的最内层区域（开块时所在的，加块内进入的），供异常边分析使用。
  */
 data class CoroutineBlock(
     val id: Int,
     val resumeBinding: String?,
     val assignments: List<Pair<String, JasExpression>>,
     val exit: CoroutineBlockExit,
-    val cleanups: List<Int> = emptyList()
+    val cleanups: List<Int> = emptyList(),
+    val regions: Set<Int> = emptySet()
 )
 
 /**
@@ -179,7 +181,7 @@ object CoroutineBlockPlanner {
     )
 
     /**
-     * 帧值类型：可作参数、局部、await 结果与返回值，帧字段直接使用该类型。
+     * 帧值类型：可作参数、局部、await 结果与返回值。
      * 可空数值不在内：`FutureOutcome.value` 的 null 经拆箱会失败，需要单独的装箱规则。
      */
     fun isFrameValueType(type: JasType?): Boolean = isScalar(type) || isFrameReferenceType(type)
@@ -187,6 +189,9 @@ object CoroutineBlockPlanner {
     /** int32 / int64 / float64 / bool / string：比较与拼接不会进入用户代码。 */
     private fun isScalar(type: JasType?) =
         type == INT || type == INT64 || type == FLOAT64 || type == BOOL || type == JasStringType
+
+    /** 槽位是引用的类型（无隐式默认值、写入与读取走 std.FrameSlot、死亡后清除）：string 与 [isFrameReferenceType]。 */
+    fun isReferenceSlot(type: JasType?): Boolean = type == JasStringType || isFrameReferenceType(type)
 
     /** 帧字段保存引用本身（不复制）的类型：具名类型，及具名类型 / string 的可空形式。 */
     private fun isFrameReferenceType(type: JasType?): Boolean = when (type) {
@@ -217,6 +222,7 @@ object CoroutineBlockPlanner {
     private class OpenBlock(val id: Int, val resumeBinding: String?) {
         val assignments = mutableListOf<Pair<String, JasExpression>>()
         val cleanups = mutableListOf<Int>()
+        val regions = linkedSetOf<Int>()
     }
 
     /**
@@ -257,8 +263,12 @@ object CoroutineBlockPlanner {
                     }
                 }
             }
-            CoroutineBlockPlan(blocks, state.locals.toList(), loopHeaders = state.headers.toSet(),
+            val plan = CoroutineBlockPlan(blocks, state.locals.toList(), loopHeaders = state.headers.toSet(),
                 tryRegions = state.regions.toList())
+            CoroutineSlotAnalysis.uninitializedRead(plan, slotTypes.keys)?.let {
+                throw Rejected("local '$it' may be read before it is initialized")
+            }
+            plan
         } catch (rejected: Rejected) {
             CoroutineBlockPlan(emptyList(), emptyList(), rejected.message)
         }
@@ -285,12 +295,14 @@ object CoroutineBlockPlanner {
         private var nextTemp = 0
 
         /** 分配新块；编号按分配顺序递增，是前向不变量的来源。 */
-        fun open(resumeBinding: String?) = OpenBlock(nextId++, resumeBinding)
+        fun open(resumeBinding: String?) = OpenBlock(nextId++, resumeBinding).also { block ->
+            tries.lastOrNull()?.let { block.regions += it.id }
+        }
 
         /** 封闭块并登记出口。 */
         fun close(block: OpenBlock, exit: CoroutineBlockExit) {
             closed[block.id] = CoroutineBlock(block.id, block.resumeBinding, block.assignments.toList(), exit,
-                block.cleanups.toList())
+                block.cleanups.toList(), block.regions.toSet())
         }
 
         /**
@@ -631,6 +643,7 @@ object CoroutineBlockPlanner {
             val region = CoroutineTryRegion(regions.size + 1, tries.lastOrNull()?.id ?: 0, cleanup)
             regions += region
             block.assignments += REGION_LOCAL to JasIntLiteral(region.id.toLong(), region.id.toString())
+            block.regions += region.id
             tries.addLast(region)
             return region
         }

@@ -1,0 +1,57 @@
+package std;
+
+// ============================================================================
+// FrameSlot.jas —— 生成协程帧引用槽的写入与读取检查
+// ============================================================================
+// 职责：
+//   落实用户 2026-11-04 对帧引用槽的裁决在运行期的部分：非空引用有效时不得为 null；
+//   可空引用用「有效标记 + null」表示显式空值；未初始化或已死亡的槽位不能被读取。
+//   帧发射器生成对这里的调用，源码不直接使用。
+//
+// 与编译期的分工：
+//   规划器已证明读取之前每条路径都写入过，活跃性分析保证被读取的槽位没有被清除，所以
+//   readNonNull / readNullable 的失败分支只在编译器有缺陷时才会走到；written 不同，
+//   平台调用与泛型擦除都可能把 null 送进非空类型，是用户程序可以走到的。
+//
+// 为什么用 Objects.isNull 而不是 `value == null`：
+//   引用的 `==` 走 Objects.equals，非 null 时会调用用户的 equals(null)；读写槽位不得进入用户代码，
+//   否则用户 equals 会早于它之前的 await 运行。
+//
+// 失败模式：
+//   FrameSlotError 走帧的段内异常路由：可被 catch 匹配，未捕获时发布 Failure(message, "error")。
+// ============================================================================
+
+/** 帧引用槽违反裁决：向非空槽位写入 null，或读取未初始化 / 已死亡的槽位。 */
+public class FrameSlotError extends Error {
+    /** 做什么：构造错误。前置条件：message 非 null；失败模式：不会失败。 */
+    public constructor(message: string) {
+        super(message);
+    }
+}
+
+/** 帧引用槽的检查。无状态；帧的串行恢复门保证同一槽位不会并发访问。 */
+public class FrameSlot {
+    /** 写入非空槽位前检查：返回 value，为 null 时抛 FrameSlotError。name 是源码局部名。 */
+    public static function written(value: any?, name: string): any {
+        if (java.util.Objects.isNull(value)) {
+            throw new FrameSlotError("null written to non-null frame slot '" + name + "'");
+        }
+        return value;
+    }
+
+    /** 读取非空槽位：null 表示未初始化或已死亡。 */
+    public static function readNonNull(value: any?, name: string): any {
+        if (java.util.Objects.isNull(value)) {
+            throw new FrameSlotError("frame slot '" + name + "' read while not valid");
+        }
+        return value;
+    }
+
+    /** 读取可空槽位：valid 为 false 表示未初始化或已死亡，为 true 时 null 是显式空值。 */
+    public static function readNullable(value: any?, valid: bool, name: string): any? {
+        if (!valid) {
+            throw new FrameSlotError("frame slot '" + name + "' read while not valid");
+        }
+        return value;
+    }
+}

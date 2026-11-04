@@ -113,6 +113,7 @@ object StdLib {
         "TaskGroup.jas",
         "Context.jas",
         "CleanupBudget.jas",
+        "FrameSlot.jas",
         "JvmExecutor.jas",
         "ContinuationDispatch.jas"
     )

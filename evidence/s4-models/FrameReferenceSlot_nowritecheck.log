@@ -1,0 +1,40 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Warning: Please run the Java VM which executes TLC with a throughput optimized garbage collector by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 107 and seed 5655080881915381140 with 1 worker on 8 cores with 1984MB heap and 64MB offheap memory [pid: 198243] (Linux 7.0.0-42-generic amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file verification/tla/FrameReferenceSlot.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module FrameReferenceSlot
+Starting... (2026-11-04 20:44:21)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-04 20:44:22.
+Error: Invariant NonNullValidNotNull is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pending = TRUE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "none"
+/\ entered = FALSE
+/\ valid = FALSE
+/\ pc = "ctor"
+/\ snap = "none"
+
+State 2: <First line 50, col 5 to line 56, col 57 of module FrameReferenceSlot>
+/\ pending = FALSE
+/\ ownFired = FALSE
+/\ done = FALSE
+/\ fault = "none"
+/\ outcome = "none"
+/\ value = "null"
+/\ entered = TRUE
+/\ valid = TRUE
+/\ pc = "suspended"
+/\ snap = "none"
+
+2 states generated, 2 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 2.
+Finished in 00s at (2026-11-04 20:44:22)
