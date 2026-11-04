@@ -18,10 +18,12 @@
 package jasper
 
 import jasper.compiler.JasperCompiler
+import java.lang.reflect.Proxy
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -214,6 +216,21 @@ class TryFinallyCoroutinePipelineTest {
             assertFalse(isDone(target), "frame must stay suspended: $mode")
         }
 
+        /**
+         * 等工作线程跑完已入队的段：向单线程执行器排一个闸门任务并有界等待它运行。
+         * 固定 sleep 在高负载下可能早于帧的首段，取消就落在进入 try / 登记清理之前。
+         */
+        fun drainWorker() {
+            val ran = CountDownLatch(1)
+            val runnable = loader.loadClass("std.Runnable")
+            val gate = Proxy.newProxyInstance(runnable.classLoader, arrayOf(runnable)) { _, method, _ ->
+                if (method.name == "run") ran.countDown()
+                null
+            }
+            executor.javaClass.getMethod("schedule", runnable).invoke(executor, gate)
+            assertTrue(ran.await(30, TimeUnit.SECONDS), "worker did not drain")
+        }
+
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
@@ -357,6 +374,38 @@ class TryFinallyCoroutinePipelineTest {
     }
 
     /**
+     * 做什么：首段运行之前就被作用域取消：帧没有进入任何 try，所以不执行清理，直接 Cancelled 并 settled。
+     * 失败模式：取消丢失、首段仍进入 try、未进入的 try 也跑清理。
+     */
+    @Test
+    fun `scope cancellation before the first segment runs no cleanup`() {
+        withRuntime("cancel-early") { rt ->
+            val release = CountDownLatch(1)
+            val entered = CountDownLatch(1)
+            val runnable = rt.loader.loadClass("std.Runnable")
+            val blocker = Proxy.newProxyInstance(runnable.classLoader, arrayOf(runnable)) { _, method, _ ->
+                if (method.name == "run") {
+                    entered.countDown()
+                    release.await(30, TimeUnit.SECONDS)
+                }
+                null
+            }
+            rt.executor.javaClass.getMethod("schedule", runnable).invoke(rt.executor, blocker)
+            assertTrue(entered.await(30, TimeUnit.SECONDS), "worker did not take the blocker")
+
+            val input = rt.newFuture()
+            val scoped = rt.newFuture()
+            val marksBefore = rt.marks()
+            rt.start(scoped, input, rt.newFuture(), 3, -1)
+            rt.future.getMethod("cancel").invoke(scoped)
+            release.countDown()
+            rt.awaitSettled(scoped)
+            assertEquals("Cancelled", rt.status(scoped))
+            assertEquals(0, rt.marks() - marksBefore, "cleanup ran for a try the frame never entered")
+        }
+    }
+
+    /**
      * 做什么：帧挂在内层 try 内时被作用域取消：工作线程展开内层、外层清理各一次后才 settled；
      *   晚到输入不复活帧、不重跑清理；挂在外层 try 内（gate）时取消只执行外层清理。
      * 失败模式：取消后不清理就回收、清理重复执行、settled 早于清理。
@@ -368,6 +417,7 @@ class TryFinallyCoroutinePipelineTest {
             val scoped = rt.newFuture()
             var marksBefore = rt.marks()
             rt.start(scoped, input, rt.newFuture(), 3, -1)
+            rt.drainWorker()
             rt.assertStillPending(scoped, "before scope cancel")
             rt.future.getMethod("cancel").invoke(scoped)
             rt.awaitSettled(scoped)
@@ -383,6 +433,7 @@ class TryFinallyCoroutinePipelineTest {
             marksBefore = rt.marks()
             rt.start(outerOnly, rt.newFuture().also { rt.complete(it, 1) }, gate, 1, -1)
             rt.awaitMarks(marksBefore + 2)
+            rt.drainWorker()
             rt.assertStillPending(outerOnly, "suspended on gate")
             rt.future.getMethod("cancel").invoke(outerOnly)
             rt.awaitSettled(outerOnly)

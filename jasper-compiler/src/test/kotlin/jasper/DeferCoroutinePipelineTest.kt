@@ -19,10 +19,12 @@
 package jasper
 
 import jasper.compiler.JasperCompiler
+import java.lang.reflect.Proxy
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -220,6 +222,21 @@ class DeferCoroutinePipelineTest {
             assertFalse(isDone(target), "frame must stay suspended: $mode")
         }
 
+        /**
+         * 等工作线程跑完已入队的段：向单线程执行器排一个闸门任务并有界等待它运行。
+         * 固定 sleep 在高负载下可能早于帧的首段，取消就落在进入 try / 登记清理之前。
+         */
+        fun drainWorker() {
+            val ran = CountDownLatch(1)
+            val runnable = loader.loadClass("std.Runnable")
+            val gate = Proxy.newProxyInstance(runnable.classLoader, arrayOf(runnable)) { _, method, _ ->
+                if (method.name == "run") ran.countDown()
+                null
+            }
+            executor.javaClass.getMethod("schedule", runnable).invoke(executor, gate)
+            assertTrue(ran.await(30, TimeUnit.SECONDS), "worker did not drain")
+        }
+
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
@@ -376,6 +393,7 @@ class DeferCoroutinePipelineTest {
             val scoped = rt.newFuture()
             var marksBefore = rt.marks()
             rt.start(scoped, input, rt.newFuture(), 3, -1)
+            rt.drainWorker()
             rt.assertStillPending(scoped, "before scope cancel")
             rt.future.getMethod("cancel").invoke(scoped)
             rt.awaitSettled(scoped)
@@ -391,6 +409,7 @@ class DeferCoroutinePipelineTest {
             marksBefore = rt.marks()
             rt.start(outerOnly, rt.newFuture().also { rt.complete(it, 1) }, gate, 1, -1)
             rt.awaitMarks(marksBefore + 3)
+            rt.drainWorker()
             rt.assertStillPending(outerOnly, "suspended on gate")
             rt.future.getMethod("cancel").invoke(outerOnly)
             rt.awaitSettled(outerOnly)

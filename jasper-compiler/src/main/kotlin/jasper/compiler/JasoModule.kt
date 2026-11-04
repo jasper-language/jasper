@@ -221,6 +221,7 @@ object JasoExports {
         private val imports: Map<String, String> = ast.imports.filterIsInstance<JasImport>().filter { !it.isOnDemand }
             .associate { (it.alias ?: it.name.substringAfterLast('.')) to it.name }
 
+        /** 遍历本文件的顶层声明：公开形态写入导出，不能表达的公开形态记诊断。 */
         fun walk() {
             for (decl in ast.declarations) {
                 when (decl) {
