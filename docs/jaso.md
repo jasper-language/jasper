@@ -77,7 +77,7 @@ jasperc --emit jaso -o demo.jaso --name jaso-demo --version 1.2.3 [--description
 | top-level `public function f` in package `p` | `p.f.f` | `fn p.f.f(a: int32): int32` |
 | `public static function m` in `public class C` | `p.C.m` | `fn p.C.m(a: int32): int32` |
 | `public function m` in `public class C`, or a method of `public interface I` | `p.C.m` | `fn p.C.m(this: p.C, a: int32): int32` |
-| `public constructor` (or the implicit one) of a non-abstract `public class C` | `p.C.new` | `fn p.C.new(a: int32): p.C` |
+| `public constructor` (or the implicit one) of a `public class C`, abstract or not (an importer can only call it through `super`) | `p.C.new` | `fn p.C.new(a: int32): p.C` |
 
 Overloads of one name all get a suffix derived from their parameter types (`p.C.m$05c31294`). The suffix does not depend on declaration order, but adding the first overload to a name does change the existing symbol. Importers resolve through the declared signature, so the suffix is opaque to them.
 
@@ -89,7 +89,7 @@ Meaning of types in `jasper.import` (SPEC section 9.4 leaves it to the Jasper la
 
 `jasper.import` version 1 has no syntax for supertypes, so an importer cannot yet learn from the file that `Square` implements `Shape`, and inherited methods are declared only on the type that defines them.
 
-Not implemented yet: the `jasper.source` extension, namespaced manifest keys from annotations, signing in the compiler, and source `import` resolution against a `.jaso`. Apart from `jasper.import`, the Jasper reader stores extension contents as offsets and does not interpret them.
+Not implemented yet: the `jasper.source` extension, namespaced manifest keys from annotations, and signing in the compiler. Apart from `jasper.import`, the Jasper reader stores extension contents as offsets and does not interpret them.
 
 ## Runtime Loading (L1, Managed Modules)
 
@@ -112,6 +112,18 @@ read -> steps 2 to 6a -> reserve -> link -> discover -> init -> start -> running
 **Discovery** reads the manifest and `jasper.import`. Reflection only resolves names that were declared, and nothing scans classes.
 
 **Class visibility.** A module sees its own classes, the classes its declared dependencies make public (`type` lines and the owners of `fn` lines), and `java`, `javax`, and `std`. This follows the declared graph. It is not a security boundary: JVM code can still reach other class loaders through platform APIs.
+
+**Source imports.** `jasperc --emit jaso --module-path <paths>` (entries separated by the platform path separator; each is a directory of `*.jaso`, not searched recursively, or a single file) resolves `import a.b.C;` and `from a.b import f;` against the modules on the path. Without `--module-path`, imports are not resolved against modules and `--depends` is not checked.
+
+- The module is found by the package named in its `jasper.import`. Types and signatures come from `jasper.import`. Version 1 cannot say whether a type is a class or an interface, what its supertypes are, or which methods are abstract, so those come from the class files in the same module. A supertype missing from the interface is skipped and its own supertypes are used, so `Square` is a `Shape` even through a non-public class.
+- Nothing from the imported module is copied: its classes stay in its own file, and the call sites link at run time. The importer needs the same interface when it runs; the runtime's link step checks only the module's own declarations.
+- This is not step L1. Digests, signatures, platform, and grants are checked at load. The compiler reads the path with a structural reader of its own, because `std.jaso` would have to be compiled first.
+- Every imported module must be listed in `--depends`, and so must a module whose types appear in an imported module's interface, because a module can only see classes of its declared dependencies. A listed dependency must be on the path exactly once, with a version in the declared range. The importer must also `--requires` every capability that the modules it imports directly declare with `cap`; this is a check by this compiler, and what the runtime really grants is still decided at load.
+- A file on the path with the same name as the module being compiled is ignored, so an output directory can be on the path. Any other unreadable file on the path is an error that names the file, even if nothing imports it.
+
+Diagnosed: a package no module provides, or several; a name the module does not export; `import a.b.*` on a module package; undeclared modules and capabilities; arguments that do not match a constructor, static method, method, function, or `super(...)` of the interface; `new` of an interface or abstract class, or of a class with no constructor in its interface; a file that uses a module function without importing it.
+
+Limits of this beta: a top-level function cannot be imported under another name (types can, with `from a.b import C as D`), and its simple name must be unique in the compilation, because the function table is global by simple name. Plain programs (no `--emit jaso`) have no module path, so the importer has to be a module, and it is run through `std.jaso.JasoRuntime` with its dependencies loaded first; the runtime does not yet look modules up on a path by itself. Method overloads across modules are by parameter count, as in the language; a concrete subclass that leaves an abstract superclass method unimplemented is not diagnosed; `final` on a class is not enforced by this compiler.
 
 **Codes.** Steps 1 to 6a report the codes of SPEC section 13 through `JasoError`. SPEC defines no codes for later steps, so these belong to this runtime and are reported through `JasoRuntimeError`, and they are not part of the cross-implementation table: `link.binding`, `link.payload`, `link.symbol`, `module.duplicate`, `lifecycle.init`, `lifecycle.start`, `stop.unknown`, `stop.already`, `stop.dependent`, `stop.hook`, `module.stopped`, `module.symbol`, `module.argument`.
 

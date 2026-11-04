@@ -241,6 +241,7 @@ class LabeledLoopCoroutinePipelineTest {
             val result = rt.newFuture()
             rt.start(result, input, gate, 4, false)
             rt.assertStillPending(result, "first input await inside the inner while")
+            rt.drainWorker()
             assertEquals(1, rt.steps())
             rt.complete(input, 2)
             rt.assertStillPending(result, "gate await inside the inner do-while")

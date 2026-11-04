@@ -437,7 +437,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      *   内部名，而 owner 往往定义在别的 IR 文件里；先全量收集索引才能让跨文件与前向
      *   引用都解析成功。
      */
-    fun generate(translationResult: TranslationResult, outputDir: Path) {
+    fun generate(translationResult: TranslationResult, outputDir: Path, headerFiles: Set<IrFile> = emptySet()) {
         // 清空上一次运行留下的索引，保证重复调用/多编译单元时不串味。
         functionSymbolToName.clear()
         functionSymbolToOwner.clear()
@@ -515,6 +515,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         interfaceMethods = interfaceMethodIndex
         // 第 2 遍：真正生成。每个 IR 文件按包名建目录，逐顶层声明写出 <Name>.class。
         for (file in translationResult.irFiles) {
+            // 模块路径上的接口声明：第 1 遍已提供调用目标，class 在模块自己的文件里。
+            if (file in headerFiles) continue
             currentPkg = file.packageFqName?.toString()?.replace('.', '/') ?: ""
             val dir = outputDir.resolve(currentPkg).toFile()
             dir.mkdirs()
@@ -577,6 +579,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             isInterface -> Opcodes.ACC_PUBLIC or Opcodes.ACC_INTERFACE or Opcodes.ACC_ABSTRACT
             isEnum -> Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER or Opcodes.ACC_ENUM
             isAnnotation -> Opcodes.ACC_PUBLIC or Opcodes.ACC_ANNOTATION or Opcodes.ACC_INTERFACE or Opcodes.ACC_ABSTRACT
+            // 抽象类必须带 ACC_ABSTRACT：否则它的抽象方法过不了校验，也能被 new。
+            cls.modality == Modality.ABSTRACT -> Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER or Opcodes.ACC_ABSTRACT
             else -> Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER
         }
         // 超类：枚举一律继承 java/lang/Enum（枚举常量的 name/ordinal 由它提供）；普通类查
@@ -608,7 +612,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     // 由 generateIrFunction 按 isStatic 决定是否补 ACC_STATIC（此处传 -1 表示
                     // 「不接管 access」）。声明为 static 的成员函数参数槽从 0 起（无 this）。
                     val isStaticMember = !isInterface && decl.symbol in staticFunctionSymbols
-                    val methodFlags = if (isInterface) Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT else -1
+                    val isAbstractMember = cls.modality == Modality.ABSTRACT && decl.modality == Modality.ABSTRACT
+                    val methodFlags = if (isInterface || isAbstractMember) Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT else -1
                     generateIrFunction(cw, decl, internalName, isStaticMember, methodFlags)
                 }
                 is IrConstructor -> {
@@ -683,8 +688,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
         }
         // 桥接方法：泛型接口方法擦除后与实现类方法描述符不同，须由编译器补桥
-        // （ACC_BRIDGE|ACC_SYNTHETIC）。只对「非接口、非抽象」的普通类生成。
-        if (!isInterface && !isEnum && !isAnnotation && cls.modality != Modality.ABSTRACT) {
+        // （ACC_BRIDGE|ACC_SYNTHETIC）。接口、枚举、注解不生成；抽象类要生成：子类会继承它的实现。
+        if (!isInterface && !isEnum && !isAnnotation) {
             generateBridgeMethods(cw, cls, internalName)
         }
         // 只有当存在「需要运行期初始化的静态字段」时才生成 <clinit>，避免发出空的、

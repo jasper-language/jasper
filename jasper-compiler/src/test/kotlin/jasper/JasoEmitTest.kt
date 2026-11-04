@@ -204,6 +204,7 @@ private val EXPECTED_IMPORT = listOf(
     "type Square",
     "cap alloc",
     "cap log",
+    "fn demo.api.Base.new(): demo.api.Base",
     "fn demo.api.Base.one(this: demo.api.Base): int32",
     "fn demo.api.Plain.new(): demo.api.Plain",
     "fn demo.api.Plain.twice\$HASH_INT(this: demo.api.Plain, x: int32): int32",
@@ -394,7 +395,7 @@ class JasoEmitTest {
         assertFalse(Emitted.sections.importText.contains("secret"))
         assertFalse(Emitted.sections.importText.contains("moduleOnly"))
         assertFalse(Emitted.sections.importText.contains("helper"))
-        assertFalse(Emitted.sections.importText.contains("Base.new"), "abstract class has no exported constructor")
+        assertTrue(Emitted.sections.importText.contains("Base.new"), "another module extending the class needs its constructor")
     }
 
     @Test

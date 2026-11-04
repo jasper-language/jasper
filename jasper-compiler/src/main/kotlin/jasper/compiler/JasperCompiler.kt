@@ -146,7 +146,9 @@ class JasperCompiler {
         val suspensionEffects: jasper.checker.SuspensionEffects =
             jasper.checker.SuspensionEffectAnalysis.analyzeSources(listOf(ast)),
         // 协程降级之前的 AST：模块接口按它固化，生成帧不属于接口。
-        val declaredAst: jasper.ast.JasSourceFile = ast
+        val declaredAst: jasper.ast.JasSourceFile = ast,
+        // 来自模块路径的接口声明：参与符号解析，不产 class。
+        val isHeader: Boolean = false
     )
 
     /**
@@ -301,6 +303,7 @@ class JasperCompiler {
      */
     private fun generateAll(results: Map<String, CompilePipeline>, outputDir: Path) {
         val allIrFiles = mutableListOf<IrFile>()
+        val headerIrFiles = results.values.filter { it.isHeader }.flatMap { it.ir.irFiles }.toSet()
         val mergedCallNames = mutableMapOf<IrSimpleFunctionSymbol, String>()
         val mergedCtorTypes = mutableMapOf<IrConstructorSymbol, String>()
         val mergedSuperClasses = mutableMapOf<String, String>()
@@ -358,7 +361,7 @@ class JasperCompiler {
         )
 
         val backend = JvmIrBackend(typeMapper)
-        backend.generate(mergedResult, outputDir)
+        backend.generate(mergedResult, outputDir, headerIrFiles)
     }
 
     /**
@@ -388,8 +391,11 @@ class JasperCompiler {
      * 什么时候用：命令行 `--emit jaso`。
      * 前置条件：sources 是一个模块的全部严格模式源文件，且只有一个包。
      * 失败模式：不抛异常，统一返回 CompileResult；失败时不写输出文件。
+     *
+     * @param modulePath 非 null 时，import 按它解析到 `.jaso`（见 [JasoImportResolver]）；
+     *   null 时不查模块，`--depends` 也不核对。
      */
-    fun compileToJaso(sources: Map<String, String>, options: JasoModuleOptions, outputFile: Path): CompileResult {
+    fun compileToJaso(sources: Map<String, String>, options: JasoModuleOptions, outputFile: Path, modulePath: List<Path>? = null): CompileResult {
         var temp: Path? = null
         return try {
             val stdlib = StdLib.sources()
@@ -401,7 +407,8 @@ class JasperCompiler {
             }
             if (problems.isNotEmpty()) throw CompileException(problems)
 
-            val results = compileAll(stdlib + sources)
+            val modules = modulePath?.let { JasoModuleContext(it, options.name, options.depends, options.requires) }
+            val results = compileAll(stdlib + sources, modules)
             val plan = JasoExports.plan(sources.keys.map { results.getValue(it).declaredAst }, options.requires)
             val module = plan.module ?: throw CompileException(plan.errors)
             val tempDir = Files.createTempDirectory("jasper-jaso").also { temp = it }
@@ -542,7 +549,13 @@ class JasperCompiler {
      * 失败模式：聚合所有文件的解析/注解/符号/类型错误，非空即抛 [CompileException]。
      * 边界：返回 Map 的 key 即输入文件名；IR 与解析结果靠 zip 按同序对齐。
      */
-    fun compileAll(sources: Map<String, String>): Map<String, CompilePipeline> {
+    fun compileAll(sources: Map<String, String>): Map<String, CompilePipeline> = compileAll(sources, null)
+
+    /**
+     * 同 [compileAll]，另按 [modules] 把 import 解析到模块路径上的 `.jaso`。
+     * 返回值多出接口声明的 pipeline（键以 `<module:` 开头，[CompilePipeline.isHeader] 为 true）。
+     */
+    fun compileAll(sources: Map<String, String>, modules: JasoModuleContext?): Map<String, CompilePipeline> {
         val allErrors = mutableListOf<CompileError>()
         // 共享符号表：先注册内建，随后逐文件 collectDeclarations 累加（顺序影响覆盖）。
         val symbolTable = SymbolTable()
@@ -569,6 +582,19 @@ class JasperCompiler {
                 CompileError.Annotation(ae.message, ae.line, ae.column)
             })
             symbolTable.collectDeclarations(annotated.ast)
+        }
+
+        // 模块路径上的接口在全部源文件解析之后才知道要哪些；解析不了就不再做类型检查，
+        // 否则每个用到缺失模块的地方都多报一条「未知类型」，盖住真正的原因。
+        val headers = if (modules == null) emptyList() else {
+            val localPackages = parsed.values.mapNotNullTo(mutableSetOf()) { it.packageName }
+            val plan = JasoImportResolver(modules, localPackages) { symbolTable.findFunctions(it).isNotEmpty() }.resolve(parsed.values)
+            allErrors.addAll(plan.errors)
+            if (allErrors.isNotEmpty()) throw CompileException(allErrors)
+            plan.headers.forEach(symbolTable::collectDeclarations)
+            symbolTable.headerFunctions.putAll(plan.headerFunctions)
+            plan.headers.mapNotNullTo(symbolTable.headerPackages) { it.packageName }
+            plan.headers
         }
 
         allErrors.addAll(symbolTable.errors.map { se ->
@@ -603,7 +629,7 @@ class JasperCompiler {
 
         // 第四轮：一次性翻译全部文件（含生成帧类），再把结果按文件切回各自的 TranslationResult。
         val translator = JasperToIrTranslator()
-        val translated = translator.translateAll(parsed.values.toList(), symbolTable)
+        val translated = translator.translateAll(parsed.values.toList() + headers, symbolTable)
         val pipelines = mutableMapOf<String, CompilePipeline>()
         // parsed.entries 与 translated.irFiles 同序（translateAll 按传入列表顺序产出），
         // 因此可用 zip 一一对应。
@@ -629,6 +655,27 @@ class JasperCompiler {
             )
             pipelines[filename] = CompilePipeline(sources[filename]!!, ast, ir,
                 annotationIndexes[filename] ?: AnnotationIndex.EMPTY, suspensionEffects, declared.getValue(filename))
+        }
+        // 接口声明排在源文件之后翻译，对应的 IrFile 也在尾部；后端要它们解析调用目标。
+        headers.forEachIndexed { index, header ->
+            val ir = TranslationResult(
+                irFiles = listOf(translated.irFiles[parsed.size + index]),
+                callNames = translated.callNames,
+                constructorTypes = translated.constructorTypes,
+                typeMapper = translated.typeMapper,
+                functionDescriptors = translated.functionDescriptors,
+                parameterDescriptors = translated.parameterDescriptors,
+                classSuperclassNames = translated.classSuperclassNames,
+                classInterfaceNames = translated.classInterfaceNames,
+                interfaceDeclNames = translated.interfaceDeclNames,
+                staticFieldSymbols = translated.staticFieldSymbols,
+                staticFunctionSymbols = translated.staticFunctionSymbols,
+                syntheticStaticCallOwners = translated.syntheticStaticCallOwners,
+                memberSignaturesByType = translated.memberSignaturesByType,
+                memberCallKeys = translated.memberCallKeys,
+                platformStaticCallOwners = translated.platformStaticCallOwners
+            )
+            pipelines["<module:${header.packageName}>"] = CompilePipeline("", header, ir, AnnotationIndex.EMPTY, suspensionEffects, header, isHeader = true)
         }
         return pipelines
     }
@@ -993,7 +1040,7 @@ fun main(args: Array<String>) {
 
 private const val EMIT_USAGE = "Usage: jasperc --emit jaso -o <file> --name <name> --version <x.y.z> " +
     "[--description <text>] [--publisher <name>] [--runtime <range>] [--depends <dep>]... " +
-    "[--requires <capability>]... [--lifecycle plugin|system] <source-file>..."
+    "[--requires <capability>]... [--lifecycle plugin|system] [--module-path <paths>] <source-file>..."
 
 /**
  * `--emit jaso` 的命令行：解析参数，编译一个模块，返回退出码。
@@ -1008,7 +1055,7 @@ internal fun emitJasoMain(args: List<String>): Int {
     val depends = mutableListOf<String>()
     val requires = mutableListOf<String>()
     val files = mutableListOf<String>()
-    val singleOptions = setOf("--emit", "-o", "--name", "--version", "--description", "--publisher", "--runtime", "--lifecycle")
+    val singleOptions = setOf("--emit", "-o", "--name", "--version", "--description", "--publisher", "--runtime", "--lifecycle", "--module-path")
     var i = 0
     while (i < args.size) {
         val a = args[i]
@@ -1053,7 +1100,8 @@ internal fun emitJasoMain(args: List<String>): Int {
         name, version, single["--description"], single["--publisher"],
         single["--runtime"] ?: JasoManifestText.DEFAULT_RUNTIME, depends, requires, single["--lifecycle"]
     )
-    return when (val result = JasperCompiler().compileToJaso(sources, options, Paths.get(output))) {
+    val modulePath = single["--module-path"]?.split(java.io.File.pathSeparatorChar)?.filter { it.isNotEmpty() }?.map { Paths.get(it) }
+    return when (val result = JasperCompiler().compileToJaso(sources, options, Paths.get(output), modulePath)) {
         is JasperCompiler.CompileResult.Success -> {
             println(result.message)
             0

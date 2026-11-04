@@ -142,6 +142,12 @@ class SymbolTable {
     val imports: MutableMap<String, String> = mutableMapOf()
     val importDeclarations: MutableMap<String, JasImport> = mutableMapOf()
 
+    /** 从模块路径导入的顶层函数：简单名 → 全限定名。函数表全局共享，可见性靠它按文件判定。 */
+    val headerFunctions: MutableMap<String, String> = mutableMapOf()
+
+    /** 接口声明所在的包：这些类型来自模块路径，声明只有签名。 */
+    val headerPackages: MutableSet<String> = mutableSetOf()
+
     /**
      * 「类型简单名 -> 该名字出现的包名集合」索引，供类型检查阶段判定可见性。
      *

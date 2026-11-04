@@ -991,7 +991,7 @@ class JasperToIrTranslator {
             if (func.modifiers.contains("public")) DescriptorVisibilities.PUBLIC else DescriptorVisibilities.INTERNAL,
             false, false,
             returnType,
-            if (func.modifiers.contains("abstract") || func.modifiers.contains("open")) Modality.ABSTRACT else Modality.FINAL,
+            if (func.modifiers.contains("abstract")) Modality.ABSTRACT else if (func.modifiers.contains("open")) Modality.OPEN else Modality.FINAL,
             symbol,
             false, false, false, false, false,
             null, false
@@ -1262,7 +1262,7 @@ class JasperToIrTranslator {
             visibility,
             symbol,
             kind,
-            if (cls.modifiers.contains("abstract") || cls.modifiers.contains("open")) Modality.OPEN else Modality.FINAL,
+            if (cls.modifiers.contains("abstract")) Modality.ABSTRACT else if (cls.modifiers.contains("open")) Modality.OPEN else Modality.FINAL,
             false, false, false, false, false, false, false, false,
             SourceElement.NO_SOURCE
         )

@@ -278,13 +278,11 @@ object JasoExports {
         private fun classDecl(decl: JasClass) {
             if (!typeName(decl.name, decl.typeParameters.isNotEmpty(), decl)) return
             val owner = "$pkg.${decl.name}"
-            val isAbstract = "abstract" in decl.modifiers
-            if (!isAbstract) {
-                if (decl.constructors.isEmpty()) {
-                    exports += Export("$owner.new", "", "(): $owner", decl)
-                }
-                decl.constructors.filter { isPublic(it.modifiers) }.forEach { constructor(it, owner) }
+            // 抽象类的构造器也属于接口：别的模块继承它要调 super(...)；不能 new 由导入方的检查与 JVM 共同保证。
+            if (decl.constructors.isEmpty()) {
+                exports += Export("$owner.new", "", "(): $owner", decl)
             }
+            decl.constructors.filter { isPublic(it.modifiers) }.forEach { constructor(it, owner) }
             members(decl.members, owner, interfaceMembers = false)
         }
 

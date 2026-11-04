@@ -742,6 +742,84 @@ class TypeChecker(
     }
 
     /**
+     * 检查 `new`：抽象类不能创建；来自模块路径的类型只有接口上写明的构造器才能用。
+     *
+     * 做什么：抽象类、模块里的接口、没有公开构造器的模块类直接报错；模块类按实参个数与类型找公开构造器。
+     * 什么时候用：[inferExpressionCore] 的 `JasNew` 分支。
+     * 前置条件：无。
+     * 失败模式：不抛异常，走 [error]。
+     * 为什么实参只查模块类型：本次编译内的 `new` 目前不查实参（后端按个数选构造器），放开要单独改；
+     *   模块边界上不查，错的调用要到另一个模块装载时才以链接错误暴露。
+     */
+    private fun checkModuleConstruction(expr: JasNew, env: TypeEnvironment) {
+        val st = symbolTable ?: return
+        val name = (expr.type as? JasNamedType)?.name ?: return
+        val key = st.resolveTypeKey(name) ?: return
+        val cls = st.findClass(key)
+        if (cls != null && "abstract" in cls.modifiers) {
+            error("Cannot create abstract class '$name'", expr)
+            return
+        }
+        if (key.packageName !in st.headerPackages) return
+        if (cls == null) {
+            error("Cannot create '$name': it is not a class", expr)
+            return
+        }
+        checkModuleConstructorArgs(cls, name, expr.args.map { inferExpression(it, env) }, expr)
+    }
+
+    /** 实参能否对上模块类的某个公开构造器；对不上就报错。 */
+    private fun checkModuleConstructorArgs(cls: JasClass, name: String, argTypes: List<JasType?>, at: JasNode) {
+        val public = cls.constructors.filter { "public" in it.modifiers }
+        if (public.isEmpty()) {
+            error("Class '$name' has no public constructor in its module interface", at)
+            return
+        }
+        val byArity = public.filter { it.parameters.size == argTypes.size }
+        if (byArity.isEmpty()) {
+            error("Constructor of '$name' expects ${public.joinToString(" or ") { it.parameters.size.toString() }} argument(s), got ${argTypes.size}", at)
+            return
+        }
+        val fits = byArity.any { c ->
+            c.parameters.zip(argTypes).all { (p, a) -> a == null || p.type == null || typesCompatible(a, p.type) }
+        }
+        if (!fits) {
+            error("No constructor of '$name' accepts (${argTypes.joinToString { typeDisplayName(it ?: JasAnyType) }})", at)
+        }
+    }
+
+    /**
+     * 子类继承模块里的类：super(...) 要对上接口上写明的构造器。
+     *
+     * 什么时候用：[checkClass] 检查每个构造器时；类没写构造器时按隐式 super() 查一次。
+     * 前置条件：[ctorEnv] 含构造器形参。
+     * 失败模式：不抛异常，走 [error]。
+     */
+    private fun checkModuleSuperclass(cls: JasClass, ctor: JasConstructor?, ctorEnv: TypeEnvironment) {
+        val st = symbolTable ?: return
+        val name = (cls.superclass as? JasNamedType)?.name ?: return
+        val key = st.resolveTypeKey(name) ?: return
+        if (key.packageName !in st.headerPackages) return
+        val parent = st.findClass(key) ?: return
+        val delegate = ctor?.delegateCall
+        // this(...) 把 super 调用交给另一个构造器，那个构造器自己会被查到。
+        if (delegate != null && !delegate.isSuper) return
+        checkModuleConstructorArgs(parent, name, delegate?.args.orEmpty().map { inferExpression(it, ctorEnv) }, ctor ?: cls)
+    }
+
+    /**
+     * 模块路径导入的顶层函数在函数表里全局可查，但只有写了 import 的文件能用。
+     *
+     * 做什么：名字来自模块、且当前文件没有导入同一个全限定名时返回 true。
+     * 什么时候用：解析裸名调用与函数引用之前。
+     * 失败模式：无。
+     */
+    private fun isHiddenModuleFunction(name: String): Boolean {
+        val qualified = symbolTable?.headerFunctions?.get(name) ?: return false
+        return fileImports[name] != qualified
+    }
+
+    /**
      * 构造「未知类型」诊断消息，并在能找到同名别包类型时给出 import 提示。
      *
      * 做什么：例如 `Unknown type 'Error' (did you mean to import std.Error?)`；
@@ -829,6 +907,7 @@ class TypeChecker(
         checkTypeParameters(cls.typeParameters, clsEnv, "class '${cls.name}'")
         checkTypeReferences(cls.superclass, clsEnv)
         cls.interfaces.forEach { checkTypeReferences(it, clsEnv) }
+        if (cls.constructors.isEmpty()) checkModuleSuperclass(cls, null, clsEnv)
         val memberNames = mutableSetOf<String>()
         for (member in cls.members) {
             when (member) {
@@ -841,6 +920,9 @@ class TypeChecker(
                     clsEnv.set(member.name, member.type)
                 }
                 is JasFunction -> {
+                    if ("abstract" in member.modifiers && "abstract" !in cls.modifiers) {
+                        error("Abstract method '${member.name}' needs an abstract class, '${cls.name}' is not", member)
+                    }
                     // 方法用「名字/形参个数/是否 vararg」判重：同名不同元数、以及
                     // 定长 1 参 vs vararg 1 参都是合法重载，必须允许共存。
                     // 同元数不同参数类型暂不支持（本任务非目标），在声明处就明确拒绝，
@@ -870,6 +952,7 @@ class TypeChecker(
                 checkDeclaredType(param.type, ctorEnv)
                 ctorEnv.set(param.name, param.type)
             }
+            checkModuleSuperclass(cls, ctor, ctorEnv)
             if (ctor.body != null) {
                 for (stmt in ctor.body!!.statements) {
                     checkStatement(stmt, ctorEnv, JasUnitType)
@@ -1366,7 +1449,7 @@ class TypeChecker(
                         symbolTable.findEnum(expr.name) != null ||
                         symbolTable.findAnnotation(expr.name) != null) {
                         JasNamedType(expr.name)
-                    } else if (symbolTable.findFunctions(expr.name).isNotEmpty()) {
+                    } else if (symbolTable.findFunctions(expr.name).isNotEmpty() && !isHiddenModuleFunction(expr.name)) {
                         // Function reference - return function type
                         // 函数引用：具体签名未知，先用无参、返回 any 的函数类型占位。
                         JasFunctionType(emptyList(), JasAnyType)
@@ -1447,7 +1530,10 @@ class TypeChecker(
                 if (symbolTable != null && expr.target is JasIdentifier) {
                     val name = (expr.target as JasIdentifier).name
                     val funcs = symbolTable.findFunctions(name)
-                    if (funcs.isEmpty()) {
+                    if (isHiddenModuleFunction(name)) {
+                        error("Function '$name' comes from a module and this file does not import it (import ${symbolTable.headerFunctions[name]})", expr)
+                        JasAnyType
+                    } else if (funcs.isEmpty()) {
                         // 符号表里没有同名函数：可能是未知/外部函数，宽松放行为 any（不报错）。
                         JasAnyType
                     } else {
@@ -1750,6 +1836,7 @@ class TypeChecker(
             is JasNew -> {
                 // new 的类型即其表达式类型；显式类型引用需校验可见性与类型实参个数。
                 checkTypeReferences(expr.type, env)
+                checkModuleConstruction(expr, env)
                 expr.type
             }
             is JasArrayCreation -> {
@@ -1869,6 +1956,7 @@ class TypeChecker(
             }
         }
         val fn = findFunctionMember(typeName, memberName)
+        moduleStaticCall(typeName, memberName, argTypes, expr)?.let { return it }
         if (fn != null && fn.modifiers.any { it is String && it == "static" }) {
             val required = fn.parameters.count { it.defaultValue == null && !it.vararg }
             val hasVararg = fn.parameters.lastOrNull()?.vararg == true
@@ -1891,6 +1979,38 @@ class TypeChecker(
             error("Cannot resolve static method '$memberName' on type '$typeName'", expr)
         }
         return JasAnyType
+    }
+
+    /**
+     * 模块接口上的静态方法：按个数选候选，再查实参类型。
+     *
+     * 做什么：类型来自模块路径且有同名静态方法时，返回调用的结果类型（不符时报错）；否则返回 null，
+     *   交回普通路径。
+     * 什么时候用：[inferStaticMemberCall]。
+     * 失败模式：不抛异常，走 [error]。
+     * 为什么只管模块类型：本次编译内的静态调用目前只查个数，放开要单独改；模块边界上不查，
+     *   错的调用要到另一个模块装载时才以链接错误暴露。
+     */
+    private fun moduleStaticCall(typeName: String, memberName: String, argTypes: List<JasType?>, expr: JasCall): JasType? {
+        val st = symbolTable ?: return null
+        val key = st.resolveTypeKey(typeName) ?: return null
+        if (key.packageName !in st.headerPackages) return null
+        val statics = st.findMemberFunctions(typeName, memberName).filter { "static" in it.modifiers }
+        if (statics.isEmpty()) return null
+        val byArity = statics.filter { it.parameters.size == argTypes.size }
+        if (byArity.isEmpty()) {
+            error("Function '$memberName' expects ${statics.joinToString(" or ") { it.parameters.size.toString() }} argument(s), got ${argTypes.size}", expr)
+            return statics.first().returnType ?: JasUnitType
+        }
+        // 语言不支持同元数重载，所以至多一个候选。
+        val chosen = byArity.first()
+        for ((param, arg) in chosen.parameters.zip(argTypes)) {
+            val type = param.type
+            if (arg != null && type != null && !typesCompatible(arg, type)) {
+                error("Function '$memberName' does not accept ${typeDisplayName(arg)} for parameter '${param.name}' of type ${typeDisplayName(type)}", expr)
+            }
+        }
+        return chosen.returnType ?: JasUnitType
     }
 
     /**
