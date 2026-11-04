@@ -19,10 +19,12 @@
 package jasper
 
 import jasper.compiler.JasperCompiler
+import java.lang.reflect.Proxy
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -247,6 +249,21 @@ class TryCatchCoroutinePipelineTest {
         }
 
         /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
+        /**
+         * 等工作线程跑完已入队的段：向单线程执行器排一个闸门任务并有界等待它运行。
+         * 固定 sleep 在高负载下可能早于帧的首段，取消就落在进入 try / 登记清理之前。
+         */
+        fun drainWorker() {
+            val ran = CountDownLatch(1)
+            val runnable = loader.loadClass("std.Runnable")
+            val gate = Proxy.newProxyInstance(runnable.classLoader, arrayOf(runnable)) { _, method, _ ->
+                if (method.name == "run") ran.countDown()
+                null
+            }
+            executor.javaClass.getMethod("schedule", runnable).invoke(executor, gate)
+            assertTrue(ran.await(30, TimeUnit.SECONDS), "worker did not drain")
+        }
+
         fun assertStillPending(target: Any, mode: String) {
             Thread.sleep(50)
             assertFalse(isDone(target), "frame must stay suspended: $mode")
@@ -400,6 +417,7 @@ class TryCatchCoroutinePipelineTest {
             var marksBefore = rt.marks()
             rt.start(scoped, input, rt.newFuture(), 3, 0)
             rt.assertStillPending(scoped, "before scope cancel")
+            rt.drainWorker()
             rt.cancel(scoped)
             rt.awaitSettled(scoped)
             assertEquals("Cancelled", rt.status(scoped))
@@ -416,6 +434,7 @@ class TryCatchCoroutinePipelineTest {
             rt.start(inHandler, rt.newFuture().also { rt.cancel(it) }, gate, 1, 0)
             rt.awaitMarks(marksBefore + 1)
             rt.assertStillPending(inHandler, "suspended in the cancellation handler")
+            rt.drainWorker()
             assertEquals(1, rt.marks() - marksBefore)
             rt.cancel(inHandler)
             rt.awaitSettled(inHandler)

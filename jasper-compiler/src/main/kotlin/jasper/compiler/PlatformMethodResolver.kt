@@ -21,6 +21,7 @@
 
 package jasper.compiler
 
+import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import org.jetbrains.org.objectweb.asm.Type
 
@@ -76,10 +77,11 @@ data class PlatformMethodSignature(
  */
 class PlatformMethodResolver {
 
-    /** 平台调用的两种 JVM 形态；缓存键必须区分，否则同名同实参可能命中错误候选。 */
+    /** 平台调用的形态；缓存键必须区分，否则同名同实参可能命中错误候选。 */
     private enum class CallKind {
         INSTANCE,
-        STATIC
+        STATIC,
+        INHERITED
     }
 
     /**
@@ -141,6 +143,40 @@ class PlatformMethodResolver {
     }
 
     /**
+     * 做什么：解析源码类从平台超类继承的实例方法，public 与 protected 都算。
+     * 什么时候用：接收者是本次编译单元声明的类，方法不是源码声明的，沿超类链到了平台类。
+     * 前置条件：ownerInternalName 是链上第一个平台类；调用点的接收者类型是该源码类。
+     * 失败模式：同 [resolve]。
+     * 为什么单独一个入口：[resolve] 的接收者是平台类型，只能调用 public；继承来的 protected
+     *   成员（如 ClassLoader.defineClass）只有子类能调用，不能放宽给普通平台调用。
+     */
+    fun resolveInherited(
+        ownerInternalName: String,
+        methodName: String,
+        argumentDescriptors: List<String>
+    ): PlatformMethodSignature? {
+        return resolveMethod(ownerInternalName, methodName, argumentDescriptors, CallKind.INHERITED)
+    }
+
+    /** 沿超类链收集 public / protected 方法，再加 getMethods 带来的接口默认方法；子类的覆盖在前。 */
+    private fun inheritableMethods(start: Class<*>): List<Method> {
+        val out = LinkedHashMap<Pair<String, List<Class<*>>>, Method>()
+        var current: Class<*>? = start
+        while (current != null) {
+            for (method in current.declaredMethods) {
+                if (Modifier.isPublic(method.modifiers) || Modifier.isProtected(method.modifiers)) {
+                    out.putIfAbsent(method.name to method.parameterTypes.asList(), method)
+                }
+            }
+            current = current.superclass
+        }
+        for (method in start.methods) {
+            out.putIfAbsent(method.name to method.parameterTypes.asList(), method)
+        }
+        return out.values.toList()
+    }
+
+    /**
      * 做什么：按调用形态执行缓存查询与未命中解析。
      * 什么时候用：公共 resolve/resolveStatic 的共同入口。
      * 前置条件：argumentDescriptors 已按 JVM 实参顺序给出。
@@ -176,7 +212,8 @@ class PlatformMethodResolver {
     ): PlatformMethodSignature? {
         val receiverClass = loadClass(internalNameToBinaryName(receiverInternalName)) ?: return null
         val candidates = try {
-            receiverClass.methods.filter { method ->
+            val visible = if (kind == CallKind.INHERITED) inheritableMethods(receiverClass) else receiverClass.methods.asList()
+            visible.filter { method ->
                 // getMethods 已只返回 public 方法；再按调用形态过滤 static。
                 // bridge/synthetic 是编译器生成的转发器，保留它们会让候选重复。
                 (Modifier.isStatic(method.modifiers) == (kind == CallKind.STATIC)) &&

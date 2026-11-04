@@ -412,7 +412,9 @@ class JasperCompiler {
                 .associate { it.relativeTo(tempFile).invariantSeparatorsPath to it.readBytes() }
                 .filterKeys { !it.startsWith("std/") }
             for (symbol in module.exports) {
-                val owner = symbol.substringBeforeLast('.').replace('.', '/') + ".class"
+                // 生命周期导出不带包名（见 JasoExports），其余符号最后一段之前就是持有者。
+                val qualified = if ('.' in symbol) symbol.substringBeforeLast('.') else "${module.packageName}.$symbol"
+                val owner = qualified.replace('.', '/') + ".class"
                 check(owner in classes) { "exported '$symbol' has no class '$owner' in the module image" }
             }
             val bytes = JasoWriter.assemble(JasoManifestText.render(options, module.exports), classes, module.exports, module.importText)

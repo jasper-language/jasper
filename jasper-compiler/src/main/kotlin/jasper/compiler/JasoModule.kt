@@ -18,6 +18,7 @@
 //   - 带点的名字是全限定类型；不带点的是语言内建：int32 等基本类型、string、bytes、regex、void、any；
 //   - 数组写 Array<T>（SPEC 的类型语法没有 []），可空写 T?；
 //   - 第一个形参名为 this 的是实例方法，符号 <类>.new 是构造器；
+//   - 顶层 public function jaso_init / jaso_start / jaso_stop(): int32 是生命周期导出，只进导出表；
 //   - 托管对象按 GC 引用传递，没有所有权转移，所以不写 own / borrow。
 //
 // 已知限制（都报诊断，见 docs/jaso.md）：一个模块只能有一个包；泛型声明、嵌套类型、枚举、
@@ -108,6 +109,9 @@ object JasoExports {
     private const val MAX_IMPORT_LINES = 1024
     private const val MAX_TYPE_DEPTH = 8
 
+    /** 生命周期导出：规范第 9.4 节。 */
+    private val LIFECYCLE = setOf("jaso_init", "jaso_start", "jaso_stop")
+
     private val IDENT = Regex("[A-Za-z_][A-Za-z0-9_]*")
     private val SYMBOL = Regex("[A-Za-z0-9_.$]+")
     private val DOTTED = Regex("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*")
@@ -187,7 +191,7 @@ object JasoExports {
         val lines = mutableListOf("package $pkg")
         exportedTypes.mapTo(lines) { "type $it" }
         requires.sorted().mapTo(lines) { "cap $it" }
-        symbols.mapTo(lines) { (symbol, e) -> "fn $symbol${e.signature}" }
+        symbols.filterKeys { it !in LIFECYCLE }.mapTo(lines) { (symbol, e) -> "fn $symbol${e.signature}" }
         val text = lines.joinToString("\n", postfix = "\n")
         val size = text.toByteArray(StandardCharsets.UTF_8).size
         if (size > MAX_IMPORT_BYTES || lines.size > MAX_IMPORT_LINES) {
@@ -225,9 +229,10 @@ object JasoExports {
         fun walk() {
             for (decl in ast.declarations) {
                 when (decl) {
-                    is JasFunction -> if (isPublic(decl.modifiers)) {
+                    is JasFunction -> when {
+                        decl.name in LIFECYCLE -> lifecycle(decl)
                         // 顶层函数落在以函数名命名的类里，是它的静态方法（见 JvmIrBackend）。
-                        function(decl, "$pkg.${decl.name}.${decl.name}", null)
+                        isPublic(decl.modifiers) -> function(decl, "$pkg.${decl.name}.${decl.name}", null)
                     }
                     is JasClass -> if (isPublic(decl.modifiers)) classDecl(decl)
                     is JasInterface -> if (isPublic(decl.modifiers)) interfaceDecl(decl)
@@ -237,6 +242,20 @@ object JasoExports {
                     else -> Unit
                 }
             }
+        }
+
+        /**
+         * 生命周期钩子：规范第 9.4 节把裸名 jaso_init / jaso_start / jaso_stop 排除在 fn 集合外，
+         * 运行时按 `<包>.<名>.<名>()` 解析（见 JasoLinker.hook）。形状不对或忘了 public 都会让钩子
+         * 静默不运行，所以报诊断。
+         */
+        private fun lifecycle(f: JasFunction) {
+            val returnsInt = (f.returnType as? JasPrimitiveType)?.name == "int32"
+            if (!isPublic(f.modifiers) || f.parameters.isNotEmpty() || f.typeParameters.isNotEmpty() || !returnsInt) {
+                errors += located("Lifecycle function '${f.name}' must be declared 'public function ${f.name}(): int32'", f.name, f)
+                return
+            }
+            exports += Export(f.name, "", "", f)
         }
 
         private fun unsupported(what: String, name: String, at: JasNode) {

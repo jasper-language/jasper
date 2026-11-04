@@ -1,0 +1,1399 @@
+package std.jaso;
+
+import std.RecoverableError;
+
+// ============================================================================
+// JasoRuntime.jas —— Managed 模块的 L1 运行时装载（规范第 12.2 节第 7–9 步与 stop / unload）
+// ============================================================================
+// 职责：
+//   - JasoModuleTable：模块表与生命周期决策（已预订 → 运行中 → 已停止），不碰代码；
+//   - JasoCarrier：JVM 镜像的载体，只负责按模块声明的依赖把 class 名字解析到字节；
+//   - JasoRuntime：把第 1–6a 步、链接、发现、init / start 串成一次全有或全无的装载。
+//
+// 核心裁决：模块是运行时管理的模块对象，ClassLoader 只是镜像载体，不定义模块语义。
+//   依赖、能力、生命周期全部来自清单与 jasper.import，不扫描 class、不靠反射发现服务；
+//   反射只用于按已声明的名字和签名解析入口，声明与 class 不符就拒绝装载。
+//
+// 不变量（模型 verification/tla/JasoModuleLifecycle.tla）：预订或运行中模块的每项依赖都在运行中。
+//   依赖只在预订时按运行中模块判定；存在预订或运行中的依赖者时拒绝 stop；已停止的表项不移除，
+//   所以名字不复用（beta 没有卸载）。装载失败时移除预订，名字可以再用。
+//
+// 模块代码不在表锁内运行：init / start / stop 钩子可以再调用本运行时，也可以阻塞。
+//
+// 不是安全边界：JVM 上模块仍能通过 java.lang.Class 等 API 够到别的加载器。能力比对是
+//   请求与授予的比较，真正的隔离属于后续工作。
+// ============================================================================
+
+/**
+ * 第 7–9 步与 stop 的拒绝。
+ *
+ * 做什么：携带码名与细节。这些码属于 Jasper 运行时，不在规范第 13 节的跨实现码表里，
+ *   第 1–6a 步的拒绝仍是 JasoError。
+ * 码名：link.binding、link.payload、link.symbol、module.duplicate、lifecycle.init、lifecycle.start、
+ *   stop.unknown、stop.already、stop.dependent、stop.hook、module.stopped、module.symbol、module.argument。
+ * 失败模式：本类自身不失败。
+ */
+public class JasoRuntimeError extends RecoverableError {
+    private var codeName: string;
+    private var detailText: string;
+
+    /** 做什么：由码名与细节构造。 */
+    public constructor(code: string, detail: string) {
+        super(code + ": " + detail);
+        this.codeName = code;
+        this.detailText = detail;
+    }
+
+    /** 做什么：稳定码名。 */
+    public function code(): string {
+        return this.codeName;
+    }
+
+    /** 做什么：给人看的细节，如依赖者的名字。 */
+    public function detail(): string {
+        return this.detailText;
+    }
+}
+
+/**
+ * 模块表的一项。
+ *
+ * 做什么：记录一个模块的身份与阶段。phase 由 JasoModuleTable 的锁保护，其余字段构造后不变。
+ * 阶段：0 已预订（依赖已满足，正在链接或 init / start）；1 运行中；2 已停止。
+ */
+public class JasoModuleEntry {
+    public var name: string;
+    public var version: JasoVersion;
+    public var lifecycle: string;
+    public var depends: string[];
+    public var phase: int32;
+
+    /** 做什么：由清单事实构造，初始为已预订。 */
+    public constructor(name: string, version: JasoVersion, lifecycle: string, depends: string[]) {
+        this.name = name;
+        this.version = version;
+        this.lifecycle = lifecycle;
+        this.depends = depends;
+        this.phase = 0;
+    }
+
+    /** 做什么：是否依赖名为 target 的模块。 */
+    public function dependsOn(target: string): bool {
+        var i: int32 = 0;
+        while (i < this.depends.length) {
+            if (this.depends[i] == target) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+/**
+ * 模块表：生命周期决策，与规范第 12.2 节的 stop / unload 段对应。
+ *
+ * 做什么：reserve 判定并登记一次装载，commit / abort 结束它，beginStop 判定并记录一次停止。
+ * 什么时候用：JasoRuntime；不接触代码，所以可以单独做并发检查。
+ * 线程安全：全部方法在同一把锁内完成，彼此线性化。
+ * 失败模式：reserve 抛 module.duplicate 或 dependency.unsatisfied，beginStop 抛 stop.*；失败时表不变。
+ */
+public class JasoModuleTable {
+    private var mutex: java.util.concurrent.Semaphore;
+    private var entries: JasoModuleEntry[];
+    private var count: int32;
+
+    /** 做什么：空表。 */
+    public constructor() {
+        this.mutex = new java.util.concurrent.Semaphore(1);
+        this.entries = new JasoModuleEntry[16];
+        this.count = 0;
+    }
+
+    /**
+     * 做什么：同一把锁内判定名字未被占用（已停止的也算占用）、每项依赖都由运行中模块满足，
+     *   然后登记一个已预订项。预订中的依赖者会挡住被依赖模块的 stop。
+     * 为什么在这里再查一次依赖：第 5 步按快照判定，快照之后依赖可能已被停止；这里是最终裁定。
+     */
+    public function reserve(manifest: JasoManifest): JasoModuleEntry {
+        this.mutex.acquireUninterruptibly();
+        try {
+            var i: int32 = 0;
+            while (i < this.count) {
+                if (this.entries[i].name == manifest.name) {
+                    throw new JasoRuntimeError("module.duplicate", manifest.name);
+                }
+                i = i + 1;
+            }
+            var names: string[] = new string[manifest.dependencyCount];
+            i = 0;
+            while (i < manifest.dependencyCount) {
+                if (!this.satisfied(manifest.dependencies[i])) {
+                    throw new JasoError("dependency.unsatisfied");
+                }
+                names[i] = manifest.dependencies[i].name;
+                i = i + 1;
+            }
+            var entry: JasoModuleEntry = new JasoModuleEntry(manifest.name, manifest.version, manifest.lifecycle, names);
+            if (this.count == this.entries.length) {
+                var grown: JasoModuleEntry[] = new JasoModuleEntry[this.count * 2];
+                i = 0;
+                while (i < this.count) {
+                    grown[i] = this.entries[i];
+                    i = i + 1;
+                }
+                this.entries = grown;
+            }
+            this.entries[this.count] = entry;
+            this.count = this.count + 1;
+            return entry;
+        } finally {
+            this.mutex.release();
+        }
+    }
+
+    /** 做什么：调用方持锁；是否有运行中的模块满足这项依赖。 */
+    private function satisfied(dependency: JasoDependency): bool {
+        var i: int32 = 0;
+        while (i < this.count) {
+            var e: JasoModuleEntry = this.entries[i];
+            if (e.phase == 1 && e.name == dependency.name) {
+                var range: JasoVersionRange? = dependency.range;
+                return range == null || range.contains(e.version);
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /** 做什么：init 与 start 都成功：已预订 → 运行中。 */
+    public function commit(entry: JasoModuleEntry): void {
+        this.mutex.acquireUninterruptibly();
+        entry.phase = 1;
+        this.mutex.release();
+    }
+
+    /** 做什么：装载失败：移除预订，表中不留痕迹，名字可以再用。 */
+    public function abort(entry: JasoModuleEntry): void {
+        this.mutex.acquireUninterruptibly();
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.entries[i] == entry) {
+                var j: int32 = i;
+                while (j + 1 < this.count) {
+                    this.entries[j] = this.entries[j + 1];
+                    j = j + 1;
+                }
+                this.count = this.count - 1;
+                this.entries[this.count] = null;
+                break;
+            }
+            i = i + 1;
+        }
+        this.mutex.release();
+    }
+
+    /**
+     * 做什么：判定并记录一次 stop：成功返回后模块已停止服务，调用者随即运行 stop 钩子。
+     * 为什么先记录再调用：钩子只能运行一次；钩子运行期间新的装载已经看不到这个依赖。
+     */
+    public function beginStop(entry: JasoModuleEntry): void {
+        this.mutex.acquireUninterruptibly();
+        try {
+            if (!this.known(entry) || entry.phase == 0) {
+                throw new JasoRuntimeError("stop.unknown", entry.name);
+            }
+            if (entry.phase == 2) {
+                throw new JasoRuntimeError("stop.already", entry.name);
+            }
+            var i: int32 = 0;
+            while (i < this.count) {
+                var other: JasoModuleEntry = this.entries[i];
+                if (other.phase != 2 && other.dependsOn(entry.name)) {
+                    throw new JasoRuntimeError("stop.dependent", other.name);
+                }
+                i = i + 1;
+            }
+            entry.phase = 2;
+        } finally {
+            this.mutex.release();
+        }
+    }
+
+    /** 做什么：调用方持锁；entry 是否属于本表。 */
+    private function known(entry: JasoModuleEntry): bool {
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.entries[i] == entry) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /** 做什么：entry 当前阶段。 */
+    public function phaseOf(entry: JasoModuleEntry): int32 {
+        this.mutex.acquireUninterruptibly();
+        var phase: int32 = entry.phase;
+        this.mutex.release();
+        return phase;
+    }
+
+    /** 做什么：运行中模块的快照，供第 5 步判定：names 与 versions 下标一一对应。 */
+    public function runningNames(): JasoStrings {
+        this.mutex.acquireUninterruptibly();
+        var out: JasoStrings = new JasoStrings();
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.entries[i].phase == 1) {
+                out.append(this.entries[i].name);
+            }
+            i = i + 1;
+        }
+        this.mutex.release();
+        return out;
+    }
+
+    /** 做什么：名字对应的运行中模块版本；不在运行返回 null。 */
+    public function runningVersion(name: string): JasoVersion? {
+        this.mutex.acquireUninterruptibly();
+        var found: JasoVersion? = null;
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.entries[i].phase == 1 && this.entries[i].name == name) {
+                found = this.entries[i].version;
+            }
+            i = i + 1;
+        }
+        this.mutex.release();
+        return found;
+    }
+
+    /** 做什么：不变量：预订或运行中模块的每项依赖都有同名的运行中模块。测试用。 */
+    public function dependenciesHold(): bool {
+        this.mutex.acquireUninterruptibly();
+        var ok: bool = true;
+        var i: int32 = 0;
+        while (i < this.count) {
+            var e: JasoModuleEntry = this.entries[i];
+            if (e.phase != 2) {
+                var d: int32 = 0;
+                while (d < e.depends.length) {
+                    if (!this.runningNamed(e.depends[d])) {
+                        ok = false;
+                    }
+                    d = d + 1;
+                }
+            }
+            i = i + 1;
+        }
+        this.mutex.release();
+        return ok;
+    }
+
+    /** 做什么：调用方持锁；是否有名为 name 的运行中模块。 */
+    private function runningNamed(name: string): bool {
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.entries[i].phase == 1 && this.entries[i].name == name) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /** 做什么：表中项数（含已停止与已预订）。 */
+    public function size(): int32 {
+        this.mutex.acquireUninterruptibly();
+        var n: int32 = this.count;
+        this.mutex.release();
+        return n;
+    }
+}
+
+/** class 表的一项：定义前持有字节，定义后持有 class。 */
+public class JasoClassSlot {
+    public var name: string;
+    public var content: byte[]?;
+    public var made: java.lang.Class?;
+    public var visible: bool;
+
+    /** 做什么：未定义、不公开的一项。 */
+    public constructor(name: string, content: byte[]) {
+        this.name = name;
+        this.content = content;
+        this.made = null;
+        this.visible = false;
+    }
+}
+
+/**
+ * 一个镜像的 class 表：开放寻址散列，保留插入顺序。
+ *
+ * 线程安全：链接在单线程内写完；此后只读（见 JasoCarrier）。
+ */
+public class JasoClassTable {
+    private var slots: JasoClassSlot[];
+    private var order: JasoClassSlot[];
+    private var used: int32;
+
+    /** 做什么：空表。 */
+    public constructor() {
+        this.slots = new JasoClassSlot[64];
+        this.order = new JasoClassSlot[32];
+        this.used = 0;
+    }
+
+    /** 做什么：加入一项；名字已存在返回 false。 */
+    public function insert(name: string, content: byte[]): bool {
+        if (this.find(name) != null) {
+            return false;
+        }
+        if (this.used == this.order.length) {
+            this.grow();
+        }
+        var slot: JasoClassSlot = new JasoClassSlot(name, content);
+        this.place(slot);
+        this.order[this.used] = slot;
+        this.used = this.used + 1;
+        return true;
+    }
+
+    /** 做什么：放进散列槽；装载因子不超过 1/2，一定有空槽。 */
+    private function place(slot: JasoClassSlot): void {
+        var mask: int32 = this.slots.length - 1;
+        var i: int32 = slot.name.hashCode() & mask;
+        while (this.slots[i] != null) {
+            i = (i + 1) & mask;
+        }
+        this.slots[i] = slot;
+    }
+
+    /** 做什么：散列槽翻倍。 */
+    private function grow(): void {
+        this.slots = new JasoClassSlot[this.slots.length * 2];
+        var grown: JasoClassSlot[] = new JasoClassSlot[this.order.length * 2];
+        var i: int32 = 0;
+        while (i < this.used) {
+            grown[i] = this.order[i];
+            this.place(this.order[i]);
+            i = i + 1;
+        }
+        this.order = grown;
+    }
+
+    /** 做什么：按名字找；没有返回 null。 */
+    public function find(name: string): JasoClassSlot? {
+        var mask: int32 = this.slots.length - 1;
+        var i: int32 = name.hashCode() & mask;
+        while (this.slots[i] != null) {
+            if (this.slots[i].name == name) {
+                return this.slots[i];
+            }
+            i = (i + 1) & mask;
+        }
+        return null;
+    }
+
+    /** 做什么：项数。 */
+    public function size(): int32 {
+        return this.used;
+    }
+
+    /** 做什么：第 i 个插入的名字。 */
+    public function nameAt(i: int32): string {
+        return this.order[i].name;
+    }
+}
+
+/**
+ * 一个 JVM 镜像的载体。
+ *
+ * 做什么：只回答「这个名字对应哪份 class」：本镜像 → 依赖模块公开的 class → 运行时的 java / javax / std。
+ *   其余名字一律找不到，所以模块看不到未声明的模块，也看不到依赖模块的内部 class。
+ * 为什么先看本镜像：包名已在链接时限定，不可能与 java / std 重名；别的宿主 class 不能遮蔽模块自己的。
+ * 线程安全：链接在单线程内把全部 class 定义完并清空 pending，此后 defined 只读。
+ * 失败模式：找不到抛 ClassNotFoundException；坏 class 抛 LinkageError，由 JasoLinker 转成 link.payload。
+ */
+public class JasoCarrier extends java.lang.ClassLoader {
+    private var table: JasoClassTable;
+    private var dependencies: JasoCarrier[];
+
+    /** 做什么：由 class 表与依赖载体构造；parent 提供 java 与 std。 */
+    public constructor(parent: java.lang.ClassLoader, table: JasoClassTable, dependencies: JasoCarrier[]) {
+        super(parent);
+        this.table = table;
+        this.dependencies = dependencies;
+    }
+
+    /** 做什么：把 name 标记为依赖方可见（来自 jasper.import 的 type 与 fn 声明）；不是本镜像的 class 时不起作用。 */
+    public function expose(name: string): void {
+        var slot: JasoClassSlot? = this.table.find(name);
+        if (slot != null) {
+            slot.visible = true;
+        }
+    }
+
+    /** 做什么：name 是否本镜像的 class。 */
+    public function owns(name: string): bool {
+        return this.table.find(name) != null;
+    }
+
+    /** 做什么：依赖方查询：公开的本镜像 class；不公开或没有返回 null。 */
+    public function exported(name: string): java.lang.Class? {
+        var slot: JasoClassSlot? = this.table.find(name);
+        if (slot == null || !slot.visible) {
+            return null;
+        }
+        return slot.made;
+    }
+
+    /** 做什么：解析顺序见类注释；resolve 由 JVM 按需进行，这里不提前链接。 */
+    protected function loadClass(name: string, resolve: bool): java.lang.Class {
+        var slot: JasoClassSlot? = this.table.find(name);
+        if (slot != null) {
+            return this.own(cast slot as JasoClassSlot);
+        }
+        var i: int32 = 0;
+        while (i < this.dependencies.length) {
+            var found: java.lang.Class? = this.dependencies[i].exported(name);
+            if (found != null) {
+                return cast found as java.lang.Class;
+            }
+            i = i + 1;
+        }
+        if (name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("std.")) {
+            var parent: java.lang.ClassLoader = this.getParent();
+            return parent.loadClass(name);
+        }
+        throw new java.lang.ClassNotFoundException(name);
+    }
+
+    /** 做什么：按载体规则解析 name，不初始化；JasoLinker 用。 */
+    public function classNamed(name: string): java.lang.Class {
+        return this.loadClass(name, false);
+    }
+
+    /** 做什么：定义 slot（父类经 JVM 递归回到 loadClass）；已定义的直接返回。 */
+    private function own(slot: JasoClassSlot): java.lang.Class {
+        var made: java.lang.Class? = slot.made;
+        if (made != null) {
+            return cast made as java.lang.Class;
+        }
+        var data: byte[] = cast slot.content as byte[];
+        var defined: java.lang.Class = this.defineClass(slot.name, data, 0, data.length);
+        slot.made = defined;
+        slot.content = null;
+        return defined;
+    }
+}
+
+/** jasper.import 的一个类型，对应规范第 9.4 节的 type。 */
+public class JasoDeclaredType {
+    public var name: string;
+    public var arguments: JasoDeclaredType[];
+    public var nullable: bool;
+    public var ownership: bool;
+
+    /** 做什么：由字段构造；ownership 表示写了 own 或 borrow。 */
+    public constructor(name: string, arguments: JasoDeclaredType[], nullable: bool, ownership: bool) {
+        this.name = name;
+        this.arguments = arguments;
+        this.nullable = nullable;
+        this.ownership = ownership;
+    }
+}
+
+/** jasper.import 的一条 fn 声明。第一个形参名为 this 表示实例方法；符号以 .new 结尾表示构造器。 */
+public class JasoDeclaredFunction {
+    public var symbol: string;
+    public var owner: string;
+    public var member: string;
+    public var instance: bool;
+    public var parameters: JasoDeclaredType[];
+    public var result: JasoDeclaredType;
+
+    /** 做什么：由字段构造；parameters 不含 this。 */
+    public constructor(symbol: string, owner: string, member: string, instance: bool, parameters: JasoDeclaredType[], result: JasoDeclaredType) {
+        this.symbol = symbol;
+        this.owner = owner;
+        this.member = member;
+        this.instance = instance;
+        this.parameters = parameters;
+        this.result = result;
+    }
+}
+
+/**
+ * 已通过 JasoBinding.check 的 jasper.import 的结构化内容（第 8 步的输入）。
+ *
+ * 做什么：parse 把文本变成包名、类型表与函数表。
+ * 前置条件：内容已通过第 6a 步，所以语法错误只可能来自实现缺陷，仍按 extension.binding 报告。
+ * 失败模式：只抛 JasoError。
+ */
+public class JasoDeclaredInterface {
+    public var packageName: string?;
+    public var types: JasoStrings;
+    public var functions: JasoDeclaredFunction[];
+    public var functionCount: int32;
+    private var b: byte[];
+    private var at: int32;
+    private var end: int32;
+
+    /** 做什么：空接口。 */
+    private constructor(b: byte[]) {
+        this.packageName = null;
+        this.types = new JasoStrings();
+        this.functions = new JasoDeclaredFunction[16];
+        this.functionCount = 0;
+        this.b = b;
+        this.at = 0;
+        this.end = 0;
+    }
+
+    /** 做什么：解析 [lo, hi) 的绑定内容。 */
+    public static function parse(b: byte[], lo: int32, hi: int32): JasoDeclaredInterface {
+        var out: JasoDeclaredInterface = new JasoDeclaredInterface(b);
+        var start: int32 = lo;
+        while (start < hi) {
+            var newline: int32 = JasoText.find(b, start, hi, 10);
+            var stop: int32 = newline < 0 ? hi : newline;
+            var first: int32 = JasoText.trimStart(b, start, stop);
+            var last: int32 = JasoText.trimEnd(b, first, stop);
+            start = stop + 1;
+            if (first == last || (b[first] & 255) == 35) {
+                continue;
+            }
+            var space: int32 = JasoText.find(b, first, last, 32);
+            var rest: int32 = space;
+            while (rest < last && (b[rest] & 255) == 32) {
+                rest = rest + 1;
+            }
+            if (JasoText.same(b, first, space, "package")) {
+                out.packageName = JasoBytes.text(b, rest, last);
+            } else if (JasoText.same(b, first, space, "type")) {
+                out.types.append(JasoBytes.text(b, rest, last));
+            } else if (JasoText.same(b, first, space, "fn")) {
+                out.at = rest;
+                out.end = last;
+                out.declaredFunction();
+            }
+        }
+        return out;
+    }
+
+    /** 做什么：一条 `fn` 的内容：符号、形参、返回类型。 */
+    private function declaredFunction(): void {
+        var open: int32 = JasoText.find(this.b, this.at, this.end, 40);
+        var nameEnd: int32 = open;
+        while (nameEnd > this.at && (this.b[nameEnd - 1] & 255) == 32) {
+            nameEnd = nameEnd - 1;
+        }
+        var symbol: string = JasoBytes.text(this.b, this.at, nameEnd);
+        this.at = open + 1;
+        var parameters: JasoDeclaredType[] = new JasoDeclaredType[8];
+        var count: int32 = 0;
+        var instance: bool = false;
+        this.spaces();
+        if (!this.eat(41)) {
+            while (true) {
+                this.spaces();
+                var nameStart: int32 = this.at;
+                this.identifier();
+                var named: string = JasoBytes.text(this.b, nameStart, this.at);
+                this.spaces();
+                this.expect(58);
+                var type: JasoDeclaredType = this.declaredType(0);
+                if (named == "this" && count == 0 && !instance) {
+                    instance = true;
+                } else {
+                    if (count == parameters.length) {
+                        var grown: JasoDeclaredType[] = new JasoDeclaredType[count * 2];
+                        var k: int32 = 0;
+                        while (k < count) {
+                            grown[k] = parameters[k];
+                            k = k + 1;
+                        }
+                        parameters = grown;
+                    }
+                    parameters[count] = type;
+                    count = count + 1;
+                }
+                this.spaces();
+                if (this.eat(41)) {
+                    break;
+                }
+                this.expect(44);
+            }
+        }
+        this.spaces();
+        this.expect(58);
+        var result: JasoDeclaredType = this.declaredType(0);
+        var exact: JasoDeclaredType[] = new JasoDeclaredType[count];
+        var i: int32 = 0;
+        while (i < count) {
+            exact[i] = parameters[i];
+            i = i + 1;
+        }
+        this.append(new JasoDeclaredFunction(symbol, JasoDeclaredInterface.ownerOf(symbol), JasoDeclaredInterface.memberOf(symbol), instance, exact, result));
+    }
+
+    /** 做什么：加入函数表。 */
+    private function append(f: JasoDeclaredFunction): void {
+        if (this.functionCount == this.functions.length) {
+            var grown: JasoDeclaredFunction[] = new JasoDeclaredFunction[this.functionCount * 2];
+            var i: int32 = 0;
+            while (i < this.functionCount) {
+                grown[i] = this.functions[i];
+                i = i + 1;
+            }
+            this.functions = grown;
+        }
+        this.functions[this.functionCount] = f;
+        this.functionCount = this.functionCount + 1;
+    }
+
+    /** 做什么：符号最后一个点之前是持有者 class；没有点时持有者为空串，链接时拒绝。 */
+    private static function ownerOf(symbol: string): string {
+        var dot: int32 = symbol.lastIndexOf(".");
+        return dot < 0 ? "" : symbol.substring(0, dot);
+    }
+
+    /** 做什么：符号最后一段去掉重载后缀 $xxxxxxxx 就是 JVM 成员名。 */
+    private static function memberOf(symbol: string): string {
+        var member: string = symbol.substring(symbol.lastIndexOf(".") + 1);
+        var mark: int32 = member.indexOf("$");
+        return mark < 0 ? member : member.substring(0, mark);
+    }
+
+    /** 做什么：跳过 U+0020。 */
+    private function spaces(): void {
+        while (this.at < this.end && (this.b[this.at] & 255) == 32) {
+            this.at = this.at + 1;
+        }
+    }
+
+    /** 做什么：下一字节是 c 就吃掉。 */
+    private function eat(c: int32): bool {
+        if (this.at < this.end && (this.b[this.at] & 255) == c) {
+            this.at = this.at + 1;
+            return true;
+        }
+        return false;
+    }
+
+    /** 做什么：下一字节必须是 c。 */
+    private function expect(c: int32): void {
+        if (!this.eat(c)) {
+            throw new JasoError("extension.binding");
+        }
+    }
+
+    /** 做什么：吃掉标识符与点组成的一段。 */
+    private function identifier(): void {
+        var start: int32 = this.at;
+        while (this.at < this.end) {
+            var c: int32 = this.b[this.at] & 255;
+            if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 46)) {
+                break;
+            }
+            this.at = this.at + 1;
+        }
+        if (this.at == start) {
+            throw new JasoError("extension.binding");
+        }
+    }
+
+    /** 做什么：`[own |borrow ]dotted['<' type (',' type)* '>']['?']`。 */
+    private function declaredType(depth: int32): JasoDeclaredType {
+        if (depth > 8) {
+            throw new JasoError("extension.binding");
+        }
+        this.spaces();
+        var ownership: bool = false;
+        if (JasoText.startsWith(this.b, this.at, this.end, "own ")) {
+            this.at = this.at + 4;
+            ownership = true;
+            this.spaces();
+        } else if (JasoText.startsWith(this.b, this.at, this.end, "borrow ")) {
+            this.at = this.at + 7;
+            ownership = true;
+            this.spaces();
+        }
+        var start: int32 = this.at;
+        this.identifier();
+        var name: string = JasoBytes.text(this.b, start, this.at);
+        var arguments: JasoDeclaredType[] = new JasoDeclaredType[0];
+        if (this.eat(60)) {
+            var count: int32 = 0;
+            while (true) {
+                var argument: JasoDeclaredType = this.declaredType(depth + 1);
+                var grown: JasoDeclaredType[] = new JasoDeclaredType[count + 1];
+                var i: int32 = 0;
+                while (i < count) {
+                    grown[i] = arguments[i];
+                    i = i + 1;
+                }
+                grown[count] = argument;
+                arguments = grown;
+                count = count + 1;
+                this.spaces();
+                if (this.eat(62)) {
+                    break;
+                }
+                this.expect(44);
+            }
+        }
+        var nullable: bool = this.eat(63);
+        return new JasoDeclaredType(name, arguments, nullable, ownership);
+    }
+}
+
+/** 一个解析好的入口：普通函数或构造器。 */
+public class JasoLinkedFunction {
+    public var declared: JasoDeclaredFunction;
+    public var method: java.lang.reflect.Method?;
+    public var creator: java.lang.reflect.Constructor?;
+
+    /** 做什么：两者恰有一个非 null。 */
+    public constructor(declared: JasoDeclaredFunction, method: java.lang.reflect.Method?, creator: java.lang.reflect.Constructor?) {
+        this.declared = declared;
+        this.method = method;
+        this.creator = creator;
+    }
+}
+
+/**
+ * 第 7–8 步：把 Code 载荷交给载体，按 jasper.import 解析全部入口。
+ *
+ * 做什么：classes 校验并取出 class 字节；define 定义全部 class；resolve 按声明解析入口。
+ * 为什么校验放在 JVM 之前：包名限定与 class 版本是模块约定，JVM 不会替我们拒绝。
+ * 失败模式：只抛 JasoRuntimeError（link.*）；不运行任何模块代码（只定义 class，不初始化）。
+ */
+public class JasoLinker {
+    /**
+     * 做什么：解析只存储的 ZIP：每项必须未压缩、是包内 `.class`、不重名、魔数正确且 class 版本不超过 52；
+     *   至少一项。返回 class 名字到字节的表。
+     */
+    public static function classes(data: byte[], lo: int32, hi: int32, packageName: string): JasoClassTable {
+        var prefix: string = packageName.replace(".", "/") + "/";
+        var out: JasoClassTable = new JasoClassTable();
+        try {
+            var plain: java.io.ByteArrayInputStream = new java.io.ByteArrayInputStream(data, lo, hi - lo);
+            var source: java.io.InputStream = cast plain as java.io.InputStream;
+            var zip: java.util.zip.ZipInputStream = new java.util.zip.ZipInputStream(source);
+            while (true) {
+                var entry: java.util.zip.ZipEntry? = zip.getNextEntry();
+                if (entry == null) {
+                    break;
+                }
+                var path: string = entry.getName();
+                if (entry.getMethod() != 0) {
+                    throw new JasoRuntimeError("link.payload", "compressed entry " + path);
+                }
+                if (!path.endsWith(".class") || !path.startsWith(prefix) || path.indexOf("/", prefix.length) >= 0) {
+                    throw new JasoRuntimeError("link.payload", "entry outside package " + path);
+                }
+                var content: byte[] = JasoLinker.readAll(zip);
+                JasoLinker.checkHeader(content, path);
+                var name: string = path.substring(0, path.length - 6).replace("/", ".");
+                if (!out.insert(name, content)) {
+                    throw new JasoRuntimeError("link.payload", "duplicate entry " + path);
+                }
+            }
+        } catch (error: java.io.IOException) {
+            throw new JasoRuntimeError("link.payload", "malformed archive: " + error.getMessage());
+        } catch (error: java.lang.IllegalArgumentException) {
+            throw new JasoRuntimeError("link.payload", "malformed archive: " + error.getMessage());
+        }
+        if (out.size() == 0) {
+            throw new JasoRuntimeError("link.payload", "no classes");
+        }
+        return out;
+    }
+
+    /** 做什么：读完当前项。大小受载荷长度约束，因为只接受未压缩项。 */
+    private static function readAll(zip: java.util.zip.ZipInputStream): byte[] {
+        var out: java.io.ByteArrayOutputStream = new java.io.ByteArrayOutputStream();
+        var chunk: byte[] = new byte[8192];
+        while (true) {
+            var n: int32 = zip.read(chunk, 0, chunk.length);
+            if (n < 0) {
+                break;
+            }
+            out.write(chunk, 0, n);
+        }
+        return out.toByteArray();
+    }
+
+    /** 做什么：魔数 CAFEBABE 与主版本号不超过 52（jvm.52）。 */
+    private static function checkHeader(c: byte[], path: string): void {
+        if (c.length < 8 || (c[0] & 255) != 202 || (c[1] & 255) != 254 || (c[2] & 255) != 186 || (c[3] & 255) != 190) {
+            throw new JasoRuntimeError("link.payload", "not a class file " + path);
+        }
+        var major: int32 = ((c[6] & 255) * 256) + (c[7] & 255);
+        if (major > 52) {
+            throw new JasoRuntimeError("link.payload", "class version " + major + " in " + path);
+        }
+    }
+
+    /** 做什么：定义 names 里的全部 class，不初始化。JVM 的任何拒绝都变成 link.payload。 */
+    public static function define(carrier: JasoCarrier, table: JasoClassTable): void {
+        var i: int32 = 0;
+        while (i < table.size()) {
+            var name: string = table.nameAt(i);
+            try {
+                carrier.classNamed(name);
+            } catch (error: java.lang.ClassNotFoundException) {
+                throw new JasoRuntimeError("link.payload", name + " needs " + error.getMessage());
+            } catch (error: java.lang.LinkageError) {
+                throw new JasoRuntimeError("link.payload", name + ": " + error.toString());
+            } catch (error: java.lang.RuntimeException) {
+                throw new JasoRuntimeError("link.payload", name + ": " + error.toString());
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：按声明解析一个入口：持有者必须是本镜像的 class，形状必须与声明一致。 */
+    public static function resolve(carrier: JasoCarrier, f: JasoDeclaredFunction): JasoLinkedFunction {
+        if (!carrier.owns(f.owner)) {
+            throw new JasoRuntimeError("link.symbol", f.symbol + ": owner is not a class of this module");
+        }
+        try {
+            var owner: java.lang.Class = carrier.classNamed(f.owner);
+            var shape: java.lang.invoke.MethodType = JasoLinker.shape(f, carrier);
+            var parameters: java.lang.Class[] = shape.parameterArray();
+            var result: java.lang.Class = shape.returnType();
+            if (f.member == "new") {
+                if (f.instance || result != owner) {
+                    throw new JasoRuntimeError("link.symbol", f.symbol + ": constructor must return its class");
+                }
+                return new JasoLinkedFunction(f, null, owner.getConstructor(parameters));
+            }
+            var method: java.lang.reflect.Method = owner.getMethod(f.member, parameters);
+            if (method.getDeclaringClass() != owner) {
+                throw new JasoRuntimeError("link.symbol", f.symbol + ": inherited member");
+            }
+            if (method.getReturnType() != result) {
+                throw new JasoRuntimeError("link.symbol", f.symbol + ": return type differs");
+            }
+            if (JasoLinker.isStatic(method) == f.instance) {
+                throw new JasoRuntimeError("link.symbol", f.symbol + ": static or instance differs");
+            }
+            return new JasoLinkedFunction(f, method, null);
+        } catch (error: java.lang.NoSuchMethodException) {
+            throw new JasoRuntimeError("link.symbol", f.symbol + ": not found");
+        } catch (error: java.lang.ClassNotFoundException) {
+            throw new JasoRuntimeError("link.symbol", f.symbol + ": type " + error.getMessage());
+        } catch (error: java.lang.TypeNotPresentException) {
+            throw new JasoRuntimeError("link.symbol", f.symbol + ": type " + error.typeName());
+        } catch (error: java.lang.LinkageError) {
+            throw new JasoRuntimeError("link.symbol", f.symbol + ": " + error.toString());
+        }
+    }
+
+    /** 做什么：method 是否静态。 */
+    private static function isStatic(method: java.lang.reflect.Method): bool {
+        var modifiers: int32 = method.getModifiers();
+        return (modifiers & 8) != 0;
+    }
+
+    /** 做什么：声明对应的 JVM 方法类型；类型名经载体解析，所以只能看到载体可见的 class。 */
+    private static function shape(f: JasoDeclaredFunction, carrier: JasoCarrier): java.lang.invoke.MethodType {
+        var text: java.lang.StringBuilder = new java.lang.StringBuilder("(");
+        var i: int32 = 0;
+        while (i < f.parameters.length) {
+            text.append(JasoLinker.descriptor(f.parameters[i], f.symbol));
+            i = i + 1;
+        }
+        text.append(")");
+        text.append(JasoLinker.descriptor(f.result, f.symbol));
+        var described: string = text.toString();
+        var loader: java.lang.ClassLoader = carrier;
+        return java.lang.invoke.MethodType.fromMethodDescriptorString(described, loader);
+    }
+
+    /**
+     * 做什么：jasper.import 类型到 JVM 描述符（含义见 docs/jaso.md）：不带点的是语言内建，Array<T> 是数组，
+     *   可空基本类型是包装类，带点的是类名（类型实参擦除）。
+     * 为什么拒绝 own / borrow：托管对象按 GC 引用传递，写了就是文件与 Managed 的约定不符。
+     */
+    private static function descriptor(t: JasoDeclaredType, symbol: string): string {
+        if (t.ownership) {
+            throw new JasoRuntimeError("link.symbol", symbol + ": own and borrow are not managed types");
+        }
+        if (t.name == "Array") {
+            if (t.arguments.length != 1) {
+                throw new JasoRuntimeError("link.symbol", symbol + ": Array takes one type argument");
+            }
+            return "[" + JasoLinker.descriptor(t.arguments[0], symbol);
+        }
+        if (t.name.indexOf(".") >= 0) {
+            return "L" + t.name.replace(".", "/") + ";";
+        }
+        var builtin: string? = JasoLinker.builtin(t.name, t.nullable);
+        if (builtin == null) {
+            throw new JasoRuntimeError("link.symbol", symbol + ": unknown type " + t.name);
+        }
+        return cast builtin as string;
+    }
+
+    /** 做什么：语言内建类型名到描述符；可空的基本类型取包装类。不认识返回 null。 */
+    private static function builtin(name: string, nullable: bool): string? {
+        if (name == "string") {
+            return "Ljava/lang/String;";
+        }
+        if (name == "any") {
+            return "Ljava/lang/Object;";
+        }
+        if (name == "bytes") {
+            return "[B";
+        }
+        if (name == "regex") {
+            return "Ljava/util/regex/Pattern;";
+        }
+        if (name == "void") {
+            return "V";
+        }
+        if (name == "int32") {
+            return nullable ? "Ljava/lang/Integer;" : "I";
+        }
+        if (name == "int64") {
+            return nullable ? "Ljava/lang/Long;" : "J";
+        }
+        if (name == "float32") {
+            return nullable ? "Ljava/lang/Float;" : "F";
+        }
+        if (name == "float64") {
+            return nullable ? "Ljava/lang/Double;" : "D";
+        }
+        if (name == "bool" || name == "boolean") {
+            return nullable ? "Ljava/lang/Boolean;" : "Z";
+        }
+        if (name == "byte") {
+            return nullable ? "Ljava/lang/Byte;" : "B";
+        }
+        if (name == "short") {
+            return nullable ? "Ljava/lang/Short;" : "S";
+        }
+        if (name == "char") {
+            return nullable ? "Ljava/lang/Character;" : "C";
+        }
+        return null;
+    }
+
+    /**
+     * 做什么：解析生命周期导出 name：静态方法 `<包>.<name>.<name>()`，返回 int32；文件没有导出它时返回 null。
+     * 为什么约定在包下：清单里生命周期导出不带包名（规范第 9.4 节把这三个裸名排除在 fn 集合外），
+     *   所以持有者只能由 jasper.import 的 package 确定。
+     */
+    public static function hook(carrier: JasoCarrier, exports: JasoStrings, packageName: string, name: string): java.lang.reflect.Method? {
+        if (!exports.contains(name)) {
+            return null;
+        }
+        var owner: string = packageName + "." + name;
+        if (!carrier.owns(owner)) {
+            throw new JasoRuntimeError("link.symbol", name + ": no class " + owner);
+        }
+        try {
+            var method: java.lang.reflect.Method = carrier.classNamed(owner).getMethod(name, new java.lang.Class[0]);
+            if (!JasoLinker.isStatic(method) || method.getReturnType().getName() != "int") {
+                throw new JasoRuntimeError("link.symbol", name + " must be static and return int32");
+            }
+            return method;
+        } catch (error: java.lang.NoSuchMethodException) {
+            throw new JasoRuntimeError("link.symbol", name + ": not found");
+        } catch (error: java.lang.ClassNotFoundException) {
+            throw new JasoRuntimeError("link.symbol", name + ": " + error.getMessage());
+        } catch (error: java.lang.LinkageError) {
+            throw new JasoRuntimeError("link.symbol", name + ": " + error.toString());
+        }
+    }
+}
+
+/**
+ * 运行时管理的模块对象。
+ *
+ * 做什么：持有模块身份、已发现的入口与生命周期钩子；call 按符号调用入口。
+ * 什么时候用：JasoRuntime.load 的返回值。
+ * 边界：stop 之后拒绝新调用；已经在途的调用不等待（规范没有要求，L2 卸载时才需要跟踪）。
+ * 失败模式：call 抛 module.stopped、module.symbol、module.argument；模块代码抛出的异常原样传出。
+ */
+public class JasoModule {
+    public var name: string;
+    public var version: JasoVersion;
+    public var lifecycle: string;
+    private var entry: JasoModuleEntry;
+    private var table: JasoModuleTable;
+    private var carrier: JasoCarrier;
+    private var linked: JasoLinkedFunction[];
+    private var stopHook: java.lang.reflect.Method?;
+
+    /** 做什么：由 JasoRuntime 在链接成功后构造。 */
+    public constructor(entry: JasoModuleEntry, table: JasoModuleTable, carrier: JasoCarrier, linked: JasoLinkedFunction[], stopHook: java.lang.reflect.Method?) {
+        this.name = entry.name;
+        this.version = entry.version;
+        this.lifecycle = entry.lifecycle;
+        this.entry = entry;
+        this.table = table;
+        this.carrier = carrier;
+        this.linked = linked;
+        this.stopHook = stopHook;
+    }
+
+    /** 做什么：载体，依赖本模块的模块链接时用。 */
+    public function carrier(): JasoCarrier {
+        return this.carrier;
+    }
+
+    /** 做什么：表项，运行时判定 stop 时用。 */
+    public function entry(): JasoModuleEntry {
+        return this.entry;
+    }
+
+    /** 做什么：stop 钩子。 */
+    public function stopHook(): java.lang.reflect.Method? {
+        return this.stopHook;
+    }
+
+    /** 做什么：当前阶段：running 或 stopped。 */
+    public function phase(): string {
+        return this.table.phaseOf(this.entry) == 2 ? "stopped" : "running";
+    }
+
+    /** 做什么：模块声明的函数符号（发现只看声明，不看 class）。 */
+    public function symbols(): JasoStrings {
+        var out: JasoStrings = new JasoStrings();
+        var i: int32 = 0;
+        while (i < this.linked.length) {
+            out.append(this.linked[i].declared.symbol);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /**
+     * 做什么：按符号调用：实例方法的 args[0] 是接收者，其余按声明顺序；基本类型用包装类传。
+     * 失败模式：见类注释。
+     */
+    public function call(symbol: string, args: any[]): any? {
+        if (this.table.phaseOf(this.entry) == 2) {
+            throw new JasoRuntimeError("module.stopped", this.name);
+        }
+        var i: int32 = 0;
+        while (i < this.linked.length) {
+            if (this.linked[i].declared.symbol == symbol) {
+                return this.invoke(this.linked[i], args);
+            }
+            i = i + 1;
+        }
+        throw new JasoRuntimeError("module.symbol", symbol);
+    }
+
+    /** 做什么：调用一个入口；形参不符变成 module.argument，模块自己抛的异常解开包装后原样抛出。 */
+    private function invoke(f: JasoLinkedFunction, args: any[]): any? {
+        var creator: java.lang.reflect.Constructor? = f.creator;
+        var method: java.lang.reflect.Method? = f.method;
+        var receiver: any? = null;
+        var rest: any[] = args;
+        if (f.declared.instance) {
+            if (args.length == 0 || args[0] == null) {
+                throw new JasoRuntimeError("module.argument", f.declared.symbol + ": missing receiver");
+            }
+            receiver = args[0];
+            rest = new any[args.length - 1];
+            java.lang.System.arraycopy(args, 1, rest, 0, rest.length);
+        }
+        try {
+            if (creator != null) {
+                return creator.newInstance(rest);
+            }
+            return method.invoke(receiver, rest);
+        } catch (error: java.lang.reflect.InvocationTargetException) {
+            throw error.getCause();
+        } catch (error: java.lang.IllegalArgumentException) {
+            throw new JasoRuntimeError("module.argument", f.declared.symbol + ": " + error.getMessage());
+        } catch (error: java.lang.InstantiationException) {
+            throw new JasoRuntimeError("module.argument", f.declared.symbol + ": " + error.getMessage());
+        }
+    }
+}
+
+/**
+ * 审计记录：规范要求开发模式放行未签名文件时必须留记录，装载失败也只留这一项痕迹。
+ *
+ * 做什么：保留最近 1024 行，total 是累计行数（大于保留数说明有更早的被覆盖）。
+ * 线程安全：调用方（JasoRuntime）的各方法在本类的锁内完成。
+ */
+public class JasoAudit {
+    private var mutex: java.util.concurrent.Semaphore;
+    private var lines: string[];
+    private var written: int64;
+
+    /** 做什么：空记录。 */
+    public constructor() {
+        this.mutex = new java.util.concurrent.Semaphore(1);
+        this.lines = new string[1024];
+        this.written = 0L;
+    }
+
+    /** 做什么：追加一行。 */
+    public function record(line: string): void {
+        this.mutex.acquireUninterruptibly();
+        this.lines[(int32) (this.written % 1024L)] = line;
+        this.written = this.written + 1L;
+        this.mutex.release();
+    }
+
+    /** 做什么：累计行数。 */
+    public function total(): int64 {
+        this.mutex.acquireUninterruptibly();
+        var n: int64 = this.written;
+        this.mutex.release();
+        return n;
+    }
+
+    /** 做什么：保留的行，从旧到新。 */
+    public function snapshot(): JasoStrings {
+        this.mutex.acquireUninterruptibly();
+        var out: JasoStrings = new JasoStrings();
+        var start: int64 = this.written > 1024L ? this.written - 1024L : 0L;
+        var i: int64 = start;
+        while (i < this.written) {
+            out.append(this.lines[(int32) (i % 1024L)]);
+            i = i + 1L;
+        }
+        this.mutex.release();
+        return out;
+    }
+}
+
+/**
+ * L1 运行时：宿主的模块入口。
+ *
+ * 做什么：load 执行规范第 12.2 节全部步骤（只接受 Managed），stop 与 unload 按「stop and unload in beta」。
+ * 什么时候用：宿主给定信任策略与运行时版本后长期持有一个实例。
+ * 前置条件：std 由本类自己的加载器提供，模块不带 std。
+ * 线程安全：模块表决策线性化；不同线程可同时装载。同一文件的并发装载只有一个成功，另一个得 module.duplicate。
+ * 失败模式：第 1–6a 步抛 JasoError；其余抛 JasoRuntimeError。失败时除审计记录外不留痕迹。
+ */
+public class JasoRuntime {
+    private var policy: JasoTrustPolicy;
+    private var runtimeVersion: JasoVersion;
+    private var table: JasoModuleTable;
+    private var audit: JasoAudit;
+    private var modulesMutex: java.util.concurrent.Semaphore;
+    private var modules: JasoModule[];
+    private var moduleCount: int32;
+
+    /** 做什么：由信任策略与运行时版本构造。 */
+    public constructor(policy: JasoTrustPolicy, runtimeVersion: JasoVersion) {
+        this.policy = policy;
+        this.runtimeVersion = runtimeVersion;
+        this.table = new JasoModuleTable();
+        this.audit = new JasoAudit();
+        this.modulesMutex = new java.util.concurrent.Semaphore(1);
+        this.modules = new JasoModule[16];
+        this.moduleCount = 0;
+    }
+
+    /** 做什么：审计记录。 */
+    public function audit(): JasoAudit {
+        return this.audit;
+    }
+
+    /** 做什么：模块表（测试与诊断用）。 */
+    public function table(): JasoModuleTable {
+        return this.table;
+    }
+
+    /** 做什么：按名字找已完成装载的模块（运行中或已停止）；没有返回 null。 */
+    public function find(name: string): JasoModule? {
+        this.modulesMutex.acquireUninterruptibly();
+        var found: JasoModule? = this.moduleNamed(name);
+        this.modulesMutex.release();
+        return found;
+    }
+
+    /** 做什么：调用方持 modulesMutex；按名字找模块对象。 */
+    private function moduleNamed(name: string): JasoModule? {
+        var i: int32 = 0;
+        while (i < this.moduleCount) {
+            if (this.modules[i].name == name) {
+                return this.modules[i];
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /** 做什么：登记模块对象；失败的装载不进这里，所以模块对象只增不减。 */
+    private function remember(module: JasoModule): void {
+        this.modulesMutex.acquireUninterruptibly();
+        if (this.moduleCount == this.modules.length) {
+            var grown: JasoModule[] = new JasoModule[this.moduleCount * 2];
+            var i: int32 = 0;
+            while (i < this.moduleCount) {
+                grown[i] = this.modules[i];
+                i = i + 1;
+            }
+            this.modules = grown;
+        }
+        this.modules[this.moduleCount] = module;
+        this.moduleCount = this.moduleCount + 1;
+        this.modulesMutex.release();
+    }
+
+    /**
+     * 做什么：装载一个 `.jaso`：读入 → 第 2–6a 步 → 预订 → 链接 → 发现 → init → start → 运行中。
+     * 参数：granted 是调用者实际授予的能力；清单里写的只是请求。
+     * 失败模式：见类注释；init / start 钩子返回非 0 或抛出都使装载失败，不调用 stop 钩子。
+     */
+    public function load(data: byte[], granted: JasoStrings): JasoModule {
+        try {
+            return this.admit(data, granted);
+        } catch (error: JasoError) {
+            this.audit.record("rejected " + error.code());
+            throw error;
+        } catch (error: JasoRuntimeError) {
+            this.audit.record("rejected " + error.code() + " " + error.detail());
+            throw error;
+        }
+    }
+
+    /** 做什么：load 的主体。 */
+    private function admit(data: byte[], granted: JasoStrings): JasoModule {
+        var file: JasoFile = JasoFile.read(data);
+        var image: JasoImage = this.gate(granted).check(file, this.policy);
+        if (file.signatureOffset < 0) {
+            this.audit.record("unsigned admitted " + file.manifest.name);
+        }
+        var entry: JasoModuleEntry = this.table.reserve(file.manifest);
+        try {
+            var module: JasoModule = this.bring(file, image, entry);
+            this.remember(module);
+            this.table.commit(entry);
+            this.audit.record("loaded " + entry.name);
+            return module;
+        } catch (error: java.lang.Throwable) {
+            this.table.abort(entry);
+            throw error;
+        }
+    }
+
+    /** 做什么：按当前运行中模块的快照建立第 2–6a 步的判定器；最终裁定在 reserve。 */
+    private function gate(granted: JasoStrings): JasoLoader {
+        var names: JasoStrings = this.table.runningNames();
+        var kept: JasoStrings = new JasoStrings();
+        var versions: JasoVersion[] = new JasoVersion[names.size()];
+        var n: int32 = 0;
+        var i: int32 = 0;
+        while (i < names.size()) {
+            var v: JasoVersion? = this.table.runningVersion(names.get(i));
+            if (v != null) {
+                kept.append(names.get(i));
+                versions[n] = cast v as JasoVersion;
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        var host: JasoHostPlatform = new JasoHostPlatform(0, new JasoStrings(), 2, 0, 0, "jvm.52");
+        return new JasoLoader(null, host, this.runtimeVersion, kept, versions, granted);
+    }
+
+    /** 做什么：第 7–9 步。 */
+    private function bring(file: JasoFile, image: JasoImage, entry: JasoModuleEntry): JasoModule {
+        var binding: JasoExtension? = file.extension("jasper.import", 1);
+        if (binding == null) {
+            throw new JasoRuntimeError("link.binding", "a managed module needs jasper.import");
+        }
+        var declared: JasoDeclaredInterface = JasoDeclaredInterface.parse(file.data, binding.contentStart, binding.contentEnd);
+        var named: string? = declared.packageName;
+        if (named == null) {
+            throw new JasoRuntimeError("link.binding", "jasper.import has no package");
+        }
+        var packageName: string = cast named as string;
+        if (packageName == "java" || packageName == "javax" || packageName == "std" || packageName.startsWith("java.") || packageName.startsWith("javax.") || packageName.startsWith("std.")) {
+            throw new JasoRuntimeError("link.binding", "package " + packageName + " belongs to the platform");
+        }
+        var classes: JasoClassTable = JasoLinker.classes(file.data, image.payloadStart, image.payloadEnd, packageName);
+        var carrier: JasoCarrier = new JasoCarrier(JasoRuntime.runtimeClassLoader(this), classes, this.carriers(entry));
+        JasoLinker.define(carrier, classes);
+
+        var linked: JasoLinkedFunction[] = new JasoLinkedFunction[declared.functionCount];
+        var i: int32 = 0;
+        while (i < linked.length) {
+            linked[i] = JasoLinker.resolve(carrier, declared.functions[i]);
+            carrier.expose(declared.functions[i].owner);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < declared.types.size()) {
+            carrier.expose(packageName + "." + declared.types.get(i));
+            i = i + 1;
+        }
+        var exports: JasoStrings = file.manifest.exports;
+        var initHook: java.lang.reflect.Method? = JasoLinker.hook(carrier, exports, packageName, "jaso_init");
+        var startHook: java.lang.reflect.Method? = JasoLinker.hook(carrier, exports, packageName, "jaso_start");
+        var stopHook: java.lang.reflect.Method? = JasoLinker.hook(carrier, exports, packageName, "jaso_stop");
+        JasoRuntime.runHook(initHook, "lifecycle.init", entry.name);
+        JasoRuntime.runHook(startHook, "lifecycle.start", entry.name);
+        return new JasoModule(entry, this.table, carrier, linked, stopHook);
+    }
+
+    /** 做什么：提供 java 与 std 的加载器：运行时自己的加载器。 */
+    private static function runtimeClassLoader(self: any): java.lang.ClassLoader {
+        var plain: java.lang.Object = cast self as java.lang.Object;
+        return plain.getClass().getClassLoader();
+    }
+
+    /** 做什么：entry 各依赖的载体。预订成功保证它们都在运行，模块对象已登记。 */
+    private function carriers(entry: JasoModuleEntry): JasoCarrier[] {
+        var out: JasoCarrier[] = new JasoCarrier[entry.depends.length];
+        this.modulesMutex.acquireUninterruptibly();
+        var i: int32 = 0;
+        while (i < out.length) {
+            var dependency: JasoModule? = this.moduleNamed(entry.depends[i]);
+            out[i] = dependency.carrier();
+            i = i + 1;
+        }
+        this.modulesMutex.release();
+        return out;
+    }
+
+    /** 做什么：运行一个钩子：没有就算成功；非 0 或抛出都是 code。 */
+    private static function runHook(hook: java.lang.reflect.Method?, code: string, name: string): void {
+        if (hook == null) {
+            return;
+        }
+        var result: int32 = 0;
+        try {
+            result = (cast (hook.invoke(null, new any[0])) as java.lang.Integer).intValue();
+        } catch (error: java.lang.reflect.InvocationTargetException) {
+            throw new JasoRuntimeError(code, name + " threw " + error.getCause().toString());
+        } catch (error: java.lang.LinkageError) {
+            throw new JasoRuntimeError(code, name + ": " + error.toString());
+        }
+        if (result != 0) {
+            throw new JasoRuntimeError(code, name + " returned " + result);
+        }
+    }
+
+    /**
+     * 做什么：停止一个模块：有预订或运行中的依赖者时拒绝且不调用钩子；否则先记录已停止，再调用 stop 钩子。
+     * 失败模式：stop.unknown、stop.already、stop.dependent（模块继续服务）；stop.hook（模块同样已停止）。
+     */
+    public function stop(module: JasoModule): void {
+        this.table.beginStop(module.entry());
+        this.audit.record("stopped " + module.name);
+        JasoRuntime.runHook(module.stopHook(), "stop.hook", module.name);
+    }
+
+    /** 做什么：beta 的卸载答复：plugin 返回 deferred，system 返回 refused；两者都不改变任何状态。 */
+    public function unload(module: JasoModule): string {
+        return module.lifecycle == "system" ? "refused" : "deferred";
+    }
+}

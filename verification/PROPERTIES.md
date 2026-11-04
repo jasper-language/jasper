@@ -101,3 +101,20 @@
 | 6 Lincheck | — | — | — | `N/A`：读取器没有静态可变状态，每次调用只用自己新建的对象，无并发协议可检。替代证据为 4 线程并发调用结果与单线程一致的测试 |
 
 | `LANG-JASO-EMIT-01` | 编译器 `--emit jaso` 写出的未签名 Managed 文件通过结构读取；签名后在一致性上下文通过 L1 第 1-6 步；与参考构建器按解析结果重建的字节相同；`jasper.import` 与导出表逐项一致，每个声明的签名在 JVM 上存在且形状相同；输出与源文件顺序无关；不能表达的公开形态报诊断且不写文件。 | `jasper-compiler/src/main/kotlin/jasper/compiler/JasoModule.kt`；`JasperCompiler.compileToJaso`、`emitJasoMain`；`jasper-compiler/src/test/kotlin/jasper/JasoEmitTest.kt`；`verification/jaso-diff` 的 `check-emit` | 属性测试（种子 20261156、20261157、20261158）+ 参考实现差分 + 变异 | `tested` | `./gradlew :jasper-compiler:test --tests 'jasper.JasoEmitTest' -x lincheckTest --no-daemon`；`cargo run --release -- check-emit <样本目录>` | 变异 27 组 26 被抓；存活 1 组是「导出符号的 class 必须在镜像中」的防御检查，现有用例走不到。未覆盖：注解合成成员、签名写入、链接运行。 |
+| `LANG-JASO-RUNTIME-01` | `std.jaso.JasoRuntime` 对 Managed 模块执行规范第 12.2 节第 7–9 步与 stop / unload：装载全有或全无（失败只留审计记录，名字可再用）；init 先于 start，非 0 或抛出使装载失败且不调用 stop 钩子；链接前后不运行模块代码；载荷必须是包内、未压缩、不重名、class 版本不超过 52 的 ZIP；每个 `fn` 解析到本模块声明的成员，形参、返回类型、静态或实例形状与声明相同；模块只看到自己、已声明依赖的公开 class 与 java / javax / std；预订或运行中模块的依赖都在运行中，stop 钩子至多一次，已停止的名字不复用；unload 只答 deferred / refused 且不改变状态；任意载荷与声明只得到通过或结构化拒绝。 | `jasper-compiler/src/main/resources/stdlib/jaso/JasoRuntime.jas`；`JasoExports` 的生命周期导出 | `./gradlew :jasper-compiler:test --tests 'jasper.JasoRuntimeTest' -x lincheckTest`；`./gradlew :jasper-compiler:lincheckTest --tests 'jasper.JasoModuleTableLincheckTest'` | tested；模块表协议另有有限模型（见下表）。不是安全边界：JVM 上模块仍能经平台 API 够到别的加载器 |
+| `LANG-PLATFORM-INHERITED-01` | 源码类没有声明的成员沿超类链解析到第一个平台类（public 与 protected，含 `java.lang.Object`），描述符是真实签名；链上源码类声明的同名成员优先；调用结果可继续作接收者。 | `JvmIrBackend.inheritedPlatformOwner`、`PlatformMethodResolver.resolveInherited` | `./gradlew :jasper-compiler:test --tests 'jasper.InheritedPlatformMemberTest' -x lincheckTest` | tested；Kotlin 代码，FV-B 固定用例 + 变异。全量 `gradle test` 同时覆盖既有平台调用路径 |
+
+### `LANG-JASO-RUNTIME-01` 验证链明细
+
+源码身份：本登记所在提交的 `stdlib/jaso/JasoRuntime.jas`。实现与模型的对应：`JasoModuleTable.reserve` / `commit` / `abort` / `beginStop` 对应 `verification/tla/JasoModuleLifecycle.tla` 的同名动作，各在表锁内一步完成；不变量 `DependenciesRunning` 对应 `dependenciesHold`。
+
+| 步 | 规格 / 范围 | 工具与版本 | 命令 | 结果 |
+|---|---|---|---|---|
+| 1 TLA+ | 3 个模块、依赖 c→a,b、b→a，失败重试至多 6 次：`DependenciesRunning`、`StopAtMostOnce`、`StoppedIsFinal`、`TypeOK`。三个变异配置必须被抓（stop 不看预订者、已停止也满足依赖、已停止的名字可再预订）。Z3 不适用：新增代码没有值得证明的算术，class 版本与下标都是直接比较 | TLC（`build/tools/tla2tools.jar`） | `bash verification/run-s4-models.sh`；变异配置 `JasoModuleLifecycle_{noloadingpin,stoppedsatisfies,reusestopped}.cfg` | 主配置 No error；三个变异配置分别违反 DependenciesRunning、DependenciesRunning、StopAtMostOnce |
+| 2 性质测试 | 种子 20261162：120 轮、每轮 3–8 个模块的随机依赖图与钩子行为、40 步随机 load / stop / unload / 查询，错误码与阶段对照 Kotlin 模型，每步检查不变量与表大小 | Kotlin 固定种子（未用 jqwik，无收缩） | `--tests 'jasper.JasoRuntimeTest'` | 通过 |
+| 3 字节码校验 | `std.jaso` 全部 class 版本 52（`jasper.JasoDifferentialTest` 既有用例，随本片新增的 class 一起检查）；子 JVM `-Xverify:all -Xcheck:jni` 加载本次编译全部 class | JDK 21 | 同 `LANG-JASO-READER-01` | 通过。Miri 不适用：JVM 无未定义行为概念，此为替代证据 |
+| 4 Jazzer | `payload`（对合法 ZIP 或 class 的字节编辑，66297 次，cov 996）、`declaration`（任意 `fn` 文本，261389 次，cov 1121）各 60 秒，语料入库；被测类经 `std.jaso.**` 插桩，JVM 内部的 class 解析不在插桩范围 | jazzer-junit 0.30.0 | `JAZZER_FUZZ=1 JAZZER_INSTRUMENTATION_INCLUDES='std.jaso.**' ./gradlew :jasper-compiler:cleanTest :jasper-compiler:test --tests 'jasper.JasoLinkFuzzTest.<入口>' -x lincheckTest --no-daemon` | 无失败 |
+| 5 JBMC | — | 未安装 | — | `N/A`：工具不可用。替代证据为第 1、2、4、6 步，不等价于有界证明 |
+| 6 Lincheck | `JasoModuleTable`：依赖者预订 + 提交 与 被依赖模块 stop 竞争，恰好一方成功且不变量成立。固定场景 + EpsilonVerifier，2000 次调用，不是线性化证明；另有真实线程：同名并发装载恰好一个成功（30 轮 8 线程）、load 与 stop 竞争（150 轮） | lincheck 2.39 | `./gradlew :jasper-compiler:lincheckTest --tests 'jasper.JasoModuleTableLincheckTest'` | 通过 |
+
+变异核查（不属于六步链，记录测试强度）：`JasoRuntime.jas`、`JasoExports`、继承成员解析共 47 组变异，首轮 39 组被抓、8 组存活。其中 7 组是用例经另一条路径得到相同码而放过（坏 class 名也被 JVM 拒绝、Array 实参个数、钩子形状、无绑定文件），补用例后重跑全部被抓；1 组仍存活：`inheritedPlatformOwner` 里「链上源码类声明了该成员」的判断，声明签名路径先命中，未找到能走到这里的输入，判断保留作防御。

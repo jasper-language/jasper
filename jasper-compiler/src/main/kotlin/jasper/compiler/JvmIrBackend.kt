@@ -2068,6 +2068,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                         !isCompilationUnitDeclaredType(rawReceiverInternal, receiverInternal)))
                             ) {
                                 platformMethodResolver.resolve(receiverInternal, realName, argDescriptors)
+                            } else if (!useDeclared && !forcedPlatform && realName != "toString") {
+                                inheritedPlatformOwner(receiverInternal, declaredKey)?.let {
+                                    platformMethodResolver.resolveInherited(it, realName, argDescriptors)
+                                }
                             } else {
                                 null
                             }
@@ -2498,6 +2502,25 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     }
 
     /**
+     * 做什么：源码类没有声明这个成员时，沿超类链找到第一个平台类，继承的成员由它解析。
+     * 什么时候用：实例调用的接收者是本次编译单元声明的类，且没有声明签名可用。
+     * 前置条件：receiverInternal 是完整内部名；key 是成员表的键（含元数）。
+     * 失败模式：链上有源码类声明了这个成员，或接收者是接口时返回 null，保持原路径。
+     * 为什么需要：这类调用（`this.getClass()`、ClassLoader 子类里的 `this.defineClass(...)`）
+     *   过去按调用点 IR 类型 Unit 拼描述符，到运行期才以 NoSuchMethodError 暴露。
+     */
+    private fun inheritedPlatformOwner(receiverInternal: String, key: String): String? {
+        if (interfaceDeclNames.contains(receiverInternal)) return null
+        var current = receiverInternal
+        val seen = mutableSetOf<String>()
+        while (memberSignaturesByType.containsKey(current) && seen.add(current)) {
+            if (memberSignaturesByType[current]?.containsKey(key) == true) return null
+            current = classSuperclassNames[current] ?: return "java/lang/Object"
+        }
+        return if (current in seen) null else current
+    }
+
+    /**
      * 做什么：判断接收者是不是**本次编译单元声明**的类型（用户类/接口/枚举）。
      *
      * 什么时候用：决定是否允许 [PlatformMethodResolver] 介入之前。用户类型的成员方法
@@ -2657,12 +2680,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         val innerOwner = if (innerRawOwner.contains("/")) innerRawOwner else "$currentPkg/$innerRawOwner"
         // 用户类型不在平台解析范围内：它们的调用点类型应由声明签名给出，缺失时
         // 不在这里猜测，继续走旧路径。
-        if (isCompilationUnitDeclaredType(innerRawOwner, innerOwner)) return direct
         val innerArgs = (1 until receiver.valueArgumentsCount)
             .mapNotNull { receiver.getValueArgument(it) }
         // 实参同样可能是更内一层的平台调用（如 `a.add(b.pow(2)).subtract(c)`），
         // 用同一个函数递归取描述符，避免把 `V` 当作形参类型去解析签名。
         val innerArgDescriptors = innerArgs.map { receiverJvmDescriptor(it) }
+        if (isCompilationUnitDeclaredType(innerRawOwner, innerOwner)) {
+            val inherited = inheritedPlatformOwner(innerOwner, memberCallKeys[receiver.symbol] ?: memberArityKey(innerRealName, innerArgs.size))
+                ?: return direct
+            return platformMethodResolver.resolveInherited(inherited, innerRealName, innerArgDescriptors)
+                ?.returnDescriptor
+                ?: direct
+        }
         return platformMethodResolver.resolve(innerOwner, innerRealName, innerArgDescriptors)
             ?.returnDescriptor
             ?: direct
