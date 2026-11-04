@@ -1,0 +1,5 @@
+
+type A
+cap log
+fn p.A.f(): void
+fn jaso_startp.A.Rw(or

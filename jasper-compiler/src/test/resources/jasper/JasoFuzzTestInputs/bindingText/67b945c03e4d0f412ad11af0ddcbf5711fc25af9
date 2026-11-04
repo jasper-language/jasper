@@ -1,0 +1,5 @@
+package A
+cap log
+fn p.A.f(): vd
+fn p.A.g(a: i): bog
+fn p.g.f():orrow

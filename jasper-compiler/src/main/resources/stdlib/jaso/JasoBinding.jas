@@ -1,0 +1,249 @@
+package std.jaso;
+
+// ============================================================================
+// JasoBinding.jas —— jasper.import 版本 1 的语法与「绑定 ⇔ 清单」一致性（规范第 9.4 节）
+// ============================================================================
+// 职责：L1 第 6a 步。结构读取不看扩展段内容，这里才判定；任何违例都是 extension.binding，
+//   所以检查先后不影响结果。类型名只查语法，含义归编译器（解析到 .jaso 时再用）。
+//
+// 边界：内容最多 65536 字节、1024 个有效行；类型嵌套最多 8 层，递归因此有界。
+//   行集合用散列，超长文件不会变成平方时间：绑定内容在验签之后才看，但开发模式放行未签名文件。
+// ============================================================================
+
+/**
+ * jasper.import 的判定。
+ *
+ * 做什么：check 校验 [lo, hi) 的绑定内容，通过时无返回；第一处违例抛 extension.binding。
+ * 什么时候用：JasoLoader.check 的第 6a 步；工具也可单独调用。
+ * 前置条件：lo、hi 是 b 内的合法范围（来自已通过结构读取的扩展段）。
+ * 失败模式：只抛 JasoError。
+ */
+public class JasoBinding {
+    private var b: byte[];
+    private var at: int32;
+    private var end: int32;
+
+    /** 做什么：一个行内游标，从 lo 读到 hi。 */
+    private constructor(b: byte[], lo: int32, hi: int32) {
+        this.b = b;
+        this.at = lo;
+        this.end = hi;
+    }
+
+    /** 做什么：判定一份绑定内容与清单是否一致。 */
+    public static function check(b: byte[], lo: int32, hi: int32, manifest: JasoManifest): void {
+        if (hi - lo > 65536 || !JasoBytes.validUtf8(b, lo, hi)) {
+            throw new JasoError("extension.binding");
+        }
+        var types: JasoNameSet = new JasoNameSet();
+        var caps: JasoNameSet = new JasoNameSet();
+        var functions: JasoNameSet = new JasoNameSet();
+        var sawPackage: bool = false;
+        var effective: int32 = 0;
+        var start: int32 = lo;
+        while (start < hi) {
+            var newline: int32 = JasoText.find(b, start, hi, 10);
+            var stop: int32 = newline < 0 ? hi : newline;
+            var first: int32 = JasoText.trimStart(b, start, stop);
+            var last: int32 = JasoText.trimEnd(b, first, stop);
+            start = stop + 1;
+            if (first == last || (b[first] & 255) == 35) {
+                continue;
+            }
+            effective = effective + 1;
+            var space: int32 = JasoText.find(b, first, last, 32);
+            if (effective > 1024 || space < 0) {
+                throw new JasoError("extension.binding");
+            }
+            var rest: int32 = space;
+            while (rest < last && (b[rest] & 255) == 32) {
+                rest = rest + 1;
+            }
+            if (JasoText.same(b, first, space, "package")) {
+                if (sawPackage || !JasoBinding.packageOk(b, rest, last)) {
+                    throw new JasoError("extension.binding");
+                }
+                sawPackage = true;
+            } else if (JasoText.same(b, first, space, "type")) {
+                if (!JasoBinding.typeOk(b, rest, last) || !types.insert(JasoBytes.text(b, rest, last))) {
+                    throw new JasoError("extension.binding");
+                }
+            } else if (JasoText.same(b, first, space, "cap")) {
+                JasoBinding.capability(b, rest, last, manifest, caps);
+            } else if (JasoText.same(b, first, space, "fn")) {
+                JasoBinding.declared(b, rest, last, manifest, functions);
+            } else {
+                throw new JasoError("extension.binding");
+            }
+        }
+        // 上面已保证 fn 都在导出表里；这里反向要求每个导出都有声明。insert 成功说明此前没见过。
+        var i: int32 = 0;
+        while (i < manifest.exports.size()) {
+            var symbol: string = manifest.exports.get(i);
+            if (!JasoBinding.lifecycle(symbol) && functions.insert(symbol)) {
+                throw new JasoError("extension.binding");
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 做什么：`package <dotted>`。 */
+    private static function packageOk(b: byte[], lo: int32, hi: int32): bool {
+        var c: JasoBinding = new JasoBinding(b, lo, hi);
+        return c.dotted() && c.at == c.end;
+    }
+
+    /** 做什么：`type <ident>`。 */
+    private static function typeOk(b: byte[], lo: int32, hi: int32): bool {
+        var c: JasoBinding = new JasoBinding(b, lo, hi);
+        return c.ident() && c.at == c.end;
+    }
+
+    /** 做什么：`cap <能力>`：不含空格、未重复、在 core.requires 里。能力的字符集由清单一侧保证。 */
+    private static function capability(b: byte[], lo: int32, hi: int32, manifest: JasoManifest, caps: JasoNameSet): void {
+        if (lo >= hi || JasoText.find(b, lo, hi, 32) >= 0) {
+            throw new JasoError("extension.binding");
+        }
+        var name: string = JasoBytes.text(b, lo, hi);
+        if (!caps.insert(name) || !manifest.requires.contains(name)) {
+            throw new JasoError("extension.binding");
+        }
+    }
+
+    /** 做什么：`fn <符号>(<形参>): <类型>`：语法合法、未重复、不是生命周期导出、在 core.exports 里。 */
+    private static function declared(b: byte[], lo: int32, hi: int32, manifest: JasoManifest, functions: JasoNameSet): void {
+        var open: int32 = JasoText.find(b, lo, hi, 40);
+        if (open < 0) {
+            throw new JasoError("extension.binding");
+        }
+        var nameEnd: int32 = open;
+        while (nameEnd > lo && (b[nameEnd - 1] & 255) == 32) {
+            nameEnd = nameEnd - 1;
+        }
+        if (!JasoBytes.symbolOk(b, lo, nameEnd) || !new JasoBinding(b, open, hi).signature()) {
+            throw new JasoError("extension.binding");
+        }
+        var name: string = JasoBytes.text(b, lo, nameEnd);
+        if (!functions.insert(name) || JasoBinding.lifecycle(name) || !manifest.exports.contains(name)) {
+            throw new JasoError("extension.binding");
+        }
+    }
+
+    /** 做什么：装载器调用的生命周期导出不属于绑定。 */
+    private static function lifecycle(name: string): bool {
+        return name == "jaso_init" || name == "jaso_start" || name == "jaso_stop";
+    }
+
+    /** 做什么：跳过 U+0020；其它空白不算分隔。 */
+    private function spaces(): void {
+        while (this.at < this.end && (this.b[this.at] & 255) == 32) {
+            this.at = this.at + 1;
+        }
+    }
+
+    /** 做什么：下一字节是 c 就吃掉。 */
+    private function eat(c: int32): bool {
+        if (this.at < this.end && (this.b[this.at] & 255) == c) {
+            this.at = this.at + 1;
+            return true;
+        }
+        return false;
+    }
+
+    /** 做什么：`[A-Za-z_][A-Za-z0-9_]*`。 */
+    private function ident(): bool {
+        if (this.at >= this.end || !JasoBinding.identChar(this.b[this.at] & 255, false)) {
+            return false;
+        }
+        this.at = this.at + 1;
+        while (this.at < this.end && JasoBinding.identChar(this.b[this.at] & 255, true)) {
+            this.at = this.at + 1;
+        }
+        return true;
+    }
+
+    /** 做什么：c 是否标识符字符；digits 为假时不含数字（首字符）。 */
+    private static function identChar(c: int32, digits: bool): bool {
+        return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || (digits && c >= 48 && c <= 57);
+    }
+
+    /** 做什么：`ident ('.' ident)*`。 */
+    private function dotted(): bool {
+        if (!this.ident()) {
+            return false;
+        }
+        while (this.eat(46)) {
+            if (!this.ident()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 做什么：`[own |borrow ]dotted['<' type (',' type)* '>']['?']`；depth 超过 8 直接拒绝。 */
+    private function typeAt(depth: int32): bool {
+        if (depth > 8) {
+            return false;
+        }
+        this.spaces();
+        if (JasoText.startsWith(this.b, this.at, this.end, "own ")) {
+            this.at = this.at + 4;
+            this.spaces();
+        } else if (JasoText.startsWith(this.b, this.at, this.end, "borrow ")) {
+            this.at = this.at + 7;
+            this.spaces();
+        }
+        if (!this.dotted()) {
+            return false;
+        }
+        if (this.eat(60)) {
+            while (true) {
+                if (!this.typeAt(depth + 1)) {
+                    return false;
+                }
+                this.spaces();
+                if (this.eat(62)) {
+                    break;
+                }
+                if (!this.eat(44)) {
+                    return false;
+                }
+            }
+        }
+        this.eat(63);
+        return true;
+    }
+
+    /** 做什么：`(params): type`，从 `(` 开始一直到行尾。 */
+    private function signature(): bool {
+        if (!this.eat(40)) {
+            return false;
+        }
+        this.spaces();
+        if (!this.eat(41)) {
+            while (true) {
+                this.spaces();
+                if (!this.ident()) {
+                    return false;
+                }
+                this.spaces();
+                if (!this.eat(58) || !this.typeAt(0)) {
+                    return false;
+                }
+                this.spaces();
+                if (this.eat(41)) {
+                    break;
+                }
+                if (!this.eat(44)) {
+                    return false;
+                }
+            }
+        }
+        this.spaces();
+        if (!this.eat(58) || !this.typeAt(0)) {
+            return false;
+        }
+        this.spaces();
+        return this.at == this.end;
+    }
+}

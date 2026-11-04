@@ -597,14 +597,16 @@ class JasoEmitTest {
     }
 
     @Test
-    fun `a binding that disagrees with the export table goes to the reference implementation as a negative control`() {
-        // 读取器的结构判定不看绑定内容；这个样本单独放，供 JB-OS2 的第 6a 步确认判定确实生效。
+    fun `a binding that disagrees with the export table is refused by step 6a and by the reference implementation`() {
+        // 结构判定不看绑定内容，第 6a 步才拒绝；样本另外交给参考实现确认两边一致。
         val options = JasoModuleOptions("jaso-negative", "1.0.0", publisher = "jasper.dev")
         val file = JasoWriter.assemble(
             JasoManifestText.render(options, listOf("p.A.f", "p.A.g")), mapOf("p/A.class" to byteArrayOf(1)),
             listOf("p.A.f", "p.A.g"), "package p\nfn p.A.f(): void\n"
         )
         assertEquals("ok", JasoRuntime.structural(file))
+        val conformance = JasoRuntime.loader.loadClass("std.jaso.JasoConformance")
+        assertEquals("extension.binding", JasoRuntime.call(conformance, "check", signJaso(file, keys), publicKey))
         val dir = Paths.get("build", "tmp", "jaso-emit-negative").toFile().apply { mkdirs() }
         File(dir, "missing-fn.jaso").writeBytes(file)
     }

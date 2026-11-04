@@ -31,6 +31,10 @@ import kotlin.test.assertTrue
 
 /** 经反射访问读取器内部对象的小工具。 */
 private object JasoProbe {
+    /** fuzz 第 6a 步用的清单：与差分工具的绑定表相同。 */
+    val BINDING_MANIFEST: ByteArray =
+        "core.name = jaso-b\ncore.version = 1.0.0\ncore.abi = c.v1\ncore.stage = runtime\ncore.requires = log,net\ncore.exports = p.A.f,p.A.g,jaso_init\n".toByteArray()
+
     private val loader get() = JasoRuntime.loader
     private val errorClass by lazy { loader.loadClass("std.jaso.JasoError") }
     private val manifestClass by lazy { loader.loadClass("std.jaso.JasoManifest") }
@@ -233,6 +237,20 @@ class JasoDifferentialTest {
     }
 
     @Test
+    fun `binding check matches the reference on targeted and random contents`() {
+        val rows = table("bindings")
+        assertTrue(rows.size > 4000)
+        // 两边都不能退化成只出一种结果，否则差分没有意义。
+        val results = rows.groupingBy { it[2] }.eachCount()
+        assertEquals(setOf("ok", "extension.binding"), results.keys)
+        assertTrue(results.values.all { it > 200 }, results.toString())
+        report("bindings", rows.size, rows.mapIndexedNotNull { line, (manifest, content, expected) ->
+            val got = JasoRuntime.binding(JasoRuntime.hex(manifest), JasoRuntime.hex(content))
+            if (got == expected) null else "line ${line + 1} ${String(JasoRuntime.hex(content)).take(200)}: reference $expected, reader $got"
+        })
+    }
+
+    @Test
     fun `random bytes only ever produce a stable code`() {
         val rng = Random(20261152)
         val template = File(JasoRuntime.vectorDir, "ok-native.jaso").readBytes()
@@ -322,6 +340,12 @@ class JasoFuzzTest {
             resealJaso(data)
         }
         JasoRuntime.check(data)
+    }
+
+    @FuzzTest(maxDuration = "60s")
+    fun bindingText(data: ByteArray) {
+        val code = JasoRuntime.binding(JasoProbe.BINDING_MANIFEST, data)
+        check(code == "ok" || code == "extension.binding") { code }
     }
 
     @FuzzTest(maxDuration = "60s")

@@ -1,12 +1,13 @@
 //! 差分表生成器：种子固定，输出逐字节可复现。
 //! 用法：`jaso-diff check-emit <目录>` 核对 Jasper 编译器写出的文件，见 `check_emit`；
-//! `jaso-diff <向量目录> <输出目录>` 产出六张 TSV：
+//! `jaso-diff <向量目录> <输出目录>` 产出七张 TSV：
 //! * `diff-files.tsv`：向量 + 字节变异（重算摘要，可重签）→ 一致性判定结果
 //! * `diff-load.tsv`：完整文件（十六进制，清单随机）→ 一致性判定结果，专门走到信任之后的装载步骤
 //! * `diff-targeted.tsv`：完整文件（十六进制），各规则边界两侧的定向用例 → 一致性判定结果
 //! * `diff-platforms.tsv`：完整文件（十六进制）→ 判定结果与平台不符的字段、宿主值、文件值
 //! * `diff-manifests.tsv`：清单文本（十六进制）→ 错误码或规范化转储
 //! * `diff-signatures.tsv`：公钥、消息、签名 → 公钥合法性与严格验签结果
+//! * `diff-bindings.tsv`：清单文本、绑定内容（都是十六进制）→ L1 第 6a 步的结果
 
 use curve25519_dalek::{EdwardsPoint, Scalar};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -609,6 +610,127 @@ fn targeted(dir: &Path, key: [u8; 32]) -> String {
     out
 }
 
+/// 绑定表的清单：导出 `p.A.f`、`p.A.g` 与一个生命周期导出；请求能力 `log`、`net`。
+const BINDING_MANIFEST: &str = "core.name = jaso-b\ncore.version = 1.0.0\ncore.abi = c.v1\ncore.stage = runtime\ncore.requires = log,net\ncore.exports = p.A.f,p.A.g,jaso_init\n";
+
+/// 第 6a 步的差分：定向边界（嵌套深度、行数、字节数、各种分隔符）+ 随机文法样本及其字节变异。
+fn bindings(rng: &mut Rng, cases: usize) -> String {
+    let good = "package p\ntype A\ncap log\nfn p.A.f(): void\nfn p.A.g(a: int32, b: own L<S?>?): borrow R?\n";
+    let with = |extra: &str| format!("{good}{extra}").into_bytes();
+    let nested = |depth: usize| format!("fn p.A.f(): void\nfn p.A.g(): {}T{}\n", "L<".repeat(depth), ">".repeat(depth)).into_bytes();
+    let mut inputs: Vec<Vec<u8>> = vec![
+        good.as_bytes().to_vec(),
+        Vec::new(),
+        b"fn p.A.f(): void".to_vec(),
+        b"fn p.A.f():void\r\nfn p.A.g( ):void\r\n".to_vec(),
+        b"  fn   p.A.f  (  )  :  void  \n\tfn p.A.g():void\t\n".to_vec(),
+        "\u{3000}fn p.A.f(): void\u{a0}\n\u{2003}# 注释\u{85}\nfn p.A.g(): void\u{2029}".as_bytes().to_vec(),
+        b"fn\tp.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        "fn\u{a0}p.A.f(): void\nfn p.A.g(): void\n".as_bytes().to_vec(),
+        b"fn p.A.f(): void\rfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(): own\nfn p.A.g(): borrow\n".to_vec(),
+        b"fn p.A.f(): own T\nfn p.A.g(): borrow  own T\n".to_vec(),
+        b"fn p.A.f(): own  T\nfn p.A.g(ownx: ownx): borrowx\n".to_vec(),
+        b"fn p.A.f(): T ?\nfn p.A.g(): T??\n".to_vec(),
+        b"fn p.A.f(): L <T>\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(): L< T , U >?\nfn p.A.g(a : T , b : U ) : void\n".to_vec(),
+        b"fn p.A.f(): L<>\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(a: T,): void\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(): void x\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(): *u8\nfn p.A.g(): &u8\n".to_vec(),
+        b"fn p.A.f(): a..b\nfn p.A.g(): .a\n".to_vec(),
+        b"fn p.A.f(): 1a\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f\nfn p.A.g(): void\n".to_vec(),
+        b"fn (): void\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(): void\nfn p.A.g(): void\nfn jaso_init(): void\n".to_vec(),
+        b"fn p.A.f(): void\nfn p.A.g(): void\nfn p.A.h(): void\n".to_vec(),
+        b"fn p.A.f(): void\nfn p.A.g(): void\nfn p.A.g(a: T): void\n".to_vec(),
+        b"fn p.A.f(): void\n".to_vec(),
+        b"package\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"package a.b.c\npackage a.b.c\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"package a.b\npackage c\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"package a b\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"package a.\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"package  a\ntype   T\ncap   log\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"type a.b\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"type T\ntype T\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"type T\ntype U\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"cap log\ncap log\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"cap log\ncap net\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"cap fs\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"cap log net\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"import x\nfn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"Fn p.A.f(): void\nfn p.A.g(): void\n".to_vec(),
+        b"#\n  # x\n\n\r\nfn p.A.f(): void\nfn p.A.g(): void\n#end".to_vec(),
+        b"fn p.A.f(): void\nfn p.A.g(): void\n# \xFF\n".to_vec(),
+        with("# tail\n"),
+        b"type _X1\nfn p.A.f(_a: _T): a_b.c_d\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(): L<T U>\nfn p.A.g(): void\n".to_vec(),
+        b"fn p.A.f(a: T b: U): void\nfn p.A.g(): void\n".to_vec(),
+        nested(8),
+        nested(9),
+    ];
+    // 符号恰好 128 / 129 字节
+    for n in [128usize, 129] {
+        inputs.push(format!("fn p.A.f(): void\nfn p.A.g(): void\nfn {}(): void\n", "s".repeat(n)).into_bytes());
+    }
+    // 有效行恰好 1024 / 1025；只有注释与空行不计数
+    for types in [1022usize, 1023] {
+        let mut s = String::from("fn p.A.f(): void\nfn p.A.g(): void\n");
+        for i in 0..types {
+            writeln!(s, "type T{i}\n# c\n").unwrap();
+        }
+        inputs.push(s.into_bytes());
+    }
+    // 字节恰好 65536 / 65537
+    for size in [65536usize, 65537] {
+        let mut b = b"fn p.A.f(): void\nfn p.A.g(): void\n# ".to_vec();
+        b.resize(size, b'x');
+        inputs.push(b);
+    }
+    let pieces = ["package p", "type A", "type B", "cap log", "cap net", "cap fs", "# c", "", "fn p.A.f(): void", "fn p.A.g(a: T): U?",
+        "fn p.A.g (a: T, b: L<S>): own R", "fn p.A.h(): void", "fn jaso_init(): void"];
+    for _ in 0..cases {
+        let mut text = String::new();
+        // 大半样本带齐两个 fn，否则几乎全部死在「缺声明」。
+        if rng.below(4) != 0 {
+            text.push_str("fn p.A.f(): void\nfn p.A.g(): void\n");
+        }
+        for _ in 0..rng.below(5) {
+            text.push_str(pieces[rng.below(pieces.len())]);
+            text.push('\n');
+        }
+        let mut b = text.into_bytes();
+        for _ in 0..rng.below(3) {
+            match rng.below(3) {
+                0 if !b.is_empty() => {
+                    let at = rng.below(b.len());
+                    b[at] = rng.pick(&["(", ")", ":", "<", ">", ",", "?", " ", ".", "\t", "\n", "x", "1", "\r", "#"]).as_bytes()[0];
+                }
+                1 if !b.is_empty() => {
+                    let at = rng.below(b.len());
+                    b.remove(at);
+                }
+                _ => {
+                    let at = rng.below(b.len() + 1);
+                    b.insert(at, rng.next() as u8);
+                }
+            }
+        }
+        inputs.push(b);
+    }
+    let manifest = Manifest::parse(BINDING_MANIFEST).unwrap();
+    let mut out = String::new();
+    for b in inputs {
+        let result = match jaso::binding::check(&b, &manifest) {
+            Ok(()) => "ok",
+            Err(e) => e.code().name(),
+        };
+        writeln!(out, "{}\t{}\t{result}", hex(BINDING_MANIFEST.as_bytes()), hex(&b)).unwrap();
+    }
+    out
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args[1] == "check-emit" {
@@ -622,6 +744,7 @@ fn main() -> ExitCode {
     std::fs::write(out.join("diff-files.tsv"), files(dir, key, &mut rng, 6000)).unwrap();
     std::fs::write(out.join("diff-manifests.tsv"), manifests(&mut rng, 3000)).unwrap();
     std::fs::write(out.join("diff-load.tsv"), load_files(key, &mut rng, 600)).unwrap();
+    std::fs::write(out.join("diff-bindings.tsv"), bindings(&mut Rng(20261161), 4000)).unwrap();
     std::fs::write(out.join("diff-targeted.tsv"), targeted(dir, key)).unwrap();
     std::fs::write(out.join("diff-platforms.tsv"), platforms(key)).unwrap();
     std::fs::write(out.join("diff-signatures.tsv"), signatures(key, &mut rng)).unwrap();

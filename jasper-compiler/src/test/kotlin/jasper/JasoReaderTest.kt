@@ -29,6 +29,9 @@ internal object JasoRuntime {
     /** 结构读取：`ok` 或码名。 */
     fun structural(bytes: ByteArray): String = call(conformance, "structural", bytes) as String
 
+    /** 第 6a 步：`ok` 或码名；清单必须合法。 */
+    fun binding(manifest: ByteArray, content: ByteArray): String = call(conformance, "binding", manifest, content) as String
+
     /** 调用 `cls` 的公开静态方法，把反射包装解开。 */
     fun call(cls: Class<*>, name: String, vararg args: Any?): Any? {
         val method = cls.methods.first { it.name == name && it.parameterCount == args.size }
@@ -53,7 +56,7 @@ class JasoReaderTest {
     @Test
     fun `every conformance vector matches its expect line`() {
         val files = vectors()
-        assertEquals(68, files.size, "向量个数变化：重新核对来源提交")
+        assertEquals(76, files.size, "向量个数变化：重新核对来源提交")
         val failures = files.mapNotNull { f ->
             val got = JasoRuntime.check(f.readBytes())
             if (got == expected(f)) null else "${f.name}: expected ${expected(f)} got $got"
@@ -62,9 +65,9 @@ class JasoReaderTest {
     }
 
     @Test
-    fun `vectors cover all fifty one codes and the code table matches the specification`() {
+    fun `vectors cover all fifty two codes and the code table matches the specification`() {
         val table = File(JasoRuntime.vectorDir, "codes.tsv").readLines().filter { it.isNotBlank() }.map { it.split('\t') }
-        assertEquals(51, table.size)
+        assertEquals(52, table.size)
         val cls = JasoRuntime.loader.loadClass("std.jaso.JasoError")
         for ((number, code) in table) {
             assertEquals(number.toInt(), JasoRuntime.call(cls, "numberOf", code), code)

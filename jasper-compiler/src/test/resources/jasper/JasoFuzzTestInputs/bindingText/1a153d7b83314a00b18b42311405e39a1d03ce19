@@ -1,0 +1,4 @@
+package p
+
+cap log
+fn p.A.f(): v

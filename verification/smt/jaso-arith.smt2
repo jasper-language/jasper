@@ -1,7 +1,7 @@
 ; Arithmetic facts the `.jaso` reader relies on, checked with Z3 over 64-bit vectors.
 ; Every query negates a fact, so `unsat` means the fact holds; the final query is a
 ; deliberately wrong fact that must come back `sat`, proving the setup can fail.
-; Source: jasper-compiler/src/main/resources/stdlib/jaso/{JasoBytes,JasoFile,Ed25519}.jas
+; Source: jasper-compiler/src/main/resources/stdlib/jaso/{JasoBytes,JasoFile,JasoBinding,Ed25519}.jas
 (set-logic QF_BV)
 
 ; 1. JasoImage.roundUp: for n < 2^32, ((n + 4095) >> 12) << 12 is the next page multiple.
@@ -94,7 +94,31 @@
 (check-sat)
 (pop 1)
 
-; 8. Sanity: a wrong rounding constant must be refuted (expected: sat).
+; 8. JasoBinding: from any cursor lo <= at <= hi inside an int32 array, an `own `-style prefix
+;    accepted by JasoText.startsWith (hi - at >= n) leaves the cursor in [lo, hi], and the line
+;    start after a newline at stop < hi is at most hi; int32 arithmetic does not wrap.
+(push 1)
+(declare-const lo8 (_ BitVec 64))
+(declare-const at8 (_ BitVec 64))
+(declare-const hi8 (_ BitVec 64))
+(declare-const n8 (_ BitVec 64))
+(declare-const stop8 (_ BitVec 64))
+(define-fun limit () (_ BitVec 64) (_ bv2147483647 64))
+(assert (bvule lo8 at8))
+(assert (bvule at8 hi8))
+(assert (bvule hi8 limit))
+(assert (bvule n8 (_ bv7 64)))
+(assert (bvuge (bvsub hi8 at8) n8))
+(assert (bvule at8 stop8))
+(assert (bvult stop8 hi8))
+(assert (not (and (bvule lo8 (bvadd at8 n8))
+                  (bvule (bvadd at8 n8) hi8)
+                  (bvule (bvadd stop8 (_ bv1 64)) hi8)
+                  (bvule (bvadd stop8 (_ bv1 64)) limit))))
+(check-sat)
+(pop 1)
+
+; 9. Sanity: a wrong rounding constant must be refuted (expected: sat).
 (push 1)
 (declare-const n2 (_ BitVec 64))
 (assert (bvult n2 (_ bv4294967296 64)))

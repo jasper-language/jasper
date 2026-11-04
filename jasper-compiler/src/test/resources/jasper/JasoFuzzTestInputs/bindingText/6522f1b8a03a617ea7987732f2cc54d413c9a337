@@ -1,0 +1,5 @@
+package A
+cap log
+fn p.A.f(): void
+fn p.A.g(a: i): bog
+fn p.A.f():orrow R?

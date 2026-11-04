@@ -1,0 +1,4 @@
+package p
+type A
+fn p.A.f(): void
+fn p(

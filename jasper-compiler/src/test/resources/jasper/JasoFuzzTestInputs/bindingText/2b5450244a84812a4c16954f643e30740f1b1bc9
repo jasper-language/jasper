@@ -1,0 +1,5 @@
+package p
+type Acgolap
+ 
+fn p.A.f(): toid
+fn A.g(a: int32, b: own L<S?>?): bgp.A.fR?

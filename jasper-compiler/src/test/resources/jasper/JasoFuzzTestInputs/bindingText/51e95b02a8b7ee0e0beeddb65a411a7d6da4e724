@@ -1,0 +1,6 @@
+package p
+type A
+cap log
+fn p.A.f(): void
+fn p.A.f(): void
+fn pw R?

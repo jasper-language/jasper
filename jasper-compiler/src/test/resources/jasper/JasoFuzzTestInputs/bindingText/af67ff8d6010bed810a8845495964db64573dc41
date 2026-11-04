@@ -1,0 +1,5 @@
+
+type A
+cap log
+fn p.A.f(): voidA
+cap lr'

@@ -1,0 +1,5 @@
+package p
+
+cap log
+fn p.A.f                                 () p.A.f: void
+fn (af(

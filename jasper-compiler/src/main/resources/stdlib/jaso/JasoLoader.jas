@@ -1,9 +1,9 @@
 package std.jaso;
 
 // ============================================================================
-// JasoLoader.jas —— L1 装载的第 1–6 步（规范第 12.2 节）与一致性判定（第 14 节）
+// JasoLoader.jas —— L1 装载的第 1–6a 步（规范第 12.2 节）与一致性判定（第 14 节）
 // ============================================================================
-// 职责：在结构读取之上判定信任、平台、运行时版本、依赖与能力。这里不映射、不链接、
+// 职责：在结构读取之上判定信任、平台、运行时版本、依赖、能力与 jasper.import 绑定。这里不映射、不链接、
 //   不调用任何代码；第 7 步以后属于运行时装载（后续切片）。
 //
 // 能力是请求不是授权：清单里写了能力不等于得到，调用者授予的集合才算数。
@@ -212,7 +212,7 @@ public class JasoHostPlatform {
 /**
  * 一次装载的宿主上下文。
  *
- * 做什么：check 执行规范第 12.2 节第 1–6 步，第一处失败抛 JasoError；通过时返回文件
+ * 做什么：check 执行规范第 12.2 节第 1–6a 步，第一处失败抛 JasoError；通过时返回文件
  *   与选中的镜像由调用方接着做链接。
  * 为什么 Native / Managed 两个宿主平台分开：同一进程可以同时是 JVM 托管宿主和原生宿主，
  *   按文件种类选用，与一致性上下文的定义相同；没有的一侧传 null，对应文件必然不符。
@@ -235,7 +235,7 @@ public class JasoLoader {
         this.granted = granted;
     }
 
-    /** 做什么：第 1–6 步；policy 的构造错误由调用方先行暴露。 */
+    /** 做什么：第 1–6a 步；policy 的构造错误由调用方先行暴露。 */
     public function check(file: JasoFile, policy: JasoTrustPolicy): JasoImage {
         policy.verify(file);
         var image: JasoImage = this.select(file);
@@ -257,6 +257,10 @@ public class JasoLoader {
                 throw new JasoError("capability.denied");
             }
             i = i + 1;
+        }
+        var binding: JasoExtension? = file.extension("jasper.import", 1);
+        if (binding != null) {
+            JasoBinding.check(file.data, binding.contentStart, binding.contentEnd, manifest);
         }
         return image;
     }
@@ -341,6 +345,17 @@ public class JasoConformance {
     public static function structural(data: byte[]): string {
         try {
             JasoFile.read(data);
+            return "ok";
+        } catch (error: JasoError) {
+            return error.code();
+        }
+    }
+
+    /** 做什么：只判定第 6a 步：manifest 是清单文本，binding 是绑定内容；清单必须合法。 */
+    public static function binding(manifest: byte[], binding: byte[]): string {
+        var parsed: JasoManifest = JasoManifest.parse(manifest, 0, manifest.length);
+        try {
+            JasoBinding.check(binding, 0, binding.length, parsed);
             return "ok";
         } catch (error: JasoError) {
             return error.code();

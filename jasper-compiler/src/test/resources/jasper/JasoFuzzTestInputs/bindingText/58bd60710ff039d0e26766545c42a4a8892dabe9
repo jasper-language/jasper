@@ -1,0 +1,3 @@
+package A
+fn p.A.g(a: i): b
+fn p.A.g(f():or

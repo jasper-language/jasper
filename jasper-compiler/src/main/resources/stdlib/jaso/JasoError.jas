@@ -88,7 +88,7 @@ public class JasoError extends RecoverableError {
             "signature.section", "signature.invalid",
             "trust.unsigned", "trust.publisher", "trust.key", "trust.namespace",
             "capability.denied", "dependency.unsatisfied", "dependency.runtime",
-            "extension.malformed", "extension.critical", "extension.duplicate", "extension.required"
+            "extension.malformed", "extension.critical", "extension.duplicate", "extension.required", "extension.binding"
         ];
         var numbers: int32[] = [
             101, 102, 103, 104, 105, 106, 107, 108, 201,
@@ -99,7 +99,7 @@ public class JasoError extends RecoverableError {
             701, 702,
             801, 802, 803, 804,
             901, 1001, 1002,
-            1101, 1102, 1103, 1104
+            1101, 1102, 1103, 1104, 1105
         ];
         var i: int32 = 0;
         while (i < names.length) {

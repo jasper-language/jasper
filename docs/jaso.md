@@ -55,7 +55,8 @@ Recommended order:
 The byte-level specification is `jaso/SPEC.md` in the jasper-os repository. The Jasper side has a **reader and validator**, written in Jasper as the on-demand standard library package `std.jaso` (`StdLib.jasoSources()`; it is not compiled into every program):
 
 - `JasoFile.read`: the structural read of SPEC section 12.1, reporting the first violation with its stable code.
-- `JasoLoader.check`: L1 load steps 1 to 6 of SPEC section 12.2 (trust, platform, runtime version, dependencies, capabilities) against a context supplied by the caller. A platform mismatch reports the field, the host value, and the file value.
+- `JasoLoader.check`: L1 load steps 1 to 6a of SPEC section 12.2 (trust, platform, runtime version, dependencies, capabilities, binding) against a context supplied by the caller. A platform mismatch reports the field, the host value, and the file value.
+- `JasoBinding.check`: step 6a, the syntax of `jasper.import` version 1 and its agreement with the manifest (SPEC section 9.4). Type names are checked for syntax only.
 - `JasoConformance.check`: the fixed context of SPEC section 14, returning `ok` or a code name.
 - `Ed25519`: strict verification only, implemented in Jasper because JVM 8 has no built-in Ed25519; only SHA-256 and SHA-512 come from the platform. Verification handles public data, so it is not constant-time.
 
@@ -80,12 +81,12 @@ jasperc --emit jaso -o demo.jaso --name jaso-demo --version 1.2.3 [--description
 
 Overloads of one name all get a suffix derived from their parameter types (`p.C.m$05c31294`). The suffix does not depend on declaration order, but adding the first overload to a name does change the existing symbol. Importers resolve through the declared signature, so the suffix is opaque to them.
 
-Meaning of types in `jasper.import` (SPEC section 9.4, which arrives with the jasper-os loader work and is not on its `main` yet, leaves it to the Jasper layer): a dotted name is a fully qualified type; an undotted name is a language built-in (`int32` and the other primitives, `string`, `bytes`, `regex`, `void`, `any`); arrays are `Array<T>`; `?` is nullable. Managed objects are passed as garbage-collected references with no transfer of ownership, so `own` and `borrow` do not appear. Every capability in `--requires` is written as a `cap` line.
+Meaning of types in `jasper.import` (SPEC section 9.4 leaves it to the Jasper layer): a dotted name is a fully qualified type; an undotted name is a language built-in (`int32` and the other primitives, `string`, `bytes`, `regex`, `void`, `any`); arrays are `Array<T>`; `?` is nullable. Managed objects are passed as garbage-collected references with no transfer of ownership, so `own` and `borrow` do not appear. Every capability in `--requires` is written as a `cap` line.
 
 **Diagnosed, nothing written** (the module author must change the code or remove `public`): zero or several packages in one module; a package named `std` or `std.*`; `.jass` script units; public generic classes, interfaces, and functions; public nested types; public enums and annotation types; public fields; vararg parameters and default values; function, tuple, wildcard, pointer, and reference types in a signature; a signature that names a non-public type of the module; non-ASCII names in the interface; more than 256 exports; a `jasper.import` over 64 KiB or 1024 lines; type nesting deeper than 8; metadata that SPEC section 11 forbids.
 
 `jasper.import` version 1 has no syntax for supertypes, so an importer cannot yet learn from the file that `Square` implements `Shape`, and inherited methods are declared only on the type that defines them.
 
-Not implemented yet: the `jasper.source` extension, namespaced manifest keys from annotations, signing in the compiler, linking and running managed images (L1 steps 7 to 9), and source `import` resolution against a `.jaso`. The Jasper reader stores extension contents as offsets and does not interpret them, so it does not check `jasper.import` (L1 step 6a) yet.
+Not implemented yet: the `jasper.source` extension, namespaced manifest keys from annotations, signing in the compiler, linking and running managed images (L1 steps 7 to 9), and source `import` resolution against a `.jaso`. Apart from `jasper.import`, the Jasper reader stores extension contents as offsets and does not interpret them.
 
 The test vectors in `jasper-compiler/src/test/resources/jaso-vectors/` are unmodified copies with the source commit recorded in `SOURCE`. The tables in `jaso-diff-*.tsv.gz` hold results of the Rust reference implementation on mutated inputs; `verification/jaso-diff` regenerates them, and its `check-emit` mode checks files written by the compiler.

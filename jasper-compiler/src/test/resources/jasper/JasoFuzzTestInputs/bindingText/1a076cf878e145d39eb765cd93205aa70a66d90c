@@ -1,0 +1,5 @@
+package p
+type A
+cap log
+fn p.A.f(): void
+fn p.C.g(a: i0, b: own L<S?>?): borropac

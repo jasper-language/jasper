@@ -1,0 +1,5 @@
+package p
+type A
+cap log
+fn p.A.f(): void
+fn p.A.g(a: int32, b: own L<S?>?): borrow R?
