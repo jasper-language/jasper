@@ -1,0 +1,6 @@
+core.name = a
+core.version = 1.0.0
+core.abi = jvm.52
+core.stage = runtime
+core.depends = bc >1.,=@0,<2.01.,=@0,<ÑÏëcore.abi ge = runtname= 0.1.core.n0
+amec

@@ -1,0 +1,4 @@
+corre.version = 1.0.0
+core.abi = mj.o
+v2c5re.stage = runtime
+core.depends = b, c@>=1.0,core.’žmec

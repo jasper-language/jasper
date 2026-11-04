@@ -10,7 +10,7 @@ publish = false
 [workspace]
 
 [dependencies]
-jaso = { git = "https://github.com/jasper-language/jasper-os", rev = "1cb6c48c14c44970fb75e077b400bfb885c703ee", features = ["pack"] }
+jaso = { git = "https://github.com/jasper-language/jasper-os", rev = "146ad99ca12e7e6b29ffb4349fef8db3a8d8aea6", features = ["pack"] }
 ed25519-dalek = { version = "=3.0.0", default-features = false }
 curve25519-dalek = { version = "=5.0.0", default-features = false }
 sha2 = { version = "=0.11.1", default-features = false }

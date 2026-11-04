@@ -252,7 +252,39 @@ fn manifests(rng: &mut Rng, cases: usize) -> String {
         };
         writeln!(out, "{}\t{result}", hex(&text)).unwrap();
     }
+    depends_window(&mut out);
     out
+}
+
+/// core.depends 重名只查前 32 项、超限项仍校验取值（SPEC §12.1）的边界两侧；不用随机数，其余表不受影响。
+fn depends_window(out: &mut String) {
+    let head = "core.name = a\ncore.version = 1.0.0\ncore.abi = c.v1\ncore.stage = runtime\n";
+    for total in [31usize, 32, 33, 34, 40] {
+        for repeat_at in [None, Some(1), Some(30), Some(31), Some(32), Some(33)] {
+            for tail in ["", "BAD"] {
+                for split in [0usize, 1, 16, 32] {
+                    let mut names: Vec<String> = (0..total).map(|n| format!("m{n}")).collect();
+                    if let Some(at) = repeat_at.filter(|at| *at < total) {
+                        names[at] = "m0".to_string();
+                    }
+                    if !tail.is_empty() {
+                        names.push(tail.to_string());
+                    }
+                    let lines = if split == 0 || split >= names.len() {
+                        format!("core.depends = {}\n", names.join(", "))
+                    } else {
+                        format!("core.depends = {}\ncore.depends = {}\n", names[..split].join(", "), names[split..].join(", "))
+                    };
+                    let text = format!("{head}{lines}");
+                    let result = match Manifest::parse(&text) {
+                        Ok(m) => dump(&m),
+                        Err(e) => e.code().name().to_string(),
+                    };
+                    writeln!(out, "{}\t{result}", hex(text.as_bytes())).unwrap();
+                }
+            }
+        }
+    }
 }
 
 fn rng_bool(rng: &mut Rng) -> bool {

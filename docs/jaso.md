@@ -123,9 +123,32 @@ read -> steps 2 to 6a -> reserve -> link -> discover -> init -> start -> running
 
 Diagnosed: a package no module provides, or several; a name the module does not export; `import a.b.*` on a module package; undeclared modules and capabilities; arguments that do not match a constructor, static method, method, function, or `super(...)` of the interface; `new` of an interface or abstract class, or of a class with no constructor in its interface; a file that uses a module function without importing it.
 
-Limits of this beta: a top-level function cannot be imported under another name (types can, with `from a.b import C as D`), and its simple name must be unique in the compilation, because the function table is global by simple name. Plain programs (no `--emit jaso`) have no module path, so the importer has to be a module, and it is run through `std.jaso.JasoRuntime` with its dependencies loaded first; the runtime does not yet look modules up on a path by itself. Method overloads across modules are by parameter count, as in the language; a concrete subclass that leaves an abstract superclass method unimplemented is not diagnosed; `final` on a class is not enforced by this compiler.
+Limits of this beta: a top-level function cannot be imported under another name (types can, with `from a.b import C as D`), and its simple name must be unique in the compilation, because the function table is global by simple name. Plain programs (no `--emit jaso`) have no module path, so a program that imports modules has to be a module itself; see below for how it runs. Method overloads across modules are by parameter count, as in the language; a concrete subclass that leaves an abstract superclass method unimplemented is not diagnosed; `final` on a class is not enforced by this compiler.
 
-**Codes.** Steps 1 to 6a report the codes of SPEC section 13 through `JasoError`. SPEC defines no codes for later steps, so these belong to this runtime and are reported through `JasoRuntimeError`, and they are not part of the cross-implementation table: `link.binding`, `link.payload`, `link.symbol`, `module.duplicate`, `lifecycle.init`, `lifecycle.start`, `stop.unknown`, `stop.already`, `stop.dependent`, `stop.hook`, `module.stopped`, `module.symbol`, `module.argument`.
+**Running a program.** A program that imports modules is a module with an entry point, and it runs with:
+
+```bash
+jasperc --run [--module-path <paths>] [--grant <capability>]... [--trust <name>:<namespace>:<hexkey>]... [--allow-unsigned] <module> [args]...
+```
+
+- The entry point is a top-level `public function main()` or `main(args: string[])` in the module's package, returning `void` or `int32`. The `int32` result is the exit code. It is found in `jasper.import`, like every other service. A module with several `main` overloads is refused.
+- Everything after the module name goes to the program, including arguments that look like options. Write `--` before a module name that starts with `-`.
+- Exit codes: the result of `main`, or 0 for `void`; 1 if `main` throws, or if it returned 0 and a stop hook failed; 2 for a usage error; 3 if the load is refused. A non-zero result from `main` is not replaced by a stop failure.
+- After `main` returns or throws, all running modules stop in the reverse of their load order, so dependents stop first.
+- Trust is enforced by default. `--allow-unsigned` is development mode, and it only relaxes unsigned files: a signed file must still pass every check. Capabilities are granted only by `--grant`, and the same grants apply to every module this run loads.
+- `--run` compiles the standard library and `std.jaso` at each start, because they are not yet shipped precompiled. That costs a few seconds per start.
+
+**The runtime module path.** `JasoModulePath.scan` reads the path by the same rules as `--module-path` in the compiler: a directory contributes its `*.jaso` files, not recursively, or an entry names a single file, and any unreadable file on the path is an error naming that file. The difference is that the runtime looks modules up by module name, where the compiler looks them up by package. A name that appears twice is an error only when it is needed.
+
+`JasoRuntime.loadFromPath(path, name, granted)` first computes a load order from the manifests, with dependencies first, and then loads each module with `load`:
+
+- The plan runs no module code, so a missing dependency, a version outside the declared range, a cycle, a stopped module, or a duplicate name is reported before any `init` runs. The plan is not the final decision, because the running set can change afterwards; `reserve` still decides.
+- A module that is already running is used as it is and is not replaced by a file on the path. Its version must still fit the range, and its own dependencies are not looked at again.
+- If a later load fails, dependencies that already started stay running. Stopping them would make a retry impossible, because a stopped module keeps its name. A second call skips them.
+- If another thread is loading the same dependency, a finished load is used, and a load still in progress gives `module.duplicate` for the caller to retry. The runtime does not wait, because the other thread's `init` may block.
+- Bytes are read once per scan, so the plan and the load see the same file. A new scan sees modules added to the path since the last one.
+
+**Codes.** Steps 1 to 6a report the codes of SPEC section 13 through `JasoError`. SPEC defines no codes for later steps, so these belong to this runtime and are reported through `JasoRuntimeError`, and they are not part of the cross-implementation table: `link.binding`, `link.payload`, `link.symbol`, `module.duplicate`, `lifecycle.init`, `lifecycle.start`, `stop.unknown`, `stop.already`, `stop.dependent`, `stop.hook`, `module.stopped`, `module.symbol`, `module.argument`, `path.file`, `path.ambiguous`, `path.missing`, `path.version`, `path.stopped`, `path.cycle`, `entry.missing`, `entry.shape`, `program.usage`.
 
 The audit log keeps the most recent 1024 lines, and its total count shows whether older lines were overwritten.
 

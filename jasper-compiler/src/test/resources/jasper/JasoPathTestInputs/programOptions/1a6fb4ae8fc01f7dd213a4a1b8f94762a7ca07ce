@@ -1,0 +1,11 @@
+--module-path
+a:b
+--grant
+net
+--trust
+pub:ns-:abababababababababababababababababababababababababababababababab
+--allow-unsigned
+--
+od
+x
+y

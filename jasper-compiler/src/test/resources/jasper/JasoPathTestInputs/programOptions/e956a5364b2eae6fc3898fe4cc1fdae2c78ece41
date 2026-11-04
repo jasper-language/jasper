@@ -1,0 +1,12 @@
+--grant
+ne
+--trust
+pub:n[-:ababababababacababab6bababababababababababababababababababababae
+--trust
+pub:ns:ns-:ababababababacababababababababababababababababababababababababae
+--trust
+pubdpub:ns-:ns-:ababababababacababababababababababababababababababababababababae
+--trust
+pub:ns-:ababababababacababababababababababababababababababababababababae
+--
+puby

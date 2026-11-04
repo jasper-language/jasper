@@ -133,7 +133,8 @@ object StdLib {
         "jaso/JasoFile.jas",
         "jaso/JasoBinding.jas",
         "jaso/JasoLoader.jas",
-        "jaso/JasoRuntime.jas"
+        "jaso/JasoRuntime.jas",
+        "jaso/JasoProgram.jas"
     )
 
     /**

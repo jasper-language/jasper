@@ -1,0 +1,4 @@
+cre.abi = jvm.52
+core.stage = runtime
+core.depends = bc >1.,=@0,<2.0@.0,1=,me = b
+c/co

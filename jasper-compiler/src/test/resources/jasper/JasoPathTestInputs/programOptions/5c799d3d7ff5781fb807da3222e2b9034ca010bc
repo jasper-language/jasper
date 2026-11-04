@@ -1,0 +1,14 @@
+--grant
+aa:b
+--grant
+n
+--grant
+	a:b
+--grant
+n
+--grant
+ne
+--grant
+:b
+--grant
+n

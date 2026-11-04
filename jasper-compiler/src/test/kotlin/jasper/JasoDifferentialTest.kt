@@ -188,7 +188,7 @@ class JasoDifferentialTest {
     @Test
     fun `manifest parsing matches the reference in code and content`() {
         val rows = table("manifests")
-        assertEquals(3000, rows.size)
+        assertEquals(3240, rows.size)
         report("manifests", rows.size, rows.mapIndexedNotNull { line, (text, expected) ->
             val got = JasoProbe.manifest(JasoRuntime.hex(text))
             if (got == expected) null else "line ${line + 1}: $text\n  reference $expected\n  reader    $got"

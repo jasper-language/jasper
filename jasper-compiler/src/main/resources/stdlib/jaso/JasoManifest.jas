@@ -602,7 +602,7 @@ public class JasoManifestParser {
 
     /**
      * 做什么：一行 core.depends。逗号之后、去掉前导空白后以 < > = 开头的片段续接前一项的区间。
-     * 上限同样在整行处理完之后才检查，重名先于超限。
+     * 上限同样在整行处理完之后才检查，前 32 项的重名与任何一项的坏取值都先于超限。
      */
     private function depends(lo: int32, hi: int32): void {
         var b: byte[] = this.text;
@@ -637,7 +637,10 @@ public class JasoManifestParser {
         return c == 60 || c == 62 || c == 61;
     }
 
-    /** 做什么：一项依赖 `名字[@区间]`；超过上限的项只查合法性与重名、只计数，行末会因超限拒绝。 */
+    /**
+     * 做什么：一项依赖 `名字[@区间]`；超过上限的项只查合法性、只计数，行末会因超限拒绝。
+     * 为什么重名只查前 32 项：与规范第 12.1 节一致，未验证的清单不能决定这里的开销。
+     */
     private function dependency(rawLo: int32, rawHi: int32): void {
         var b: byte[] = this.text;
         var lo: int32 = JasoText.trimStart(b, rawLo, rawHi);
@@ -656,10 +659,10 @@ public class JasoManifestParser {
             throw new JasoError("manifest.value");
         }
         var depName: string = JasoBytes.text(b, lo, nameHi);
-        if (!this.dependencySet.insert(depName)) {
-            throw new JasoError("manifest.duplicate");
-        }
         if (this.dependencyCount < 32) {
+            if (!this.dependencySet.insert(depName)) {
+                throw new JasoError("manifest.duplicate");
+            }
             this.dependencies[this.dependencyCount] = new JasoDependency(depName, range);
         }
         this.dependencyCount = this.dependencyCount + 1;

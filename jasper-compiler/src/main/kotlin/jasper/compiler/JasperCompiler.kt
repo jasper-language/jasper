@@ -996,11 +996,15 @@ class JasperCompiler {
  * 成功打印摘要并以默认退出码 0 结束。
  * 为什么直接 System.exit：作为命令行进程顶层入口，需要把成败反映到退出码。
  *
- * 另有模块模式：`jasperc --emit jaso -o <文件> --name <名> --version <x.y.z> [选项] <源文件>...`，见 [emitJasoMain]。
+ * 另有模块模式：`jasperc --emit jaso -o <文件> --name <名> --version <x.y.z> [选项] <源文件>...`，见 [emitJasoMain]；
+ * 运行模块：`jasperc --run [选项] <模块名> [参数]...`，见 [runJasoMain]。
  */
 fun main(args: Array<String>) {
     if (args.firstOrNull() == "--emit") {
         System.exit(emitJasoMain(args.toList()))
+    }
+    if (args.firstOrNull() == "--run") {
+        System.exit(runJasoMain(args.drop(1)))
     }
     // 参数校验：至少一个源文件路径。
     if (args.isEmpty()) {
@@ -1035,6 +1039,31 @@ fun main(args: Array<String>) {
             System.err.println("Compilation failed: ${result.message}")
             System.exit(1)
         }
+    }
+}
+
+/**
+ * `--run` 的命令行：编译运行时（标准库 + std.jaso），把其余参数交给 Jasper 写的 `std.jaso.JasoProgram`。
+ *
+ * 做什么：这里只负责让运行时存在；配置解析、装载、入口与退出码全部在 JasoProgram。
+ * 为什么每次都编译：std 目前不随编译器预编译分发；模块也不带 std。代价是每次启动多几秒。
+ * 为什么父加载器取系统加载器的父：运行时与模块都不应看到编译器自己的 class。
+ * 失败模式：运行时编译失败或临时目录失败返回 1（编译器缺陷或环境问题）；其余退出码见 JasoProgram。
+ */
+internal fun runJasoMain(args: List<String>): Int {
+    val output = Files.createTempDirectory("jasper-run")
+    try {
+        val compiled = JasperCompiler().compileAllWithStdlib(StdLib.jasoSources(), output)
+        if (compiled is JasperCompiler.CompileResult.Error) {
+            System.err.println(compiled.message)
+            return 1
+        }
+        java.net.URLClassLoader(arrayOf(output.toUri().toURL()), ClassLoader.getSystemClassLoader().parent).use { loader ->
+            val program = loader.loadClass("std.jaso.JasoProgram")
+            return program.getMethod("run", Array<String>::class.java, java.io.PrintStream::class.java).invoke(null, args.toTypedArray(), System.err) as Int
+        }
+    } finally {
+        output.toFile().deleteRecursively()
     }
 }
 

@@ -1,0 +1,507 @@
+package std.jaso;
+
+// ============================================================================
+// JasoProgram.jas —— 按模块路径装载与普通程序入口（JB-L3 第四片）
+// ============================================================================
+// 职责：
+//   - JasoModulePath：运行时的模块路径，读目录与文件，只认清单里的名字；
+//   - JasoLoadPlanner：从根模块出发算出依赖在前的装载次序，不运行任何模块代码；
+//   - JasoProgram：`jasperc --run` 的入口：解析运行时配置，装载，调用 main，反序停止。
+//
+// 为什么先算次序再装载：缺依赖、版本不符、环都能在任何 init 运行之前报出来。算次序之后依赖
+//   仍可能变化，所以这不是最终裁定，最终裁定仍是 JasoModuleTable.reserve。
+//
+// 与编译器的模块路径同一套规则：目录只看 `*.jaso`、不递归；路径上任何读不了的文件都报错；
+//   同名模块出现多次时只有被用到才报错。不同之处：运行时按模块名找，编译器按包名找。
+// ============================================================================
+
+/**
+ * 模块路径上的一个文件。
+ *
+ * 做什么：持有读入的字节与清单；装载时用同一份字节，所以计划与装载看到的是同一个文件。
+ * mark 是计划器的访问标记：0 未访问，1 在栈上，2 已排好。
+ */
+public class JasoPathEntry {
+    public var source: string;
+    public var data: byte[];
+    public var manifest: JasoManifest;
+    public var mark: int32;
+
+    /** 做什么：由来源名字、字节与已解析的清单构造。 */
+    public constructor(source: string, data: byte[], manifest: JasoManifest) {
+        this.source = source;
+        this.data = data;
+        this.manifest = manifest;
+        this.mark = 0;
+    }
+}
+
+/**
+ * 运行时模块路径的一次快照。
+ *
+ * 做什么：scan 读入路径上的全部文件，find 按模块名查找。
+ * 什么时候用：一次装载用一个快照，用完丢弃，所以路径上新加的模块下次就能看到。
+ * 线程安全：非线程安全，只在构造它的线程使用。
+ * 失败模式：只抛 JasoRuntimeError（path.file、path.ambiguous）。
+ */
+public class JasoModulePath {
+    private var entries: JasoPathEntry[];
+    private var count: int32;
+
+    /** 做什么：空路径。 */
+    public constructor() {
+        this.entries = new JasoPathEntry[16];
+        this.count = 0;
+    }
+
+    /** 做什么：按平台路径分隔符切开配置文本，丢弃空段。 */
+    public static function split(text: string): JasoStrings {
+        var out: JasoStrings = new JasoStrings();
+        var separator: string = java.lang.System.getProperty("path.separator");
+        var start: int32 = 0;
+        while (start <= text.length()) {
+            var end: int32 = text.indexOf(separator, start);
+            if (end < 0) {
+                end = text.length();
+            }
+            if (end > start) {
+                out.append(text.substring(start, end));
+            }
+            start = end + separator.length();
+        }
+        return out;
+    }
+
+    /**
+     * 做什么：依次读入每一项：目录取其中的 `*.jaso`（按名字排序，不递归），文件取其本身。
+     * 失败模式：项不存在、目录列不出、文件读不了或不是合法的 `.jaso`，都报 path.file 并指出路径。
+     */
+    public static function scan(paths: JasoStrings): JasoModulePath {
+        var out: JasoModulePath = new JasoModulePath();
+        var i: int32 = 0;
+        while (i < paths.size()) {
+            out.scanEntry(paths.get(i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：读入路径的一项。 */
+    private function scanEntry(path: string): void {
+        var file: java.io.File = new java.io.File(path);
+        if (file.isDirectory()) {
+            var listed: string[]? = file.list();
+            if (listed == null) {
+                throw new JasoRuntimeError("path.file", path + ": cannot list directory");
+            }
+            var names: string[] = JasoModulePath.sorted(cast listed as string[]);
+            var i: int32 = 0;
+            while (i < names.length) {
+                if (names[i].endsWith(".jaso")) {
+                    var inner: java.io.File = new java.io.File(path, names[i]);
+                    this.add(inner.getPath(), JasoModulePath.read(inner));
+                }
+                i = i + 1;
+            }
+        } else if (file.isFile()) {
+            this.add(path, JasoModulePath.read(file));
+        } else {
+            throw new JasoRuntimeError("path.file", path + ": does not exist");
+        }
+    }
+
+    /** 做什么：按 UTF-16 码元序排序的副本（插入排序：一个目录的模块数很小）。 */
+    private static function sorted(names: string[]): string[] {
+        var out: string[] = new string[names.length];
+        var i: int32 = 0;
+        while (i < names.length) {
+            var at: int32 = i;
+            while (at > 0 && out[at - 1].compareTo(names[i]) > 0) {
+                out[at] = out[at - 1];
+                at = at - 1;
+            }
+            out[at] = names[i];
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：读整个文件；任何读失败（含内存不足）都报 path.file，不让一个坏文件带倒宿主。 */
+    private static function read(file: java.io.File): byte[] {
+        try {
+            var opened: java.io.FileInputStream = new java.io.FileInputStream(file);
+            try {
+                var collected: java.io.ByteArrayOutputStream = new java.io.ByteArrayOutputStream();
+                var chunk: byte[] = new byte[8192];
+                while (true) {
+                    var n: int32 = opened.read(chunk, 0, chunk.length);
+                    if (n < 0) {
+                        break;
+                    }
+                    collected.write(chunk, 0, n);
+                }
+                return collected.toByteArray();
+            } finally {
+                opened.close();
+            }
+        } catch (error: java.io.IOException) {
+            throw new JasoRuntimeError("path.file", file.getPath() + ": " + error.toString());
+        } catch (error: java.lang.RuntimeException) {
+            throw new JasoRuntimeError("path.file", file.getPath() + ": " + error.toString());
+        } catch (error: java.lang.OutOfMemoryError) {
+            throw new JasoRuntimeError("path.file", file.getPath() + ": too large");
+        }
+    }
+
+    /** 做什么：加入一个文件：结构读取（规范第 12.1 节）必须通过，否则报 path.file 并带上原码名。 */
+    public function add(source: string, data: byte[]): void {
+        var manifest: JasoManifest;
+        try {
+            manifest = JasoFile.read(data).manifest;
+        } catch (error: JasoError) {
+            throw new JasoRuntimeError("path.file", source + ": " + error.code());
+        }
+        if (this.count == this.entries.length) {
+            var grown: JasoPathEntry[] = new JasoPathEntry[this.count * 2];
+            var i: int32 = 0;
+            while (i < this.count) {
+                grown[i] = this.entries[i];
+                i = i + 1;
+            }
+            this.entries = grown;
+        }
+        this.entries[this.count] = new JasoPathEntry(source, data, manifest);
+        this.count = this.count + 1;
+    }
+
+    /** 做什么：按模块名找；没有返回 null，多于一个报 path.ambiguous 并列出两个来源。 */
+    public function find(name: string): JasoPathEntry? {
+        var found: JasoPathEntry? = null;
+        var i: int32 = 0;
+        while (i < this.count) {
+            if (this.entries[i].manifest.name == name) {
+                if (found != null) {
+                    throw new JasoRuntimeError("path.ambiguous", name + ": " + found.source + ", " + this.entries[i].source);
+                }
+                found = this.entries[i];
+            }
+            i = i + 1;
+        }
+        return found;
+    }
+
+    /** 做什么：文件数。 */
+    public function size(): int32 {
+        return this.count;
+    }
+
+    /** 做什么：第 i 个文件。 */
+    public function entryAt(i: int32): JasoPathEntry {
+        return this.entries[i];
+    }
+}
+
+/**
+ * 从根模块算装载次序。
+ *
+ * 做什么：显式栈的深度优先后序：结果里每个模块都排在它路径上的依赖之后。运行中的模块只查版本、
+ *   不再展开（它的依赖在它装载时已经满足）。
+ * 为什么用显式栈：路径上的文件决定深度，不能让一个长依赖链溢出调用栈。
+ * 不变量（模型 verification/tla/JasoLoadPlan.tla）：没有环且都能解析时结果恰好是闭包、依赖在前。
+ * 线程安全：改写路径项的 mark，只在持有该路径的线程使用；对模块表只读快照。
+ * 失败模式：只抛 JasoRuntimeError，不运行模块代码：path.missing、path.version、path.stopped、
+ *   path.cycle、path.ambiguous。
+ */
+public class JasoLoadPlanner {
+    private var path: JasoModulePath;
+    private var table: JasoModuleTable;
+
+    /** 做什么：由路径快照与模块表构造。 */
+    public constructor(path: JasoModulePath, table: JasoModuleTable) {
+        this.path = path;
+        this.table = table;
+    }
+
+    /** 做什么：root 及其尚未运行的依赖的装载次序；root 已在运行时为空。 */
+    public function plan(root: string): JasoPathEntry[] {
+        var size: int32 = this.path.size();
+        var i: int32 = 0;
+        while (i < size) {
+            this.path.entryAt(i).mark = 0;
+            i = i + 1;
+        }
+        var order: JasoPathEntry[] = new JasoPathEntry[size];
+        var planned: int32 = 0;
+        var stack: JasoPathEntry[] = new JasoPathEntry[size];
+        var next: int32[] = new int32[size];
+        var depth: int32 = 0;
+        var first: JasoPathEntry? = this.resolve(root, null, null);
+        if (first != null) {
+            first.mark = 1;
+            stack[0] = cast first as JasoPathEntry;
+            depth = 1;
+        }
+        while (depth > 0) {
+            var top: JasoPathEntry = stack[depth - 1];
+            var at: int32 = next[depth - 1];
+            if (at == top.manifest.dependencyCount) {
+                top.mark = 2;
+                order[planned] = top;
+                planned = planned + 1;
+                next[depth - 1] = 0;
+                depth = depth - 1;
+                continue;
+            }
+            next[depth - 1] = at + 1;
+            var dependency: JasoDependency = top.manifest.dependencies[at];
+            var target: JasoPathEntry? = this.resolve(dependency.name, dependency.range, top.manifest.name);
+            if (target != null) {
+                if (target.mark == 1) {
+                    throw new JasoRuntimeError("path.cycle", top.manifest.name + " -> " + dependency.name);
+                }
+                if (target.mark == 0) {
+                    target.mark = 1;
+                    stack[depth] = cast target as JasoPathEntry;
+                    depth = depth + 1;
+                }
+            }
+        }
+        var exact: JasoPathEntry[] = new JasoPathEntry[planned];
+        i = 0;
+        while (i < planned) {
+            exact[i] = order[i];
+            i = i + 1;
+        }
+        return exact;
+    }
+
+    /** 做什么：判定一条需求：运行中的按版本判定后返回 null；否则返回路径上满足它的文件。 */
+    private function resolve(name: string, range: JasoVersionRange?, requirer: string?): JasoPathEntry? {
+        var running: JasoVersion? = this.table.runningVersion(name);
+        if (running != null) {
+            JasoLoadPlanner.checkRange(name, range, cast running as JasoVersion, requirer, "running");
+            return null;
+        }
+        if (this.table.stoppedNamed(name)) {
+            throw new JasoRuntimeError("path.stopped", JasoLoadPlanner.need(name, requirer));
+        }
+        var entry: JasoPathEntry? = this.path.find(name);
+        if (entry == null) {
+            throw new JasoRuntimeError("path.missing", JasoLoadPlanner.need(name, requirer));
+        }
+        JasoLoadPlanner.checkRange(name, range, entry.manifest.version, requirer, entry.source);
+        return entry;
+    }
+
+    /** 做什么：版本不在区间内报 path.version。 */
+    private static function checkRange(name: string, range: JasoVersionRange?, version: JasoVersion, requirer: string?, where: string): void {
+        if (range != null && !range.contains(version)) {
+            throw new JasoRuntimeError("path.version", JasoLoadPlanner.need(name, requirer) + ": " + version.major + "." + version.minor + "." + version.patch + " at " + where);
+        }
+    }
+
+    /** 做什么：诊断里的「谁要什么」。 */
+    private static function need(name: string, requirer: string?): string {
+        if (requirer == null) {
+            return name;
+        }
+        return (cast requirer as string) + " needs " + name;
+    }
+}
+
+/**
+ * 运行时配置与命令行解析的结果。
+ *
+ * 做什么：parse 解析 `--run` 之后的参数：第一个非选项是模块名，其后全部原样交给程序。
+ * 为什么默认不放行未签名：未签名放行是开发模式，必须明确写 --allow-unsigned，并且留审计。
+ * 为什么能力不设默认：清单只是请求，不写 --grant 就什么都没授予。
+ * 失败模式：用法错误抛 program.usage。
+ */
+public class JasoProgramOptions {
+    public var modulePath: JasoStrings;
+    public var granted: JasoStrings;
+    public var publishers: JasoPublisher[];
+    public var allowUnsigned: bool;
+    public var moduleName: string;
+    public var programArguments: string[];
+
+    /** 做什么：空配置。 */
+    private constructor() {
+        this.modulePath = new JasoStrings();
+        this.granted = new JasoStrings();
+        this.publishers = new JasoPublisher[0];
+        this.allowUnsigned = false;
+        this.moduleName = "";
+        this.programArguments = new string[0];
+    }
+
+    /** 做什么：解析参数；见类注释。 */
+    public static function parse(args: string[]): JasoProgramOptions {
+        var out: JasoProgramOptions = new JasoProgramOptions();
+        var i: int32 = 0;
+        var pathSet: bool = false;
+        var named: bool = false;
+        while (i < args.length && !named) {
+            var a: string = args[i];
+            if (a == "--allow-unsigned") {
+                out.allowUnsigned = true;
+                i = i + 1;
+            } else if (a == "--module-path" || a == "--grant" || a == "--trust") {
+                if (i + 1 == args.length) {
+                    throw new JasoRuntimeError("program.usage", a + " needs a value");
+                }
+                var value: string = args[i + 1];
+                if (a == "--module-path") {
+                    if (pathSet) {
+                        throw new JasoRuntimeError("program.usage", "--module-path given twice");
+                    }
+                    pathSet = true;
+                    out.modulePath = JasoModulePath.split(value);
+                } else if (a == "--grant") {
+                    out.granted.append(value);
+                } else {
+                    out.addPublisher(value);
+                }
+                i = i + 2;
+            } else if (a == "--") {
+                if (i + 1 == args.length) {
+                    throw new JasoRuntimeError("program.usage", "no module named");
+                }
+                out.moduleName = args[i + 1];
+                i = i + 2;
+                named = true;
+            } else if (a.startsWith("-")) {
+                throw new JasoRuntimeError("program.usage", "unknown option " + a);
+            } else {
+                out.moduleName = a;
+                i = i + 1;
+                named = true;
+            }
+        }
+        if (!named) {
+            throw new JasoRuntimeError("program.usage", "no module named");
+        }
+        var rest: string[] = new string[args.length - i];
+        var k: int32 = 0;
+        while (k < rest.length) {
+            rest[k] = args[i + k];
+            k = k + 1;
+        }
+        out.programArguments = rest;
+        return out;
+    }
+
+    /** 做什么：`名字:命名空间:公钥十六进制`，命名空间可以为空但两个冒号都要有。 */
+    private function addPublisher(value: string): void {
+        var first: int32 = value.indexOf(":");
+        var last: int32 = value.lastIndexOf(":");
+        if (first <= 0 || last == first) {
+            throw new JasoRuntimeError("program.usage", "--trust takes name:namespace:hexkey");
+        }
+        var key: byte[] = JasoProgramOptions.hex(value.substring(last + 1));
+        var grown: JasoPublisher[] = new JasoPublisher[this.publishers.length + 1];
+        var i: int32 = 0;
+        while (i < this.publishers.length) {
+            grown[i] = this.publishers[i];
+            i = i + 1;
+        }
+        grown[i] = new JasoPublisher(value.substring(0, first), value.substring(first + 1, last), key);
+        this.publishers = grown;
+    }
+
+    /** 做什么：Ed25519 公钥：恰好 64 个小写十六进制数字。 */
+    private static function hex(text: string): byte[] {
+        if (text.length() != 64) {
+            throw new JasoRuntimeError("program.usage", "--trust key must be 64 hex digits");
+        }
+        var out: byte[] = new byte[32];
+        var i: int32 = 0;
+        while (i < 32) {
+            var high: int32 = JasoProgramOptions.digit(text.charAt(i * 2));
+            var low: int32 = JasoProgramOptions.digit(text.charAt(i * 2 + 1));
+            out[i] = (byte) (high * 16 + low);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /** 做什么：一个小写十六进制数字的值。 */
+    private static function digit(c: char): int32 {
+        var v: int32 = (int32) c;
+        if (v >= 48 && v <= 57) {
+            return v - 48;
+        }
+        if (v >= 97 && v <= 102) {
+            return v - 87;
+        }
+        throw new JasoRuntimeError("program.usage", "--trust key must be 64 hex digits");
+    }
+}
+
+/**
+ * 普通程序的入口：把一个模块当程序运行。
+ *
+ * 做什么：装载模块与依赖 → 调用 `<包>.main.main` → 反序停止全部模块 → 返回退出码。
+ * 入口形状：`public function main(args: string[])` 或 `public function main()`，返回 void 或 int32；
+ *   int32 是退出码，void 是 0。
+ * 退出码：0 或 main 的返回值；1 main 抛出，或 main 返回 0 而 stop 失败；2 用法错误；3 装载被拒绝。
+ * 失败模式：不向外抛；全部写到 errors。
+ */
+public class JasoProgram {
+    /** 做什么：`--run` 之后的参数对应的整个运行；errors 由宿主传入（通常是标准错误）。 */
+    public static function run(args: string[], errors: java.io.PrintStream): int32 {
+        var options: JasoProgramOptions;
+        try {
+            options = JasoProgramOptions.parse(args);
+        } catch (error: JasoRuntimeError) {
+            errors.println(error.message());
+            errors.println("Usage: jasperc --run [--module-path <paths>] [--grant <capability>]... [--trust <name>:<namespace>:<hexkey>]... [--allow-unsigned] <module> [args]...");
+            return 2;
+        }
+        var runtime: JasoRuntime;
+        var module: JasoModule;
+        var entry: JasoDeclaredFunction;
+        try {
+            var policy: JasoTrustPolicy = new JasoTrustPolicy(options.publishers, !options.allowUnsigned);
+            runtime = new JasoRuntime(policy, new JasoVersion(0L, 1L, 0L));
+            var path: JasoModulePath = JasoModulePath.scan(options.modulePath);
+            module = runtime.loadFromPath(path, options.moduleName, options.granted);
+            entry = module.entryPoint();
+        } catch (error: JasoError) {
+            errors.println(error.message());
+            return 3;
+        } catch (error: JasoRuntimeError) {
+            errors.println(error.message());
+            return 3;
+        }
+        var status: int32 = JasoProgram.invoke(module, entry, options.programArguments, errors);
+        var failures: JasoStrings = runtime.stopAll();
+        var i: int32 = 0;
+        while (i < failures.size()) {
+            errors.println(failures.get(i));
+            i = i + 1;
+        }
+        if (status == 0 && failures.size() > 0) {
+            return 1;
+        }
+        return status;
+    }
+
+    /** 做什么：调用入口；异常打印到标准错误并得退出码 1。 */
+    private static function invoke(module: JasoModule, entry: JasoDeclaredFunction, arguments: string[], errors: java.io.PrintStream): int32 {
+        var call: any[] = new any[entry.parameters.length];
+        if (call.length == 1) {
+            call[0] = arguments;
+        }
+        try {
+            var result: any? = module.call(entry.symbol, call);
+            if (result == null) {
+                return 0;
+            }
+            return (cast result as java.lang.Integer).intValue();
+        } catch (error: java.lang.Throwable) {
+            errors.println(error.toString());
+            return 1;
+        }
+    }
+}

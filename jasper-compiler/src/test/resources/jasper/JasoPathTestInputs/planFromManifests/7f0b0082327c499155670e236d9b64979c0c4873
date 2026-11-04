@@ -1,0 +1,7 @@
+core.name = a
+core.version = 1.0.0
+core.abi = jvm.52
+core.stage = runtime
+core.depends = b, c@>=1re.version = 1.0.0
+.0,52
+coamesge = runtime

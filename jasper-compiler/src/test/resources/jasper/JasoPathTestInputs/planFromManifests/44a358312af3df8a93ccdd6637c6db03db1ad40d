@@ -1,0 +1,4 @@
+core.name = a
+core.version = 1.0.0
+core.abi = jvm53
+core.stage = runtime
