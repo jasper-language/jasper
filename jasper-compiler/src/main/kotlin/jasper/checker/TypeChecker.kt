@@ -85,6 +85,9 @@ class TypeChecker(
     //   正是「子类不能赋给基类变量」的根因（R2DBC #9 / JPA #4）。接口与类关系保持独立，
     //   避免把两种继承语义混在一张表里（隔离的变化点：继承关系来源）。
     private val classExtends = mutableMapOf<String, String?>()
+    // 正在检查的最内层类及其声明的字段。字段不进作用域，这里只用来给简单名访问一条可操作的诊断。
+    private class FieldOwner(val className: String, val fields: Map<String, JasProperty>)
+    private var currentClassFields: FieldOwner? = null
 
     /**
      * 当前被检查文件声明的包名（null 表示无 package 声明）。
@@ -427,6 +430,21 @@ class TypeChecker(
             }
             else -> {}
         }
+    }
+
+    /**
+     * 做什么：给出「字段不能用简单名访问」的诊断文本，实例字段指向 this.，静态字段指向 类名.。
+     * 什么时候用：[inferExpression] 的标识符分支，名字不是局部值、类型参数或类型名，
+     *   但命中当前类自己声明的字段时。
+     * 前置条件：currentClassFields 非空且含 [name]。
+     * 为什么单列一条诊断：写过 Java 或 Kotlin 的人很可能写简单名，「未解析」说不清该怎么改。
+     *   只覆盖最内层类自己声明的字段：继承来的和外层类的字段没有这样直接的写法，走普通未解析诊断。
+     */
+    private fun simpleNameFieldMessage(name: String): String {
+        val owner = currentClassFields!!
+        val property = owner.fields.getValue(name)
+        val qualified = if (isStaticProperty(owner.className, property)) "${owner.className}.$name" else "this.$name"
+        return "Field '$name' cannot be accessed by its simple name; write '$qualified'"
     }
 
     /**
@@ -921,6 +939,17 @@ class TypeChecker(
     }
 
     private fun checkClass(cls: JasClass, env: TypeEnvironment) {
+        // 嵌套类在成员循环里递归进入本函数，保存并恢复外层登记。
+        val outerClassFields = currentClassFields
+        currentClassFields = FieldOwner(cls.name, cls.members.filterIsInstance<JasProperty>().associateBy { it.name })
+        try {
+            checkClassBody(cls, env)
+        } finally {
+            currentClassFields = outerClassFields
+        }
+    }
+
+    private fun checkClassBody(cls: JasClass, env: TypeEnvironment) {
         // 类的成员检查共享同一个 clsEnv：属性会被登记，使后续方法体能解析本类字段。
         val clsEnv = env.copy()
         checkTypeParameters(cls.typeParameters, clsEnv, "class '${cls.name}'")
@@ -936,9 +965,8 @@ class TypeChecker(
                         error("Duplicate member '${member.name}' in class '${cls.name}'", member)
                     }
                     checkDeclaredType(member.type, clsEnv)
-                    // 先查初值再登记字段：初值里用简单名读自身或后声明的字段会读到零值，按未解析诊断。
+                    // 字段不进作用域：字段只能经 this. 或 类名. 访问，简单名在 inferExpression 里诊断。
                     checkFieldInitializer(member, clsEnv)
-                    clsEnv.set(member.name, member.type)
                 }
                 is JasFunction -> {
                     if ("abstract" in member.modifiers && "abstract" !in cls.modifiers) {
@@ -1164,6 +1192,7 @@ class TypeChecker(
                 env.set(stmt.name, stmt.type ?: initType)
             }
             is JasExpressionStatement -> checkExpression(stmt.expression, env)
+            is JasStatementIncrement -> inferPostfixIncDec(stmt.increment, env)
             is JasReturn -> {
                 if (stmt.value != null) {
                     // 带值 return：值类型必须可赋给声明返回类型。返回类型作为期望类型传入，
@@ -1470,6 +1499,9 @@ class TypeChecker(
                         symbolTable.findEnum(expr.name) != null ||
                         symbolTable.findAnnotation(expr.name) != null) {
                         JasNamedType(expr.name)
+                    } else if (currentClassFields?.fields?.containsKey(expr.name) == true) {
+                        error(simpleNameFieldMessage(expr.name), expr)
+                        null
                     } else if (symbolTable.findFunctions(expr.name).isNotEmpty() && !isHiddenModuleFunction(expr.name)) {
                         // Function reference - return function type
                         // 函数引用：具体签名未知，先用无参、返回 any 的函数类型占位。
@@ -1909,7 +1941,11 @@ class TypeChecker(
                 val rightType = inferExpression(expr.right, env)
                 nullCoalescingType(leftType, rightType, expr)
             }
-            is JasStringTemplate -> JasStringType
+            is JasStringTemplate -> {
+                // 嵌入表达式必须被检查：缺这一步时模板里的未解析名字直接到翻译器，退化成 this。
+                expr.parts.forEach { if (it is JasTemplateExpr) inferExpression(it.expr, env) }
+                JasStringType
+            }
             is JasDictLiteral -> inferDictLiteral(expr, env, expected)
             is JasAssignment -> {
                 // 赋值兼容性：右值类型必须可赋给左值（目标）类型；结果类型为目标类型。
@@ -1925,12 +1961,42 @@ class TypeChecker(
                 }
                 targetType ?: JasAnyType
             }
+            is JasPostfixIncDec -> inferPostfixIncDec(expr, env)
+            is JasTupleExpr -> {
+                // 元素必须被检查，否则未解析的名字和字段简单名会从这里漏过；元组自身的类型维持 any。
+                expr.elements.forEach { inferExpression(it, env) }
+                JasAnyType
+            }
+            is JasAssignmentIncrement -> {
+                // `x = y++`：与普通赋值同样的兼容性规则，右值是自增表达式的类型。
+                val targetType = if (expr.target is JasPropertyAccess) inferExpressionCore(expr.target, env) else inferExpression(expr.target, env)
+                val valueType = inferPostfixIncDec(expr.increment, env)
+                if (valueType != null && targetType != null && !typesCompatible(valueType, targetType)) {
+                    error("Type mismatch: cannot assign ${typeDisplayName(valueType)} to ${typeDisplayName(targetType)}", expr)
+                }
+                targetType ?: JasAnyType
+            }
             else -> {
                 // 未覆盖的表达式种类：告警并兜底为 any（新增表达式类型应在此前补充分支）。
                 warn("Unhandled expression type: ${expr::class.simpleName}", expr)
                 JasAnyType
             }
         }
+    }
+
+    /**
+     * 做什么：检查 `target++` / `target--`，结果类型是目标类型。
+     * 什么时候用：[inferExpression] 处理自增表达式和 `x = y++` 的右值时。
+     * 失败模式：目标名字未解析时由目标推断诊断；目标类型确定且不是数值时追加一条诊断，
+     *   any 和类型无法确定的情形不在这里拒绝（返回 any，由既有路径处理）。
+     * 为什么需要：这条分支缺失时目标根本不被检查，`undeclared++` 和字段简单名都能过检查器。
+     */
+    private fun inferPostfixIncDec(expr: JasPostfixIncDec, env: TypeEnvironment): JasType {
+        val targetType = if (expr.target is JasPropertyAccess) inferExpressionCore(expr.target, env) else inferExpression(expr.target, env)
+        if (targetType != null && targetType !is JasAnyType && !isNumericType(targetType)) {
+            error("Operator '${expr.op}' needs a numeric operand, got ${typeDisplayName(targetType)}", expr)
+        }
+        return targetType ?: JasAnyType
     }
 
     /**
