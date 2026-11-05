@@ -206,17 +206,12 @@ data class JasProperty(
     val getter: JasPropertyAccessor?, val setter: JasPropertyAccessor?,
     val isConst: Boolean = false,
     /**
-     * Initializer expression written at the declaration site, e.g. an
-     * interface constant `const MAX_ROWS: int32 = 100;` or a class static
-     * field `public static var total: int32 = 0;`. Instance-field initializers
-     * are still assigned in constructors (the translator ignores them for the
-     * instance path); class static fields and interface constants consume it
-     * to emit a `ConstantValue` attribute or a `<clinit>` assignment.
+     * Initializer expression written at the declaration site. Interface constants and
+     * static fields consume it for a `ConstantValue` attribute or a `<clinit>` assignment;
+     * instance fields run it in every constructor that does not delegate to `this(...)`.
      *
-     * 声明处初始化的表达式，例如接口常量 `const MAX_ROWS: int32 = 100;` 或
-     * 类静态字段 `public static var total: int32 = 0;`。实例字段仍在构造器里赋值
-     * （translator 在实例路径上忽略它）；类静态字段与接口常量会消费它，
-     * 用于生成 `ConstantValue` 属性或 `<clinit>` 赋值。
+     * 声明处初始化的表达式。接口常量与静态字段用于生成 `ConstantValue` 属性或 `<clinit>` 赋值；
+     * 实例字段在每个不委托 `this(...)` 的构造器里求值：super 调用之后、构造器体之前，按声明顺序。
      */
     val initializer: JasExpression? = null
 ) : JasDeclaration()

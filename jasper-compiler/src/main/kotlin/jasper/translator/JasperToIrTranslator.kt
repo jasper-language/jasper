@@ -174,6 +174,8 @@ data class TranslationContext(
     val callNames: MutableMap<IrSimpleFunctionSymbol, String> = mutableMapOf(),
     // 构造器符号 -> 构造种类（"object"/"array:<desc>"）。
     val constructorTypes: MutableMap<IrConstructorSymbol, String> = mutableMapOf(),
+    // 当前类型声明的实例字段初始化器（按声明顺序）。构造器翻译时读取；嵌套翻译前后由所在类型保存恢复。
+    var instanceFieldInitializers: List<JasProperty> = emptyList(),
     val typeMapper: TypeMapper? = null,
     // 仍在作用域内的 lambda 变量名 -> 其 AST。用于兼容旧的「内联展开 lambda」路径。
     val lambdas: MutableMap<String, JasLambdaExpr> = mutableMapOf(),
@@ -1276,6 +1278,8 @@ class JasperToIrTranslator {
         val qualifiedClassName = typeMapper.resolveNamedTypeName(cls.name)
         val previousClassName = ctx.currentClassName
         ctx.currentClassName = qualifiedClassName
+        val previousFieldInitializers = ctx.instanceFieldInitializers
+        ctx.instanceFieldInitializers = instanceFieldInitializersOf(cls.members)
         // Record implemented interfaces
         // 记录实现的接口（补全为 JVM 风格内部名）；导出给后端决定接口表/校验。
         // 接口名同样走中央解析（import/点分包名），否则会写出 "pkg/Sink" 非法名。
@@ -1309,7 +1313,7 @@ class JasperToIrTranslator {
         ctx.classSuperclassNames[qualifiedClassName] = qualifiedSuper
         if (cls.constructors.isEmpty()) {
             // 无显式构造器时补一个默认无参 <init>；否则类无法被 new（后端要求至少一个可调用构造器）。
-            addDefaultConstructor(irCls)
+            addDefaultConstructor(irCls, ctx)
         } else {
             for (ctor in cls.constructors) {
                 val irCtor = translateConstructor(ctor, symbol, ctx)
@@ -1319,18 +1323,19 @@ class JasperToIrTranslator {
         // 恢复外层上下文（支持嵌套类/匿名类），保证翻译兄弟声明时状态不串。
         ctx.currentSuperclassName = ""
         ctx.currentClassName = previousClassName
+        ctx.instanceFieldInitializers = previousFieldInitializers
         return irCls
     }
 
     /**
-     * 做什么：为没有显式构造器的类/枚举补一个 public 无参构造器。
+     * 做什么：为没有显式构造器的类/枚举补一个 public 无参构造器，体内只有实例字段初始化。
      * 什么时候用：translateClass / translateEnum 在成员翻译完成后调用。
-     * 前置条件：irCls 已创建并已挂到当前 IR 文件；默认体为空，不引用任何成员。
+     * 前置条件：irCls 已创建并已挂到当前 IR 文件；ctx.instanceFieldInitializers 属于该类型。
      * 失败模式：不抛异常；调用方负责判断「确实没有显式构造器」。
-     * 为什么集中：普通类与枚举的默认构造器语义一致（空体；枚举的 (name,ordinal)
+     * 为什么集中：普通类与枚举的默认构造器语义一致（枚举的 (name,ordinal)
      *   前导参数由后端 `generateEnumConstructor` 统一补齐），两份实现会逐渐漂移。
      */
-    private fun addDefaultConstructor(irCls: IrClass) {
+    private fun addDefaultConstructor(irCls: IrClass, ctx: TranslationContext) {
         val defaultCtorSymbol = IrConstructorSymbolImpl()
         val defaultCtor = factory.createConstructor(
             0, 0, IrDeclarationOrigin.DEFINED,
@@ -1340,9 +1345,28 @@ class JasperToIrTranslator {
             defaultCtorSymbol, true, false, null
         )
         val defaultCtorBody = factory.createBlockBody(0, 0)
+        (defaultCtorBody.statements as MutableList<IrStatement>).addAll(translateInstanceFieldInitializers(ctx))
         defaultCtor.body = defaultCtorBody
         irCls.declarations.add(defaultCtor)
     }
+
+    /** 从成员表取出带声明初值的实例字段，顺序即声明顺序（也是运行时的求值顺序）。 */
+    private fun instanceFieldInitializersOf(members: List<JasDeclaration>): List<JasProperty> =
+        members.filterIsInstance<JasProperty>().filter { it.initializer != null && !hasModifier(it.modifiers, "static") }
+
+    /**
+     * 做什么：把当前类型的实例字段初始化器翻译成 `this.f = 初值` 语句序列。
+     * 什么时候用：每个不委托 this(...) 的构造器，在 super 调用之后、构造器体之前。
+     * 前置条件：必须在登记本构造器形参之前调用：初值不在形参作用域内，同名形参不得遮蔽字段。
+     * 失败模式：不抛异常；类型不符已由检查器在声明处诊断。
+     * 为什么走赋值语句：与构造器体内手写的赋值共用同一条字段写入路径（宽化、装箱、引用转换）。
+     *   每个构造器各翻译一次（与 javac 把初值内联进每个构造器一致），初值里的 lambda
+     *   因此每个构造器各生成一个类，语义相同。
+     */
+    private fun translateInstanceFieldInitializers(ctx: TranslationContext): List<IrStatement> =
+        ctx.instanceFieldInitializers.map { prop ->
+            translateAssignment(JasAssignment(JasPropertyAccess(JasIdentifier("this"), prop.name), prop.initializer!!), ctx)
+        }
 
     private fun translateConstructor(ctor: JasConstructor, classSymbol: IrClassSymbol, ctx: TranslationContext): IrConstructor {
         val ctorSymbol = IrConstructorSymbolImpl()
@@ -1357,6 +1381,8 @@ class JasperToIrTranslator {
             ctorSymbol,
             true, false, null
         )
+        // this(...) 委托时字段由目标构造器初始化，这里再跑一次会重复求值初值的副作用。
+        val fieldInitializers = if (ctor.delegateCall?.isSuper == false) emptyList() else translateInstanceFieldInitializers(ctx)
         for ((i, param) in ctor.parameters.withIndex()) {
             val paramType = typeMapper.mapType(param.type)
             val paramSymbol = IrValueParameterSymbolImpl()
@@ -1410,6 +1436,7 @@ class JasperToIrTranslator {
             )
             (body.statements as MutableList<IrStatement>).add(delegateCallExpr)
         }
+        (body.statements as MutableList<IrStatement>).addAll(fieldInitializers)
         if (ctor.body != null) {
             (body.statements as MutableList<IrStatement>).addAll(translateStatementSequence(ctor.body!!.statements, ctx))
         }
@@ -1557,6 +1584,8 @@ class JasperToIrTranslator {
         // 常量符号必须复用预登记的那一份（同一声明/使用共享身份）；缺失时补建，兼容直接
         // 调用 translateEnum 而没走预登记的内部路径。
         val constantSymbols = ctx.enumConstantSymbolsByType.getOrPut(qualifiedClassName) { mutableMapOf() }
+        val previousFieldInitializers = ctx.instanceFieldInitializers
+        ctx.instanceFieldInitializers = instanceFieldInitializersOf(enum.members)
         for (const in enum.constants) {
             irCls.declarations.add(translateEnumConstant(const, constantSymbols))
         }
@@ -1573,8 +1602,9 @@ class JasperToIrTranslator {
         // 枚举的 JVM 构造器必须存在：后端会在 <clinit> 中用 (String,int[,用户参数]) 调用它。
         // 没有显式构造器时补默认无参构造器（后端自动补 (name,ordinal) 前导参数）。
         if (enum.members.none { it is JasConstructor }) {
-            addDefaultConstructor(irCls)
+            addDefaultConstructor(irCls, ctx)
         }
+        ctx.instanceFieldInitializers = previousFieldInitializers
         ctx.currentClassName = previousClassName
         return irCls
     }
@@ -1662,7 +1692,7 @@ class JasperToIrTranslator {
         val propType = ctx.fieldTypesByClass[ctx.currentClassName]?.get(prop.name) ?: typeMapper.mapType(prop.type)
         // 静态性只由声明修饰符决定（接口常量走独立入口）。它同时影响三处：
         // 字段的 ACC_STATIC、字段符号是否进入 staticFieldSymbols（决定 GETSTATIC/PUTSTATIC），
-        // 以及声明初值是进 <clinit> 还是按实例字段忽略。
+        // 以及声明初值是进 <clinit> 还是进构造器。
         val isStatic = hasModifier(prop.modifiers, "static")
         val isFinal = prop.isConst || hasModifier(prop.modifiers, "final")
         val fieldVisibility = declaredFieldVisibility(prop.modifiers)
@@ -1693,8 +1723,8 @@ class JasperToIrTranslator {
             // 静态字段的符号必须进入该集合：后端据此发 GETSTATIC/PUTSTATIC、加 ACC_STATIC，
             // 并把声明初值放进 <clinit>。漏登记正是 Q17 三个探针 NPE 的根因。
             ctx.staticFieldSymbols.add(fieldSymbol)
-            // 声明初值只对静态字段生效；实例字段仍按既有语义在构造器里赋值。
-            // 后端会对 final 字面量写 ConstantValue，对非 final / 非字面量写 <clinit>。
+            // 这里只处理静态字段的声明初值：后端对 final 字面量写 ConstantValue，对其余写 <clinit>。
+            // 实例字段的初值由每个构造器发射（translateInstanceFieldInitializers）。
             if (prop.initializer != null) {
                 irField.initializer = factory.createExpressionBody(
                     0, 0, translateExpression(prop.initializer!!, ctx)

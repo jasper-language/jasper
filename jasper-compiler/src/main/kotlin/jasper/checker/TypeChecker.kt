@@ -430,6 +430,22 @@ class TypeChecker(
     }
 
     /**
+     * 做什么：检查字段声明处的初值：可推断，且可赋给声明类型。
+     * 什么时候用：类、枚举、接口的字段 / 常量声明。
+     * 前置条件：env 是声明所在类型的环境，且只含此前声明的字段。
+     * 失败模式：不抛异常；不兼容时追加诊断。没有声明类型的字段不比较（类型缺失另有处理）。
+     * 为什么需要：初值现在真的会运行；不查的话类型不符只会变成类加载期的 VerifyError。
+     */
+    private fun checkFieldInitializer(prop: JasProperty, env: TypeEnvironment) {
+        val initializer = prop.initializer ?: return
+        val initType = inferExpression(initializer, env, prop.type)
+        val declared = prop.type
+        if (declared != null && initType != null && !typesCompatible(initType, declared)) {
+            error("Type mismatch: cannot assign ${typeDisplayName(initType)} to field '${prop.name}' of type ${typeDisplayName(declared)}", prop)
+        }
+    }
+
+    /**
      * 校验「接口/枚举/注解」成员的显式类型引用。
      *
      * 做什么：对属性/注解成员校验其声明类型，对函数校验形参与返回类型（并登记其
@@ -444,7 +460,10 @@ class TypeChecker(
     private fun checkMemberTypeReferences(member: JasDeclaration, env: TypeEnvironment) {
         when (member) {
             // 接口/枚举/注解成员的声明类型都是「值位置」，错误类型不得在此出现。
-            is JasProperty -> checkDeclaredType(member.type, env)
+            is JasProperty -> {
+                checkDeclaredType(member.type, env)
+                checkFieldInitializer(member, env)
+            }
             is JasFunction -> {
                 val memberEnv = env.copy()
                 checkTypeParameters(member.typeParameters, memberEnv, "method '${member.name}'")
@@ -917,6 +936,8 @@ class TypeChecker(
                         error("Duplicate member '${member.name}' in class '${cls.name}'", member)
                     }
                     checkDeclaredType(member.type, clsEnv)
+                    // 先查初值再登记字段：初值里用简单名读自身或后声明的字段会读到零值，按未解析诊断。
+                    checkFieldInitializer(member, clsEnv)
                     clsEnv.set(member.name, member.type)
                 }
                 is JasFunction -> {
