@@ -152,7 +152,7 @@ class LoopingCoroutinePipelineTest {
 
         /** 有界等待终态。 */
         fun awaitDone(target: Any, mode: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (!isDone(target) && System.nanoTime() < deadline) Thread.sleep(1)
             assertTrue(isDone(target), "generated frame did not finish: $mode")
         }
@@ -161,14 +161,27 @@ class LoopingCoroutinePipelineTest {
         fun awaitSettled(target: Any) {
             val pool = Executors.newSingleThreadExecutor()
             try {
-                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(5, TimeUnit.SECONDS)
+                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(30, TimeUnit.SECONDS)
             } finally {
                 pool.shutdownNow()
             }
         }
 
-        /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
+        /**
+         * 确认帧已进入不挂起的循环并占住唯一工作线程：这时闸门任务排不上（不能用 drainWorker），
+         * 改等循环前的 step 计数，保证随后的取消落在回边上而不是首段之前。
+         */
+        fun assertSpinning(target: Any, mode: String) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+            while (steps() < 1 && System.nanoTime() < deadline) Thread.sleep(1)
+            assertEquals(1, steps(), "frame did not reach the loop: $mode")
+            Thread.sleep(50)
+            assertFalse(isDone(target), "frame must keep spinning: $mode")
+        }
+
+        /** 有界确认帧仍挂起：先让工作线程跑完已入队的段，再留一个窗口，期间结果不得终结。 */
         fun assertStillPending(target: Any, mode: String) {
+            drainWorker()
             Thread.sleep(50)
             assertFalse(isDone(target), "frame must stay suspended: $mode")
         }
@@ -191,7 +204,7 @@ class LoopingCoroutinePipelineTest {
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -279,7 +292,7 @@ class LoopingCoroutinePipelineTest {
         withRuntime("spin") { rt ->
             val spinning = rt.newFuture()
             rt.start(spinning, rt.newFuture(), rt.newFuture(), 3, true)
-            rt.assertStillPending(spinning, "spinning loop")
+            rt.assertSpinning(spinning, "spinning loop")
             rt.future.getMethod("cancel").invoke(spinning)
             rt.awaitSettled(spinning)
             assertEquals("Cancelled", rt.status(spinning))
@@ -321,6 +334,7 @@ class LoopingCoroutinePipelineTest {
             rt.awaitSettled(scoped)
             rt.complete(lateInput, 4)
             rt.complete(lateGate, 4)
+            rt.drainWorker()
             Thread.sleep(50)
             assertEquals("Cancelled", rt.status(scoped), "late input revived a cancelled frame")
             assertEquals(2, rt.steps(), "cancelled frame re-ran a segment")

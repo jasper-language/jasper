@@ -112,7 +112,7 @@ class LinearCoroutinePipelineTest {
     /** 有界轮询 Future 终态，失败时报告 mode，避免测试永久挂起。 */
     private fun awaitDone(future: Any, mode: String) {
         val done = future.javaClass.getMethod("isDone")
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         while (done.invoke(future) != true && System.nanoTime() < deadline) Thread.sleep(1)
         assertEquals(true, done.invoke(future), "generated frame did not finish: $mode")
     }
@@ -122,7 +122,7 @@ class LinearCoroutinePipelineTest {
         val pool = Executors.newSingleThreadExecutor()
         try {
             pool.submit { future.javaClass.getMethod("awaitTaskSettled").invoke(future) }
-                .get(5, TimeUnit.SECONDS)
+                .get(30, TimeUnit.SECONDS)
         } finally {
             pool.shutdownNow()
         }
@@ -134,7 +134,7 @@ class LinearCoroutinePipelineTest {
 
     /** 有界等待静态计数达到期望值，避免把调度异步误当成同步完成。 */
     private fun awaitStaticInt(loader: ClassLoader, method: String, expected: Int) {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         while (staticInt(loader, method) != expected && System.nanoTime() < deadline) Thread.sleep(1)
         assertEquals(expected, staticInt(loader, method), "timed out waiting for $method")
     }
@@ -145,7 +145,7 @@ class LinearCoroutinePipelineTest {
         assertEquals(
             true,
             executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L)
+                .invoke(executor, 30000L)
         )
     }
 

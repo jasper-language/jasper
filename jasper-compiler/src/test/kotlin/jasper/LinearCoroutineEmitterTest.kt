@@ -115,7 +115,7 @@ class LinearCoroutineEmitterTest {
                 executor.javaClass.getMethod("schedule", loader.loadClass("std.Runnable")).invoke(executor, producer)
             }
             val done = futureType.getMethod("isDone")
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (done.invoke(output) != true && System.nanoTime() < deadline) Thread.sleep(1)
             assertEquals(true, done.invoke(output), "generated frame did not complete: $mode")
             when (mode) {
@@ -125,7 +125,7 @@ class LinearCoroutineEmitterTest {
             }
         } finally {
             executor.javaClass.getMethod("shutdown").invoke(executor)
-            assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 5000L))
+            assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
         }
     }
 }

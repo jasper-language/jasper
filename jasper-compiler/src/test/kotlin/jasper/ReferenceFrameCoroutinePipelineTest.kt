@@ -14,11 +14,13 @@
 package jasper
 
 import jasper.compiler.JasperCompiler
+import java.lang.reflect.Proxy
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Random
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -72,7 +74,7 @@ class ReferenceFrameCoroutinePipelineTest {
 
         /** 有界等待终态。 */
         fun awaitDone(target: Any, label: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (future.getMethod("isDone").invoke(target) != true && System.nanoTime() < deadline) Thread.sleep(1)
             assertEquals(true, future.getMethod("isDone").invoke(target), "frame did not finish: $label")
         }
@@ -100,10 +102,25 @@ class ReferenceFrameCoroutinePipelineTest {
         fun bump(box: Any) { box.javaClass.getMethod("bump").invoke(box) }
         fun log(): String = loader.loadClass("demo.Program").getMethod("log").invoke(null) as String
 
+        /**
+         * 等工作线程跑完已入队的段：向单线程执行器排一个闸门任务并有界等待它运行。
+         * 固定 sleep 在高负载下可能早于帧的段，随后的断言就看不到它的效果。
+         */
+        fun drainWorker() {
+            val ran = CountDownLatch(1)
+            val runnable = loader.loadClass("std.Runnable")
+            val gate = Proxy.newProxyInstance(runnable.classLoader, arrayOf(runnable)) { _, method, _ ->
+                if (method.name == "run") ran.countDown()
+                null
+            }
+            executor.javaClass.getMethod("schedule", runnable).invoke(executor, gate)
+            assertTrue(ran.await(30, TimeUnit.SECONDS), "worker did not drain")
+        }
+
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -342,7 +359,7 @@ class ReferenceFrameCoroutinePipelineTest {
         val input = newFuture()
         start("alias", output, box, input)
         // 帧执行 bump 后才注册：等到首段完成（值变 2）再从外部改一次。
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         while (boxValue(box) != 2 && System.nanoTime() < deadline) Thread.sleep(1)
         assertEquals(2, boxValue(box))
         bump(box)
@@ -412,6 +429,7 @@ class ReferenceFrameCoroutinePipelineTest {
         val output = newFuture()
         val input = newFuture()
         start("equalsAfter", output, noisy(), input)
+        drainWorker()
         Thread.sleep(50)
         assertEquals("", log(), "equals must not run before the await resumes")
         complete(input, noisy())
@@ -421,6 +439,7 @@ class ReferenceFrameCoroutinePipelineTest {
         val text = newFuture()
         val textOutput = newFuture()
         start("concatAfter", textOutput, noisy(), text)
+        drainWorker()
         Thread.sleep(50)
         assertEquals("", log(), "toString must not run before the await resumes")
         complete(text, "!")

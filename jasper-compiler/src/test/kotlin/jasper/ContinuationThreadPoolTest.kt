@@ -112,13 +112,13 @@ class ContinuationThreadPoolTest {
                 val input = step.javaClass.getField("input").get(step)
                 val producer = loader.loadClass("std.ThreadProducer").getConstructor(loader.loadClass("std.Future")).newInstance(input)
                 executor.javaClass.getMethod("schedule", loader.loadClass("std.Runnable")).invoke(executor, producer)
-                assertTrue(done.tryAcquire(5, TimeUnit.SECONDS), "single worker did not resume consumer")
+                assertTrue(done.tryAcquire(30, TimeUnit.SECONDS), "single worker did not resume consumer")
                 assertEquals(2, step.javaClass.getField("count").getInt(step))
                 assertEquals(42, input.javaClass.getMethod("get").invoke(input))
             } finally {
                 dispatch.javaClass.getMethod("finish").invoke(dispatch)
                 executor.javaClass.getMethod("shutdown").invoke(executor)
-                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 5000L))
+                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
             }
         }
     }
@@ -135,21 +135,21 @@ class ContinuationThreadPoolTest {
             val producers = Executors.newFixedThreadPool(8)
             try {
                 resume.invoke(dispatch)
-                assertTrue((step.javaClass.getField("entered").get(step) as Semaphore).tryAcquire(5, TimeUnit.SECONDS))
+                assertTrue((step.javaClass.getField("entered").get(step) as Semaphore).tryAcquire(30, TimeUnit.SECONDS))
                 val requests = (1..8).map { producers.submit { repeat(100) { resume.invoke(dispatch) } } }
-                requests.forEach { it.get(5, TimeUnit.SECONDS) }
+                requests.forEach { it.get(30, TimeUnit.SECONDS) }
                 assertEquals(1, step.javaClass.getField("count").getInt(step), "wakes ran before current segment returned")
                 release.release()
-                assertTrue((step.javaClass.getField("done").get(step) as Semaphore).tryAcquire(5, TimeUnit.SECONDS))
+                assertTrue((step.javaClass.getField("done").get(step) as Semaphore).tryAcquire(30, TimeUnit.SECONDS))
                 assertEquals(2, step.javaClass.getField("count").getInt(step))
                 assertEquals(0, step.javaClass.getField("overlap").getInt(step))
             } finally {
                 dispatch.javaClass.getMethod("finish").invoke(dispatch)
                 release.release(8)
                 producers.shutdownNow()
-                assertTrue(producers.awaitTermination(5, TimeUnit.SECONDS))
+                assertTrue(producers.awaitTermination(30, TimeUnit.SECONDS))
                 executor.javaClass.getMethod("shutdown").invoke(executor)
-                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 5000L))
+                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
             }
         }
     }

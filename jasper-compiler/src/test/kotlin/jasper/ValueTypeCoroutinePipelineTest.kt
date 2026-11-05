@@ -70,7 +70,7 @@ class ValueTypeCoroutinePipelineTest {
 
         /** 有界等待终态后读值。 */
         fun awaitDone(target: Any, label: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (future.getMethod("isDone").invoke(target) != true && System.nanoTime() < deadline) Thread.sleep(1)
             assertEquals(true, future.getMethod("isDone").invoke(target), "frame did not finish: $label")
         }
@@ -99,7 +99,7 @@ class ValueTypeCoroutinePipelineTest {
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 

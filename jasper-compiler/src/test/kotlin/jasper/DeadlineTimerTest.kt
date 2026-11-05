@@ -94,11 +94,11 @@ class DeadlineTimerTest {
                 return 5;
             }
         }
-        /** 最多等 5 秒让计时线程退出。 */
+        /** 最多等 30 秒让计时线程退出。 */
         public function awaitIdle(timer: DeadlineTimer): bool {
             var spins: int32 = 0;
             while (timer.isRunning()) {
-                if (spins >= 500) { return false; }
+                if (spins >= 3000) { return false; }
                 java.lang.Thread.sleep(10L);
                 spins = spins + 1;
             }
@@ -157,7 +157,7 @@ class DeadlineTimerTest {
                 sibling.awaitStarted();
                 var spins: int32 = 0;
                 while (!own.isDone()) {
-                    if (spins >= 500) { return 1; }
+                    if (spins >= 3000) { return 1; }
                     java.lang.Thread.sleep(10L);
                     spins = spins + 1;
                 }

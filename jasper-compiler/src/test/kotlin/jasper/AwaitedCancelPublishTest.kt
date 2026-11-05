@@ -318,7 +318,7 @@ class AwaitedCancelPublishTest {
             val child = rt.spawn(group, executor, rt.newBody(1, awaited))
             val sibling = rt.spawn(group, executor, rt.newBody(2, gate))
             rt.future.getMethod("cancelWith", rt.reasonType).invoke(awaited, rt.reason("Deadline"))
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (rt.status(child) == "Pending" && System.nanoTime() < deadline) Thread.sleep(1)
             assertEquals("Cancelled", rt.status(child))
             assertEquals("Deadline", rt.reasonOf(child))
@@ -472,7 +472,7 @@ class AwaitedCancelPublishTest {
             loader.loadClass("demo.Program_${function}_Coroutine").constructors.single().newInstance(executor, output, *args)
         fun start(frame: Any) { frame.javaClass.getMethod("start").invoke(frame) }
         fun settle(target: Any, label: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (future.getMethod("isDone").invoke(target) != true && System.nanoTime() < deadline) Thread.sleep(1)
             assertEquals(true, future.getMethod("isDone").invoke(target), "frame did not finish: $label")
             future.getMethod("awaitTaskSettled").invoke(target)

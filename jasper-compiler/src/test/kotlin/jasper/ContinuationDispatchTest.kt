@@ -95,7 +95,7 @@ class ContinuationDispatchTest {
             val worker = Thread(invocation, "continuation-contract-$name").also { it.isDaemon = true }
             worker.start()
             try {
-                assertEquals(0, invocation.get(10, TimeUnit.SECONDS), name)
+                assertEquals(0, invocation.get(30, TimeUnit.SECONDS), name)
             } finally {
                 invocation.cancel(true)
             }

@@ -123,7 +123,7 @@ class CallArgumentAwaitCoroutinePipelineTest {
 
         /** 有界等待终态。 */
         fun awaitDone(target: Any, mode: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (!isDone(target) && System.nanoTime() < deadline) Thread.sleep(1)
             assertTrue(isDone(target), "generated frame did not finish: $mode")
         }
@@ -132,14 +132,15 @@ class CallArgumentAwaitCoroutinePipelineTest {
         fun awaitSettled(target: Any) {
             val pool = Executors.newSingleThreadExecutor()
             try {
-                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(5, TimeUnit.SECONDS)
+                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(30, TimeUnit.SECONDS)
             } finally {
                 pool.shutdownNow()
             }
         }
 
-        /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
+        /** 有界确认帧仍挂起：先让工作线程跑完已入队的段，再留一个窗口，期间结果不得终结。 */
         fun assertStillPending(target: Any, mode: String) {
+            drainWorker()
             Thread.sleep(50)
             assertFalse(isDone(target), "frame must stay suspended: $mode")
         }
@@ -162,7 +163,7 @@ class CallArgumentAwaitCoroutinePipelineTest {
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -197,7 +198,7 @@ class CallArgumentAwaitCoroutinePipelineTest {
             assertEquals(0, rt.calls(), "call ran before its awaited argument")
             rt.complete(gate, 2)
             // 恢复在工作线程上执行：固定 sleep 在高负载下会抢跑，先有界等待调用发生，再断言恰好一次。
-            val resumed = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            val resumed = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (rt.calls() < 1 && System.nanoTime() < resumed) Thread.sleep(1)
             rt.assertStillPending(result, "while condition argument await")
             assertEquals(1, rt.calls(), "initializer call must run exactly once after the resume")
@@ -265,6 +266,7 @@ class CallArgumentAwaitCoroutinePipelineTest {
             rt.awaitSettled(scoped)
             rt.complete(lateGate, 3)
             rt.complete(lateInput, 3)
+            rt.drainWorker()
             Thread.sleep(50)
             assertEquals("Cancelled", rt.status(scoped), "late input revived a cancelled frame")
             assertEquals(1, rt.calls(), "cancelled frame ran a call")

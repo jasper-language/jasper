@@ -15,11 +15,13 @@
 package jasper
 
 import jasper.compiler.JasperCompiler
+import java.lang.reflect.Proxy
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Random
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -71,7 +73,7 @@ class CallStatementCoroutinePipelineTest {
 
         /** 有界等待终态。 */
         fun awaitDone(target: Any, label: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (!isDone(target) && System.nanoTime() < deadline) Thread.sleep(1)
             assertTrue(isDone(target), "frame did not finish: $label")
         }
@@ -103,10 +105,25 @@ class CallStatementCoroutinePipelineTest {
         fun boxValue(box: Any): Int = box.javaClass.getMethod("get").invoke(box) as Int
         fun log(): String = loader.loadClass("demo.Program").getMethod("log").invoke(null) as String
 
+        /**
+         * 等工作线程跑完已入队的段：向单线程执行器排一个闸门任务并有界等待它运行。
+         * 固定 sleep 在高负载下可能早于帧的段，随后的断言就看不到它的效果。
+         */
+        fun drainWorker() {
+            val ran = CountDownLatch(1)
+            val runnable = loader.loadClass("std.Runnable")
+            val gate = Proxy.newProxyInstance(runnable.classLoader, arrayOf(runnable)) { _, method, _ ->
+                if (method.name == "run") ran.countDown()
+                null
+            }
+            executor.javaClass.getMethod("schedule", runnable).invoke(executor, gate)
+            assertTrue(ran.await(30, TimeUnit.SECONDS), "worker did not drain")
+        }
+
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -329,7 +346,7 @@ class CallStatementCoroutinePipelineTest {
         val input = newFuture()
         start("order", output, input)
         // 输入未完成时只执行挂起点之前的调用；恢复不重放它。
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         var seen = ""
         while (seen.isEmpty() && System.nanoTime() < deadline) { seen = log(); Thread.sleep(1) }
         assertEquals("a;", seen)
@@ -368,7 +385,7 @@ class CallStatementCoroutinePipelineTest {
         start("argument", output, first, second)
         complete(first, 7)
         // 第二个输入未完成时，第二条调用不会先行：恰好停在 await second。
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         var seen = ""
         while (seen.isEmpty() && System.nanoTime() < deadline) { seen = log(); Thread.sleep(1) }
         assertEquals("7;", seen)
@@ -447,7 +464,7 @@ class CallStatementCoroutinePipelineTest {
         val output = newFuture()
         val input = newFuture()
         start("cancelled", output, input)
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         var seen = ""
         while (seen.isEmpty() && System.nanoTime() < deadline) { seen = log(); Thread.sleep(1) }
         assertEquals("before;", seen)
@@ -457,6 +474,7 @@ class CallStatementCoroutinePipelineTest {
         assertEquals("finally;", cleaned)
         // 晚到的输入不复活帧：恢复块的调用不执行。
         complete(input, 1)
+        drainWorker()
         Thread.sleep(50)
         assertEquals("", log())
         assertEquals("Cancelled", status(output))

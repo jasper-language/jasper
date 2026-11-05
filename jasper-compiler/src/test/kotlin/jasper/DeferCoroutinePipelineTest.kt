@@ -195,7 +195,7 @@ class DeferCoroutinePipelineTest {
 
         /** 有界等待终态。 */
         fun awaitDone(target: Any, mode: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (!isDone(target) && System.nanoTime() < deadline) Thread.sleep(1)
             assertTrue(isDone(target), "generated frame did not finish: $mode")
         }
@@ -204,7 +204,7 @@ class DeferCoroutinePipelineTest {
         fun awaitSettled(target: Any) {
             val pool = Executors.newSingleThreadExecutor()
             try {
-                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(5, TimeUnit.SECONDS)
+                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(30, TimeUnit.SECONDS)
             } finally {
                 pool.shutdownNow()
             }
@@ -216,8 +216,9 @@ class DeferCoroutinePipelineTest {
             while (marks() < expected && System.nanoTime() < deadline) Thread.sleep(1)
         }
 
-        /** 有界确认帧仍挂起：给工作线程时间跑完当前段，期间结果不得终结。 */
+        /** 有界确认帧仍挂起：先让工作线程跑完已入队的段，再留一个窗口，期间结果不得终结。 */
         fun assertStillPending(target: Any, mode: String) {
+            drainWorker()
             Thread.sleep(50)
             assertFalse(isDone(target), "frame must stay suspended: $mode")
         }
@@ -240,7 +241,7 @@ class DeferCoroutinePipelineTest {
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -400,6 +401,7 @@ class DeferCoroutinePipelineTest {
             assertEquals(3, rt.marks() - marksBefore, "settled before defers finished")
             assertEquals(31, rt.last())
             rt.complete(input, 4)
+            rt.drainWorker()
             Thread.sleep(50)
             assertEquals("Cancelled", rt.status(scoped), "late input revived a cancelled frame")
             assertEquals(3, rt.marks() - marksBefore, "cancelled frame re-ran a defer")

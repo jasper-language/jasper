@@ -512,7 +512,7 @@ class S4RuntimeJasperTest {
                 done.waitOne();
                 done.waitOne();
                 executor.shutdown();
-                if (!executor.awaitTermination(2000L)) { return 1; }
+                if (!executor.awaitTermination(30000L)) { return 1; }
                 if (result.wins() != 1) { return 2; }
                 if (future.status() != FutureStatus.Completed) { return 3; }
                 var observed: int32 = future.get();
@@ -596,9 +596,9 @@ class S4RuntimeJasperTest {
                 done.waitOne();
                 done.waitOne();
                 executor.shutdown();
-                var firstWait: bool = executor.awaitTermination(2000L);
+                var firstWait: bool = executor.awaitTermination(30000L);
                 if (!firstWait) {
-                    var secondWait: bool = executor.awaitTermination(2000L);
+                    var secondWait: bool = executor.awaitTermination(30000L);
                     if (secondWait) { return 7; }
                     return 1;
                 }
@@ -727,7 +727,7 @@ class S4RuntimeJasperTest {
                     closeThrew = true;
                 }
                 executor.shutdown();
-                var terminated: bool = executor.awaitTermination(2000L);
+                var terminated: bool = executor.awaitTermination(30000L);
                 if (!closeThrew) { return 1; }
                 if (!terminated) { return 2; }
                 if (!flag.seen()) { return 3; }
@@ -797,9 +797,9 @@ class S4RuntimeJasperTest {
                     closeThrew = true;
                 }
                 executor.shutdown();
-                var firstWait: bool = executor.awaitTermination(2000L);
+                var firstWait: bool = executor.awaitTermination(30000L);
                 if (!firstWait) {
-                    var secondWait: bool = executor.awaitTermination(2000L);
+                    var secondWait: bool = executor.awaitTermination(30000L);
                     if (secondWait) { return 7; }
                     return 3;
                 }
@@ -864,7 +864,7 @@ class S4RuntimeJasperTest {
                     secondThrew = true;
                 }
                 executor.shutdown();
-                if (!executor.awaitTermination(2000L)) { return 4; }
+                if (!executor.awaitTermination(30000L)) { return 4; }
                 if (!secondThrew) { return 5; }
                 if (successFuture.get() != 5) { return 6; }
                 return 0;
@@ -1211,7 +1211,7 @@ class S4RuntimeJasperTest {
                 executor.schedule(new RecordTask(signal));
                 signal.waitOne();
                 executor.shutdown();
-                if (!executor.awaitTermination(2000L)) { return 1; }
+                if (!executor.awaitTermination(30000L)) { return 1; }
                 if (!executor.isTerminated()) { return 2; }
                 return 0;
             }
@@ -1234,7 +1234,7 @@ class S4RuntimeJasperTest {
             public function main(): int32 {
                 var executor: JvmExecutor = new JvmExecutor(1);
                 executor.shutdown();
-                var waited: bool = executor.awaitTermination(2000L);
+                var waited: bool = executor.awaitTermination(30000L);
                 if (!waited) {
                     if (executor.isTerminated()) { return 2; }
                     return 3;

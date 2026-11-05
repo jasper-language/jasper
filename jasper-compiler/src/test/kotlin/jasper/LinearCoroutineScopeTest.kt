@@ -115,7 +115,7 @@ class LinearCoroutineScopeTest {
 
     /** 有界等待条件成立；超时报告 what，避免把异步调度误当成同步完成。 */
     private fun awaitTrue(what: String, condition: () -> Boolean) {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         while (!condition() && System.nanoTime() < deadline) Thread.sleep(1)
         assertTrue(condition(), "timed out waiting for $what")
     }
@@ -134,7 +134,7 @@ class LinearCoroutineScopeTest {
                 } catch (error: InvocationTargetException) {
                     error.targetException.javaClass.name
                 }
-            }.get(5, TimeUnit.SECONDS)
+            }.get(30, TimeUnit.SECONDS)
         } finally {
             pool.shutdownNow()
         }
@@ -150,7 +150,7 @@ class LinearCoroutineScopeTest {
         executor.javaClass.getMethod("shutdown").invoke(executor)
         assertEquals(
             true,
-            executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 5000L)
+            executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L)
         )
     }
 

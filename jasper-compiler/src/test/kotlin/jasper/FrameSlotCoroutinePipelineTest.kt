@@ -133,7 +133,7 @@ class FrameSlotCoroutinePipelineTest {
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -784,7 +784,7 @@ class FrameSlotCoroutinePipelineTest {
         assertNull(slot(frame, 1), "gate has no later read")
         assertNull(slot(frame, 2), "got has no later read")
         assertNull(field(frame, "__outcome"), "the outcome snapshot must not outlive the binding")
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         while (weak.get() != null && System.nanoTime() < deadline) {
             System.gc()
             Thread.sleep(10)

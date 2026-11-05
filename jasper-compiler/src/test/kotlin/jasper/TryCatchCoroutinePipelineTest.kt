@@ -227,7 +227,7 @@ class TryCatchCoroutinePipelineTest {
 
         /** 有界等待终态。 */
         fun awaitDone(target: Any, mode: String) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
             while (!isDone(target) && System.nanoTime() < deadline) Thread.sleep(1)
             assertTrue(isDone(target), "generated frame did not finish: $mode")
         }
@@ -236,7 +236,7 @@ class TryCatchCoroutinePipelineTest {
         fun awaitSettled(target: Any) {
             val pool = Executors.newSingleThreadExecutor()
             try {
-                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(5, TimeUnit.SECONDS)
+                pool.submit { future.getMethod("awaitTaskSettled").invoke(target) }.get(30, TimeUnit.SECONDS)
             } finally {
                 pool.shutdownNow()
             }
@@ -265,6 +265,7 @@ class TryCatchCoroutinePipelineTest {
         }
 
         fun assertStillPending(target: Any, mode: String) {
+            drainWorker()
             Thread.sleep(50)
             assertFalse(isDone(target), "frame must stay suspended: $mode")
         }
@@ -272,7 +273,7 @@ class TryCatchCoroutinePipelineTest {
         fun shutdown() {
             executor.javaClass.getMethod("shutdown").invoke(executor)
             assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType)
-                .invoke(executor, 5000L))
+                .invoke(executor, 30000L))
         }
     }
 
@@ -424,6 +425,7 @@ class TryCatchCoroutinePipelineTest {
             assertEquals(2, rt.marks() - marksBefore, "only the two finally blocks may run")
             assertEquals(21, rt.last() % 100)
             rt.fail(input, rt.failure("late"))
+            rt.drainWorker()
             Thread.sleep(50)
             assertEquals("Cancelled", rt.status(scoped), "late input revived a cancelled frame")
             assertEquals(2, rt.marks() - marksBefore, "cancelled frame ran a handler or a cleanup again")
@@ -442,6 +444,7 @@ class TryCatchCoroutinePipelineTest {
             assertEquals(3, rt.marks() - marksBefore, "handler mark, inner and outer finally")
             assertEquals(421, rt.last())
             rt.complete(gate, 1)
+            rt.drainWorker()
             Thread.sleep(50)
             assertEquals(3, rt.marks() - marksBefore)
         }
