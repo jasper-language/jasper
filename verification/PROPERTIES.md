@@ -155,3 +155,16 @@
 | 6 并发 | Lincheck | `N/A`：`FrameSlot` 无状态，帧字段由恢复门串行访问 | — | 串行性由 `ContinuationDispatch` 的模型与 Lincheck 负责；快照清空与自身回调的交错见第 1 步 | 替代证据：TLA+ 模型 |
 
 变异共 32 组，30 组被抓，存活 2 组为防御性读取检查，详见边界文档。
+
+## LANG-FIELD-INIT-01 实例字段声明初值（FV-B，Kotlin 编译器变换）
+
+源码身份：引入本节的提交；`JasperToIrTranslator.kt`（`translateInstanceFieldInitializers`、`addDefaultConstructor`、`translateConstructor`）、`TypeChecker.kt`（`checkFieldInitializer`）。
+
+性质：每个不委托 `this(...)` 的构造器在 super 调用之后、构造器体之前按声明顺序恰好求值每个实例字段初值一次；委托 `this(...)` 的构造器不求值；静态字段不进构造器；同名形参不遮蔽；初值类型不符与简单名前向引用在声明处诊断。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `FieldInitializerTest` 种子 20261105，60 个随机类（无构造器 / 显式 / this 委托 / 构造器体改写，两层继承）；判据由测试按规则独立计算，经副作用日志同时检查求值顺序与次数 |
+| 端到端 | 同一测试类共 17 项，每项编译、加载并运行 |
+| 变异 | 9 组全部被抓；`statics-included` 首轮存活，已加强用例后复跑；`checker-no-compat` 首轮变异体未通过编译，改写后复跑 |
+| 边界 | 枚举实例字段只验证了经枚举方法读取，外部读取 `E.A.f` 检查器仍不支持；经 `this.` 读后声明字段不诊断 |
