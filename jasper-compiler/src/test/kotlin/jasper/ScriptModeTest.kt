@@ -16,10 +16,10 @@ class ScriptModeTest {
 
     @Test
     fun `mode is selected by extension and explicit api only`() {
-        assertEquals(SourceMode.Strict, modeForFilename("App.jas"))
+        assertEquals(SourceMode.Module, modeForFilename("App.jas"))
         assertEquals(SourceMode.Script, modeForFilename("App.jass"))
         assertEquals(SourceMode.Script, modeForFilename("APP.JASS"))
-        assertEquals(SourceMode.Strict, modeForFilename("App.jss"))
+        assertEquals(SourceMode.Module, modeForFilename("App.jss"))
     }
 
     @Test

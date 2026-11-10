@@ -201,3 +201,21 @@
 | Lincheck | N/A：单线程编译变换 |
 | JBMC | 发版时验证 |
 | 边界 | `+=` 等复合赋值未在本片改动；帧内（协程）自增走同一翻译函数，未单独加帧用例 |
+
+## LANG-STRICT-LAYOUT-01 strict 选项：一文件一类型（FV-B，Kotlin 编译器前端）
+
+源码身份：引入本节的提交；`StrictLayout.kt`、`SourceMode.kt`（`CompileOptions`、`SourceMode.Module` 改名）、`JasperCompiler.kt`（`strictBeforeParse` / `strictAfterParse`、`compileAll` 中的 strict 分支、`wrapLegacyTopLevelMembers` / `lastHeaderSemicolonEnd`、命令行 `--strict`）、`StdLib.isBundled`。
+
+性质：strict 编译时，每个用户源文件恰好一个顶层类型且文件主名等于类型名；顶层语句与脚本单元报 STRICT-001，多余顶层类型 STRICT-002，裸顶层函数 STRICT-003，主名不符 STRICT-004，无类型 STRICT-005；随附标准库（名字与全文都相同）不受约束；不加 strict 时行为不变。兼容包装（非 strict）现在保持原文行号与列号，package / import 之间的注释不再把 import 推进类体（Q159）。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `StrictLayoutTest` 种子 20261110，150 个随机文件布局（类型数、裸函数数、顶层语句、脚本扩展名、主名是否相符、头部注释含分号）；诊断码集合由生成器独立计算，断言通过与拒绝两边各至少 15 例 |
+| 端到端 | 同一测试类 10 项：正例（含嵌套类型、接口 / 枚举、目录前缀文件名、单源码 API）、各码反例与位置、非 strict 不变、标准库豁免与同名冒充、Q159 行号、`--emit jaso --strict` |
+| 变异 | 6 组全部被抓（只跑本测试类）：标准库豁免只比名字、只报第三个起的多余类型、去掉脚本单元检查、主名忽略大小写、合成类开头另起一行（Q159 原行为）、header 扫描不跳过行注释 |
+| 批次全量 | 2026-11-10 compiler 122 类 4153 项 0 失败 1 跳过、jucs UP-TO-DATE、llvm 通过（含 Q222），lincheckTest 未跑（未改并发代码） |
+| 一致性语料 | 推迟到 Beta 1 收口：运行器不支持编译选项与依赖文件名的规则（用例名是 `<短名>.<kind>.jas`） |
+| Z3 | N/A：无算术约束 |
+| Lincheck | N/A：单线程前端 |
+| JBMC | 发版时验证 |
+| 边界 | 顶层字段在源码布局上被归为语句，报 STRICT-001 而不是 STRICT-003；`--run` 只运行已编译模块，不接受 `--strict` |

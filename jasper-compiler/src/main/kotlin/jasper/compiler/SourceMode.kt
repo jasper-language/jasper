@@ -8,17 +8,27 @@ import org.antlr.v4.runtime.Token
 /**
  * 源文件的顶层语法模式。
  *
- * `Strict` 是默认模式，只接受正式模块结构；`Script` 是显式脚本模式，
+ * `Module` 是默认模式（2026-11-10 前叫 `Strict`），拒绝顶层可执行语句；`Script` 是显式脚本模式，
  * 由 `.jass` 扩展名或显式编译 API 选择。模式不通过源码内容推断。
+ * 改名原因：「strict」现在专指 [CompileOptions.strict]（一文件一类型），两个「严格」会混淆。
  */
 enum class SourceMode {
-    Strict,
+    Module,
     Script
 }
 
-/** `.jass` 是脚本；其余（包括 `.jas`）默认严格。 */
+/** `.jass` 是脚本；其余（包括 `.jas`）是模块模式。 */
 fun modeForFilename(filename: String): SourceMode =
-    if (filename.endsWith(".jass", ignoreCase = true)) SourceMode.Script else SourceMode.Strict
+    if (filename.endsWith(".jass", ignoreCase = true)) SourceMode.Script else SourceMode.Module
+
+/**
+ * 一次编译的选项，作用于本次编译的全部用户源文件（即模块级生效），不从源码内容推断。
+ *
+ * @property strict 一文件一类型：每个源文件恰好一个顶层类型，文件主名等于类型名；
+ *   不接受脚本单元、裸顶层函数 / 字段、多个顶层类型（诊断码见 [StrictLayout]）。
+ *   标准库源码不受约束：它是平台的一部分，由编译器随附，不是用户模块。
+ */
+data class CompileOptions(val strict: Boolean = false)
 
 /**
  * 一个已切分的顶层条目。

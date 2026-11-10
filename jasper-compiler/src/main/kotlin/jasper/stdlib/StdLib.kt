@@ -165,6 +165,14 @@ object StdLib {
      *
      * The `.jaso` reader sources keyed by their synthetic file name.
      */
+    /**
+     * [name] 与 [source] 是否正是随编译器附带的标准库文件（名字与全文都相同）。
+     * 什么时候用：strict 选项只约束用户源文件，标准库是平台的一部分，不按一文件一类型拆分。
+     * 为什么连内容一起比：只比名字时，用户可以起一个同名文件绕开 strict。
+     */
+    fun isBundled(name: String, source: String): Boolean =
+        (name in FILES || name in JASO_FILES) && read(name) == source
+
     fun jasoSources(): Map<String, String> {
         val out = LinkedHashMap<String, String>()
         for (file in JASO_FILES) {

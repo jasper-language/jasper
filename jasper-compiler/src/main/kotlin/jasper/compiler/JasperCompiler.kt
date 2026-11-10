@@ -30,7 +30,7 @@ package jasper.compiler
  *     统一返回 CompileResult（Success 或 Error）；异常只出现在内部阶段；
  *   - compileToPipeline 成功返回 CompilePipeline，失败抛 CompileException（携带
  *     多阶段聚合后的全部错误）；
- *   - main(args) 为 CLI：`jasperc <source-file> [-d <output-dir>]`，失败以退出码 1 结束。
+ *   - main(args) 为 CLI：`jasperc [--strict] <source-file> [-d <output-dir>]`，失败以退出码 1 结束。
  *
  * 扩展点 / 已知限制：
  *   - 预处理（preprocessSource / preprocessPower）用正则脱糖，是**已知的脆弱点**：
@@ -130,7 +130,10 @@ private fun normalizeLambdaParams(params: String): String {
  * 失败模式：公开方法自身不抛异常；内部 CompileException 会被转成 Error，
  * 其它异常被兜底成 CompileError.Internal。
  */
-class JasperCompiler {
+class JasperCompiler(
+    /** 本次编译的选项；默认与 2026-11-10 前行为完全相同（非 strict）。 */
+    val options: CompileOptions = CompileOptions()
+) {
 
     /**
      * 流水线的中间产物快照：源文本 + 最终 AST + IR 翻译结果 + 注解索引。
@@ -168,7 +171,7 @@ class JasperCompiler {
      * 单文件严格模式入口（默认）。脚本必须显式使用 [compileScript] 或 `.jass`。
      */
     fun compile(source: String): CompileResult {
-        return compile(source, SourceMode.Strict)
+        return compile(source, SourceMode.Module)
     }
 
     /**
@@ -189,8 +192,8 @@ class JasperCompiler {
      * 严格模式：`package/import + 顶层声明`；顶层裸语句直接报错。
      * 这是 `.jas` 与 `compile` 的默认语义。
      */
-    fun compileStrict(source: String): CompileResult {
-        return compile(source, SourceMode.Strict)
+    fun compileModule(source: String): CompileResult {
+        return compile(source, SourceMode.Module)
     }
 
     /**
@@ -229,7 +232,7 @@ class JasperCompiler {
      * 失败模式：同 [compileToDirWithIr]。
      */
     fun compileToDir(source: String, outputDir: Path): CompileResult {
-        return compileToDir(source, outputDir, SourceMode.Strict)
+        return compileToDir(source, outputDir, SourceMode.Module)
     }
 
     /** 显式模式的单文件落盘入口。 */
@@ -246,7 +249,7 @@ class JasperCompiler {
      * 失败模式：编译错误 → [CompileResult.Error]；IO/后端异常 → [CompileError.Internal] 兜底。
      */
     fun compileToDirWithIr(source: String, outputDir: Path): CompileResult {
-        return compileToDirWithIr(source, outputDir, SourceMode.Strict)
+        return compileToDirWithIr(source, outputDir, SourceMode.Module)
     }
 
     /** 显式模式的单文件编译与 IR→JVM 字节码写盘入口。 */
@@ -402,7 +405,7 @@ class JasperCompiler {
             val problems = JasoManifestText.validate(options).toMutableList()
             if (sources.isEmpty()) problems += CompileError.Symbol("A .jaso module needs at least one source file", "sources")
             for (file in sources.keys) {
-                if (modeForFilename(file) != SourceMode.Strict) problems += CompileError.Symbol("Script unit '$file' cannot be part of a module", file)
+                if (modeForFilename(file) != SourceMode.Module) problems += CompileError.Symbol("Script unit '$file' cannot be part of a module", file)
                 if (file in stdlib) problems += CompileError.Symbol("Source file name '$file' is taken by the standard library", file)
             }
             if (problems.isNotEmpty()) throw CompileException(problems)
@@ -483,16 +486,18 @@ class JasperCompiler {
      * 说明：本重载每次新建 SymbolTable 并注册内建；多文件场景请用 [compileAll]。
      */
     fun compileToPipeline(source: String): CompilePipeline {
-        return compileToPipeline(source, SourceMode.Strict)
+        return compileToPipeline(source, SourceMode.Module)
     }
 
     /** 显式模式的完整流水线入口。 */
     fun compileToPipeline(source: String, mode: SourceMode): CompilePipeline {
+        strictBeforeParse(null, mode, source)
         val prepared = prepareSource(source, mode)
         // 阶段一：文本脱糖（先 ** 再其它语法糖，顺序见 preprocessPower）。
         val processed = preprocessPower(preprocessSource(prepared))
         // 阶段二：两段式解析，失败会在此抛 CompileException。
         val parsed = parseSource(processed, mode)
+        strictAfterParse(null, parsed.ast)
 
         // Annotation processing phase: synthesize member signatures before type checking.
         // 阶段三：注解处理，在类型检查前合成 @Getter/@Setter 等成员签名。
@@ -567,10 +572,20 @@ class JasperCompiler {
         // 第一轮：逐文件预处理 + 解析 + 注解处理，并收集声明进共享符号表。
         for ((filename, source) in sources) {
             val mode = modes.getValue(filename)
+            // strict 只约束用户文件；布局不合格的文件不再解析，免得兼容包装的报错盖住真正原因。
+            val strictFile = options.strict && !StdLib.isBundled(filename, source)
+            if (strictFile) {
+                val layoutErrors = StrictLayout.beforeParse(filename, mode, source)
+                if (layoutErrors.isNotEmpty()) {
+                    allErrors += layoutErrors
+                    continue
+                }
+            }
             val prepared = prepareSource(source, mode)
             val processed = preprocessPower(preprocessSource(prepared))
             val result = parseSource(processed, mode)
-            if (mode == SourceMode.Strict) {
+            if (strictFile) allErrors += StrictLayout.afterParse(filename, result.ast)
+            if (mode == SourceMode.Module) {
                 allErrors += rejectScriptImports(filename, result.ast, sources.keys)
             }
             // Annotation processing phase: synthesize member signatures before type checking.
@@ -680,6 +695,20 @@ class JasperCompiler {
         return pipelines
     }
 
+    /** strict 时做解析前布局检查；有诊断就直接抛出（单文件入口没有可继续的其它文件）。 */
+    private fun strictBeforeParse(filename: String?, mode: SourceMode, source: String) {
+        if (!options.strict) return
+        val errors = StrictLayout.beforeParse(filename, mode, source)
+        if (errors.isNotEmpty()) throw CompileException(errors)
+    }
+
+    /** strict 时做解析后布局检查；单文件入口的布局诊断先于类型检查报告。 */
+    private fun strictAfterParse(filename: String?, ast: jasper.ast.JasSourceFile) {
+        if (!options.strict) return
+        val errors = StrictLayout.afterParse(filename, ast)
+        if (errors.isNotEmpty()) throw CompileException(errors)
+    }
+
     /**
      * 编辑器/文件 API 的模式准备入口：模式来自扩展名，不来自源码内容。
      */
@@ -690,14 +719,14 @@ class JasperCompiler {
     /**
      * 按已知模式准备源码。
      *
-     * `Strict` 只允许 package/import + 顶层声明；`Script` 仅把顶层可执行语句收进
+     * `Module` 只允许 package/import + 顶层声明；`Script` 仅把顶层可执行语句收进
      * 规范化 `main()`。两者之后都进入同一解析/检查/翻译流水线。
      */
     private fun prepareSource(source: String, mode: SourceMode): String {
         val layout = analyzeSourceLayout(source)
         return when (mode) {
             SourceMode.Script -> layout.asScriptSource(source)
-            SourceMode.Strict -> {
+            SourceMode.Module -> {
                 layout.firstExecutable?.let { item ->
                     throw CompileException(listOf(
                         CompileError.Syntax(
@@ -712,7 +741,7 @@ class JasperCompiler {
         }
     }
 
-    /** 严格模块不能依赖脚本入口；`.jass` 不是可复用库单元。 */
+    /** 模块单元不能依赖脚本入口；`.jass` 不是可复用库单元。 */
     private fun rejectScriptImports(
         filename: String,
         ast: jasper.ast.JasSourceFile,
@@ -733,7 +762,7 @@ class JasperCompiler {
             val targetStem = normalized.substringBeforeLast('.').substringAfterLast('/')
             if (normalized.endsWith(".jass", ignoreCase = true) || targetStem in scriptStems) {
                 CompileError.Symbol(
-                    "Strict module '$filename' cannot import script unit '$source'",
+                    "Module unit '$filename' cannot import script unit '$source'",
                     name = import.name,
                     line = import.sourceLine,
                     column = import.sourceColumn
@@ -752,15 +781,17 @@ class JasperCompiler {
      * 失败模式：聚合错误后抛 [CompileException]；成功返回 [CompilePipeline]。
      */
     fun compileToPipeline(source: String, symbolTable: SymbolTable): CompilePipeline {
-        return compileToPipeline(source, symbolTable, SourceMode.Strict)
+        return compileToPipeline(source, symbolTable, SourceMode.Module)
     }
 
     /** 复用外部符号表并显式选择源模式。 */
     fun compileToPipeline(source: String, symbolTable: SymbolTable, mode: SourceMode): CompilePipeline {
         // 复用调用方传入的符号表（不注册内建、不新建），声明直接并入。
+        strictBeforeParse(null, mode, source)
         val prepared = prepareSource(source, mode)
         val processed = preprocessPower(preprocessSource(prepared))
         val parsed = parseSource(processed, mode)
+        strictAfterParse(null, parsed.ast)
         // Annotation processing phase: synthesize member signatures before type checking.
         // 注解处理：在类型检查前合成成员签名。
         val annotated = AnnotationProcessor().process(parsed.ast)
@@ -808,7 +839,7 @@ class JasperCompiler {
      *   吞掉并落入第二段（见 try/catch）。
      */
     private fun parseSource(source: String, mode: SourceMode): ParsedSource {
-        if (mode == SourceMode.Strict) {
+        if (mode == SourceMode.Module) {
             analyzeSourceLayout(source).firstExecutable?.let { item ->
                 throw CompileException(listOf(
                     CompileError.Syntax(
@@ -898,22 +929,49 @@ class JasperCompiler {
      * 前置条件：仅用于解析兼容，最终由 [unwrapLegacyTopLevelMembers] 还原。
      */
     private fun wrapLegacyTopLevelMembers(source: String): String {
-        // (?s) 让 `.` 跨行；group1=前导注释/空白 + 可选 package 行，group2=import/from 行，group3=其余 body。
+        // (?s) 让 `.` 跨行；group1 = 前导空白 / 注释 + 可选 package + 其后任意多个 import / from、空白、注释，
+        // group2 = 其余 body。
         //
-        // ⚠️ 2026-10-17 修复（R2DBC 探针 #12）：原正则只允许 `\s*` 出现在 `package` 之前，
-        //    于是「文件头注释 + package + 多顶层类型」这种极常见写法会解析失败
-        //    （报 `mismatched input 'package' expecting ...`，错误信息完全看不出真实原因）。
-        //    这里把「空白 / 行注释 / 块注释」都纳入前导部分，并且**保留在 header 里**，
-        //    使注释仍然贴在文件顶部，而不是被吞掉。
+        // ⚠️ 2026-10-17 修复（R2DBC 探针 #12）：前导注释 + package + 多顶层类型曾解析失败。
+        // ⚠️ 2026-11-10 修复（Q159）：① package 与 import 之间、import 与 import 之间的注释此前不在
+        //    header 里，后面的 import 被包进类体，报错指向 import；现在 header 允许注释与导入交错。
+        //    ② 合成类的开头此前另起一行插入，body 里所有行号偏 1；现在插在 header 最后一个非空白
+        //    字符之后、同一行上，body 的行号与列号都与原文一致（只有无 header 时第一行列号右移）。
+        val trivia = """(?:[ \t\r\n]+|//[^\n]*\n?|/\*.*?\*/)"""
         val match = Regex(
-            """(?s)^((?:(?:[ \t\r\n]+)|(?://[^\n]*\n?)|(?:/\*.*?\*/))*(?:package\b[^;]*;\s*)?)""" +
-            """((?:\s*(?:import|from)\b[^;]*;\s*)*)(.*)$"""
+            """(?s)^($trivia*(?:package\b[^;]*;)?(?:$trivia|(?:import|from)\b[^;]*;)*)(.*)$"""
         )
             .matchEntire(source)
             ?: return source
-        val header = (match.groupValues[1] + match.groupValues[2])
-        val body = match.groupValues[3]
-        return header + "public class __JasperCompatTopLevel {\n" + body + "\n}"
+        val header = match.groupValues[1]
+        val body = match.groupValues[2]
+        val cut = lastHeaderSemicolonEnd(header)
+        val opener = "public class __JasperCompatTopLevel { "
+        return header.substring(0, cut) + (if (cut == 0) "" else " ") + opener + header.substring(cut) + body + "\n}"
+    }
+
+    /**
+     * header 里最后一条 package / import / from 语句的分号之后的位置；没有这类语句时为 0。
+     * 为什么手工扫描：分号也可能出现在注释里（`// a; b`），合成类开头必须插在代码里、
+     * 不能落进行注释；header 已由正则保证只由空白、注释和这几类语句组成。
+     */
+    private fun lastHeaderSemicolonEnd(header: String): Int {
+        var i = 0
+        var end = 0
+        while (i < header.length) {
+            when {
+                header[i].isWhitespace() -> i++
+                header.startsWith("//", i) -> i = header.indexOf('\n', i).let { if (it < 0) header.length else it + 1 }
+                header.startsWith("/*", i) -> i = header.indexOf("*/", i + 2).let { if (it < 0) header.length else it + 2 }
+                else -> {
+                    val semi = header.indexOf(';', i)
+                    if (semi < 0) return end
+                    i = semi + 1
+                    end = i
+                }
+            }
+        }
+        return end
     }
 
     /**
@@ -999,16 +1057,24 @@ class JasperCompiler {
  * 另有模块模式：`jasperc --emit jaso -o <文件> --name <名> --version <x.y.z> [选项] <源文件>...`，见 [emitJasoMain]；
  * 运行模块：`jasperc --run [选项] <模块名> [参数]...`，见 [runJasoMain]。
  */
-fun main(args: Array<String>) {
-    if (args.firstOrNull() == "--emit") {
-        System.exit(emitJasoMain(args.toList()))
+fun main(rawArgs: Array<String>) {
+    if (rawArgs.firstOrNull() == "--emit") {
+        System.exit(emitJasoMain(rawArgs.toList()))
     }
-    if (args.firstOrNull() == "--run") {
-        System.exit(runJasoMain(args.drop(1)))
+    if (rawArgs.firstOrNull() == "--run") {
+        System.exit(runJasoMain(rawArgs.drop(1)))
     }
+    compileMain(rawArgs)
+}
+
+/** 普通单文件编译的命令行：`jasperc [--strict] <source-file> [-d <output-dir>]`。 */
+private fun compileMain(rawArgs: Array<String>) {
+    // `--strict` 可出现在任意位置；其余参数按位置解析。
+    val strict = "--strict" in rawArgs
+    val args = rawArgs.filter { it != "--strict" }
     // 参数校验：至少一个源文件路径。
     if (args.isEmpty()) {
-        System.err.println("Usage: jasperc <source-file> [-d <output-dir>]")
+        System.err.println("Usage: jasperc [--strict] <source-file> [-d <output-dir>]")
         System.exit(1)
     }
 
@@ -1027,8 +1093,14 @@ fun main(args: Array<String>) {
     }
 
     val source = String(Files.readAllBytes(sourceFile))
-    val compiler = JasperCompiler()
-    val result = compiler.compileToDir(source, outputDir, modeForFilename(sourceFile.fileName.toString()))
+    val compiler = JasperCompiler(CompileOptions(strict = strict))
+    val fileName = sourceFile.fileName.toString()
+    val result = if (strict) {
+        // 文件名参与 STRICT-004，走带文件名的多文件入口（单文件也一样）。
+        compiler.compileAllToDir(mapOf(fileName to source), outputDir)
+    } else {
+        compiler.compileToDir(source, outputDir, modeForFilename(fileName))
+    }
 
     // 统一分派：成功打印到 stdout；失败打印到 stderr 并以退出码 1 结束。
     when (result) {
@@ -1069,7 +1141,7 @@ internal fun runJasoMain(args: List<String>): Int {
 
 private const val EMIT_USAGE = "Usage: jasperc --emit jaso -o <file> --name <name> --version <x.y.z> " +
     "[--description <text>] [--publisher <name>] [--runtime <range>] [--depends <dep>]... " +
-    "[--requires <capability>]... [--lifecycle plugin|system] [--module-path <paths>] <source-file>..."
+    "[--requires <capability>]... [--lifecycle plugin|system] [--module-path <paths>] [--strict] <source-file>..."
 
 /**
  * `--emit jaso` 的命令行：解析参数，编译一个模块，返回退出码。
@@ -1085,10 +1157,15 @@ internal fun emitJasoMain(args: List<String>): Int {
     val requires = mutableListOf<String>()
     val files = mutableListOf<String>()
     val singleOptions = setOf("--emit", "-o", "--name", "--version", "--description", "--publisher", "--runtime", "--lifecycle", "--module-path")
+    var strict = false
     var i = 0
     while (i < args.size) {
         val a = args[i]
         when {
+            a == "--strict" -> {
+                strict = true
+                i++
+            }
             a in singleOptions || a == "--depends" || a == "--requires" -> {
                 val value = args.getOrNull(i + 1)
                 if (value == null || (a in singleOptions && single.put(a, value) != null)) {
@@ -1130,7 +1207,7 @@ internal fun emitJasoMain(args: List<String>): Int {
         single["--runtime"] ?: JasoManifestText.DEFAULT_RUNTIME, depends, requires, single["--lifecycle"]
     )
     val modulePath = single["--module-path"]?.split(java.io.File.pathSeparatorChar)?.filter { it.isNotEmpty() }?.map { Paths.get(it) }
-    return when (val result = JasperCompiler().compileToJaso(sources, options, Paths.get(output), modulePath)) {
+    return when (val result = JasperCompiler(CompileOptions(strict = strict)).compileToJaso(sources, options, Paths.get(output), modulePath)) {
         is JasperCompiler.CompileResult.Success -> {
             println(result.message)
             0

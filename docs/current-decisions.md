@@ -136,6 +136,22 @@ Jasper uses a Java-style file organization rule to keep AI-generated code struct
 - Top-level functions, top-level variables, and top-level statements are not valid source-file items.
 - Public/exported API is expressed with annotations such as `@Export`, not with extra top-level declarations.
 
+Compiler status: without options the compiler still accepts several top-level
+types and bare top-level functions in one `.jas` file (a compatibility wrapper),
+so existing code keeps compiling. The `strict` compile option (`--strict`,
+`CompileOptions(strict = true)`) enforces this section for every user source file
+of a compilation; the bundled standard library is exempt. Diagnostics:
+
+| Code | Rejected layout |
+|---|---|
+| `STRICT-001` | top-level statements; script units (`.jass`, `compileScript`) |
+| `STRICT-002` | a second (or later) top-level type |
+| `STRICT-003` | a bare top-level function |
+| `STRICT-004` | file stem differs from the single top-level type name (checked when the file name is known) |
+| `STRICT-005` | no top-level type at all |
+
+The option is never selected by source content, consistent with source modes.
+
 ```jasper
 package app.model;
 
@@ -146,11 +162,12 @@ public class User {
 
 ## Source Modes And `.jass`
 
-Strict mode is the default. It is selected for `.jas` and for the
-single-source compiler API unless a mode is passed explicitly:
+Module mode (called "strict mode" before 2026-11-10; renamed so that "strict"
+refers only to the compile option above) is the default. It is selected for
+`.jas` and for the single-source compiler API unless a mode is passed explicitly:
 
 ```text
-JasperCompiler.compile(source)                 -> strict
+JasperCompiler.compile(source)                 -> module
 JasperCompiler.compileScript(source)           -> script
 JasperCompiler.compile(source, SourceMode)     -> explicit mode
 ```
@@ -174,12 +191,12 @@ println(result);
 
 The mode boundary is deliberate:
 
-- Mode does not propagate through imports. A `.jass` entry may import strict
-  `.jas` modules, which remain strict.
-- A strict module cannot import a `.jass` unit. Scripts are entry units, not
+- Mode does not propagate through imports. A `.jass` entry may import
+  `.jas` module units, which stay in module mode.
+- A module unit cannot import a `.jass` unit. Scripts are entry units, not
   reusable libraries.
 - Script mode reuses the same AST, static type checker, IR, backend, standard
-  library, resource rules, and capability model as strict mode.
+  library, resource rules, and capability model as module mode.
 - Script mode does not enable dynamic types, dynamic member lookup, implicit
   conversions, runtime type mutation, reflection-by-default, or a second
   interpreter.
