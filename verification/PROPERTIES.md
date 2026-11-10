@@ -345,3 +345,19 @@
 | 定点回归 | 除 Lincheck 外全部测试类 + 一致性：119 个类 0 失败 1 跳过 |
 | 属性测试 / Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
+
+## LANG-STATIC-ENUM-FIELDS-01 静态字段初值与枚举成员（FV-B，Kotlin 前端 + 后端）
+
+源码身份：引入本节的提交；`JvmIrBackend.kt`（`emitStaticFieldInitializers` 的存储转换、`staticFieldConstantValue` 按字段描述符写 ConstantValue）、`SymbolTable.kt`（枚举成员进索引）、`TypeChecker.kt`（枚举体按类体检查）。
+
+性质：静态字段初值按声明类型做拓宽 / 装箱 / 引用转换（`static var a: int64 = 5` 不再 VerifyError），`static final` 字面量的 ConstantValue 类型与字段描述符一致；枚举的字段与方法进成员索引（`Color.RED.weight` 可读）；枚举的字段初值、方法体、构造器体走与类相同的检查（字段简单名诊断、返回类型等），此前只校验类型引用（Q221）。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `StaticEnumFieldTest` 种子 20261115，12 个随机静态初值（int32 → int64 / float64 / int32），期望值由 Kotlin 转换独立算出 |
+| 端到端 | 同一测试类 4 项：五种静态初值与 `static final int64` 常量、枚举实例字段外部读取、枚举方法简单名与返回类型被诊断、枚举方法正常调用 |
+| 变异 | 4 组全部被抓：去掉存储拓宽、ConstantValue 不按字段类型、成员不进索引、枚举体不检查 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：120 个类 1578 项 0 失败 1 跳过 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | int32 → float32 不是隐式拓宽（检查器既有规则，可能丢精度）；带实参的枚举常量 `RED(5)` 后端未实现（入 Q230） |

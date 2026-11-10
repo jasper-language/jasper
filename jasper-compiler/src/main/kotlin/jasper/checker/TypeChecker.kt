@@ -408,8 +408,14 @@ class TypeChecker(
                 decl.members.forEach { checkMemberTypeReferences(it, ifaceEnv) }
             }
             is JasEnum -> {
-                // 枚举体内除常量外的成员同样可能带显式类型引用。
-                decl.members.forEach { checkMemberTypeReferences(it, env) }
+                // 枚举体按类体检查（Q221）：字段初值、方法体、构造器体都进检查器，与类同一套规则
+                // （含字段简单名诊断）。此前只校验成员的类型引用，方法体里的错误留到字节码阶段。
+                val ctors = decl.members.filterIsInstance<JasConstructor>()
+                checkClass(
+                    JasClass(decl.name, decl.modifiers, emptyList(), null, emptyList(), decl.members - ctors.toSet(), ctors)
+                        .also { it.sourceLine = decl.sourceLine; it.sourceColumn = decl.sourceColumn },
+                    env
+                )
             }
             is JasProperty -> {}
             is JasImport -> {}

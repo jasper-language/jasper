@@ -359,6 +359,8 @@ class SymbolTable {
                 is JasEnum -> {
                     val key = registerTypeIdentity(decl, packageName, "enum", fileImports)
                     enums[key] = decl
+                    // 枚举的字段与方法同样进成员索引（Q221）：否则 `Color.GREEN.weight` 报 Cannot resolve member。
+                    indexMembers(key, decl.members)
                 }
                 is JasAnnotationType -> {
                     val key = registerTypeIdentity(decl, packageName, "annotation", fileImports)

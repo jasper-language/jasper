@@ -717,7 +717,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      */
     private fun staticFieldConstantValue(field: IrField): Any? {
         val expr = field.initializer?.expression as? IrConstImpl ?: return null
-        return when (expr.kind) {
+        val raw: Any = when (expr.kind) {
             IrConstKind.Int -> (expr.value as Number).toInt()
             IrConstKind.Long -> expr.value as Long
             IrConstKind.Float -> expr.value as Float
@@ -725,7 +725,17 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             IrConstKind.Boolean -> expr.value as Boolean
             IrConstKind.Char -> (expr.value as Char).code
             IrConstKind.String -> expr.value as String
-            else -> null
+            else -> return null
+        }
+        // ConstantValue 的常量池类型必须与字段描述符一致（Q221）：`static final x: int64 = 5`
+        // 的字面量是 int，必须按 long 写入，否则类加载时 ClassFormatError。按字段类型做数值拓宽。
+        val number = raw as? Number ?: return raw
+        return when (typeMapper.jvmDescriptorFromIrType(field.type)) {
+            "J" -> number.toLong()
+            "F" -> number.toFloat()
+            "D" -> number.toDouble()
+            "I", "B", "S", "C" -> if (raw is Int) raw else null
+            else -> raw
         }
     }
 
@@ -797,10 +807,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             val body = field.initializer ?: continue
             if (!needsRuntimeStaticInit(field)) continue
             generateIrExpression(mv, body.expression, ctx, owner)
-            mv.visitFieldInsn(
-                Opcodes.PUTSTATIC, owner, field.name.toString(),
-                typeMapper.jvmDescriptorFromIrType(field.type)
-            )
+            // 初值按字段声明类型做存储转换（Q221）：`static var a: int64 = 5` 的值是 int，
+            // 直接 PUTSTATIC 到 J 字段是 VerifyError。与局部赋值同一套拓宽 / 装箱 / 引用转换。
+            val fieldDesc = typeMapper.jvmDescriptorFromIrType(field.type)
+            val valueDesc = receiverJvmDescriptor(body.expression)
+            widenIfNeeded(mv, valueDesc, fieldDesc)
+            emitBoxingIfNeeded(mv, valueDesc, fieldDesc)
+            emitReferenceWidening(mv, valueDesc, fieldDesc)
+            mv.visitFieldInsn(Opcodes.PUTSTATIC, owner, field.name.toString(), fieldDesc)
         }
     }
 
