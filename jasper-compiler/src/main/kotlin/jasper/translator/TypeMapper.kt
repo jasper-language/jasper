@@ -152,6 +152,14 @@ class TypeMapper {
      * 失败模式：非 IrSimpleType，或 classifier 不在 symbolToName 里（不是本类 type() 造出来的），返回 null；
      *   调用方必须显式处理 null，不能把它当成空名字。
      */
+    private companion object {
+        /** byte（无符号）数组元素在数组类型名里的标记；描述符里换回 `B`。 */
+        const val UBYTE_MARK = "!B"
+    }
+
+    /** 是否 Jasper `byte`（无符号 uint8）：后端据此在读出后补 `& 0xFF`（Q229）。 */
+    fun isUnsignedByte(type: IrType): Boolean = irTypeClassName(type) == "kotlin.UByte"
+
     fun irTypeClassName(type: IrType): String? {
         if (type is IrSimpleType) {
             return symbolToName[type.classifier]
@@ -198,7 +206,9 @@ class TypeMapper {
      * 为什么需要：数组元素是类型变量时，数组整体描述符也必须擦除，否则接口方法
      *   （如 `findAll(): T[]`）会写出 `[LT;` 这种非法签名。
      */
-    private fun eraseArrayDescriptor(desc: String): String {
+    private fun eraseArrayDescriptor(rawName: String): String {
+        // byte 数组名里的标记（见 arrayType）不属于描述符。
+        val desc = rawName.replace(UBYTE_MARK, "B")
         var dims = 0
         while (dims < desc.length && desc[dims] == '[') dims++
         val element = desc.substring(dims)
@@ -286,7 +296,9 @@ class TypeMapper {
         // int8 / int16 是规范名；byte 当前与 int8 同表示（与规范 uint8 的差异见 PrimitiveTypes）。
         // 没有 short：它不是 Jasper 类型名，文法也不接受。
         "int8" to "kotlin.Byte",
-        "byte" to "kotlin.Byte",
+        // byte 是无符号 uint8（规范 A5，用户 2026-11-10 裁决，Q229）：单独的 IR 类型 kotlin.UByte，
+        // JVM 存储仍是 B / byte[]（平台互操作），后端在每次读出时零扩展到 0..255。int8 仍是有符号 kotlin.Byte。
+        "byte" to "kotlin.UByte",
         "int16" to "kotlin.Short",
         "char" to "kotlin.Char",
         // 集合族：语言层名字统一落到 JDK 集合类型，成员调用再由 BuiltinCollections
@@ -311,6 +323,7 @@ class TypeMapper {
         "kotlin.Double" to "D",
         "kotlin.Boolean" to "Z",
         "kotlin.Byte" to "B",
+        "kotlin.UByte" to "B",
         "kotlin.Short" to "S",
         "kotlin.Char" to "C",
         "kotlin.String" to "Ljava/lang/String;",
@@ -334,6 +347,7 @@ class TypeMapper {
         "kotlin.Double" to "double",
         "kotlin.Boolean" to "boolean",
         "kotlin.Byte" to "byte",
+        "kotlin.UByte" to "byte",
         "kotlin.Short" to "short",
         "kotlin.Char" to "char",
         "kotlin.String" to "java/lang/String",
@@ -572,6 +586,11 @@ class TypeMapper {
     fun arrayType(inner: IrType): IrType {
         // 元素描述符经 jvmDescriptorFromIrType 得到，类型变量元素会擦除为 Object
         // （如 `T[]` → `[Ljava/lang/Object;`），避免写出 `[LT;` 这种非法签名。
+        // byte（无符号）数组单独命名 `[!B`（多维 `[[!B`），描述符与 int8[] 相同都是 `[B`，但元素读取时
+        // 能认出是 byte、补零扩展（Q229）。`!` 只在名字里出现，转描述符 / 内部名时由 eraseArrayDescriptor 去掉。
+        val innerName = irTypeClassName(inner)
+        if (isUnsignedByte(inner) && !inner.isMarkedNullable()) return type("[$UBYTE_MARK")
+        if (innerName != null && innerName.startsWith("[") && UBYTE_MARK in innerName) return type("[$innerName")
         val innerDesc = jvmDescriptorFromIrType(inner)
         // 已知边界：两个分支目前表达式相同（统一为 `[` + 描述符），
         // 分开写是为将来区分基本类型数组与对象数组留出落点。
@@ -606,6 +625,11 @@ class TypeMapper {
      *   - 多维数组的元素仍是数组描述符（如 `[[I` 的元素是 `[I`），原样交给 [type]。
      */
     fun irArrayElementType(arrayType: IrType): IrType {
+        val name = irTypeClassName(arrayType)
+        if (name != null && name.startsWith("[") && UBYTE_MARK in name) {
+            val rest = name.substring(1)
+            return if (rest == UBYTE_MARK) type("kotlin.UByte") else type(rest)
+        }
         val desc = jvmDescriptorFromIrType(arrayType)
         if (!desc.startsWith("[")) return type("kotlin.Any")
         return irTypeFromDescriptor(desc.substring(1))

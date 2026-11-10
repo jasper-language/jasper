@@ -54,8 +54,9 @@ class NumericPromotionRegressionTest {
             assertEquals(8, call("shift", 1, 3L))
             assertEquals(-7L, call("storeLong", -7))
             assertEquals(5e9, call("storeDouble", 5_000_000_000L))
-            assertEquals(-2, call("storeIntFromByte", byteArrayOf(-2)))
-            assertEquals(-2L, call("storeLongFromByte", byteArrayOf(-2)))
+            // byte 是无符号 uint8（Q229）：位模式 0xFE 读出是 254。
+            assertEquals(254, call("storeIntFromByte", byteArrayOf(-2)))
+            assertEquals(254L, call("storeLongFromByte", byteArrayOf(-2)))
         }
     }
 }

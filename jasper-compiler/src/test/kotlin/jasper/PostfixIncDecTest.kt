@@ -223,7 +223,7 @@ class PostfixIncDecTest {
             package t;
             public function main(): char { var x: float64 = 65.9; return cast x as char; }
         """))
-        assertEquals(-1L, run("cast-byte-long", """
+        assertEquals(255L, run("cast-byte-long", """
             package t;
             public function main(): int64 { var x: byte = cast -1 as byte; return cast x as int64; }
         """))
@@ -258,7 +258,7 @@ class PostfixIncDecTest {
             val kind = listOf(
                 Kind("int32", 2147483640L) { v, d -> (v.toInt() + d).toLong() },
                 Kind("int64", 9223372036854775800L) { v, d -> v + d },
-                Kind("byte", 120L) { v, d -> (v.toInt() + d).toByte().toLong() },
+                Kind("byte", 250L) { v, d -> ((v.toInt() + d) and 0xFF).toLong() },  // byte 无符号（Q229），在 255/0 处回绕
             )[random.nextInt(3)]
             val shape = random.nextInt(4)
             val ops = List(random.nextInt(1, 25)) { if (random.nextBoolean()) "++" else "--" }

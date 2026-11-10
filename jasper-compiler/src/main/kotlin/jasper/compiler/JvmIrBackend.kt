@@ -1607,7 +1607,29 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 表达式生成分派：调用方约定「生成结束后操作数栈顶恰好是表达式的一个值」，
     // 语句位置由调用方负责 POP。这里集中定义 IR 形态 → 指令序列的映射；
     // 关键变化点是 irName（translator 的语义调用名），它把后端与翻译策略解耦。
+    /**
+     * 生成表达式；Jasper `byte`（无符号 uint8，Q229）的值在栈上一律保持 0..255。
+     *
+     * 为什么在这里统一补 `& 0xFF`：JVM 的 BALOAD、GETFIELD B、以 B 为返回类型的 ireturn、I2B 都会把
+     * 值按有符号 8 位扩展。凡结果类型是 byte、且不是读局部（局部里存的已是零扩展值）的表达式，
+     * 生成后都掩码一次；掩码幂等，重复无害。int8 不受影响，仍是有符号。
+     */
     private fun generateIrExpression(mv: MethodVisitor, expr: IrExpression, ctx: MethodContext, owner: String) {
+        generateIrExpressionCore(mv, expr, ctx, owner)
+        // 只对「把值留在栈上」的读出类节点掩码：调用、字段读、转换。块 / when 的值来自其内部
+        // 这些节点，已掩码；IrSetField 等语句节点的类型可能也记成字段类型，但栈上没有值。
+        // 运算符调用（`b * 1000`、`-b`）不是读出：结果按 int 运算，翻译器沿用左操作数类型记成 byte，
+        // 若在这里掩码会把 int 结果截成 8 位。
+        val isOperator = expr is IrCall && (callNames[expr.symbol] ?: "") in BYTE_MASK_EXEMPT_CALLS
+        if ((expr is IrCall || expr is IrGetField || expr is IrTypeOperatorCall) && !isOperator && typeMapper.isUnsignedByte(expr.type) &&
+            typeMapper.jvmDescriptorFromIrType(expr.type) == "B"
+        ) {
+            mv.visitIntInsn(Opcodes.SIPUSH, 0xFF)
+            mv.visitInsn(Opcodes.IAND)
+        }
+    }
+
+    private fun generateIrExpressionCore(mv: MethodVisitor, expr: IrExpression, ctx: MethodContext, owner: String) {
         when (expr) {
             is IrConstImpl -> {
                 // 常量：负数优先用 ICONST/BIPUSH/SIPUSH/LDC 的最短编码（pushInt 内部判断）；
@@ -2467,6 +2489,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 mv.visitTypeInsn(Opcodes.CHECKCAST, internalName)
                             }
                         } else if (isPrimitiveDesc(srcDesc)) {
+                            if (srcDesc == "B" && dstDesc == "B" && typeMapper.isUnsignedByte(expr.argument.type) &&
+                                !typeMapper.isUnsignedByte(expr.typeOperand)
+                            ) {
+                                // byte（0..255）→ int8：描述符相同，但要按有符号截断（Q229）。
+                                mv.visitInsn(Opcodes.I2B)
+                            }
                             emitNumericConversion(mv, srcDesc, dstDesc)
                         } else {
                             // Reference -> primitive: checkcast to the box
@@ -2997,6 +3025,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         desc.length == 1 && desc[0] in "IJFDBSCZ"
 
     // 包装类描述符 → 基本类型描述符：可空基本类型（`int32?`）的 JVM 表示就是这些包装类。
+    /** 产生运算结果而不是读出值的调用名：byte 零扩展不作用于它们（见 generateIrExpression）。 */
+    private val BYTE_MASK_EXEMPT_CALLS = setOf(
+        "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>",
+        IrIntrinsics.NEGATE, IrIntrinsics.NOT, IrIntrinsics.INV, IrIntrinsics.UNARY_PLUS
+    )
+
     private val BOXED_TO_PRIMITIVE = mapOf(
         "Ljava/lang/Integer;" to "I",
         "Ljava/lang/Long;" to "J",
@@ -3086,6 +3120,23 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 "F" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Float", "valueOf", "(F)Ljava/lang/Float;", false)
                 "D" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Double", "valueOf", "(D)Ljava/lang/Double;", false)
                 "Z" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;", false)
+                // 窄类型此前不装箱，传给 Object 形参时 VerifyError（Q229 实测 MutableList<byte>.add）。
+                // byte 的 0..255 装成 java.lang.Byte 时按位截断，读回时由调用点零扩展。
+                "B" -> {
+                    // 先截断：JVM 不会把传给 B 形参的 int 截断，Byte.valueOf 用它做缓存下标会越界。
+                    mv.visitInsn(Opcodes.I2B)
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;", false)
+                }
+                "S" -> {
+                    // 先截断：JVM 不会把传给 S 形参的 int 截断，Short.valueOf 用它做缓存下标会越界。
+                    mv.visitInsn(Opcodes.I2S)
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Short", "valueOf", "(S)Ljava/lang/Short;", false)
+                }
+                "C" -> {
+                    // 先截断：JVM 不会把传给 C 形参的 int 截断，Character.valueOf 用它做缓存下标会越界。
+                    mv.visitInsn(Opcodes.I2C)
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "valueOf", "(C)Ljava/lang/Character;", false)
+                }
             }
         }
     }
@@ -3115,6 +3166,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Boolean")
                     mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Boolean", "booleanValue", "()Z", false)
                 }
+                "B" -> {
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Byte")
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Byte", "byteValue", "()B", false)
+                }
+                "S" -> {
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Short")
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Short", "shortValue", "()S", false)
+                }
+                "C" -> {
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Character")
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Character", "charValue", "()C", false)
+                }
             }
         }
     }
@@ -3122,7 +3185,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 二元运算的操作数提升：返回两者中「更宽」的描述符。优先级 I(0) < F/J(1) < D(2)，
     // 同优先级取 desc1（因此 long+float 会提升为 long，是既定的近似策略）。
     // 注意：表里没有的（引用类型）直接返回对方，调用方需自行保证两侧同类型。
-    private fun binaryOpWiderDesc(desc1: String, desc2: String): String {
+    private fun binaryOpWiderDesc(rawDesc1: String, rawDesc2: String): String {
+        // byte / short / char 参与运算先提升为 int（二元数值提升，Q229）：否则 `b + b` 的结果描述符
+        // 记成 B，装箱成 Byte、截断成 8 位。两侧都非数值时原样返回，保持引用比较等既有路径。
+        val desc1 = if (rawDesc1.length == 1 && rawDesc1 in "BSC") "I" else rawDesc1
+        val desc2 = if (rawDesc2.length == 1 && rawDesc2 in "BSC") "I" else rawDesc2
         if (desc1 == desc2) return desc1
         val priority = mapOf("I" to 0, "F" to 1, "J" to 1, "D" to 2)
         val p1 = priority[desc1] ?: return desc1

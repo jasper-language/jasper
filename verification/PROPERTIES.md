@@ -361,3 +361,20 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | int32 → float32 不是隐式拓宽（检查器既有规则，可能丢精度）；带实参的枚举常量 `RED(5)` 后端未实现（入 Q230） |
+
+## LANG-BYTE-UINT8-01 byte 是无符号 uint8（FV-B，Kotlin 翻译器类型 + 后端）
+
+源码身份：引入本节的提交；`TypeMapper.kt`（`kotlin.UByte`、byte 数组名标记、`isUnsignedByte`、`irArrayElementType`）、`JvmIrBackend.kt`（`generateIrExpression` 零扩展、byte→int8 转换、窄类型装箱拆箱、`binaryOpWiderDesc` 窄类型提升）。
+
+性质：用户 2026-11-10 裁决按规范 A5：`byte` 的值在栈上恒为 0..255——数组元素、实例 / 静态字段、方法返回、`cast`、集合元素读出后零扩展；`cast x as byte` 取低 8 位；byte → int8 按有符号截断；byte 参与运算先提升为 int32（`b + b` 不截断）；int8 仍是有符号。JVM 存储仍为 `B` / `byte[]`，平台字节数组按无符号读。顺带修：byte / short / char 装箱成 Object 此前缺失（VerifyError）且 Byte.valueOf 需先截断。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `ByteUnsignedTest` 种子 20261116，20 个随机 int64 转 byte，期望 `v and 0xFF` |
+| 端到端 | 同一测试类 6 项：五种读出点、比较与拓宽与 byte→int8、byte 运算是 int 运算（含装箱进 int32 集合）、平台 UTF-8 字节、`MutableList<byte>` 元素 |
+| 既有测试改期望 | `PostfixIncDecTest` 随机模型改为无符号回绕、`cast -1 as byte` 转 int64 为 255；`NumericPromotionRegressionTest` 字节 0xFE 读出 254（语义变化，按裁决） |
+| 变异 | 6 组全部被抓：掩码改 0xFFFF、byte 数组不标记、byte→int8 不截断、装箱前不截断、窄类型不提升；翻译器层的提升变异与后端提升等价，已删去该冗余改动 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：121 个类 1584 项 0 失败 1 跳过 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | `char` 仍是 UTF-16 码元（Q229 第二部分）；`byte?` 装箱值读出依赖调用点零扩展 |
