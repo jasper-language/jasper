@@ -412,3 +412,19 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | for-in 元组模式文法不能解析（Q232）；类字段的多名字声明不做按位置绑定；元组暂无相等与字符串形式；instanceof 操作数仍不经检查（Q233） |
+
+## LANG-PLATFORM-RESULT-01 平台成员调用结果在翻译期带真实类型（FV-B，Kotlin 翻译器）
+
+源码身份：引入本节的提交；`JasperToIrTranslator.kt`（`translateCall` 末尾对平台实例成员调用套 `withPlatformReturnType`，与 `?.` 路径共用同一解析器）。
+
+性质（Q226）：平台实例成员调用（接收者不是本编译单元声明的类型、未解析到 Jasper 函数、非平台静态调用）的 IR 类型此前恒为 Unit，真实返回类型只在后端写指令时补救；翻译期据 IR 类型做的决定因此出错——`var r = p.add(q)` 的局部成 void（运行时 NoClassDefFoundError `t/void`），`p.add(q).toString() + ","` 选成数值加（VerifyError）。现在翻译期按 PlatformMethodResolver 回填返回类型。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `PlatformResultTypeTest` 种子 20261111：60 步随机 add / subtract / multiply（带取模）BigInteger 链，每步结果存局部再续算，结果与 Kotlin BigInteger 独立计算一致 |
+| 端到端 | 同一测试类：结果存局部（BigInteger / int / bool）、拼接左右两侧、数值加、作用户函数实参、写入并读回字段 |
+| 变异 | 核心变异（不回填）被抓（3/4 失败）；两处守卫条件（`resolvedFunction == null`、声明类型接收者排除）去掉后存活，判为等价：本编译单元声明的类型不在类路径上，解析器对其返回 null，回填不发生 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：124 个类 1599 项 0 失败（其中 7 个类在构建机磁盘满期间失败，腾出空间后重跑 535 项全过） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 平台静态调用仍由后端 `receiverJvmDescriptor` 回填（Q158 / Q163 / Q165 同族）；解析不到的平台成员保持 Unit |

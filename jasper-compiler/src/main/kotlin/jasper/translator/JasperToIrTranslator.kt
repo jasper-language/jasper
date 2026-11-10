@@ -3211,10 +3211,17 @@ class JasperToIrTranslator {
         // 泛型接收者（如 `Repo<Person>`）的返回类型里仍可能是接口声明的类型变量 T；
         // 用接收者实参把它替换成源码视角的具体类型，调用点才能据此补 CHECKCAST。
         returnType = substituteByReceiverTypeArgs(returnType, receiverOwner, receiverType, ctx)
-        return IrNodeFactory.createCall(
+        val call = IrNodeFactory.createCall(
             0, 0, returnType, IrStatementOrigin.INVOKE,
             irArgs, emptyArray<IrType>(), symbol, null
         )
+        // 平台实例成员（接收者不是本编译单元声明的类型、检查器也没解析到 Jasper 函数）：
+        // 调用点类型此前一直是 Unit，只有后端写指令时才按真实签名补救；但局部变量类型、
+        // `+` 选拼接还是数值加，都在翻译期按 IR 类型决定，于是 `var r = p.add(q)` 成了 void 局部、
+        // `p.add(q).toString() + ","` 发成 iadd（Q226）。这里用后端同一个解析器在翻译期回填。
+        val platformMember = expr.target is JasPropertyAccess && expr.resolvedFunction == null &&
+            expr.platformStaticOwner == null && memberReturnType == null && !receiverHasDeclaredType
+        return if (platformMember) withPlatformReturnType(call, name) else call
     }
 
     /**
