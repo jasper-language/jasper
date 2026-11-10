@@ -2103,8 +2103,8 @@ class JasperToIrTranslator {
                     iterableExpr,
                     ctx,
                     arrayElementType(iterableExpr.type),
-                    sizeCallName = "size",
-                    getCallName = "get"
+                    sizeCallName = IrIntrinsics.ARRAY_SIZE,
+                    getCallName = IrIntrinsics.ARRAY_GET
                 )
                 // Arrays keep the index-based lowering. A declared object type is treated
                 // as an instance of the iteration protocol (`hasNext()` / `next()`); any
@@ -2118,8 +2118,8 @@ class JasperToIrTranslator {
                     iterableExpr,
                     ctx,
                     arrayElementType(iterableExpr.type),
-                    sizeCallName = "size",
-                    getCallName = "get"
+                    sizeCallName = IrIntrinsics.ARRAY_SIZE,
+                    getCallName = IrIntrinsics.ARRAY_GET
                 )
             }
         }
@@ -2211,7 +2211,7 @@ class JasperToIrTranslator {
         // 下标在循环体开头自增、元素读取用 i-1：这样 `continue` 跳到条件时
         // 不会跳过自增，避免 for-in 数组循环无限执行。
         val incSymbol = IrSimpleFunctionSymbolImpl()
-        ctx.callNames[incSymbol] = "inc"
+        ctx.callNames[incSymbol] = IrIntrinsics.INC
         val incCall = IrNodeFactory.createCall(
             0, 0, typeMapper.intType(), null,
             arrayOf(IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), idxSymbol, null)),
@@ -2692,7 +2692,7 @@ class JasperToIrTranslator {
             val varType = typeMapper.mapType(binding.type)
             val varSymbol = IrVariableSymbolImpl()
             val getSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[getSymbol] = "get"
+            ctx.callNames[getSymbol] = IrIntrinsics.ARRAY_GET
             val getCall = IrNodeFactory.createCall(
                 0, 0, varType, null,
                 arrayOf(
@@ -2970,12 +2970,12 @@ class JasperToIrTranslator {
         }
         val operand = translateExpression(expr.operand, ctx)
         val funcName = when (expr.op) {
-            "-" -> "negate"
-            "!" -> "not"
-            "~" -> "inv"
-            "+" -> "unaryPlus"
-            "++" -> "inc"
-            "--" -> "dec"
+            "-" -> IrIntrinsics.NEGATE
+            "!" -> IrIntrinsics.NOT
+            "~" -> IrIntrinsics.INV
+            "+" -> IrIntrinsics.UNARY_PLUS
+            "++" -> IrIntrinsics.INC
+            "--" -> IrIntrinsics.DEC
             else -> "unknown"
         }
         val symbol = ctx.functionSymbols[funcName] ?: IrSimpleFunctionSymbolImpl()
@@ -2998,7 +2998,7 @@ class JasperToIrTranslator {
     ): IrExpression {
         val receiverType = ctx.varTypes[receiverName] ?: typeMapper.unitType()
         val invokeSymbol = IrSimpleFunctionSymbolImpl()
-        ctx.callNames[invokeSymbol] = "invoke_lambda"
+        ctx.callNames[invokeSymbol] = IrIntrinsics.INVOKE_LAMBDA
         val receiver = IrNodeFactory.createGetValue(
             0, 0, receiverType, ctx.symbols[receiverName] ?: IrValueParameterSymbolImpl(),
             IrStatementOrigin.GET_PROPERTY
@@ -3127,7 +3127,16 @@ class JasperToIrTranslator {
         // has a more specific type. Without this the backend derives the call
         // descriptor from the *argument* type and misses the `Object`-typed
         // parameter (e.g. synthesized `equals(other: any)`).
-        if (expr.target is JasPropertyAccess) {
+        // Q152：只对本次编译声明的接收者类型做这步拓宽。functionParamTypes 按名字全局登记，
+        // 平台接收者（BigInteger.add）会撞上标准库里同名的 add(any)，实参被转成 Object，
+        // 后端再也解析不到真实平台签名，拼出 add(Object)V 并在运行时 NoSuchMethodError。
+        val widenOwner = if (expr.target is JasPropertyAccess) args.firstOrNull()?.type?.let { typeMapper.irTypeClassName(it) } else null
+        val widenOwnerDeclared = widenOwner != null && (
+            widenOwner.substringAfterLast('/') in ctx.declaredTypeNames ||
+                ctx.memberReturnTypesByType.containsKey(widenOwner) ||
+                ctx.memberSignaturesByType.containsKey(widenOwner)
+            )
+        if (expr.target is JasPropertyAccess && widenOwnerDeclared) {
             val declaredParams = ctx.functionParamTypes[name]
             if (declaredParams != null && declaredParams.size == expr.args.size) {
                 for (i in expr.args.indices) {
@@ -3746,8 +3755,9 @@ class JasperToIrTranslator {
     private fun translateArrayAccess(expr: JasArrayAccess, ctx: TranslationContext): IrExpression {
         val target = translateExpression(expr.target, ctx)
         val index = translateExpression(expr.index, ctx)
-        val getSymbol = ctx.functionSymbols["get"] ?: IrSimpleFunctionSymbolImpl()
-        ctx.callNames[getSymbol] = "get"
+        // 必须是新符号：旧实现借用名为 get 的用户函数符号，再把它登记成内建，用户 get() 随之被劫持。
+        val getSymbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[getSymbol] = IrIntrinsics.ARRAY_GET
         // 元素读的 IR 结果类型必须是**元素类型**，而不是 Unit：旧实现硬编码 unitType()，
         // 于是 `var x = a[i]` 推断出 void 描述符，任何后续使用都会生成 V 指令
         // （VerifyError / ClassFormatError，FINDINGS #11）。元素类型从数组目标类型反推。
@@ -3874,7 +3884,7 @@ class JasperToIrTranslator {
             // 引用元素数组（如 any[] = Object[]）装入原始值时先转型（后端据此装箱）。
             val valExpr = if (elementType != null && (elemDesc.startsWith("L") || elemDesc.startsWith("["))) castToDeclared(elementType, v) else v
             val setSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[setSymbol] = "arraySet"
+            ctx.callNames[setSymbol] = IrIntrinsics.ARRAY_SET
             val setCall = IrNodeFactory.createCall(
                 0, 0, resultType, null,
                 arrayOf(
@@ -4296,7 +4306,7 @@ class JasperToIrTranslator {
         var result: IrExpression = parts.first()
         for (i in 1 until parts.size) {
             val stubSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[stubSymbol] = "string_plus"
+            ctx.callNames[stubSymbol] = IrIntrinsics.STRING_PLUS
             result = IrNodeFactory.createCall(
                 0, 0, typeMapper.stringType(), IrStatementOrigin.PLUS,
                 arrayOf(result, parts[i]), emptyArray(), stubSymbol, null
@@ -4399,7 +4409,7 @@ class JasperToIrTranslator {
             if (expr.op != "=") {
                 val op = expr.op.removeSuffix("=")
                 val getSymbol = IrSimpleFunctionSymbolImpl()
-                ctx.callNames[getSymbol] = "get"
+                ctx.callNames[getSymbol] = IrIntrinsics.ARRAY_GET
                 val getCall = IrNodeFactory.createCall(
                     0, 0, resultType, null,
                     arrayOf(
@@ -4418,7 +4428,7 @@ class JasperToIrTranslator {
                 valVar.initializer = binOp
                 (block.statements as MutableList<IrStatement>).add(valVar)
                 val setSymbol = IrSimpleFunctionSymbolImpl()
-                ctx.callNames[setSymbol] = "arraySet"
+                ctx.callNames[setSymbol] = IrIntrinsics.ARRAY_SET
                 val setCall = IrNodeFactory.createCall(
                     0, 0, resultType, null,
                     arrayOf(
@@ -4435,7 +4445,7 @@ class JasperToIrTranslator {
                 valVar.initializer = value
                 (block.statements as MutableList<IrStatement>).add(valVar)
                 val setSymbol = IrSimpleFunctionSymbolImpl()
-                ctx.callNames[setSymbol] = "arraySet"
+                ctx.callNames[setSymbol] = IrIntrinsics.ARRAY_SET
                 val setCall = IrNodeFactory.createCall(
                     0, 0, resultType, null,
                     arrayOf(
@@ -4515,12 +4525,12 @@ class JasperToIrTranslator {
                     expr.op, type, listOf(arrayVar, indexVar), needsResult, ctx,
                     read = {
                         val getSymbol = IrSimpleFunctionSymbolImpl()
-                        ctx.callNames[getSymbol] = "get"
+                        ctx.callNames[getSymbol] = IrIntrinsics.ARRAY_GET
                         IrNodeFactory.createCall(0, 0, type, null, arrayOf(arrayRead(), indexRead()), emptyArray(), getSymbol, null)
                     },
                     write = { value ->
                         val setSymbol = IrSimpleFunctionSymbolImpl()
-                        ctx.callNames[setSymbol] = "arraySet"
+                        ctx.callNames[setSymbol] = IrIntrinsics.ARRAY_SET
                         IrNodeFactory.createCall(0, 0, type, null, arrayOf(arrayRead(), indexRead(), value), emptyArray(), setSymbol, null)
                     }
                 )

@@ -252,3 +252,19 @@
 | Z3 / Lincheck | N/A：无算术约束 / 单线程 |
 | JBMC | 发版时验证 |
 | 边界 | 嵌套初始化器 `new int32[][]{{1}}` 的内层值翻译未在本片单独覆盖 |
+
+## LANG-INTRINSIC-NAMES-01 内建语义调用名与用户 / 平台名隔离（FV-B，Kotlin 翻译器 + 后端）
+
+源码身份：引入本节的提交；`IrIntrinsics.kt`、`JasperToIrTranslator.kt`（内建调用登记、`translateArrayAccess`、成员调用实参拓宽的接收者判定）、`JvmIrBackend.kt`（内建分派、`receiverJvmDescriptor`，删除不可达的 `put` 分支）。
+
+性质：翻译器生成的内建指令调用（数组长度 / 取 / 写、一元运算、自增减、字符串拼接、闭包调用）使用保留名 `__jasper_*__`，用户顶层函数、静态方法、平台方法无论叫 `size`、`get`、`negate`、`inc` 等都按所写调用（Q224）；数组取元素不再借用名为 `get` 的用户函数符号；成员调用实参按「同名声明参数为 any」转 Object 的拓宽只对本次编译声明的接收者类型做，平台接收者按真实签名解析（`BigInteger.add(BigInteger)`，Q152）。
+
+| 项 | 内容 |
+|---|---|
+| 端到端 | `BuiltinNameCollisionTest` 4 项：8 个与内建同名的用户顶层函数、同名实例 / 静态方法、`BigInteger.add` 及链式实参、内建数组 / 集合成员不回归 |
+| 变异 | 3 组全部被抓：数组取元素借用用户 get 符号、拓宽不判接收者、内建名恢复成普通名 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性语料：114 个类 1557 项 0 失败 1 跳过 |
+| 属性测试 | N/A：名字冲突是有限枚举，端到端已逐个覆盖后端全部内建名 |
+| Z3 / Lincheck | N/A：无算术约束 / 单线程 |
+| JBMC | 发版时验证 |
+| 边界 | `println` / `print` / `toString` 是语言全局内建函数名，用户同名顶层函数仍会被内建路径处理；平台调用结果存进 `var` 仍被定成 void、`平台调用.toString() + ","` 发成 iadd（入 Q226）；`MutableList<int32>.get` 未拆箱（入 Q227） |

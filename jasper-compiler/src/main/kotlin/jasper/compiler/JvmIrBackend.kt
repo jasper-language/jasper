@@ -1664,7 +1664,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     // String.valueOf，但全限定 `Integer.toString(int)` 是真实静态方法。
                     emitPlatformStaticCall(mv, expr, platformOwner, irName, ctx, owner)
                 } else when (irName) {
-                    "invoke_lambda" -> {
+                    IrIntrinsics.INVOKE_LAMBDA -> {
                         // 闭包调用：translator 把 lambda 编译成一个带 invoke 方法的匿名类，
                         // 这里退化为对接收者的 INVOKEVIRTUAL invoke(...)。接收者类型的
                         // 内部名可能已是全限定名（含 '/'）或只是简单名，后者按当前包补全。
@@ -1775,7 +1775,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // 具体转换/校验见 emitStringCodePointAtCall。
                         emitStringCodePointAtCall(mv, expr, ctx, owner)
                     }
-                    "negate" -> {
+                    IrIntrinsics.NEGATE -> {
                         // 一元取负按操作数槽型选择 NEG 指令。平台静态调用的实参可能是
                         // double（如 Math.abs(-2.5)）；统一发 INEG 会在类加载时抛 VerifyError。
                         val operand = expr.getValueArgument(0)!!
@@ -1789,7 +1789,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                         mv.visitInsn(opcode)
                     }
-                    "not" -> {
+                    IrIntrinsics.NOT -> {
                         // 逻辑非：用「IFEQ 为真」分支把非 0 归 1、0 归 0，避免依赖
                         // 具体数值，只关心零/非零，符合布尔语义。
                         val trueLabel = Label()
@@ -1802,12 +1802,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitInsn(Opcodes.ICONST_1)
                         mv.visitLabel(endLabel)
                     }
-                    "size" -> {
+                    IrIntrinsics.ARRAY_SIZE -> {
                         // 数组长度：数组引用压栈后 ARRAYLENGTH（不是字段读取）。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         mv.visitInsn(Opcodes.ARRAYLENGTH)
                     }
-                    "get" -> {
+                    IrIntrinsics.ARRAY_GET -> {
                         // 数组取元素：arr、idx 依次压栈，再按「元素描述符」选 xALOAD。
                         // 元素类型从数组自身的描述符（形如 "[I"）去掉前导 '[' 得到；
                         // 解析不出时按引用元素处理（AALOAD）。
@@ -1819,7 +1819,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         val elemDesc = if (arrDesc.startsWith("[")) arrDesc.substring(1) else "Ljava/lang/Object;"
                         mv.visitInsn(arrayLoadOpcode(elemDesc))
                     }
-                    "arraySet" -> {
+                    IrIntrinsics.ARRAY_SET -> {
                         // 数组写元素且表达式有值（a[i] = v 的值是 v）：先算 rhs 存进临时槽，
                         // 再压 arr、idx，取出 rhs 做 xASTORE，最后再 load 一份 rhs 留栈上。
                         // 为什么绕一圈：xASTORE 会消耗栈上的 rhs，但表达式语义要求结果仍是 v。
@@ -1848,20 +1848,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         }
                         loadLocal(mv, rhsDesc, rhsSlot)
                     }
-                    "put" -> {
-                        // Map.put：receiver/key/rhs 依次压栈，key 与 value 都先装箱成
-                        // Object（HashMap 只接受引用），最后调用 put 返回旧值。
-                        val receiver = expr.getValueArgument(0)!!
-                        val key = expr.getValueArgument(1)!!
-                        val rhs = expr.getValueArgument(2)!!
-                        generateIrExpression(mv, receiver, ctx, owner)
-                        generateIrExpression(mv, key, ctx, owner)
-                        boxTopOfStack(mv, typeMapper.jvmDescriptorFromIrType(key.type))
-                        generateIrExpression(mv, rhs, ctx, owner)
-                        boxTopOfStack(mv, typeMapper.jvmDescriptorFromIrType(rhs.type))
-                        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", false)
-                    }
-                    "inc" -> {
+                    IrIntrinsics.INC -> {
                         // 自增：long 用 LADD（常量 1 用 LCONST_1），其余用 IADD。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         val arg0 = expr.getValueArgument(0)!!
@@ -1874,7 +1861,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             mv.visitInsn(Opcodes.IADD)
                         }
                     }
-                    "dec" -> {
+                    IrIntrinsics.DEC -> {
                         // 自减：与 inc 对称，long 用 LSUB，其余用 ISUB。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         val arg0 = expr.getValueArgument(0)!!
@@ -1887,7 +1874,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             mv.visitInsn(Opcodes.ISUB)
                         }
                     }
-                    "inv" -> {
+                    IrIntrinsics.INV -> {
                         // 按位取反：JVM 没有 NOT 指令，等价于 x XOR -1（全 1 掩码），
                         // long 用 LC 常量 -1L + LXOR，int 用 ICONST_M1 + IXOR。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
@@ -1901,12 +1888,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             mv.visitInsn(Opcodes.IXOR)
                         }
                     }
-                    "unaryPlus" -> {
+                    IrIntrinsics.UNARY_PLUS -> {
                         // 一元正号是纯 no-op：只求值并保留在栈上，不生成任何指令。
                         generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
                         // No-op: unary plus just returns the value
                     }
-                    "string_plus" -> {
+                    IrIntrinsics.STRING_PLUS -> {
                         emitStringConcatCall(mv, expr, ctx, owner)
                     }
                     "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>" -> {
@@ -2663,7 +2650,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         // 运算表达式的 IR 类型可能仍是 Unit（左操作数是未知平台调用），但栈上结果类型
         // 可由操作数真实描述符恢复。例如 `parseInt("7") * 6` 作为静态方法实参时必须是 I，
         // 不能把 V 送给重载解析器。
-        if (innerCallName == "string_plus") return "Ljava/lang/String;"
+        if (innerCallName == IrIntrinsics.STRING_PLUS) return "Ljava/lang/String;"
         if (innerCallName in setOf("==", "!=", "<", ">", "<=", ">=", "!")) return "Z"
         if (innerCallName in setOf("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>")) {
             val left = receiver.getValueArgument(0)?.let { receiverJvmDescriptor(it) } ?: return direct
@@ -2672,7 +2659,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             val right = receiver.getValueArgument(1)?.let { receiverJvmDescriptor(it) } ?: return left
             return binaryOpWiderDesc(left, right)
         }
-        if (innerCallName in setOf("negate", "unaryPlus", "inc", "dec", "inv")) {
+        if (innerCallName in setOf(IrIntrinsics.NEGATE, IrIntrinsics.UNARY_PLUS, IrIntrinsics.INC, IrIntrinsics.DEC, IrIntrinsics.INV)) {
             return receiver.getValueArgument(0)?.let { receiverJvmDescriptor(it) } ?: direct
         }
         // 运算表达式的调用点 IR 类型既可能是 Unit，也可能因操作数 any 被推成 Object；
@@ -3179,7 +3166,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         mv.visitLabel(endLabel)
     }
 
-    // 字符串拼接（"string_plus"）：new StringBuilder → 逐参数 append → toString。
+    // 字符串拼接（IrIntrinsics.STRING_PLUS）：new StringBuilder → 逐参数 append → toString。
     // 不使用 invokedynamic（StringConcatFactory）以避开 class 版本与 native-image
     // 配置问题；代价是体积略大、性能略低于 JIT 优化后的 makeConcatWithConstants。
     // 每个参数先经 String.valueOf 归一成 String，再走 append(String)。
