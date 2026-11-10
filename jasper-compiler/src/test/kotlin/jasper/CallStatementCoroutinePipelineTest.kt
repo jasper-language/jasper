@@ -336,7 +336,7 @@ class CallStatementCoroutinePipelineTest {
     private fun withProgram(name: String, body: Runtime.() -> Unit) {
         compile(name, program).use { loader ->
             val runtime = Runtime(loader)
-            try { runtime.body() } finally { runtime.shutdown() }
+            withCleanup({ runtime.shutdown() }) { runtime.body() }
         }
     }
 
@@ -609,7 +609,7 @@ class CallStatementCoroutinePipelineTest {
         assertTrue(programs.sumOf { it.third.caught } >= 40, "caught ${programs.sumOf { it.third.caught }}")
         compile("seeded", source).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 programs.forEachIndexed { index, (_, run, _) ->
                     val inputs = intArrayOf(random.nextInt(50), random.nextInt(50))
                     val start = random.nextInt(20)
@@ -625,8 +625,6 @@ class CallStatementCoroutinePipelineTest {
                         assertEquals(model.trace.toString(), runtime.log(), "g$index trace")
                     }
                 }
-            } finally {
-                runtime.shutdown()
             }
         }
     }
@@ -671,7 +669,7 @@ class CallStatementCoroutinePipelineTest {
         """.trimIndent()
         compile("unqualified-sibling", source).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 loader.loadClass("demo.Program").getMethod("sync").invoke(null)
                 val sync = runtime.log()
                 assertEquals(1, runtime.runSuspended("f", listOf(1)))
@@ -681,8 +679,6 @@ class CallStatementCoroutinePipelineTest {
                 assertEquals("program;", runtime.log())
                 assertEquals(2, runtime.runSuspended("privateSibling", listOf(2)))
                 assertEquals("hidden;", runtime.log())
-            } finally {
-                runtime.shutdown()
             }
         }
     }
@@ -725,7 +721,7 @@ class CallStatementCoroutinePipelineTest {
         """.trimIndent()
         compile("safe-access", source).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 val box = runtime.box(1)
                 assertEquals(5, runtime.runSuspended("statement", listOf(5), box))
                 assertEquals("pass;", runtime.log())
@@ -744,8 +740,6 @@ class CallStatementCoroutinePipelineTest {
                 assertEquals(3, runtime.runSuspended("inFinally", listOf(3), null))
                 assertEquals("tag", runtime.runSuspended("text", listOf(1), loader.loadClass("demo.Tagged").getConstructor().newInstance()))
                 assertEquals(null, runtime.runSuspended("text", listOf(1), null))
-            } finally {
-                runtime.shutdown()
             }
         }
     }

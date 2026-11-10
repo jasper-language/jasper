@@ -239,7 +239,7 @@ class ValueTypeCoroutinePipelineTest {
     private fun withProgram(name: String, body: Runtime.() -> Unit) {
         compile(name, program).use { loader ->
             val runtime = Runtime(loader)
-            try { runtime.body() } finally { runtime.shutdown() }
+            withCleanup({ runtime.shutdown() }) { runtime.body() }
         }
     }
 
@@ -345,7 +345,7 @@ class ValueTypeCoroutinePipelineTest {
         var awaitsInExpressions = 0
         compile("seeded", source).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 programs.forEach { program ->
                     val label = "${program.name}\n${program.source}"
                     val pre = program.inputs.map { value -> runtime.newFuture().also { runtime.complete(it, value) } }
@@ -356,8 +356,6 @@ class ValueTypeCoroutinePipelineTest {
                     byType.merge(program.returnType, 1, Int::plus)
                     awaitsInExpressions += program.hoisted
                 }
-            } finally {
-                runtime.shutdown()
             }
         }
         listOf("int32", "int64", "float64", "bool", "string").forEach { type ->

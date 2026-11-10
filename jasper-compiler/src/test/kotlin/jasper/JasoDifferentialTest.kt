@@ -289,14 +289,14 @@ class JasoDifferentialTest {
         val inputs = files.map { it.readBytes() to File(it.path.removeSuffix(".jaso") + ".expect").readText().trim() }
         JasoRuntime.check(inputs[0].first)
         val pool = Executors.newFixedThreadPool(4)
-        try {
+        withCleanup({
+            pool.shutdown()
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS))
+        }) {
             val tasks = (0 until 4).map { worker ->
                 Callable { repeat(3) { inputs.forEachIndexed { i, (b, e) -> if (i % 4 == worker || i % 3 == 0) assertEquals(e, JasoRuntime.check(b)) } } }
             }
             pool.invokeAll(tasks).forEach { it.get() }
-        } finally {
-            pool.shutdown()
-            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS))
         }
     }
 

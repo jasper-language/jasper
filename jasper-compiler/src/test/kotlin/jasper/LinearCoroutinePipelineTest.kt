@@ -164,7 +164,7 @@ class LinearCoroutinePipelineTest {
                 .getConstructor(Int::class.javaPrimitiveType).newInstance(1)
             val input = future.getConstructor().newInstance()
             val result = future.getConstructor().newInstance()
-            try {
+            withCleanup({ shutdown(executor) }) {
                 val frame = newFrame(loader, executor, result, input, 2)
                 frame.javaClass.getMethod("start").invoke(frame)
                 // 第一段应已求值一次并注册回调，然后返回工作线程。
@@ -182,8 +182,6 @@ class LinearCoroutinePipelineTest {
                 assertEquals(1, staticInt(loader, "steps"), "pre-suspension expression re-executed")
                 assertEquals(1, staticInt(loader, "fetches"), "await operand re-evaluated")
                 awaitSettled(result)
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -201,7 +199,7 @@ class LinearCoroutinePipelineTest {
                 .getConstructor(Int::class.javaPrimitiveType).newInstance(1)
             val input = future.getConstructor().newInstance()
             val result = future.getConstructor().newInstance()
-            try {
+            withCleanup({ shutdown(executor) }) {
                 future.getMethod("complete", Any::class.java).invoke(input, 10)
                 val frame = newFrame(loader, executor, result, input, 2)
                 frame.javaClass.getMethod("start").invoke(frame)
@@ -209,8 +207,6 @@ class LinearCoroutinePipelineTest {
                 assertEquals(26, future.getMethod("get").invoke(result))
                 assertEquals(1, staticInt(loader, "fetches"))
                 awaitSettled(result)
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -226,7 +222,7 @@ class LinearCoroutinePipelineTest {
             val future = loader.loadClass("std.Future")
             val executor = loader.loadClass("std.JvmExecutor")
                 .getConstructor(Int::class.javaPrimitiveType).newInstance(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 val failure = loader.loadClass("std.Failure")
                     .getConstructor(String::class.java, String::class.java)
                     .newInstance("expected", "error")
@@ -247,8 +243,6 @@ class LinearCoroutinePipelineTest {
                 awaitDone(cancelledResult, "cancelled")
                 assertEquals("Cancelled", future.getMethod("status").invoke(cancelledResult).toString())
                 awaitSettled(cancelledResult)
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -297,7 +291,7 @@ class LinearCoroutinePipelineTest {
             val future = loader.loadClass("std.Future")
             val executor = loader.loadClass("std.JvmExecutor")
                 .getConstructor(Int::class.javaPrimitiveType).newInstance(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 for (case in cases) {
                     val input = future.getConstructor().newInstance()
                     future.getMethod("complete", Any::class.java).invoke(input, 10)
@@ -314,8 +308,6 @@ class LinearCoroutinePipelineTest {
                     )
                     awaitSettled(result)
                 }
-            } finally {
-                shutdown(executor)
             }
         }
     }

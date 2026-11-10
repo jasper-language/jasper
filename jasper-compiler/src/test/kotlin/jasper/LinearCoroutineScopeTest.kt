@@ -165,7 +165,7 @@ class LinearCoroutineScopeTest {
         val rt = compile("two-frames")
         rt.loader.use {
             val executor = rt.executor(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 val group = rt.newGroup(false)
                 val inputs = listOf(rt.newFuture(), rt.newFuture())
                 val results = listOf(rt.newFuture(), rt.newFuture())
@@ -183,8 +183,6 @@ class LinearCoroutineScopeTest {
                 assertEquals(expected(3, 20), rt.value(results[1]))
                 assertEquals(2, rt.counter("resumed"))
                 results.forEach(::assertSettled)
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -200,7 +198,7 @@ class LinearCoroutineScopeTest {
         val rt = compile("normal-failure")
         rt.loader.use {
             val executor = rt.executor(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 val group = rt.newGroup(false)
                 val failing = rt.newFuture()
                 val waiting = rt.newFuture()
@@ -219,8 +217,6 @@ class LinearCoroutineScopeTest {
                 assertEquals("Cancelled", rt.status(sibling), "late input must not overwrite cancellation")
                 assertEquals(0, rt.counter("resumed"), "no resume segment may run after failure/cancel")
                 assertSettled(failed)
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -236,7 +232,7 @@ class LinearCoroutineScopeTest {
         val rt = compile("supervisor")
         rt.loader.use {
             val executor = rt.executor(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 for (acknowledge in listOf(true, false)) {
                     val group = rt.newGroup(true)
                     val failing = rt.newFuture()
@@ -261,8 +257,6 @@ class LinearCoroutineScopeTest {
                     assertSettled(failed)
                     assertSettled(sibling)
                 }
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -278,7 +272,7 @@ class LinearCoroutineScopeTest {
         val rt = compile("cancel")
         rt.loader.use {
             val executor = rt.executor(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 val group = rt.newGroup(false)
                 val inputs = listOf(rt.newFuture(), rt.newFuture())
                 val results = inputs.mapIndexed { index, input ->
@@ -291,8 +285,6 @@ class LinearCoroutineScopeTest {
                 inputs.forEach { rt.complete(it, 1) }
                 assertEquals("std.CancellationException", boundedCall(group, "close"))
                 assertEquals(0, rt.counter("resumed"))
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -309,7 +301,7 @@ class LinearCoroutineScopeTest {
         val rt = compile("cancelled-scope")
         rt.loader.use {
             val executor = rt.executor(1)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 val cancelled = rt.newGroup(false)
                 cancelled.javaClass.getMethod("cancel").invoke(cancelled)
                 val input = rt.newFuture()
@@ -333,8 +325,6 @@ class LinearCoroutineScopeTest {
                 assertEquals("std.TaskGroupFailure", boundedCall(failedGroup, "close"))
                 assertEquals(1, rt.counter("entered"), "only the failing frame may enter its first segment")
                 assertEquals(0, rt.counter("resumed"))
-            } finally {
-                shutdown(executor)
             }
         }
     }
@@ -385,7 +375,7 @@ class LinearCoroutineScopeTest {
         val rt = compile("seeded")
         rt.loader.use {
             val executor = rt.executor(2)
-            try {
+            withCleanup({ shutdown(executor) }) {
                 repeat(64) { round ->
                     val supervisor = random.nextBoolean()
                     val kinds = List(3) { listOf("complete", "fail", "cancel")[random.nextInt(3)] }
@@ -445,8 +435,6 @@ class LinearCoroutineScopeTest {
                     assertEquals(expectedClose, boundedCall(group, "close"), trace)
                     results.forEach(::assertSettled)
                 }
-            } finally {
-                shutdown(executor)
             }
         }
     }

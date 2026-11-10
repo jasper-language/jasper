@@ -212,10 +212,8 @@ class LoopingCoroutinePipelineTest {
     private fun withRuntime(name: String, body: (Runtime) -> Unit) {
         compile(name).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 body(runtime)
-            } finally {
-                runtime.shutdown()
             }
         }
     }

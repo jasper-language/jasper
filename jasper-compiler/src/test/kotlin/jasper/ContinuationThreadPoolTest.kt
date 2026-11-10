@@ -107,7 +107,11 @@ class ContinuationThreadPoolTest {
             val step = loader.loadClass("std.ThreadAwait").getConstructor(executorType).newInstance(executor)
             val dispatch = step.javaClass.getField("dispatch").get(step)
             val done = step.javaClass.getField("done").get(step) as Semaphore
-            try {
+            withCleanup({
+                dispatch.javaClass.getMethod("finish").invoke(dispatch)
+                executor.javaClass.getMethod("shutdown").invoke(executor)
+                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
+            }) {
                 dispatch.javaClass.getMethod("resume").invoke(dispatch)
                 val input = step.javaClass.getField("input").get(step)
                 val producer = loader.loadClass("std.ThreadProducer").getConstructor(loader.loadClass("std.Future")).newInstance(input)
@@ -115,10 +119,6 @@ class ContinuationThreadPoolTest {
                 assertTrue(done.tryAcquire(30, TimeUnit.SECONDS), "single worker did not resume consumer")
                 assertEquals(2, step.javaClass.getField("count").getInt(step))
                 assertEquals(42, input.javaClass.getMethod("get").invoke(input))
-            } finally {
-                dispatch.javaClass.getMethod("finish").invoke(dispatch)
-                executor.javaClass.getMethod("shutdown").invoke(executor)
-                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
             }
         }
     }
@@ -133,7 +133,14 @@ class ContinuationThreadPoolTest {
             val resume = dispatch.javaClass.getMethod("resume")
             val release = step.javaClass.getField("releaseFirst").get(step) as Semaphore
             val producers = Executors.newFixedThreadPool(8)
-            try {
+            withCleanup({
+                dispatch.javaClass.getMethod("finish").invoke(dispatch)
+                release.release(8)
+                producers.shutdownNow()
+                assertTrue(producers.awaitTermination(30, TimeUnit.SECONDS))
+                executor.javaClass.getMethod("shutdown").invoke(executor)
+                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
+            }) {
                 resume.invoke(dispatch)
                 assertTrue((step.javaClass.getField("entered").get(step) as Semaphore).tryAcquire(30, TimeUnit.SECONDS))
                 val requests = (1..8).map { producers.submit { repeat(100) { resume.invoke(dispatch) } } }
@@ -143,13 +150,6 @@ class ContinuationThreadPoolTest {
                 assertTrue((step.javaClass.getField("done").get(step) as Semaphore).tryAcquire(30, TimeUnit.SECONDS))
                 assertEquals(2, step.javaClass.getField("count").getInt(step))
                 assertEquals(0, step.javaClass.getField("overlap").getInt(step))
-            } finally {
-                dispatch.javaClass.getMethod("finish").invoke(dispatch)
-                release.release(8)
-                producers.shutdownNow()
-                assertTrue(producers.awaitTermination(30, TimeUnit.SECONDS))
-                executor.javaClass.getMethod("shutdown").invoke(executor)
-                assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
             }
         }
     }

@@ -339,7 +339,7 @@ class ReferenceFrameCoroutinePipelineTest {
     private fun withProgram(name: String, body: Runtime.() -> Unit) {
         compile(name, mapOf("Program.jas" to program)).use { loader ->
             val runtime = Runtime(loader)
-            try { runtime.body() } finally { runtime.shutdown() }
+            withCleanup({ runtime.shutdown() }) { runtime.body() }
         }
     }
 
@@ -506,11 +506,9 @@ class ReferenceFrameCoroutinePipelineTest {
         """.trimIndent()
         compile("cross-imported", mapOf("Lib.jas" to library, "Program.jas" to imported)).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 val item = loader.loadClass("lib.Item").getConstructor().newInstance()
                 assertSame(item, runtime.runSuspended("run", listOf(item)))
-            } finally {
-                runtime.shutdown()
             }
         }
     }
@@ -559,10 +557,8 @@ class ReferenceFrameCoroutinePipelineTest {
         assertTrue(message.contains("Unknown type 'Item'"), message)
         compile("cross-imported-untyped", mapOf("Lib.jas" to itemLibrary, "Program.jas" to caller("import lib.Item;"))).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 assertEquals("lib", runtime.runSuspended("run", emptyList()))
-            } finally {
-                runtime.shutdown()
             }
         }
     }
@@ -604,10 +600,8 @@ class ReferenceFrameCoroutinePipelineTest {
         val qualified = itemLibrary.replace("Future<Item>", "Future<lib.Item>")
         compile("cross-shadow-qualified", mapOf("Lib.jas" to qualified, "Program.jas" to caller)).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 assertEquals("lib", runtime.runSuspended("run", emptyList()))
-            } finally {
-                runtime.shutdown()
             }
         }
     }
@@ -634,7 +628,7 @@ class ReferenceFrameCoroutinePipelineTest {
         }
         compile("seeded", mapOf("Program.jas" to source)).use { loader ->
             val runtime = Runtime(loader)
-            try {
+            withCleanup({ runtime.shutdown() }) {
                 for (program in programs) {
                     for (completeFirst in listOf(true, false)) {
                         val context = "seed=$seed ${program.name} completeFirst=$completeFirst\n${program.source}"
@@ -651,8 +645,6 @@ class ReferenceFrameCoroutinePipelineTest {
                         assertEquals(program.expectedValues, boxes.map(runtime::boxValue), context)
                     }
                 }
-            } finally {
-                runtime.shutdown()
             }
         }
     }

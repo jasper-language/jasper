@@ -311,7 +311,7 @@ class AwaitedCancelPublishTest {
     @Test
     fun `body blocked in get on a real thread publishes the cancel and keeps its sibling running`() {
         val executor = rt.loader.loadClass("std.JvmExecutor").getConstructor(Int::class.javaPrimitiveType).newInstance(2)
-        try {
+        withCleanup({ executor.javaClass.getMethod("shutdown").invoke(executor) }) {
             val group = rt.newGroup(false)
             val awaited = rt.future.getConstructor().newInstance()
             val gate = rt.future.getConstructor().newInstance()
@@ -327,8 +327,6 @@ class AwaitedCancelPublishTest {
             while (rt.status(sibling) == "Pending" && System.nanoTime() < deadline) Thread.sleep(1)
             assertEquals(3, rt.value(sibling))
             assertEquals("cancel:Deadline", rt.close(group))
-        } finally {
-            executor.javaClass.getMethod("shutdown").invoke(executor)
         }
     }
 
@@ -453,7 +451,7 @@ class AwaitedCancelPublishTest {
         assertTrue(result is JasperCompiler.CompileResult.Success, "compilation failed: $result")
         URLClassLoader(arrayOf(output.toUri().toURL())).use { loader ->
             val runtime = FrameRuntime(loader)
-            try { runtime.body() } finally { runtime.shutdown() }
+            withCleanup({ runtime.shutdown() }) { runtime.body() }
         }
     }
 

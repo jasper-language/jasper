@@ -139,7 +139,7 @@ class FrameSlotCoroutinePipelineTest {
 
     private fun withRuntime(name: String, source: String, body: Runtime.() -> Unit) {
         val runtime = Runtime(compile(name, source))
-        try { runtime.body() } finally { runtime.shutdown() }
+        withCleanup({ runtime.shutdown() }) { runtime.body() }
     }
 
     private val program = """

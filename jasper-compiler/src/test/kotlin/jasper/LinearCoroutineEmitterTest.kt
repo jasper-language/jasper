@@ -100,7 +100,10 @@ class LinearCoroutineEmitterTest {
         val input = futureType.getConstructor().newInstance()
         val output = futureType.getConstructor().newInstance()
         val failure = loader.loadClass("std.Failure").getConstructor(String::class.java, String::class.java).newInstance("expected", "error")
-        try {
+        withCleanup({
+            executor.javaClass.getMethod("shutdown").invoke(executor)
+            assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
+        }) {
             when (mode) {
                 "ready" -> futureType.getMethod("complete", Any::class.java).invoke(input, 10)
                 "failed" -> futureType.getMethod("fail", loader.loadClass("std.Failure")).invoke(input, failure)
@@ -123,9 +126,6 @@ class LinearCoroutineEmitterTest {
                 "failed" -> assertSame(failure, futureType.getMethod("failureOrNull").invoke(output))
                 "cancelled" -> assertEquals("Cancelled", futureType.getMethod("status").invoke(output).toString())
             }
-        } finally {
-            executor.javaClass.getMethod("shutdown").invoke(executor)
-            assertEquals(true, executor.javaClass.getMethod("awaitTermination", Long::class.javaPrimitiveType).invoke(executor, 30000L))
         }
     }
 }
