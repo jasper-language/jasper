@@ -253,7 +253,8 @@ class GrammarRegressionTest {
                     return c;
                 }
             """.trimIndent(),
-            "test.main", "main", expected = 'A'
+            // char 是 32 位码点（Q229），JVM 上返回 int。
+            "test.main", "main", expected = 'A'.code
         )
     }
 

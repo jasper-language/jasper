@@ -2813,7 +2813,8 @@ class JasperToIrTranslator {
                 else -> typeMapper.doubleConst(expr.value)
             }
             is JasStringLiteral -> typeMapper.stringConst(expr.text)
-            is JasCharLiteral -> typeMapper.charConst(expr.value.toChar())
+            // 码点原样保留：旧实现 toChar() 把 BMP 以外的字符（'😀'）截成 16 位。
+            is JasCharLiteral -> typeMapper.charConst(expr.value)
             is JasBoolLiteral -> typeMapper.boolConst(expr.value)
             is JasNullLiteral -> typeMapper.nullConst()
             is JasIdentifier -> translateIdentifier(expr, ctx)

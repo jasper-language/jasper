@@ -360,9 +360,10 @@ class SafeAccessPipelineTest {
         p.resetTrace()
         assertEquals(9, p.call("primitiveLeft", 9))
         assertEquals("", p.traceLog())
-        assertEquals('b', p.call("small", none, 'b'))
-        assertEquals('c', p.call("small", 'c', 'b'))
-        assertEquals('d', p.call("smallArray", 'd'))
+        // char 是 32 位码点（Q229），在 JVM 上是 int / Integer：反射传入、读回都用码点。
+        assertEquals('b'.code, p.call("small", none, 'b'.code))
+        assertEquals('c'.code, p.call("small", 'c'.code, 'b'.code))
+        assertEquals('d'.code, p.call("smallArray", 'd'.code))
         assertEquals(null, p.call("nullRight", none))
         assertEquals(1, p.call("nullRight", 1))
         // JVM 表示是包装类：与 Java 互操作和泛型实参一致。

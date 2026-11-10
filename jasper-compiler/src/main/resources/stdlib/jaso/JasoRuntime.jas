@@ -997,8 +997,15 @@ public class JasoLinker {
         if (name == "short") {
             return nullable ? "Ljava/lang/Short;" : "S";
         }
+        if (name == "int8") {
+            return nullable ? "Ljava/lang/Byte;" : "B";
+        }
+        if (name == "int16") {
+            return nullable ? "Ljava/lang/Short;" : "S";
+        }
+        // char 是 32 位码点（Q229），JVM 上与 int32 同表示。
         if (name == "char") {
-            return nullable ? "Ljava/lang/Character;" : "C";
+            return nullable ? "Ljava/lang/Integer;" : "I";
         }
         return null;
     }

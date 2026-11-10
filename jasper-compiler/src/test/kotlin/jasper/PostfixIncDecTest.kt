@@ -57,8 +57,9 @@ class PostfixIncDecTest {
         Case("float32", "cast 1.5 as float32", 2.5f, 0.5f),
         Case("byte", "cast 127 as byte", (-128).toByte(), 126.toByte()),
         Case("byte", "cast -128 as byte", (-127).toByte(), 127.toByte()),
-        Case("char", "cast 65535 as char", 0.toChar(), 65534.toChar()),
-        Case("char", "cast 0 as char", 1.toChar(), 65535.toChar()),
+        // char 是 32 位码点（Q229），在 JVM 上是 int：65535 之后是 65536，不再按 16 位回绕。
+        Case("char", "cast 65535 as char", 65536, 65534),
+        Case("char", "cast 1114110 as char", 1114111, 1114109),
     )
 
     @Test
@@ -129,7 +130,7 @@ class PostfixIncDecTest {
             package t;
             public function main(): byte { var a: byte[] = new byte[1]; a[0] = cast 127 as byte; a[0]++; return a[0]; }
         """))
-        assertEquals(0.toChar(), run("array-char", """
+        assertEquals(65536, run("array-char", """
             package t;
             public function main(): char { var a: char[] = new char[1]; a[0] = cast 65535 as char; a[0]++; return a[0]; }
         """))
@@ -219,7 +220,7 @@ class PostfixIncDecTest {
             package t;
             public function main(): byte { var x: int64 = 300L; return cast x as byte; }
         """))
-        assertEquals(65.toChar(), run("cast-float64-char", """
+        assertEquals(65, run("cast-float64-char", """
             package t;
             public function main(): char { var x: float64 = 65.9; return cast x as char; }
         """))

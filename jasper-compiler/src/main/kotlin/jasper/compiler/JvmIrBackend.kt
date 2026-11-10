@@ -1739,18 +1739,9 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;")
                         val arg = expr.getValueArgument(0)
                         if (arg != null) {
-                            val desc = typeMapper.jvmDescriptorFromIrType(arg.type)
                             generateIrExpression(mv, arg, ctx, owner)
-                            when (desc) {
-                                "I", "Z", "B", "S", "C" ->
-                                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "($desc)Ljava/lang/String;", false)
-                                "J" ->
-                                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(J)Ljava/lang/String;", false)
-                                "F" ->
-                                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(F)Ljava/lang/String;", false)
-                                "D" ->
-                                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(D)Ljava/lang/String;", false)
-                            }
+                            val desc = typeMapper.jvmDescriptorFromIrType(arg.type)
+                            if (isPrimitiveDesc(desc)) emitPrimitiveToString(mv, arg.type)
                         }
                         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", irName, "(Ljava/lang/String;)V", false)
                         // PrintStream.print/println 返回 void，补 null 维持「留一个值」约定。
@@ -2121,7 +2112,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // 实参的描述符同样要按「平台感知」方式取：实参本身可能是
                             // 平台调用链（如 `a.add(b.pow(2))`），其 IR 类型是 Unit，
                             // 直接取会得到 `V` 并把重载决议带偏。
-                            val argDescriptors = argExpressions.map { receiverJvmDescriptor(it) }
+                            val argDescriptors = argExpressions.map { platformArgDescriptor(it) }
                             // 平台方法真实签名：仅在「没有声明签名」且接收者不是本次编译
                             // 单元声明的类型时尝试。toString 与 isKnownJdkFluentCall 是既有
                             // 契约（RemoveMethodTest 锁死 StringBuilder.append 的流畅形状）；
@@ -2630,7 +2621,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         currentOwner: String
     ) {
         val argExpressions = (0 until expr.valueArgumentsCount).mapNotNull { expr.getValueArgument(it) }
-        val argDescriptors = argExpressions.map { receiverJvmDescriptor(it) }
+        val argDescriptors = argExpressions.map { platformArgDescriptor(it) }
         val signature = platformMethodResolver.resolveStatic(
             ownerInternalName,
             methodName,
@@ -2701,6 +2692,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      *   链式调用改写成顶层函数；用户声明类型的成员签名由 translator 预登记，
      *   这里遇到本次编译单元声明的类型时保持原行为（返回 `V`），不越权猜测。
      */
+    /**
+     * 作平台方法实参时的描述符：Jasper `char`（32 位码点，JVM 上是 int）按 `C` 匹配平台的 char 重载，
+     * 否则 `sb.append(c)` 会选到 append(int) 打印出数字（Q229）。BMP 以外的码点传给 char 形参会被截断，
+     * 这是与 16 位平台 API 互通的已知边界；其余按 [receiverJvmDescriptor]。
+     */
+    private fun platformArgDescriptor(arg: IrExpression): String =
+        if (typeMapper.isChar(arg.type)) "C" else receiverJvmDescriptor(arg)
+
     private fun receiverJvmDescriptor(receiver: IrExpression): String {
         val direct = typeMapper.jvmDescriptorFromIrType(receiver.type)
         if (receiver !is IrCall) return direct
@@ -2711,7 +2710,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         if (staticOwner != null) {
             val args = (0 until receiver.valueArgumentsCount)
                 .mapNotNull { receiver.getValueArgument(it) }
-                .map { receiverJvmDescriptor(it) }
+                .map { platformArgDescriptor(it) }
             return platformMethodResolver.resolveStatic(staticOwner, innerCallName, args)
                 ?.returnDescriptor
                 ?: direct
@@ -2755,7 +2754,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             .mapNotNull { receiver.getValueArgument(it) }
         // 实参同样可能是更内一层的平台调用（如 `a.add(b.pow(2)).subtract(c)`），
         // 用同一个函数递归取描述符，避免把 `V` 当作形参类型去解析签名。
-        val innerArgDescriptors = innerArgs.map { receiverJvmDescriptor(it) }
+        val innerArgDescriptors = innerArgs.map { platformArgDescriptor(it) }
         if (isCompilationUnitDeclaredType(innerRawOwner, innerOwner)) {
             val inherited = inheritedPlatformOwner(innerOwner, memberCallKeys[receiver.symbol] ?: memberArityKey(innerRealName, innerArgs.size))
                 ?: return direct
@@ -3294,15 +3293,11 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             val arg = expr.getValueArgument(i) ?: continue
             generateIrExpression(mv, arg, ctx, owner)
             val argDesc = typeMapper.jvmDescriptorFromIrType(arg.type)
-            when (argDesc) {
-                "I", "Z", "B", "S", "C" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "($argDesc)Ljava/lang/String;", false)
-                "J" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(J)Ljava/lang/String;", false)
-                "F" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(F)Ljava/lang/String;", false)
-                "D" -> mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(D)Ljava/lang/String;", false)
-                "Ljava/lang/String;" -> {}
-                else -> if (argDesc.startsWith("L") || argDesc.startsWith("[")) {
+            when {
+                isPrimitiveDesc(argDesc) -> emitPrimitiveToString(mv, arg.type)
+                argDesc == "Ljava/lang/String;" -> {}
+                argDesc.startsWith("L") || argDesc.startsWith("[") ->
                     mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;", false)
-                }
             }
             mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false)
         }
@@ -3314,15 +3309,30 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     private fun emitToString(mv: MethodVisitor, expr: IrCall, ctx: MethodContext, owner: String) {
         val arg = expr.getValueArgument(0)!!
         val desc = typeMapper.jvmDescriptorFromIrType(arg.type)
-        val valueOfMethod = when (desc) {
-            "I", "Z", "B", "S", "C" -> "($desc)Ljava/lang/String;"
-            "J" -> "(J)Ljava/lang/String;"
-            "F" -> "(F)Ljava/lang/String;"
-            "D" -> "(D)Ljava/lang/String;"
-            else -> "(Ljava/lang/Object;)Ljava/lang/String;"
-        }
         generateIrExpression(mv, arg, ctx, owner)
-        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", valueOfMethod, false)
+        if (isPrimitiveDesc(desc)) {
+            emitPrimitiveToString(mv, arg.type)
+        } else {
+            mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;", false)
+        }
+    }
+
+    /**
+     * 栈顶基本类型值 → String。char 是 32 位码点（Q229），按字符转换：Character.toChars 得到 1 或 2 个
+     * UTF-16 码元，再 String.valueOf(char[])；否则按数值。byte / short 在栈上是 int，用 valueOf(int)
+     * （String 没有 valueOf(byte) / valueOf(short)，旧实现会 NoSuchMethodError）。
+     */
+    private fun emitPrimitiveToString(mv: MethodVisitor, type: IrType) {
+        if (typeMapper.isChar(type)) {
+            mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Character", "toChars", "(I)[C", false)
+            mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "([C)Ljava/lang/String;", false)
+            return
+        }
+        val desc = when (val d = typeMapper.jvmDescriptorFromIrType(type)) {
+            "B", "S", "C" -> "I"
+            else -> d
+        }
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "($desc)Ljava/lang/String;", false)
     }
 
     /**

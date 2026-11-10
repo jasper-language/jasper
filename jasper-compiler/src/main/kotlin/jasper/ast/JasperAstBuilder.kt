@@ -1665,7 +1665,8 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitCharLiteral(ctx: JasperParser.CharLiteralContext): JasNode? {
         val text = ctx.text
         val unescaped = doUnescape(text.drop(1).dropLast(1))
-        return if (unescaped.length == 1) {
+        // 按码点数判断：'😀' 是 1 个码点、2 个 UTF-16 码元，旧实现按 length == 1 判成 0（Q229）。
+        return if (unescaped.isNotEmpty() && unescaped.codePointCount(0, unescaped.length) == 1) {
             JasCharLiteral(unescaped.codePointAt(0), text)
         } else {
             JasCharLiteral(0, text)

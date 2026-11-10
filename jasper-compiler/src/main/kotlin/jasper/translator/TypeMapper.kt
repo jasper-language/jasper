@@ -148,7 +148,12 @@ class TypeMapper {
     private companion object {
         /** byte（无符号）数组元素在数组类型名里的标记；描述符里换回 `B`。 */
         const val UBYTE_MARK = "!B"
+        /** char（32 位码点）数组元素的标记；描述符里换回 `I`。 */
+        const val CHAR_MARK = "!C"
     }
+
+    /** 是否 Jasper `char`（非空）：字符串转换按码点处理，平台调用按 `char` 形参匹配（Q229）。 */
+    fun isChar(type: IrType): Boolean = irTypeClassName(type) == "kotlin.Char" && !type.isMarkedNullable()
 
     /** 是否 Jasper `byte`（无符号 uint8）：后端据此在读出后补 `& 0xFF`（Q229）。 */
     fun isUnsignedByte(type: IrType): Boolean = irTypeClassName(type) == "kotlin.UByte"
@@ -208,7 +213,7 @@ class TypeMapper {
      */
     private fun eraseArrayDescriptor(rawName: String): String {
         // byte 数组名里的标记（见 arrayType）不属于描述符。
-        val desc = rawName.replace(UBYTE_MARK, "B")
+        val desc = rawName.replace(UBYTE_MARK, "B").replace(CHAR_MARK, "I")
         var dims = 0
         while (dims < desc.length && desc[dims] == '[') dims++
         val element = desc.substring(dims)
@@ -325,7 +330,8 @@ class TypeMapper {
         "kotlin.Byte" to "B",
         "kotlin.UByte" to "B",
         "kotlin.Short" to "S",
-        "kotlin.Char" to "C",
+        // char 是 32 位 Unicode scalar（规范 A5 char32，Q229 第二部分）：JVM 上存成 int 码点。
+        "kotlin.Char" to "I",
         "kotlin.String" to "Ljava/lang/String;",
         "kotlin.Unit" to "V",
         "kotlin.Any" to "Ljava/lang/Object;",
@@ -349,7 +355,7 @@ class TypeMapper {
         "kotlin.Byte" to "byte",
         "kotlin.UByte" to "byte",
         "kotlin.Short" to "short",
-        "kotlin.Char" to "char",
+        "kotlin.Char" to "int",
         "kotlin.String" to "java/lang/String",
         "kotlin.Unit" to "void",
         "kotlin.Any" to "java/lang/Object",
@@ -590,7 +596,8 @@ class TypeMapper {
         // 能认出是 byte、补零扩展（Q229）。`!` 只在名字里出现，转描述符 / 内部名时由 eraseArrayDescriptor 去掉。
         val innerName = irTypeClassName(inner)
         if (isUnsignedByte(inner) && !inner.isMarkedNullable()) return type("[$UBYTE_MARK")
-        if (innerName != null && innerName.startsWith("[") && UBYTE_MARK in innerName) return type("[$innerName")
+        if (isChar(inner)) return type("[$CHAR_MARK")
+        if (innerName != null && innerName.startsWith("[") && (UBYTE_MARK in innerName || CHAR_MARK in innerName)) return type("[$innerName")
         val innerDesc = jvmDescriptorFromIrType(inner)
         // 已知边界：两个分支目前表达式相同（统一为 `[` + 描述符），
         // 分开写是为将来区分基本类型数组与对象数组留出落点。
@@ -626,9 +633,13 @@ class TypeMapper {
      */
     fun irArrayElementType(arrayType: IrType): IrType {
         val name = irTypeClassName(arrayType)
-        if (name != null && name.startsWith("[") && UBYTE_MARK in name) {
+        if (name != null && name.startsWith("[") && (UBYTE_MARK in name || CHAR_MARK in name)) {
             val rest = name.substring(1)
-            return if (rest == UBYTE_MARK) type("kotlin.UByte") else type(rest)
+            return when (rest) {
+                UBYTE_MARK -> type("kotlin.UByte")
+                CHAR_MARK -> charType()
+                else -> type(rest)
+            }
         }
         val desc = jvmDescriptorFromIrType(arrayType)
         if (!desc.startsWith("[")) return type("kotlin.Any")
@@ -859,7 +870,9 @@ class TypeMapper {
     /** 做什么：造 Double 字面量（Jasper float64）。 */
     fun doubleConst(value: Double): IrExpression = IrConstImpl.double(0, 0, doubleType(), value)
     /** 做什么：造 Char 字面量。 */
-    fun charConst(value: Char): IrExpression = IrConstImpl.char(0, 0, charType(), value)
+    fun charConst(value: Char): IrExpression = charConst(value.code)
+    /** 做什么：造 char 字面量（32 位码点，可超出 BMP；JVM 上是 int 常量）。 */
+    fun charConst(codePoint: Int): IrExpression = IrConstImpl.int(0, 0, charType(), codePoint)
     /** 做什么：造 String 字面量。 */
     fun stringConst(value: String): IrExpression = IrConstImpl.string(0, 0, stringType(), value)
     /** 做什么：把 Kotlin Boolean 翻成真/假常量表达式。 */

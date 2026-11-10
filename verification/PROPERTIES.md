@@ -378,3 +378,20 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | `char` 仍是 UTF-16 码元（Q229 第二部分）；`byte?` 装箱值读出依赖调用点零扩展 |
+
+## LANG-CHAR32-01 char 是 32 位 Unicode scalar（FV-B，Kotlin 前端 + 后端 + Jasper 运行时）
+
+源码身份：引入本节的提交；`TypeMapper.kt`（`kotlin.Char` → `I`、char 数组名标记、`isChar`、码点常量）、`JasperAstBuilder.kt`（`visitCharLiteral` 按码点数判断）、`JasperToIrTranslator.kt`（字面量保留码点）、`JvmIrBackend.kt`（`emitPrimitiveToString`、`platformArgDescriptor`）、`JasoRuntime.jas`（char → `I`，补 int8 / int16）。
+
+性质：用户 2026-11-10 裁决按规范 A5：`char` 是 32 位码点，JVM 上是 int；补充平面字面量不再截断（`'😀'` 此前得 0）；拼接 / println / toString 用 `Character.toChars` 输出字符；char 数组是 `int[]`；平台 char 形参按 `C` 重载匹配。顺带修：byte / short 转字符串此前调用不存在的 `String.valueOf(B)`。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `Char32Test` 种子 20261117，20 个随机非代理码点：转 int64 等于码点，转字符串长度等于 UTF-16 码元数 |
+| 端到端 | 同一测试类 5 项：'😀' 码点与拼接、char 数组、println 输出、`StringBuilder.append(char)` |
+| 既有测试改期望 | `PostfixIncDecTest` 的 char 用例：65535++ 为 65536（不再 16 位回绕）；`GrammarRegressionTest`、`SafeAccessPipelineTest` 反射传入 / 读回改为码点（语义变化，按裁决） |
+| 变异 | 4 组全部被抓：字符串转换不按码点、平台实参不按 C 匹配、字面量按码元数判断、char 数组不标记 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：122 个类 1589 项，2 项失败均为按 UTF-16 char 写的期望（GrammarRegressionTest、SafeAccessPipelineTest），按裁决改为码点后定点 31 项通过 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 不校验 scalar 范围；传给平台 char 形参截断为 16 位；多码点字符字面量仍静默为 0（应诊断） |
