@@ -184,3 +184,20 @@
 | Lincheck | N/A：检查器单线程，新增状态只在一次 `checkClass` 内保存恢复 |
 | JBMC | 发版时验证 |
 | 边界 | 枚举方法体不经检查器（Q221），其中的简单名仍未诊断；继承字段与外层字段只走普通未解析诊断；非数值自增目标是 any 或无法确定类型时不在此拒绝 |
+
+## LANG-POSTFIX-INCDEC-01 后缀自增减按目标真实类型更新（FV-B，Kotlin 编译器变换）
+
+源码身份：引入本节的提交；`JasperToIrTranslator.kt`（`translatePostfixIncDec`、`postfixOperandTemp`、`postfixUpdate`）、`JvmIrBackend.kt`（`emitNumericConversion` 的窄化分支）。
+
+性质：局部、实例字段、静态字段、数组元素的 `x++` / `x--` 按声明类型运算（int64 走 long、float32/float64 走浮点、byte/short/char 按 int 运算后收窄回绕）；作表达式时结果一律是旧值；接收者与下标各求值一次且先于读旧值；非数值目标编译期拒绝。`cast` 到 byte/short/char 现在截断（此前 int-like 之间是空操作，值会越界）。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `PostfixIncDecTest` 种子 20261107：随机更新序列（目标种类 × 类型 × 方向 × 语句/表达式）与独立 Kotlin 模型逐步比较 |
+| 端到端 | 同一测试类 8 项，编译、加载、运行；边界值（int32/int64 极值、byte ±128、char 0/65535）期望值独立写出 |
+| 变异 | 3 组全部被抓（只跑本测试类）：结果改为新值、去掉窄化、接收者/下标求值两次 |
+| 定点回归 | 13 个测试类 270 项 0 失败（含 FeaturesTranslation、JvmBackend、IrBackendSmoke、For/LabeledLoop 帧、LoopSuffix、SimpleNameField、FieldInitializer、ArrayElement/Assign、Java8 字节码兼容） |
+| Z3 | N/A：回绕由 JVM 指令语义决定，测试直接比较极值 |
+| Lincheck | N/A：单线程编译变换 |
+| JBMC | 发版时验证 |
+| 边界 | `+=` 等复合赋值未在本片改动；帧内（协程）自增走同一翻译函数，未单独加帧用例 |

@@ -4447,164 +4447,124 @@ class JasperToIrTranslator {
         return value
     }
 
+    /**
+     * 做什么：把后缀 `x++` / `x--` 降级为「读旧值 → 旧值 ± 1 → 写回目标 → 结果是旧值」。
+     * 什么时候用：自增减作语句（[needsResult] 为 false）或作表达式时；局部、字段、数组元素共用。
+     * 前置条件：检查器已拒绝非数值目标；目标类型取声明类型，而不是固定 int32。
+     * 失败模式：目标不是可写位置，或翻译时类型不是数值基本类型（如 `any`），抛
+     *   [IllegalStateException]，让编译失败，不生成坏字节码，也不静默丢弃这次更新。
+     * 为什么这样设计：接收者、下标各只求值一次，且先于读旧值；byte / short / char 按 int
+     *   运算后收窄回绕（与 `cast` 同一转换）。旧实现全程按 int32 建 IR，并把接收者求值两次。
+     */
     private fun translatePostfixIncDec(expr: JasPostfixIncDec, ctx: TranslationContext, needsResult: Boolean): IrExpression {
         val target = expr.target
-        val op = expr.op
-        val one = typeMapper.intConst(1)
-        if (target is JasIdentifier) {
-            val foundSymbol = ctx.symbols[target.name]
-            if (foundSymbol != null) {
-                val getX = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), foundSymbol, IrStatementOrigin.GET_PROPERTY)
-                val stubSymbol = IrSimpleFunctionSymbolImpl()
-                ctx.callNames[stubSymbol] = if (op == "++") "+" else "-"
-                if (needsResult) {
-                    val resultSymbol = IrVariableSymbolImpl()
-                    val resultVar = IrNodeFactory.createVariable(
-                        0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "inc"),
-                        typeMapper.intType(), resultSymbol, true, false, false
-                    )
-                    resultVar.initializer = getX
-                    val outerBlock = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
-                    (outerBlock.statements as MutableList<IrStatement>).add(resultVar)
-                    val binOp = IrNodeFactory.createCall(
-                        0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
-                        arrayOf(getX, one), emptyArray(), stubSymbol, null
-                    )
-                    val setX = IrNodeFactory.createSetValue(
-                        0, 0, typeMapper.unitType(), foundSymbol,
-                        IrStatementOrigin.EQ, binOp
-                    )
-                    val innerBlock = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
-                    (innerBlock.statements as MutableList<IrStatement>).add(setX)
-                    val getResult = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), resultSymbol, IrStatementOrigin.GET_PROPERTY)
-                    (innerBlock.statements as MutableList<IrStatement>).add(getResult)
-                    (outerBlock.statements as MutableList<IrStatement>).add(innerBlock)
-                    return outerBlock
-                } else {
-                    val binOp = IrNodeFactory.createCall(
-                        0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
-                        arrayOf(getX, one), emptyArray(), stubSymbol, null
-                    )
-                    val setX = IrNodeFactory.createSetValue(
-                        0, 0, typeMapper.unitType(), foundSymbol,
-                        IrStatementOrigin.EQ, binOp
-                    )
-                    val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
-                    (block.statements as MutableList<IrStatement>).add(setX)
-                    return block
-                }
-            }
-        } else if (target is JasPropertyAccess) {
-            val pa = target
-            // 与赋值路径共用同一判据：静态字段既不求值接收者，也不挂 receiver。
-            val staticRef = resolveStaticFieldRef(pa.property, pa.target, ctx)
-            val targetExpr = if (staticRef != null) null else translateExpression(pa.target, ctx)
-            val fieldSymbol = staticRef?.symbol
-                ?: resolveFieldSymbol(pa.property, pa.target, targetExpr!!, ctx)
-            val isStatic = staticRef != null || fieldSymbol in ctx.staticFieldSymbols
-            val getField = IrNodeFactory.createGetField(0, 0, typeMapper.intType(), fieldSymbol, null, IrStatementOrigin.GET_PROPERTY)
-            if (!isStatic && targetExpr != null) getField.receiver = targetExpr
-            val stubSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[stubSymbol] = if (op == "++") "+" else "-"
-            val binOp = IrNodeFactory.createCall(
-                0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
-                arrayOf(getField, one), emptyArray(), stubSymbol, null
-            )
-            val targetExpr2 = if (isStatic) null else translateExpression(pa.target, ctx)
-            val setField = IrNodeFactory.createSetField(0, 0, typeMapper.unitType(), fieldSymbol, null, IrStatementOrigin.EQ)
-            if (targetExpr2 != null) setField.receiver = targetExpr2
-            setField.value = binOp
-            if (needsResult) {
-                val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
-                val resultSymbol = IrVariableSymbolImpl()
-                val resultVar = IrNodeFactory.createVariable(
-                    0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "inc"),
-                    typeMapper.intType(), resultSymbol, true, false, false
+        return when (target) {
+            is JasIdentifier -> {
+                val symbol = ctx.symbols[target.name]
+                    ?: throw IllegalStateException("Operator '${expr.op}' cannot update '${target.name}'")
+                val type = ctx.varTypes[target.name] ?: typeMapper.intType()
+                postfixUpdate(
+                    expr.op, type, emptyList(), needsResult, ctx,
+                    read = { IrNodeFactory.createGetValue(0, 0, type, symbol, IrStatementOrigin.GET_PROPERTY) },
+                    write = { value -> IrNodeFactory.createSetValue(0, 0, typeMapper.unitType(), symbol, IrStatementOrigin.EQ, value) }
                 )
-                if (op == "++") {
-                    resultVar.initializer = getField
+            }
+            is JasPropertyAccess -> {
+                // 与赋值路径共用同一判据：静态字段既不求值接收者，也不挂 receiver。
+                val staticRef = resolveStaticFieldRef(target.property, target.target, ctx)
+                val receiver = if (staticRef != null) null else translateExpression(target.target, ctx)
+                val symbol = staticRef?.symbol ?: resolveFieldSymbol(target.property, target.target, receiver!!, ctx)
+                val type = staticRef?.type
+                    ?: resolveFieldType(target.property, target.target, receiver!!, ctx)
+                    ?: typeMapper.intType()
+                if (staticRef != null || symbol in ctx.staticFieldSymbols) {
+                    postfixUpdate(
+                        expr.op, type, emptyList(), needsResult, ctx,
+                        read = { IrNodeFactory.createGetField(0, 0, type, symbol, null, IrStatementOrigin.GET_PROPERTY) },
+                        write = { value ->
+                            IrNodeFactory.createSetField(0, 0, typeMapper.unitType(), symbol, null, IrStatementOrigin.EQ).also { it.value = value }
+                        }
+                    )
                 } else {
-                    resultVar.initializer = IrNodeFactory.createCall(
-                        0, 0, typeMapper.intType(), IrStatementOrigin.MINUS,
-                        arrayOf(getField, one), emptyArray(), stubSymbol, null
+                    val (receiverVar, receiverRead) = postfixOperandTemp(receiver!!, "ar", ctx)
+                    postfixUpdate(
+                        expr.op, type, listOf(receiverVar), needsResult, ctx,
+                        read = {
+                            IrNodeFactory.createGetField(0, 0, type, symbol, null, IrStatementOrigin.GET_PROPERTY).also { it.receiver = receiverRead() }
+                        },
+                        write = { value ->
+                            IrNodeFactory.createSetField(0, 0, typeMapper.unitType(), symbol, null, IrStatementOrigin.EQ).also {
+                                it.receiver = receiverRead()
+                                it.value = value
+                            }
+                        }
                     )
                 }
-                (block.statements as MutableList<IrStatement>).add(resultVar)
-                (block.statements as MutableList<IrStatement>).add(setField)
-                val getResult = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), resultSymbol, IrStatementOrigin.GET_PROPERTY)
-                (block.statements as MutableList<IrStatement>).add(getResult)
-                return block
-            } else {
-                val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
-                (block.statements as MutableList<IrStatement>).add(setField)
-                return block
             }
-        } else if (target is JasArrayAccess) {
-            val aa = target
-            val arrayExpr = translateExpression(aa.target, ctx)
-            val indexExpr = translateExpression(aa.index, ctx)
-            val arrSymbol = IrVariableSymbolImpl()
-            val arrVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "aa"), arrayExpr.type, arrSymbol, true, false, false)
-            arrVar.initializer = arrayExpr
-            val idxSymbol = IrVariableSymbolImpl()
-            val idxVar = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "ai"), indexExpr.type, idxSymbol, true, false, false)
-            idxVar.initializer = indexExpr
-            val getSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[getSymbol] = "get"
-            val getCall = IrNodeFactory.createCall(
-                0, 0, typeMapper.intType(), null,
-                arrayOf(
-                    IrNodeFactory.createGetValue(0, 0, arrayExpr.type, arrSymbol, null),
-                    IrNodeFactory.createGetValue(0, 0, indexExpr.type, idxSymbol, null)
-                ), emptyArray(), getSymbol, null
-            )
-            val stubSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[stubSymbol] = if (op == "++") "+" else "-"
-            val binOp = IrNodeFactory.createCall(
-                0, 0, typeMapper.intType(), IrStatementOrigin.PLUS,
-                arrayOf(getCall, one), emptyArray(), stubSymbol, null
-            )
-            val setSymbol = IrSimpleFunctionSymbolImpl()
-            ctx.callNames[setSymbol] = "arraySet"
-            val setCall = IrNodeFactory.createCall(
-                0, 0, typeMapper.unitType(), null,
-                arrayOf(
-                    IrNodeFactory.createGetValue(0, 0, arrayExpr.type, arrSymbol, null),
-                    IrNodeFactory.createGetValue(0, 0, indexExpr.type, idxSymbol, null),
-                    binOp
-                ), emptyArray(), setSymbol, null
-            )
-            if (needsResult) {
-                val block = IrNodeFactory.createBlock(0, 0, typeMapper.intType(), null)
-                (block.statements as MutableList<IrStatement>).add(arrVar)
-                (block.statements as MutableList<IrStatement>).add(idxVar)
-                val resultSymbol = IrVariableSymbolImpl()
-                val resultVar = IrNodeFactory.createVariable(
-                    0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "inc"),
-                    typeMapper.intType(), resultSymbol, true, false, false
+            is JasArrayAccess -> {
+                val array = translateExpression(target.target, ctx)
+                val type = arrayElementType(array.type)
+                val (arrayVar, arrayRead) = postfixOperandTemp(array, "aa", ctx)
+                val (indexVar, indexRead) = postfixOperandTemp(translateExpression(target.index, ctx), "ai", ctx)
+                postfixUpdate(
+                    expr.op, type, listOf(arrayVar, indexVar), needsResult, ctx,
+                    read = {
+                        val getSymbol = IrSimpleFunctionSymbolImpl()
+                        ctx.callNames[getSymbol] = "get"
+                        IrNodeFactory.createCall(0, 0, type, null, arrayOf(arrayRead(), indexRead()), emptyArray(), getSymbol, null)
+                    },
+                    write = { value ->
+                        val setSymbol = IrSimpleFunctionSymbolImpl()
+                        ctx.callNames[setSymbol] = "arraySet"
+                        IrNodeFactory.createCall(0, 0, type, null, arrayOf(arrayRead(), indexRead(), value), emptyArray(), setSymbol, null)
+                    }
                 )
-                if (op == "++") {
-                    resultVar.initializer = getCall
-                } else {
-                    resultVar.initializer = IrNodeFactory.createCall(
-                        0, 0, typeMapper.intType(), IrStatementOrigin.MINUS,
-                        arrayOf(getCall, one), emptyArray(), stubSymbol, null
-                    )
-                }
-                (block.statements as MutableList<IrStatement>).add(resultVar)
-                (block.statements as MutableList<IrStatement>).add(setCall)
-                val getResult = IrNodeFactory.createGetValue(0, 0, typeMapper.intType(), resultSymbol, IrStatementOrigin.GET_PROPERTY)
-                (block.statements as MutableList<IrStatement>).add(getResult)
-                return block
-            } else {
-                val block = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
-                (block.statements as MutableList<IrStatement>).add(arrVar)
-                (block.statements as MutableList<IrStatement>).add(idxVar)
-                (block.statements as MutableList<IrStatement>).add(setCall)
-                return block
             }
+            else -> throw IllegalStateException("Operator '${expr.op}' needs a variable, field or array element")
         }
-        return typeMapper.unitExpr()
+    }
+
+    /** 把只该求值一次的操作数存进临时局部；返回变量声明与每次取值用的读取工厂。 */
+    private fun postfixOperandTemp(value: IrExpression, prefix: String, ctx: TranslationContext): Pair<IrVariable, () -> IrExpression> {
+        val symbol = IrVariableSymbolImpl()
+        val variable = IrNodeFactory.createVariable(0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, prefix), value.type, symbol, true, false, false)
+        variable.initializer = value
+        return variable to { IrNodeFactory.createGetValue(0, 0, value.type, symbol, null) }
+    }
+
+    /**
+     * 组装自增减块：依次是 [operands]（接收者 / 下标临时量）、旧值临时量、写回；需要结果时最后读旧值。
+     * 常量 1 与运算按目标宽度取（int64 走 long 运算，float 走浮点运算），窄整数运算后收窄回目标类型。
+     */
+    private fun postfixUpdate(
+        op: String,
+        type: IrType,
+        operands: List<IrVariable>,
+        needsResult: Boolean,
+        ctx: TranslationContext,
+        read: () -> IrExpression,
+        write: (IrExpression) -> IrStatement
+    ): IrExpression {
+        val one = when (typeMapper.jvmDescriptorFromIrType(type)) {
+            "B", "S", "C", "I" -> typeMapper.intConst(1)
+            "J" -> typeMapper.longConst(1L)
+            "F" -> typeMapper.floatConst(1f)
+            "D" -> typeMapper.doubleConst(1.0)
+            else -> throw IllegalStateException(
+                "Operator '$op' needs a numeric operand, got ${typeMapper.jvmDescriptorFromIrType(type)}"
+            )
+        }
+        val (oldVar, oldRead) = postfixOperandTemp(read(), "inc", ctx)
+        val stub = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[stub] = if (op == "++") "+" else "-"
+        val stepped = IrNodeFactory.createCall(0, 0, one.type, IrStatementOrigin.PLUS, arrayOf(oldRead(), one), emptyArray(), stub, null)
+        val block = IrNodeFactory.createBlock(0, 0, if (needsResult) type else typeMapper.unitType(), null)
+        val statements = block.statements as MutableList<IrStatement>
+        statements += operands
+        statements += oldVar
+        statements += write(castToDeclared(type, stepped))
+        if (needsResult) statements += oldRead()
+        return block
     }
 
     private fun translateAssignmentIncrement(expr: JasAssignmentIncrement, ctx: TranslationContext): IrExpression {

@@ -2971,20 +2971,31 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
 
     /**
      * Primitive-to-primitive numeric conversion used by `cast` lowering.
-     * Boolean/byte/short/char all live on the JVM stack as ints, so
-     * conversions among the int-like descriptors are no-ops.
+     * Boolean/byte/short/char all live on the JVM stack as ints; a conversion
+     * to byte/short/char must still truncate, or the value escapes its range.
      * 中文：cast 降低所需的基本类型互转。boolean/byte/short/char 在 JVM 栈上都以
-     * int 存在，因此 int-like 之间的转换是空操作（直接 return）；其余按 12 种
-     * 组合查表选指令。边界：不支持的组合 opcode 为 -1，静默不发指令。
+     * int 存在，但转成 byte/short/char 必须截断（long/浮点先转 int），否则值超出
+     * 目标范围；其余按 12 种组合查表选指令。边界：不支持的组合 opcode 为 -1，静默不发指令。
      */
     private fun emitNumericConversion(mv: MethodVisitor, srcDesc: String, dstDesc: String) {
         if (srcDesc == dstDesc) return
         val intLike = "IZBSC"
+        val narrowing = when (dstDesc) {
+            "B" -> Opcodes.I2B
+            "S" -> Opcodes.I2S
+            "C" -> Opcodes.I2C
+            else -> -1
+        }
+        if (narrowing >= 0 && srcDesc != "Z") {
+            if (srcDesc !in intLike) emitNumericConversion(mv, srcDesc, "I")
+            mv.visitInsn(narrowing)
+            return
+        }
         if (srcDesc in intLike && dstDesc in intLike) return
         val opcode = when {
-            srcDesc == "I" && dstDesc == "J" -> Opcodes.I2L
-            srcDesc == "I" && dstDesc == "F" -> Opcodes.I2F
-            srcDesc == "I" && dstDesc == "D" -> Opcodes.I2D
+            srcDesc in "IBSC" && dstDesc == "J" -> Opcodes.I2L
+            srcDesc in "IBSC" && dstDesc == "F" -> Opcodes.I2F
+            srcDesc in "IBSC" && dstDesc == "D" -> Opcodes.I2D
             srcDesc == "J" && dstDesc == "I" -> Opcodes.L2I
             srcDesc == "J" && dstDesc == "F" -> Opcodes.L2F
             srcDesc == "J" && dstDesc == "D" -> Opcodes.L2D
