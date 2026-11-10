@@ -283,8 +283,11 @@ class TypeMapper {
         "string" to "kotlin.String",
         // void 在 IR 侧落到 kotlin.Unit，其 JVM 描述符为 V、内部名为 void。
         "void" to "kotlin.Unit",
+        // int8 / int16 是规范名；byte 当前与 int8 同表示（与规范 uint8 的差异见 PrimitiveTypes）。
+        // 没有 short：它不是 Jasper 类型名，文法也不接受。
+        "int8" to "kotlin.Byte",
         "byte" to "kotlin.Byte",
-        "short" to "kotlin.Short",
+        "int16" to "kotlin.Short",
         "char" to "kotlin.Char",
         // 集合族：语言层名字统一落到 JDK 集合类型，成员调用再由 BuiltinCollections
         // 决定语义。dict 是 Map 的具体实现；List/MutableList 共用 java.util.List

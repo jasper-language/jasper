@@ -2933,7 +2933,8 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 用途是让二元运算两侧类型一致；窄化必须走 emitNumericConversion（cast 语义）。
     private fun widenIfNeeded(mv: MethodVisitor, sourceDesc: String, targetDesc: String) {
         if (sourceDesc == targetDesc) return
-        when (sourceDesc) {
+        // byte / short / char 在操作数栈上就是 int，拓宽规则与 I 相同（Q149：int8 → int64 曾漏 I2L）。
+        when (if (sourceDesc in "BSC" && sourceDesc.length == 1) "I" else sourceDesc) {
             "I" -> when (targetDesc) {
                 "J" -> mv.visitInsn(Opcodes.I2L)
                 "F" -> mv.visitInsn(Opcodes.I2F)

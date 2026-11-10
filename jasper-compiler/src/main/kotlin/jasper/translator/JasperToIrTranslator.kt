@@ -2806,9 +2806,11 @@ class JasperToIrTranslator {
                     typeMapper.intConst(expr.value.toInt())
                 }
             }
+            // 类型只看后缀：f / F 是 float32，其余是 float64。旧实现看有没有小数点，
+            // 2.5f 被发成 double，与检查器、文档都不一致（Q149 实测）。
             is JasFloatLiteral -> when {
-                expr.raw.contains('.') || expr.raw.contains('e') || expr.raw.contains('E') -> typeMapper.doubleConst(expr.value)
-                else -> typeMapper.floatConst(expr.value.toFloat())
+                expr.raw.endsWith("f") || expr.raw.endsWith("F") -> typeMapper.floatConst(expr.value.toFloat())
+                else -> typeMapper.doubleConst(expr.value)
             }
             is JasStringLiteral -> typeMapper.stringConst(expr.text)
             is JasCharLiteral -> typeMapper.charConst(expr.value.toChar())
@@ -3948,8 +3950,8 @@ class JasperToIrTranslator {
                 if (returnVal != null) {
                     // Infer from literal types
                     when (returnVal) {
-                        is JasIntLiteral -> typeMapper.intType()
-                        is JasFloatLiteral -> typeMapper.doubleType()
+                        is JasIntLiteral -> if (returnVal.raw.endsWith("L") || returnVal.raw.endsWith("l")) typeMapper.longType() else typeMapper.intType()
+                        is JasFloatLiteral -> if (returnVal.raw.endsWith("f") || returnVal.raw.endsWith("F")) typeMapper.floatType() else typeMapper.doubleType()
                         is JasStringLiteral -> typeMapper.stringType()
                         is JasBoolLiteral -> typeMapper.boolType()
                         is JasBinaryOp -> typeMapper.intType()

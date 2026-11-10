@@ -284,3 +284,19 @@
 | Z3 / Lincheck | N/A：边界由 BigInteger 精确比较，测试直接覆盖边界 / 单线程 |
 | JBMC | 发版时验证 |
 | 边界 | 字面量不按目标类型推断；十六进制浮点字面量仍静默为 0.0（另入队） |
+
+## LANG-PRIMITIVE-NAMES-01 基本类型名的单一来源（FV-B，Kotlin 前端 + 后端）
+
+源码身份：引入本节的提交；`PrimitiveTypes.kt`、`JasperAstBuilder.kt`（`visitPrimitiveType`）、`TypeChecker.kt`（`rejectUnsupportedPrimitives`、数值集合与拓宽表、浮点字面量类型）、`TypeMapper.kt`（int8 / int16，删除 short）、`JvmIrBackend.kt`（`widenIfNeeded` 的 B/S/C）、`JasperToIrTranslator.kt`（浮点字面量按后缀）。
+
+性质：文法接受的基本类型写法在 AST 构造时归一（`int`→`int32`、`uint`→`uint32`、`float`→`float32`）；`int8` / `int16` 编译运行并按宽度回绕、可拓宽到更宽类型；规范列出但后端未实现的类型（uint8..uint128、int128、char8/16/32、float128）在声明类型任意嵌套位置报诊断；`short` 不是类型名。顺带：`f` 后缀浮点字面量是 float32（检查器、发射、平台描述符一致，此前 `2.5f` 被当 float64 发成 double）；byte / short / char 局部拓宽到 int64 / 浮点补齐转换指令（此前 int8 → int64 漏 I2L，VerifyError）。
+
+| 项 | 内容 |
+|---|---|
+| 端到端 | `PrimitiveTypeNamesTest` 4 项：int8 / int16 回绕、拓宽与数组；别名与规范名互赋；11 个未实现类型在 `T[]?` 与形参位置被拒；short 被拒 |
+| 变异 | 5 组全部被抓：不归一别名、去掉 int8 映射、去掉未实现诊断、拓宽不认 B/S/C、f 后缀仍发 double |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：116 个类 1564 项 0 失败 1 跳过 |
+| 属性测试 | N/A：名字表是有限枚举，逐个覆盖 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | `byte` 与 `char` 仍与规范不一致（规范 uint8 / char32，实现有符号 8 位 / UTF-16），入 Q229 |

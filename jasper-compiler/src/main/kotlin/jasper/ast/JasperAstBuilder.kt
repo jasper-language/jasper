@@ -651,7 +651,9 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     /**
      * primitiveType 规则：以原文构造 JasPrimitiveType 并回填位置。
      */
-    override fun visitPrimitiveType(ctx: JasperParser.PrimitiveTypeContext): JasNode? = JasPrimitiveType(ctx.getText()).at(ctx)
+    override fun visitPrimitiveType(ctx: JasperParser.PrimitiveTypeContext): JasNode? =
+        // 别名在这里归一（int → int32 等），下游只见规范名（Q149）。注解前缀不属于名字。
+        JasPrimitiveType(PrimitiveTypes.canonical(ctx.getChild(ctx.childCount - 1).text)).at(ctx)
     /**
      * TypeSuffix 的 Array 标签（'[' ']'）：占位产出 JasArrayType(JasAnyType)，真实内层由 TypeExpression 包裹。
      */

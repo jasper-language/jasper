@@ -611,8 +611,26 @@ class TypeChecker(
      *   在每个声明分支里各写一遍检查；同时让 `catch`/`new` 的例外保持显式、可审计。
      */
     private fun checkDeclaredType(type: JasType?, env: TypeEnvironment) {
+        rejectUnsupportedPrimitives(type)
         checkTypeReferences(type, env)
         rejectErrorTypeAsValue(type, env)
+    }
+
+    /**
+     * 规范列出、后端未实现的基本类型（uint32、char32 等）一律诊断（Q149），
+     * 不能落到「未知名字当类名」的路径——那会在运行时 NoClassDefFoundError。
+     */
+    private fun rejectUnsupportedPrimitives(type: JasType?) {
+        when (type) {
+            is JasPrimitiveType -> if (type.name in PrimitiveTypes.unsupported) {
+                error("Type '${type.name}' is specified but not yet supported by the JVM backend", type)
+            }
+            is JasArrayType -> rejectUnsupportedPrimitives(type.inner)
+            is JasNullableType -> rejectUnsupportedPrimitives(type.inner)
+            is JasNamedType -> type.typeArguments.forEach(::rejectUnsupportedPrimitives)
+            is JasFunctionType -> { type.paramTypes.forEach(::rejectUnsupportedPrimitives); rejectUnsupportedPrimitives(type.returnType) }
+            else -> {}
+        }
     }
 
     /**
@@ -1495,7 +1513,8 @@ class TypeChecker(
                     JasPrimitiveType("int32")
                 }
             }
-            is JasFloatLiteral -> JasPrimitiveType("float64")
+            // 后缀 f / F 是 float32，其余（含 d / D）是 float64（docs/02 §2.2）。
+            is JasFloatLiteral -> JasPrimitiveType(if (expr.raw.endsWith("f") || expr.raw.endsWith("F")) "float32" else "float64")
             is JasStringLiteral -> JasStringType
             is JasBoolLiteral -> JasPrimitiveType("bool")
             is JasNullLiteral -> JasNullableType(JasAnyType)
@@ -2244,7 +2263,7 @@ class TypeChecker(
                 if (expr.op == "!") "Z" else platformExpressionDescriptor(expr.operand, inferredType)
             }
             is JasIntLiteral -> if (expr.raw.endsWith("L") || expr.raw.endsWith("l")) "J" else "I"
-            is JasFloatLiteral -> "D"
+            is JasFloatLiteral -> if (expr.raw.endsWith("f") || expr.raw.endsWith("F")) "F" else "D"
             is JasStringLiteral -> "Ljava/lang/String;"
             is JasBoolLiteral -> "Z"
             is JasNullLiteral -> "Ljava/lang/Object;"
@@ -3270,7 +3289,7 @@ class TypeChecker(
     /** 判断类型是否为可参与数值拓宽的内建数值类型。 */
     private fun isNumericType(type: JasType): Boolean {
         val name = canonicalTypeKey(type) ?: return false
-        return name in setOf("byte", "short", "char", "int32", "int64", "float32", "float64")
+        return name in setOf("int8", "byte", "int16", "char", "int32", "int64", "float32", "float64")
     }
 
     /**
@@ -3371,8 +3390,9 @@ class TypeChecker(
         "int32" to listOf("int64", "float64"),
         "int64" to listOf("float64"),
         "float32" to listOf("float64"),
-        "byte" to listOf("short", "int32", "int64", "float32", "float64"),
-        "short" to listOf("int32", "int64", "float32", "float64"),
+        "int8" to listOf("int16", "int32", "int64", "float32", "float64"),
+        "byte" to listOf("int16", "int32", "int64", "float32", "float64"),
+        "int16" to listOf("int32", "int64", "float32", "float64"),
         "char" to listOf("int32", "int64", "float32", "float64")
     )
 
