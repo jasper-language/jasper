@@ -145,13 +145,6 @@ class TypeMapper {
     // 只能识别由本类 type() 造出来（因而登记过）的类型，外部符号查不到会返回 null。
     private val symbolToName = mutableMapOf<IrClassifierSymbol, String>()
 
-    /**
-     * 做什么：把 IR 类型还原成它登记过的 Jasper/JVM 名字。
-     *
-     * 什么时候用：后端/翻译器需要知道某个 IR 类型「原来叫什么」时（例如判断是否为数组、迭代器）。
-     * 失败模式：非 IrSimpleType，或 classifier 不在 symbolToName 里（不是本类 type() 造出来的），返回 null；
-     *   调用方必须显式处理 null，不能把它当成空名字。
-     */
     private companion object {
         /** byte（无符号）数组元素在数组类型名里的标记；描述符里换回 `B`。 */
         const val UBYTE_MARK = "!B"
@@ -160,6 +153,13 @@ class TypeMapper {
     /** 是否 Jasper `byte`（无符号 uint8）：后端据此在读出后补 `& 0xFF`（Q229）。 */
     fun isUnsignedByte(type: IrType): Boolean = irTypeClassName(type) == "kotlin.UByte"
 
+    /**
+     * 做什么：把 IR 类型还原成它登记过的 Jasper/JVM 名字。
+     *
+     * 什么时候用：后端/翻译器需要知道某个 IR 类型「原来叫什么」时（例如判断是否为数组、迭代器）。
+     * 失败模式：非 IrSimpleType，或 classifier 不在 symbolToName 里（不是本类 type() 造出来的），返回 null；
+     *   调用方必须显式处理 null，不能把它当成空名字。
+     */
     fun irTypeClassName(type: IrType): String? {
         if (type is IrSimpleType) {
             return symbolToName[type.classifier]
