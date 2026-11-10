@@ -80,6 +80,8 @@ class TypeChecker(
     private val checkReturnPaths: Boolean = true
 ) {
     private val errors = mutableListOf<TypeError>()
+    // 正在检查的一元负号的直接操作数（若是整数字面量）；只用于 int32 / int64 最小值字面量的范围判定。
+    private var negatedLiteral: JasIntLiteral? = null
     private val classImplements = mutableMapOf<String, List<String>>() // className -> interfaceNames
     private val interfaceExtends = mutableMapOf<String, List<String>>() // interfaceName -> parentInterfaceNames
     // className -> direct superclassName（简单名）。null 表示无显式父类（等价 Object）。
@@ -1483,7 +1485,9 @@ class TypeChecker(
         // 返回 null 表示「无法推断」（多数由 warn 记录）；调用方普遍以 ?: JasAnyType 兜底。
         return when (expr) {
             is JasIntLiteral -> {
-                // 整数字面量默认 int32；带 L/l 后缀表示 int64。
+                // 整数字面量默认 int32；带 L/l 后缀表示 int64。越界诊断（Q151）：此前 4294967295
+                // 被静默截成 -1。紧跟在一元负号后的十进制允许取到最小值（-2147483648）。
+                IntegerLiterals.overflow(expr.raw, negated = expr === negatedLiteral)?.let { error(it, expr) }
                 val raw = expr.raw
                 if (raw.endsWith("L") || raw.endsWith("l")) {
                     JasPrimitiveType("int64")
@@ -1550,6 +1554,7 @@ class TypeChecker(
             }
             is JasUnaryOp -> {
                 expr.awaitResultType = null
+                if (expr.op == "-") negatedLiteral = expr.operand as? JasIntLiteral
                 val operandType = inferExpression(expr.operand, env)
                 if (expr.op != "await") rejectNullablePrimitiveOperand(operandType, expr.op, expr)
                 when (expr.op) {

@@ -97,13 +97,13 @@ class WideLocalSlotRegressionTest {
             package test;
             function k(s: string): int64 {
                 var t: string = s;
-                var n: int64 = 40000000000;
+                var n: int64 = 40000000000L;
                 if (t == "x") { return 1; }
                 return n;
             }
             public function main(): int32 {
                 var r: int32 = 0;
-                if (k("y") == 40000000000) { r = r + 1; }
+                if (k("y") == 40000000000L) { r = r + 1; }
                 if (k("x") == 1) { r = r + 10; }
                 return r;
             }

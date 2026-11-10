@@ -268,3 +268,19 @@
 | Z3 / Lincheck | N/A：无算术约束 / 单线程 |
 | JBMC | 发版时验证 |
 | 边界 | `println` / `print` / `toString` 是语言全局内建函数名，用户同名顶层函数仍会被内建路径处理；平台调用结果存进 `var` 仍被定成 void、`平台调用.toString() + ","` 发成 iadd（入 Q226）；`MutableList<int32>.get` 未拆箱（入 Q227） |
+
+## LANG-INT-LITERAL-RANGE-01 整数字面量取值范围（FV-B，Kotlin 前端）
+
+源码身份：引入本节的提交；`IntegerLiterals.kt`、`JasperAstBuilder.kt`（四种进制的字面量构造）、`TypeChecker.kt`（`JasIntLiteral`、`JasUnaryOp` 的 `negatedLiteral`）。
+
+性质：整数字面量按精确值解析；无后缀超出 int32、带 L 超出 int64 是编译错误（docs/02 §2.1.1，Java 规则），不再截断（Q151：`x & 4294967295` 按 -1 计算）或变 0（超出 int64）。一元负号的直接操作数可取到最小值；十六 / 八 / 二进制按位宽补码解释。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `IntegerLiteralRangeTest` 种子 20261113，60 个随机字面量（四种进制 × 有无 L × 有无负号，一半取在边界 ±2），期望值由 Kotlin BigInteger / Int / Long 独立算出，通过与拒绝两边各至少 10 例 |
+| 端到端 | 同一测试类：9 个边界值运行验值、8 种越界拒绝（含 Q151 原探针与 `0 - 2147483648`） |
+| 变异 | 4 组全部被抓：忽略负号放宽、非十进制按有符号上限、去掉检查、超出 63 位回退 0 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：1560 项，2 项失败均为测试自身字面量越界（`var n: int64 = 40000000000`，旧实现两边同样截断才相等），补 L 后通过 |
+| Z3 / Lincheck | N/A：边界由 BigInteger 精确比较，测试直接覆盖边界 / 单线程 |
+| JBMC | 发版时验证 |
+| 边界 | 字面量不按目标类型推断；十六进制浮点字面量仍静默为 0.0（另入队） |

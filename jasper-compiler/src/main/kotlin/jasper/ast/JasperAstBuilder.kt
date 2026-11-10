@@ -1597,11 +1597,11 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      * literal 的 Decimal 标签：去掉下划线与整数后缀 L/l 后转 Long，产出 JasIntLiteral（原始文本保留）。
      *
      * 边界：词法规则把类型后缀计入 token 文本，若不去后缀 `1000L` 会被当成非法并回退为 0；
-     * 溢出/非法时数值仍回退为 0（与既有行为一致）。
+     * 取 64 位补码值（IntegerLiterals）；越界由检查器诊断（Q151），此前溢出静默回退为 0。
      */
     override fun visitDecimalLiteral(ctx: JasperParser.DecimalLiteralContext): JasNode? {
         val cleaned = stripIntegerSuffix(ctx.text.replace("_", ""))
-        return JasIntLiteral(cleaned.toLongOrNull() ?: 0L, ctx.text).at(ctx)
+        return JasIntLiteral(IntegerLiterals.wrappedValue(ctx.text), ctx.text).at(ctx)
     }
 
     /**
@@ -1611,7 +1611,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         val cleaned = stripIntegerSuffix(
             ctx.text.replace("_", "").removePrefix("0x").removePrefix("0X"),
         )
-        return JasIntLiteral(cleaned.toLongOrNull(16) ?: 0L, ctx.text).at(ctx)
+        return JasIntLiteral(IntegerLiterals.wrappedValue(ctx.text), ctx.text).at(ctx)
     }
 
     /**
@@ -1621,7 +1621,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         val cleaned = stripIntegerSuffix(
             ctx.text.replace("_", "").removePrefix("0o").removePrefix("0O"),
         )
-        return JasIntLiteral(cleaned.toLongOrNull(8) ?: 0L, ctx.text).at(ctx)
+        return JasIntLiteral(IntegerLiterals.wrappedValue(ctx.text), ctx.text).at(ctx)
     }
 
     /**
@@ -1631,7 +1631,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         val cleaned = stripIntegerSuffix(
             ctx.text.replace("_", "").removePrefix("0b").removePrefix("0B"),
         )
-        return JasIntLiteral(cleaned.toLongOrNull(2) ?: 0L, ctx.text).at(ctx)
+        return JasIntLiteral(IntegerLiterals.wrappedValue(ctx.text), ctx.text).at(ctx)
     }
 
     /**

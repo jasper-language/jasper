@@ -70,7 +70,7 @@ class WideDiscardRegressionTest {
         val source = """
             package test;
             function g(): int64 {
-                var v: int64 = 70368744177664;
+                var v: int64 = 70368744177664L;
                 return v;
             }
             public function main(): int32 { g(); return 0; }
