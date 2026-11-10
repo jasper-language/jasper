@@ -119,6 +119,9 @@ class DocExamplesParseTest {
 
     private companion object {
         val KNOWN_FRAGMENTS = listOf(
+            // 01 §1.1.1: strict 反例，一个文件两个顶层类型 + 裸函数；文法只允许一个顶层类型，
+            // 非 strict 时由编译器的兼容包装接受，这里只做文法解析，故不可解析是预期的。
+            "package demo;\npublic function helper(): int32 { return 1; }\npublic class Tools { }\npublic class More { }",
             // 03/overview: pure type listings (not a compilable unit).
             "T\nT?\n*T\nT[]\nList<T>\n(A, B)",
             "T\nT?\n*T\nT[]\nList<T>\n(A, B)",
