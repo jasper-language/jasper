@@ -1934,9 +1934,34 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // 否则 `System.nanoTime() - 1L` 会选 ISUB 而产出无法校验的字节码。
                         val desc0 = receiverJvmDescriptor(arg0)
                         val desc1 = receiverJvmDescriptor(arg1)
-                        // 可空基本类型与基本类型比较：基本类型一侧装成对方的包装类再走 Objects.equals，
-                        // 这样 null 与任何值都不相等，值相等时也不会因包装类不同而误判。
-                        if (desc0 in BOXED_TO_PRIMITIVE && isPrimitiveDesc(desc1) ||
+                        // 可空基本类型与基本类型比较（下面第二支）：基本类型一侧装成对方的包装类再走
+                        // Objects.equals，这样 null 与任何值都不相等，值相等时也不会因包装类不同而误判。
+                        // 与 null 字面量比较是空判断（Q166）：只看引用是否为 null，不调用户 equals。
+                        // 旧实现走 Objects.equals(x, null)，x 非 null 时调用 x.equals(null)，
+                        // 用户 equals 的副作用或异常会在一次空判断里发生。
+                        val nullSide = when {
+                            isNullLiteral(arg1) -> arg0
+                            isNullLiteral(arg0) -> arg1
+                            else -> null
+                        }
+                        if ((irName == "==" || irName == "!=") && nullSide != null) {
+                            val trueLabel = Label()
+                            val endLabel = Label()
+                            generateIrExpression(mv, nullSide, ctx, owner)
+                            val sideDesc = receiverJvmDescriptor(nullSide)
+                            if (isPrimitiveDesc(sideDesc)) {
+                                // 非空基本类型永远不等于 null：丢掉值，直接得出结果。
+                                if (sideDesc == "J" || sideDesc == "D") mv.visitInsn(Opcodes.POP2) else mv.visitInsn(Opcodes.POP)
+                                mv.visitInsn(if (irName == "==") Opcodes.ICONST_0 else Opcodes.ICONST_1)
+                            } else {
+                                mv.visitJumpInsn(if (irName == "==") Opcodes.IFNULL else Opcodes.IFNONNULL, trueLabel)
+                                mv.visitInsn(Opcodes.ICONST_0)
+                                mv.visitJumpInsn(Opcodes.GOTO, endLabel)
+                                mv.visitLabel(trueLabel)
+                                mv.visitInsn(Opcodes.ICONST_1)
+                                mv.visitLabel(endLabel)
+                            }
+                        } else if (desc0 in BOXED_TO_PRIMITIVE && isPrimitiveDesc(desc1) ||
                             desc1 in BOXED_TO_PRIMITIVE && isPrimitiveDesc(desc0)
                         ) {
                             generateIrExpression(mv, arg0, ctx, owner)
@@ -3110,6 +3135,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             ">>" -> mv.visitInsn(if (isLong) Opcodes.LSHR else Opcodes.ISHR)
             ">>>" -> mv.visitInsn(if (isLong) Opcodes.LUSHR else Opcodes.IUSHR)
         }
+    }
+
+    /** IR 里的 `null` 字面量（可能被包了一层转型）。 */
+    private fun isNullLiteral(expr: IrExpression): Boolean = when (expr) {
+        is IrConstImpl -> expr.kind == IrConstKind.Null
+        is IrTypeOperatorCall -> isNullLiteral(expr.argument)
+        else -> false
     }
 
     // 比较生成布尔结果（0/1），栈上两个操作数已被拓宽到同一 desc。

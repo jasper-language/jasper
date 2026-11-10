@@ -316,3 +316,18 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 协程帧内的 do-while 由块规划器单独降级（S-C 第十二片），未改 |
+
+## LANG-NULL-COMPARE-01 与 null 比较是空判断（FV-B，Kotlin 后端）
+
+源码身份：引入本节的提交；`JvmIrBackend.kt`（比较分支的 `nullSide`、`isNullLiteral`）。
+
+性质：`x == null` / `x != null` / `null == x` 生成 IFNULL / IFNONNULL，不调用用户 `equals`；非空基本类型与 null 比较恒为不等；其余引用比较仍走 `Objects.equals`。同步路径与协程帧共用同一后端，一起生效（Q166，第二十二片已知缺口）。
+
+| 项 | 内容 |
+|---|---|
+| 端到端 | `NullCompareTest` 3 项：探针类的 equals 每次计数且收到 null 即抛出；七种空判断写法（含作值）调用次数为 0；值相等仍调用一次；string 与 int32? 的空判断 |
+| 变异 | 1 组被抓：不识别 null 字面量（退回 Objects.equals） |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：118 个类 1570 项 0 失败 1 跳过 |
+| 属性测试 / Z3 / Lincheck | N/A：写法为有限枚举、逐个覆盖 / 无算术约束 / 单线程 |
+| JBMC | 发版时验证 |
+| 边界 | 与「值为 null 的变量」比较（非字面量）仍走 Objects.equals，语义同样正确，但若对方非 null 会调用其 equals |
