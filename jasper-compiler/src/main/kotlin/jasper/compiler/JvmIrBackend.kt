@@ -3587,8 +3587,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             "S" -> mv.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_SHORT)
             "C" -> mv.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_CHAR)
             else -> {
-                // 引用元素：把 "Ljava/lang/String;" 还原成 "java/lang/String" 内部名。
-                val internalName = elemDesc.removePrefix("L").removeSuffix(";").replace('.', '/')
+                // 引用元素：把 "Ljava/lang/String;" 还原成 "java/lang/String" 内部名；
+                // 数组元素（"[J"、"[Ljava/lang/String;"）的内部名就是描述符本身（Q153）。
+                val internalName = if (elemDesc.startsWith("[")) elemDesc
+                    else elemDesc.removePrefix("L").removeSuffix(";").replace('.', '/')
                 mv.visitTypeInsn(Opcodes.ANEWARRAY, internalName)
             }
         }

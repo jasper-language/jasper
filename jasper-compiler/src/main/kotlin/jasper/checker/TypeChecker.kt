@@ -1906,7 +1906,7 @@ class TypeChecker(
             is JasArrayCreation -> {
                 // 数组创建的元素类型是显式类型引用（如 `new Row[n]` 的 Row）。
                 checkTypeReferences(expr.type, env)
-                JasArrayType(expr.type)
+                expr.resultType
             }
             is JasLambdaExpr -> {
                 // lambda 在子环境中检查：形参注入其中；返回类型由 body 的首个 return 推断。

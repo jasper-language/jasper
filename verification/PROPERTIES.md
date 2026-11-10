@@ -236,3 +236,19 @@
 | Lincheck | N/A：单线程 |
 | JBMC | 发版时验证 |
 | 边界 | 不做常量折叠（`while (1 == 1)` 视为可能走过）；不可达语句不报诊断；协程降级生成的帧类复查时不查本规则（由降级保证）；lambda 体未纳入 |
+
+## LANG-ARRAY-DIMS-01 数组创建的总维数（FV-B，Kotlin 编译器前端 + 后端）
+
+源码身份：引入本节的提交；`JasperAst.kt`（`JasArrayCreation.depth` / `resultType`）、`JasperAstBuilder.kt`（`bracketPairs`）、`TypeChecker.kt`（`JasArrayCreation` 分支）、`JasperToIrTranslator.kt`（`translateArrayCreation`）、`JvmIrBackend.kt`（`emitNewArray` 的数组元素）。
+
+性质：`new T[a]...[z][]...[]` 的结果类型有「给出长度的维数 + 尾随 `[]` 对数」层，检查器与翻译器共用 `resultType`；未给长度的内层元素为 null；元素本身是数组时用该数组描述符作 ANEWARRAY 的类型（此前 `[Ljava/lang/String;` 被截成 `[Ljava/lang/String`）。`new T[]{...}` 的维数等于 `[]` 对数。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `ArrayDimsTest` 种子 20261112，30 个随机形状（给出长度 1–3 维、尾随 0–2 对），沿下标 0 读最后一层长度、检查未分配层为 null，期望值由生成器给出 |
+| 端到端 | 同一测试类：int64 / string 锯齿数组、三维、满维；维数不符的三种赋值被拒绝 |
+| 变异 | 4 组全部被抓：丢尾随 `[]`、检查器仍按一维、数组元素描述符照旧截断、array: 描述符只去一层 |
+| 定点回归 | 21 个测试类 385 项 0 失败（含数组、一致性、标准库、Features、文档解析、R2DBC 回归、JasoImport） |
+| Z3 / Lincheck | N/A：无算术约束 / 单线程 |
+| JBMC | 发版时验证 |
+| 边界 | 嵌套初始化器 `new int32[][]{{1}}` 的内层值翻译未在本片单独覆盖 |

@@ -3814,7 +3814,7 @@ class JasperToIrTranslator {
     }
 
     private fun translateArrayCreation(expr: JasArrayCreation, ctx: TranslationContext): IrExpression {
-        val resultType = typeMapper.mapType(JasArrayType(expr.type))
+        val resultType = typeMapper.mapType(expr.resultType)
         // 数组元素描述符从已解析的数组类型反推（去掉前导 '['），复用 mapType 的包/import 解析；
         // 若直接用 jvmDescriptorFromType(expr.type) 会丢掉包名，导致用户类对象数组
         // 生成无包名的 ANEWARRAY（#1）。
@@ -3825,7 +3825,12 @@ class JasperToIrTranslator {
             return buildArrayFromValues(resultType, expr.init.values.map { translateExpression(it, ctx) }, ctx, elemDesc)
         } else {
             val ctorSymbol = IrConstructorSymbolImpl()
-            ctx.constructorTypes[ctorSymbol] = "array:$elemDesc"
+            // 「array:」后面是去掉「给出长度的维数」层之后剩下的描述符：new int64[4][] 是 "[J"
+            // （ANEWARRAY [J），new int32[2][3] 是 "I"（MULTIANEWARRAY [[I 2）。
+            check(arrayDesc.length > expr.dims.size && arrayDesc.take(expr.dims.size).all { it == '[' }) {
+                "array creation descriptor '$arrayDesc' has fewer than ${expr.dims.size} dimensions"
+            }
+            ctx.constructorTypes[ctorSymbol] = "array:${arrayDesc.substring(expr.dims.size)}"
             val dims = expr.dims.map { translateExpression(it, ctx) }
             return IrNodeFactory.createConstructorCall(
                 0, 0, resultType, null,

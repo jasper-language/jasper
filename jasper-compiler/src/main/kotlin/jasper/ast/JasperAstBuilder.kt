@@ -1488,7 +1488,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitArrayNewPrimitiveDimExprs(ctx: JasperParser.ArrayNewPrimitiveDimExprsContext): JasNode? {
         val type = visit(ctx.primitiveType()) as JasPrimitiveType
         val dims = ctx.dimExprs().dimExpr().map { de -> visit(de.expression()) as? JasExpression ?: JasIntLiteral(0L, "0") }
-        return JasArrayCreation(type, dims, null).at(ctx)
+        return JasArrayCreation(type, dims, null, dims.size + bracketPairs(ctx.dims())).at(ctx)
     }
 
     /**
@@ -1499,7 +1499,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitArrayNewRefDimExprs(ctx: JasperParser.ArrayNewRefDimExprsContext): JasNode? {
         val type = visit(ctx.typeExpr()) as? JasType ?: return null
         val dims = ctx.dimExprs().dimExpr().map { de -> visit(de.expression()) as? JasExpression ?: JasIntLiteral(0L, "0") }
-        return JasArrayCreation(type, dims, null).at(ctx)
+        return JasArrayCreation(type, dims, null, dims.size + bracketPairs(ctx.dims())).at(ctx)
     }
 
     /**
@@ -1507,7 +1507,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      */
     override fun visitArrayInitPrimitive(ctx: JasperParser.ArrayInitPrimitiveContext): JasNode? {
         val type = visit(ctx.primitiveType()) as JasPrimitiveType
-        return JasArrayCreation(type, emptyList(), visit(ctx.arrayInitializer()) as? JasArrayInit).at(ctx)
+        return JasArrayCreation(type, emptyList(), visit(ctx.arrayInitializer()) as? JasArrayInit, bracketPairs(ctx.dims())).at(ctx)
     }
 
     /**
@@ -1515,8 +1515,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      */
     override fun visitArrayInitRef(ctx: JasperParser.ArrayInitRefContext): JasNode? {
         val type = visit(ctx.typeExpr()) as? JasType ?: return null
-        return JasArrayCreation(type, emptyList(), visit(ctx.arrayInitializer()) as? JasArrayInit).at(ctx)
+        return JasArrayCreation(type, emptyList(), visit(ctx.arrayInitializer()) as? JasArrayInit, bracketPairs(ctx.dims())).at(ctx)
     }
+
+    /** `dims` 规则里 `[ ]` 的对数（规则可省略时为 0）；Q153 前这些尾随 `[]` 被丢弃。 */
+    private fun bracketPairs(dims: JasperParser.DimsContext?): Int =
+        dims?.children?.count { it.text == "[" } ?: 0
 
     /**
      * primaryAtom 的 ArrayLiteral 标签（`[...]`）：构造无显式元素类型的 [JasArrayLiteral]。

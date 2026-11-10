@@ -582,10 +582,22 @@ data class JasArrayAccess(val target: JasExpression, val index: JasExpression) :
 data class JasNew(val type: JasType, val args: List<JasExpression>) : JasExpression()
 
 /**
- * 数组创建表达式：type 元素/数组类型；dims 各维长度表达式；init 可选的初始化器
- * （null 表示按维度长度分配）。
+ * 数组创建表达式：type 元素类型；dims 各维长度表达式；init 可选的初始化器
+ * （null 表示按维度长度分配）；depth 结果数组的总维数（Q153）。
+ *
+ * `new int64[4][]` 是 type=int64、dims=[4]、depth=2：给出长度的维数可以少于总维数，
+ * 未给长度的内层维度元素为 null。`new T[]{...}` 的 depth 等于 `[]` 的对数。
+ * [resultType] 是唯一的结果类型来源，检查器与翻译器都用它，避免两边各自拼。
  */
-data class JasArrayCreation(val type: JasType, val dims: List<JasExpression>, val init: JasArrayInit?) : JasExpression()
+data class JasArrayCreation(
+    val type: JasType,
+    val dims: List<JasExpression>,
+    val init: JasArrayInit?,
+    val depth: Int = maxOf(1, dims.size)
+) : JasExpression() {
+    /** 结果类型：元素类型外包 [depth] 层数组。 */
+    val resultType: JasType get() = (1..depth).fold(type) { t, _ -> JasArrayType(t) }
+}
 
 /**
  * 无显式元素类型的数组字面量表达式（`[a, b, c]`）。
