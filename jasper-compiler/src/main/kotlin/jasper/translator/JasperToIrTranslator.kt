@@ -2824,6 +2824,7 @@ class JasperToIrTranslator {
             is JasPropertyAccess -> translatePropertyAccess(expr, ctx)
             is JasArrayAccess -> translateArrayAccess(expr, ctx)
             is JasArrayLiteral -> translateArrayLiteral(expr, ctx)
+            is JasTupleExpr -> translateTuple(expr, ctx)
             is JasNew -> translateNew(expr, ctx)
             is JasArrayCreation -> translateArrayCreation(expr, ctx)
             is JasLambdaExpr -> translateLambda(expr, ctx)
@@ -3764,11 +3765,28 @@ class JasperToIrTranslator {
         // 元素读的 IR 结果类型必须是**元素类型**，而不是 Unit：旧实现硬编码 unitType()，
         // 于是 `var x = a[i]` 推断出 void 描述符，任何后续使用都会生成 V 指令
         // （VerifyError / ClassFormatError，FINDINGS #11）。元素类型从数组目标类型反推。
+        val tupleElement = expr.tupleElementType
         val elementType = arrayElementType(target.type)
-        return IrNodeFactory.createCall(
+        val read = IrNodeFactory.createCall(
             0, 0, elementType, null,
             arrayOf(target, index), emptyArray(), getSymbol, null
         )
+        // 元组元素以 Object 存放，读出后按检查器回填的元素类型 checkcast / 拆箱。
+        return if (tupleElement != null) castToDeclared(typeMapper.mapType(tupleElement), read) else read
+    }
+
+    /**
+     * 元组字面量：降级为 `Object[]`（docs/03 §3.7 的值在 JVM 上的表示）。
+     * 每个元素先按检查器回填的元素类型转换（`(int64, string)` 里的 1 要先拓宽成 long），
+     * 再由 [buildArrayFromValues] 装箱存入；读取侧见 [translateArrayAccess]。
+     */
+    private fun translateTuple(expr: JasTupleExpr, ctx: TranslationContext): IrExpression {
+        val types = expr.resolvedType?.types
+        val values = expr.elements.mapIndexed { i, element ->
+            val value = translateExpression(element, ctx)
+            if (types != null) castToDeclared(typeMapper.mapType(types[i]), value) else value
+        }
+        return buildArrayFromValues(typeMapper.mapType(JasArrayType(JasAnyType)), values, ctx, "Ljava/lang/Object;")
     }
 
     /**

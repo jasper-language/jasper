@@ -341,7 +341,9 @@ data class JasForInStatement(
     val body: JasBlock,
     val thenBody: JasBlock? = null,
     val elseBody: JasBlock? = null,
-    val suffix: LoopSuffix? = null
+    val suffix: LoopSuffix? = null,
+    /** 绑定写成了元组模式或多个名字（`for ((k, v) in m)`）；尚未实现，检查器报错，不静默取首名。 */
+    val patternBinding: Boolean = false
 ) : JasStatement()
 
 /**
@@ -573,8 +575,19 @@ data class JasPropertyAccess(val target: JasExpression, val property: String, va
 
 /**
  * 下标访问表达式：target 被索引的对象/数组；index 下标表达式。
+ *
+ * bindingArity 只由构建器在把 `var a, b = e` 拆成按位置绑定时设置：值为绑定的名字个数，
+ * 检查器据此要求 target 是同样元数的元组（规范 docs/04 §4.3「数量必须匹配」）。
+ * tupleElementType 是检查阶段回填的元组元素类型（target 为元组时），翻译器据此把
+ * `Object[]` 里取出的值转回元素类型；与 [JasCall.inferredTypeArgs] 同样只由检查器写、翻译器读。
  */
-data class JasArrayAccess(val target: JasExpression, val index: JasExpression) : JasExpression()
+data class JasArrayAccess(
+    val target: JasExpression,
+    val index: JasExpression,
+    val bindingArity: Int? = null
+) : JasExpression() {
+    var tupleElementType: JasType? = null
+}
 
 /**
  * 对象创建表达式（new）：type 目标类型；args 构造实参列表。
@@ -671,8 +684,14 @@ data class JasTernaryExpr(val condition: JasExpression, val thenExpr: JasExpress
 
 /**
  * 元组表达式：elements 各元素表达式。
+ *
+ * resolvedType 是检查阶段回填的元组类型：有期望元组类型且各元素可赋给它时取期望类型
+ * （`var p: (int64, string) = (1, "a")` 的 1 要按 int64 存），否则取各元素推断类型。
+ * 翻译器按它把每个元素先转成元素类型再装箱存入 `Object[]`。
  */
-data class JasTupleExpr(val elements: List<JasExpression>) : JasExpression()
+data class JasTupleExpr(val elements: List<JasExpression>) : JasExpression() {
+    var resolvedType: JasTupleType? = null
+}
 
 /**
  * 字符串模板/插值表达式：parts 按顺序拼接的片段（字面文本或嵌入表达式）。

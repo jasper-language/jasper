@@ -395,3 +395,20 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 不校验 scalar 范围；传给平台 char 形参截断为 16 位；多码点字符字面量仍静默为 0（应诊断） |
+
+## LANG-TUPLE-01 元组值、多值返回与按位置绑定（FV-B，Kotlin 前端 + 翻译器）
+
+源码身份：引入本节的提交；`JasperAst.kt`（`JasArrayAccess.bindingArity` / `tupleElementType`、`JasTupleExpr.resolvedType`、`JasForInStatement.patternBinding`）、`JasperAstBuilder.kt`（`return a, b` 成元组、`positionalBinding`、`isForInPattern`）、`TypeChecker.kt`（`inferTupleExpr`、`inferTupleAccess`、`tupleValueCompatible`、元组运算 / 打印诊断、cast 操作数检查）、`JasperToIrTranslator.kt`（`translateTuple`、元组下标转回元素类型）、`TypeMapper.kt`（元组 → `Object[]`）。
+
+性质（Q223）：元组表达式不再被翻译成 Unit 静默丢值；`return a, b` 不再只留首值；元组值是装箱 `Object[]`，常量下标按元素类型读回；字面量按期望元素类型转换；已有元组值不做元素级数值拓宽；`var a, b = e` 按位置绑定且元数必须一致；元组的 `==` / `+` / 插值 / 打印、变量或越界下标、void 元素、for-in 多名字绑定一律诊断。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `TupleTest` 种子 20261110，40 个随机元组（元数 2–4，int32 / int64 / string / bool / float64）经函数返回、形参传递、按位置绑定与常量下标往返，拼接结果与 Kotlin 独立算出的期望一致 |
+| 端到端 | 同一测试类：字面量与嵌套元组、Q220 原始复现 `var t = (1, 2)`、`divide` 多值返回、括号 return、元组形参、int64 / float64 拓宽、byte / char 元素、可空元素；普通多声明 `var a = 1, b = 2` 行为不变 |
+| 负例 | 13 个：元数不符、越界、变量下标、绑定元数、绑定非元组、`==`、拼接、println、for-in 元组模式（解析失败）与多名字、值拓宽、return 元数、void 元素 |
+| 变异 | 8 组全部被抓：元素不按声明类型转换、下标读出不转回元素类型、return 只留首值、不做按位置绑定、元组值元素级拓宽、cast 操作数不检查、越界不报、元组运算不报 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：123 个类 1595 项 0 失败 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | for-in 元组模式文法不能解析（Q232）；类字段的多名字声明不做按位置绑定；元组暂无相等与字符串形式；instanceof 操作数仍不经检查（Q233） |

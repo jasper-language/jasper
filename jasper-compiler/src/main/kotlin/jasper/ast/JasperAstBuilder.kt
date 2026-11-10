@@ -810,7 +810,8 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             val forInCtx = control.forInControl()
             val varName = doExtractForInVar(forInCtx.forInBinding())
             val iterable = visit(forInCtx.expression()) as JasExpression
-            return JasForInStatement(varName, iterable, body, null, null, suffix).at(ctx)
+            val pattern = isForInPattern(forInCtx.forInBinding())
+            return JasForInStatement(varName, iterable, body, null, null, suffix, pattern).at(ctx)
         }
 
         if (control.forClassicControl() != null) {
@@ -878,6 +879,16 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         return "_"
     }
 
+    /** for-in 绑定是不是元组模式或多个名字：这些形态尚未实现，由检查器诊断，不能只取首名。 */
+    private fun isForInPattern(ctx: JasperParser.ForInBindingContext): Boolean {
+        val decl = ctx.forInDeclBinding()
+        if (decl != null) {
+            return decl.bindingPattern().size != 1 || decl.bindingPattern(0).bindingTuple() != null
+        }
+        val pats = ctx.bindingPatternNoType()
+        return pats.size != 1 || pats[0].bindingNoTypeTuple() != null
+    }
+
     /**
      * 私有辅助：把经典 for 的初始化段构造为 JasStatement。
      *
@@ -932,12 +943,16 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     override fun visitStatementReturn(ctx: JasperParser.StatementReturnContext): JasNode? = visit(ctx.returnStatement())
 
     /**
-     * returnStatement 规则：取表达式的首个结果作为返回值，产出 JasReturn。
+     * returnStatement 规则：产出 JasReturn。`return a, b` 是多值返回（docs/05 §5.3），
+     * 值是元组 `(a, b)`；以前只取首个表达式，其余被静默丢弃（Q223）。
      */
     override fun visitReturnStatement(ctx: JasperParser.ReturnStatementContext): JasNode? {
-        val value = if (ctx.exprList() != null) {
-            ctx.exprList().expression().mapNotNull { visit(it) as? JasExpression }.firstOrNull()
-        } else null
+        val values = ctx.exprList()?.expression()?.mapNotNull { visit(it) as? JasExpression }.orEmpty()
+        val value = when (values.size) {
+            0 -> null
+            1 -> values.single()
+            else -> JasTupleExpr(values).at(ctx.exprList())
+        }
         return JasReturn(value).at(ctx)
     }
 
@@ -2324,6 +2339,7 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
         }
         // Handle variableBinding (multiple bindings)
         // 普通绑定：多绑定包成 JasBlock，单绑定直接返回 JasVariableStatement。
+        positionalBinding(tail.variableBinding(), isConst, ctx)?.let { return it }
         val stmts = tail.variableBinding().map { vb ->
             val b = vb.core
             JasVariableStatement(
@@ -2334,6 +2350,36 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
             ).at(ctx)
         }
         return if (stmts.size == 1) stmts[0] else JasBlock(stmts).at(ctx)
+    }
+
+    /**
+     * 按位置绑定多返回值：`var q, r = divide(17, 5);`（docs/04 §4.3、docs/05 §5.3）。
+     *
+     * 什么时候算：两个以上名字，只有最后一个带初始化器，前面的名字既无初始化器也无类型标注。
+     * 其余写法（`var a = 1, b = 2`、`var a: int32, b = x`）仍是各自独立的声明，行为不变。
+     * 怎么降级：初始化器先存进临时变量（名字用编译器内部的 `__jasper_*__` 形式并带行列号），每个名字
+     * 取它的第 i 个元素；这些下标访问带 [JasArrayAccess.bindingArity]，检查器据此要求
+     * 初始化器恰好是同元数的元组。包成 JasBlock 与普通多绑定一致：检查器与翻译器都不为它开新作用域。
+     */
+    private fun positionalBinding(
+        bindings: List<JasperParser.VariableBindingContext>,
+        isConst: Boolean,
+        ctx: ParserRuleContext
+    ): JasNode? {
+        if (bindings.size < 2) return null
+        val init = bindings.last().`init` ?: return null
+        if (bindings.dropLast(1).any { it.`init` != null || it.core.typeRef != null }) return null
+        if (bindings.last().core.typeRef != null) return null
+        val value = visit(init) as? JasExpression ?: return null
+        val temp = "__jasper_tuple_${ctx.start.line}_${ctx.start.charPositionInLine}__"
+        val stmts = mutableListOf<JasStatement>(JasVariableStatement(temp, null, value, true).at(ctx))
+        bindings.forEachIndexed { i, vb ->
+            val element = JasArrayAccess(
+                JasIdentifier(temp).at(vb), JasIntLiteral(i.toLong(), i.toString()).at(vb), bindings.size
+            ).at(vb)
+            stmts += JasVariableStatement(vb.core.name.text, null, element, isConst).at(vb)
+        }
+        return JasBlock(stmts).at(ctx)
     }
 
 }

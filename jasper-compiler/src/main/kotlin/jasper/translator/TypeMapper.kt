@@ -506,7 +506,8 @@ class TypeMapper {
             }
             is JasPointerType -> type("kotlin.Long")
             is JasReferenceType -> type("kotlin.Any")
-            is JasTupleType -> type("TupleType")
+            // 元组的值是 Object[]（元素装箱），与 jvmDescriptorFromType 一致。
+            is JasTupleType -> arrayType(type("kotlin.Any"))
             else -> unitType()
         }
     }
@@ -707,7 +708,7 @@ class TypeMapper {
             is JasNullableType -> boxedDescriptor(jvmDescriptorFromType(type.inner))
             is JasNonNullType -> jvmDescriptorFromType(type.inner)
             is JasFunctionType -> "Ljava/lang/Object;"
-            is JasTupleType -> "Ljava/lang/Object;"
+            is JasTupleType -> "[Ljava/lang/Object;"
             is JasWildcardType -> {
                 if (type.bound != null) jvmDescriptorFromType(type.bound) else "Ljava/lang/Object;"
             }

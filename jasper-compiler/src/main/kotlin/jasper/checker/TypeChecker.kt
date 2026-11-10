@@ -1277,6 +1277,10 @@ class TypeChecker(
                 }
             }
             is JasForInStatement -> {
+                if (stmt.patternBinding) {
+                    // 构建器只保留了首个名字；静默按单名绑定会让其余名字悄悄未定义或取错值。
+                    error("Tuple patterns and multiple names in for-in bindings are not supported yet; bind a single name", stmt)
+                }
                 val iterableType = inferExpression(stmt.iterable, env)
                 val loopEnv = env.copy()
                 // Arrays expose their element type directly; a declared object
@@ -1452,6 +1456,81 @@ class TypeChecker(
         return inner
     }
 
+    /**
+     * 元组字面量 `(a, b, ...)` 的类型（docs/03 §3.7）。
+     *
+     * 有期望元组类型、元数相同且每个元素都可赋给对应元素类型时，结果取期望类型：
+     * 翻译器按它把元素先转换（如 int32 → int64）再装箱，读回时才与声明类型一致。
+     * 否则结果是各元素推断类型组成的元组，由调用方的兼容性检查报不匹配。
+     * void 元素没有值，直接拒绝。结果回填到 [JasTupleExpr.resolvedType]。
+     */
+    private fun inferTupleExpr(expr: JasTupleExpr, env: TypeEnvironment, expected: JasType?): JasType {
+        val target = (if (expected is JasNullableType) expected.inner else expected) as? JasTupleType
+        val hints = target?.types?.takeIf { it.size == expr.elements.size }
+        val actual = expr.elements.mapIndexed { i, element ->
+            val type = inferExpression(element, env, hints?.get(i))
+            if (type is JasUnitType) error("A tuple element must have a value, got void", element)
+            type ?: JasAnyType
+        }
+        val fits = hints != null && actual.indices.all { typesCompatible(actual[it], hints[it]) }
+        val result = if (fits) target!! else JasTupleType(actual)
+        expr.resolvedType = result
+        return result
+    }
+
+    /**
+     * 元组下标 `t[i]`：下标必须是范围内的整数字面量，结果是该元素的类型（docs/03 §3.7）。
+     * 由按位置绑定生成的访问（[JasArrayAccess.bindingArity]）另要求元组元数与名字个数相同，
+     * 只在第 0 个元素上报一次。元素类型回填到 [JasArrayAccess.tupleElementType]。
+     */
+    private fun inferTupleAccess(expr: JasArrayAccess, targetType: JasType?): JasType {
+        val arity = expr.bindingArity
+        val index = (expr.index as? JasIntLiteral)?.value
+        if (targetType !is JasTupleType) {
+            if (arity != null && index == 0L && targetType != null) {
+                error("Positional binding of $arity names needs a tuple of $arity values, got ${typeDisplayName(targetType)}", expr)
+            }
+            return JasAnyType
+        }
+        if (arity != null) {
+            if (targetType.types.size != arity) {
+                if (index == 0L) {
+                    error("Positional binding of $arity names needs a tuple of $arity values, got ${typeDisplayName(targetType)}", expr)
+                }
+                return JasAnyType
+            }
+        }
+        if (index == null) {
+            error("A tuple index must be an integer literal", expr)
+            return JasAnyType
+        }
+        if (index < 0 || index >= targetType.types.size) {
+            error("Tuple index $index is out of range for ${typeDisplayName(targetType)}", expr)
+            return JasAnyType
+        }
+        val element = targetType.types[index.toInt()]
+        expr.tupleElementType = element
+        return element
+    }
+
+    /**
+     * 已存在的元组值能否赋给另一元组类型：元数相同，逐元素兼容；但两侧元素都是（可空）基本类型时
+     * 必须同名。元组按 Object[] 装箱存储，读取时按目标元素类型拆箱：存的是 Integer 却按 int64 读
+     * 会 ClassCastException，所以不做元素级数值拓宽；字面量在构造时按目标类型转换，不受此限。
+     */
+    private fun tupleValueCompatible(actual: JasTupleType, expected: JasTupleType): Boolean {
+        if (actual.types.size != expected.types.size) return false
+        return actual.types.zip(expected.types).all { (a, e) ->
+            val ap = (if (a is JasNullableType) a.inner else a) as? JasPrimitiveType
+            val ep = (if (e is JasNullableType) e.inner else e) as? JasPrimitiveType
+            if (ap != null && ep != null) {
+                canonicalTypeName(ap) == canonicalTypeName(ep) && typesCompatible(a, e)
+            } else {
+                typesCompatible(a, e)
+            }
+        }
+    }
+
     /** 基本类型的可空形式：JVM 上是包装类，不能直接参与算术、排序比较或作条件。 */
     private fun isNullablePrimitive(type: JasType?): Boolean =
         type is JasNullableType && type.inner is JasPrimitiveType
@@ -1569,6 +1648,11 @@ class TypeChecker(
                     rejectNullablePrimitiveOperand(rightType, expr.op, expr)
                 }
                 if (expr.op == "==" || expr.op == "!=") checkBoxedEquality(leftType, rightType, expr)
+                if (leftType is JasTupleType || rightType is JasTupleType) {
+                    // 元组在 JVM 上是 Object[]：== 只比引用、+ 拼接出数组地址，都不是规范意义上的值。
+                    // 规范未定元组的相等与字符串形式，先拒绝（可放宽），提示按元素操作。
+                    error("Operator '${expr.op}' cannot be applied to a tuple; use its elements (t[0], t[1], ...)", expr)
+                }
                 // 比较/逻辑运算符结果恒为 bool；其余（算术等）取一侧类型兜底 int32。
                 when (expr.op) {
                     "&&", "||" -> JasPrimitiveType("bool")
@@ -1609,6 +1693,12 @@ class TypeChecker(
                 expr.resolvedFunction = null
                 // 先推断所有实参类型，再按 callee 形态走两条路：具名函数（重载解析）或函数值。
                 val argTypes = expr.args.map { inferExpression(it, env) }
+                val printTarget = (expr.target as? JasIdentifier)?.name
+                if ((printTarget == "println" || printTarget == "print") && env.get(printTarget) == null &&
+                    argTypes.any { it is JasTupleType }
+                ) {
+                    error("A tuple has no string form yet; print its elements instead", expr)
+                }
                 // 类名静态方法调用（`A.f()` / 枚举合成方法 `Types.values()`）必须在「按函数值
                 // 推断 target」之前分流：否则 `A.f` 会被当成对类名的属性访问，落入
                 // 「类名不能访问实例成员」的错误路径，而正确的语义是静态调用（Q19 C22）。
@@ -1911,6 +2001,9 @@ class TypeChecker(
                 if (indexType != null && !typesCompatible(indexType, JasPrimitiveType("int32"))) {
                     error("Array index must be int32, got ${typeDisplayName(indexType)}", expr)
                 }
+                if (expr.bindingArity != null || targetType is JasTupleType) {
+                    return inferTupleAccess(expr, targetType)
+                }
                 when (targetType) {
                     is JasArrayType -> targetType.inner
                     is JasStringType -> {
@@ -1969,6 +2062,9 @@ class TypeChecker(
             is JasCastExpr -> {
                 // 强制转型的目标类型是显式类型引用；校验可见性与类型实参个数。
                 checkTypeReferences(expr.type, env)
+                // 被转型的表达式也必须检查：否则其中的未解析名字漏过检查器，元组下标等
+                // 依赖检查阶段回填的信息（元素类型）也缺失，`cast t[0] as int32` 会按错误类型拆箱。
+                inferExpression(expr.expression, env)
                 expr.type
             }
             is JasInstanceOfExpr -> {
@@ -1984,7 +2080,11 @@ class TypeChecker(
             }
             is JasStringTemplate -> {
                 // 嵌入表达式必须被检查：缺这一步时模板里的未解析名字直接到翻译器，退化成 this。
-                expr.parts.forEach { if (it is JasTemplateExpr) inferExpression(it.expr, env) }
+                expr.parts.forEach {
+                    if (it is JasTemplateExpr && inferExpression(it.expr, env) is JasTupleType) {
+                        error("A tuple has no string form yet; interpolate its elements instead", it.expr)
+                    }
+                }
                 JasStringType
             }
             is JasDictLiteral -> inferDictLiteral(expr, env, expected)
@@ -2003,11 +2103,7 @@ class TypeChecker(
                 targetType ?: JasAnyType
             }
             is JasPostfixIncDec -> inferPostfixIncDec(expr, env)
-            is JasTupleExpr -> {
-                // 元素必须被检查，否则未解析的名字和字段简单名会从这里漏过；元组自身的类型维持 any。
-                expr.elements.forEach { inferExpression(it, env) }
-                JasAnyType
-            }
+            is JasTupleExpr -> inferTupleExpr(expr, env, expected)
             is JasAssignmentIncrement -> {
                 // `x = y++`：与普通赋值同样的兼容性规则，右值是自增表达式的类型。
                 val targetType = if (expr.target is JasPropertyAccess) inferExpressionCore(expr.target, env) else inferExpression(expr.target, env)
@@ -3117,6 +3213,7 @@ class TypeChecker(
         // Interface subtype checking
         // 接口/父接口子类型：沿已收集的 implements/extends 关系链判断。
         if (actual is JasNamedType && expected is JasNamedType && isSubtype(actual.name, expected.name)) return true
+        if (actual is JasTupleType && expected is JasTupleType) return tupleValueCompatible(actual, expected)
         // Numeric widening conversions
         // 数值拓宽：int32 -> int64 -> float64 等按 numericWidening 表放行。
         if (isNumericWidening(actual, expected)) return true
