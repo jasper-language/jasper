@@ -403,7 +403,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 属性测试 | `Char32Test` 种子 20261117，20 个随机非代理码点：转 int64 等于码点，转字符串长度等于 UTF-16 码元数 |
+| 属性测试 | `Char32Test` 种子 20261117，20 个随机非代理码点：转 int64 等于码点，转字符串长度等于码点数（Q231 起用属性 `s.length`；原先的 `s.length()` 走的是 JVM UTF-16 计数，已被编译期拒绝） |
 | 端到端 | 同一测试类 5 项：'😀' 码点与拼接、char 数组、println 输出、`StringBuilder.append(char)` |
 | 既有测试改期望 | `PostfixIncDecTest` 的 char 用例：65535++ 为 65536（不再 16 位回绕）；`GrammarRegressionTest`、`SafeAccessPipelineTest` 反射传入 / 读回改为码点（语义变化，按裁决） |
 | 变异 | 4 组全部被抓：字符串转换不按码点、平台实参不按 C 匹配、字面量按码元数判断、char 数组不标记 |
@@ -575,3 +575,21 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 十进制浮点字面量的范围检查不在本节 |
+
+## LANG-BUILTIN-WIDEN-01 int32 内建结果在 int64 / float64 目标位置的拓宽（FV-B，Kotlin 检查器 + 后端）
+
+源码身份：引入本节的提交；`TypeChecker.kt`（实例成员调用分流：string / 数组上的 `length(...)` 调用形式诊断）、`JvmIrBackend.kt`（静态调用实参改走 `emitCallArgumentConversion`）。
+
+性质（Q231）：`string.length`、`string.byteLength()`、`string.codePointAt(i)`、数组 `.length`、集合 `size()` 的 int32 结果在局部初始化、赋值、实例字段、返回、实参（静态 / 成员 / 构造器）、数组元素各位置存进 int64 / float64 时都按目标类型拓宽，加载不再 VerifyError，值与 Kotlin 独立算出的一致。`length` 在 string / 数组上只有属性形式（§11.3）：调用形式 `s.length()` 此前被宽松定为 any，翻译成 JVM `String.length()`（UTF-16 码元数，与码点数是两个答案，且 IR 类型不是 int32 而漏 I2L），现在编译期诊断 `'length' of a string is a property, not a method`；数组同理。第二个根因：静态调用实参此前只装箱与引用宽化，不做数值拓宽。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `BuiltinResultWideningTest` 种子 20261231：25 个随机字符串（0–11 个随机非代理码点，含补充平面）× 全部位置，随机码点索引；10 个随机容器大小（0–39）× 数组 / 集合各位置 |
+| 端到端 | 同一测试类固定样本：空串、ASCII、BMP 中文、`a😀b`、`😀😀`；容器大小 0 / 1 / 7 |
+| 负例 | `s.length()` 存 int64 局部、`return s.length()`、`xs.length()`：诊断文本指向属性写法，且不产 class |
+| 既有测试改期望 | `Char32Test` 随机用例改用 `s.length`，期望由 UTF-16 码元数改为码点数（按 §11.3） |
+| 变异 | 4 组全部被抓：不拒绝调用形式、只拒绝 string 不拒绝数组（各被负例抓）、静态实参不做数值拓宽、静态实参漏 I2D（各被固定与随机两项抓） |
+| 定点回归 | REGRESSION_RESULT |
+| Z3 / Lincheck | N/A：无并发、无可交给 SMT 的算术不变式；替代证据为上面的随机执行与变异 |
+| JBMC | 发版时验证 |
+| 边界 | 平台成员调用（如 `s.hashCode()`）的 IR 返回类型回填由 Q226（LANG-PLATFORM-RESULT-01）负责，本条不覆盖；`graphemeCount()` 尚未实现 |

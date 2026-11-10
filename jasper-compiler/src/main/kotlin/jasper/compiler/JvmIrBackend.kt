@@ -2246,9 +2246,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                                 if (func != null && i < func.valueParameters.size) {
                                     val argDesc = typeMapper.jvmDescriptorFromIrType(arg.type)
                                     val paramDesc = typeMapper.jvmDescriptorFromIrType(func.valueParameters[i].type)
-                                    // 静态调用同样按声明形参转换：装箱 + 接口/父类 CHECKCAST（C13）。
-                                    emitBoxingIfNeeded(mv, argDesc, paramDesc)
-                                    emitReferenceWidening(mv, argDesc, paramDesc)
+                                    // 静态调用同样按声明形参转换：数值拓宽（Q231：`take(s.length)` 传给
+                                    // int64 / float64 形参此前缺 I2L / I2D 而 VerifyError）、装箱、
+                                    // 接口/父类 CHECKCAST（C13）——与成员调用共用同一转换。
+                                    emitCallArgumentConversion(mv, argDesc, paramDesc)
                                 }
                             }
                             // 描述符用被调函数的声明类型（擦除后），拿不到符号时退回实参类型；

@@ -1958,6 +1958,22 @@ class TypeChecker(
                             }
                             return JasPrimitiveType("int32")
                         }
+                        // Q231：string / 数组的长度在语言层只有属性 `.length`（§11.3，单一长度成员）。
+                        // 调用形式 `s.length()` 此前落到下面的「函数值」兜底，被宽松定为 any，
+                        // 翻译后变成 JVM `String.length()`：结果是 UTF-16 码元数（与 `.length`
+                        // 的码点数是两个答案），IR 类型又不是 int32，存进 int64 局部时缺 I2L 而
+                        // VerifyError；数组上则是不存在的方法。两种都必须在编译期拒绝。
+                        if ((receiverType is JasStringType || receiverType is JasArrayType) &&
+                            expr.target.property == "length"
+                        ) {
+                            val kind = if (receiverType is JasStringType) "string" else "array"
+                            error(
+                                "'length' of a $kind is a property, not a method; write '.length' " +
+                                    "without parentheses",
+                                expr
+                            )
+                            return JasPrimitiveType("int32")
+                        }
                         // 集合成员必须先于通用「用户类型成员」路径分流：List/Map/dict
                         // 可能同时被标准库声明为接口，若不先按语言内建集合元数据解析，
                         // 就会依赖符号表里某个声明是否存在，独立编译（不带 stdlib）

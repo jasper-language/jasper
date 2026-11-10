@@ -81,11 +81,11 @@ class Char32Test {
             do { cp = random.nextInt(0x20, 0x110000) } while (cp in 0xD800..0xDFFF)
             val text = String(Character.toChars(cp))
             val literal = text.replace("\\", "\\\\").replace("'", "\\'")
-            assertEquals(cp * 1L + text.length, run("r$round", "int64", """
+            assertEquals(cp * 1L + text.codePointCount(0, text.length), run("r$round", "int64", """
                 var c: char = '$literal';
                 var s: string = "" + c;
                 var n: int64 = cast c as int64;
-                var len: int32 = s.length();
+                var len: int32 = s.length;
                 return n + len;
             """), "cp=$cp")
         }
