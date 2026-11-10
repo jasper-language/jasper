@@ -1465,13 +1465,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      */
     override fun visitNewUnqualified(ctx: JasperParser.NewUnqualifiedContext): JasNode? {
         val args = if (ctx.arguments() != null) doVisitExprList(ctx.arguments().exprList()) else emptyList()
-        val typeArgs = if (ctx.typeArgumentsOrDiamond() != null) {
-            if (ctx.typeArguments() != null) {
-                ctx.typeArguments().typeArgument().mapNotNull { visit(it) as? JasType }
-            } else {
-                emptyList()
-            }
-        } else emptyList()
+        // 类型实参取类型名后面的 `<…>`（typeArgumentsOrDiamond）。Q227 前误读了 `new` 后面那个
+        // 可选的构造器类型实参槽（ctx.typeArguments()），`new MutableList<int32>()` 的实参因此全丢，
+        // 推断出的局部成了裸集合，取元素不拆箱，参与运算时 VerifyError。钻石 `<>` 仍为空列表。
+        val typeArgs = ctx.typeArgumentsOrDiamond()?.typeArguments()?.typeArgument()
+            ?.mapNotNull { visit(it) as? JasType }
+            ?: emptyList()
         return JasNew(JasNamedType(ctx.Identifier().joinToString(".") { it.text }, typeArgs), args).at(ctx)
     }
 

@@ -331,3 +331,17 @@
 | 属性测试 / Z3 / Lincheck | N/A：写法为有限枚举、逐个覆盖 / 无算术约束 / 单线程 |
 | JBMC | 发版时验证 |
 | 边界 | 与「值为 null 的变量」比较（非字面量）仍走 Objects.equals，语义同样正确，但若对方非 null 会调用其 equals |
+
+## LANG-COLLECTION-UNBOX-01 `new` 的类型实参不丢失（FV-B，Kotlin 前端）
+
+源码身份：引入本节的提交；`JasperAstBuilder.kt`（`visitNewUnqualified`）。
+
+性质：`new T<A, …>(…)` 的类型实参取自类型名后面的 `<…>`；此前误读 `new` 后可选的构造器类型实参槽，实参全丢，`var l = new MutableList<int32>()` 推断出裸集合，`l.get(0) + 1` 取元素不拆箱，类加载时 VerifyError（Q227）。钻石 `<>` 仍为空。
+
+| 项 | 内容 |
+|---|---|
+| 端到端 | `CollectionElementUnboxTest` 4 项：推断与声明局部的 int32 元素、int64 / float64 / bool 元素、dict 值参与运算 |
+| 变异 | 1 组被抓：改回读构造器类型实参槽（3 项失败） |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：119 个类 0 失败 1 跳过 |
+| 属性测试 / Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
