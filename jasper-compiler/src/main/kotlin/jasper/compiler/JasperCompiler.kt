@@ -468,7 +468,7 @@ class JasperCompiler(
         }.toMutableList()
 
         for (file in frameFiles) {
-            val typeErrors = TypeChecker(symbolTable, rejectUnloweredAwait = false).check(file)
+            val typeErrors = TypeChecker(symbolTable, rejectUnloweredAwait = false, checkReturnPaths = false).check(file)
             errors += typeErrors.map { te ->
                 CompileError.Type(te.message, line = te.node?.sourceLine ?: 0, column = te.node?.sourceColumn ?: 0)
             }

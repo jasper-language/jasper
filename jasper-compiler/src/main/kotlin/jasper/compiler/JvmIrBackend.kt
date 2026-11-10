@@ -1284,9 +1284,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                 ctx.loopFinallyDepth[targets] = ctx.finallyStack.size
                 mv.visitLabel(loopLabel)
                 val cond = stmt.condition
-                generateIrExpression(mv, cond, ctx, owner)
-                // 条件为「非 0/true」才进体，故 false 时 IFEQ 直接跳出。
-                mv.visitJumpInsn(Opcodes.IFEQ, endLabel)
+                // 条件是字面量 true 时不发条件跳转（Q154）：出口只能经 break 到达。否则 endLabel
+                // 在字节码里永远可达，非 void 函数以 while (true) 结尾时，后面补的返回指令没有返回值
+                // 可用，校验器报 Operand stack underflow。检查器的返回路径分析按同一判据（字面量 true）。
+                if (!isAlwaysTrue(cond)) {
+                    generateIrExpression(mv, cond, ctx, owner)
+                    // 条件为「非 0/true」才进体，故 false 时 IFEQ 直接跳出。
+                    mv.visitJumpInsn(Opcodes.IFEQ, endLabel)
+                }
                 val loopBody = stmt.body
                 if (loopBody is IrBlock) {
                     for (s in loopBody.statements) {
@@ -1319,9 +1324,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                     }
                 }
                 val cond = stmt.condition
-                generateIrExpression(mv, cond, ctx, owner)
-                // 条件非 0/true 则回到循环头（IFNE）。
-                mv.visitJumpInsn(Opcodes.IFNE, loopLabel)
+                if (isAlwaysTrue(cond)) {
+                    // 同 while：字面量 true 直接回跳，出口只经 break 可达（Q154）。
+                    mv.visitJumpInsn(Opcodes.GOTO, loopLabel)
+                } else {
+                    generateIrExpression(mv, cond, ctx, owner)
+                    // 条件非 0/true 则回到循环头（IFNE）。
+                    mv.visitJumpInsn(Opcodes.IFNE, loopLabel)
+                }
                 mv.visitLabel(endLabel)
                 ctx.loopStack.removeLast()
                 ctx.loopTargets.remove(stmt)

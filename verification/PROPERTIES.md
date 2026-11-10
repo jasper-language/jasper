@@ -219,3 +219,20 @@
 | Lincheck | N/A：单线程前端 |
 | JBMC | 发版时验证 |
 | 边界 | 顶层字段在源码布局上被归为语句，报 STRICT-001 而不是 STRICT-003；`--run` 只运行已编译模块，不接受 `--strict` |
+
+## LANG-RETURN-PATHS-01 非 void 函数的返回路径（FV-B，Kotlin 编译器检查 + 后端）
+
+源码身份：引入本节的提交；`ReturnFlow.kt`、`TypeChecker.kt`（`checkFunction`、`checkReturnPaths`）、`JasperCompiler.kt`（生成帧复查关闭本规则）、`JvmIrBackend.kt`（`IrWhileLoop` / `IrDoWhileLoop` 的字面量 true 条件）。
+
+性质：声明非 void 返回类型、有函数体的函数，若函数体按结构规则（docs/05 §5.1.1）能走到末尾，编译报 `Missing return`；字面量 `true` 条件的循环不再发条件跳转，出口只经 break 可达，`while (true)` 结尾的函数不再出 VerifyError（Q154）。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `ReturnPathsTest` 种子 20261111，80 棵随机语句树（return / throw / break / 空语句 / if-else / while(true) / 有界 while）；独立模型判定能否走到末尾：能则必须报 Missing return，不能则必须编译成功，并以 n=0..3 运行，只允许返回 int 或抛 std.Error（排除 VerifyError），断言两边各至少 15 例 |
+| 端到端 | 同一测试类：四种无限循环结尾（while / for(;;) / do-while / 带标签）及 int64、string 返回，按 n 运行验值；9 种拒绝形态；6 种接受形态运行验值；void 不受影响 |
+| 变异 | 4 组全部被抓：后端照旧发条件跳转、无 else 的 if 判为不能走过、忽略 break、忽略 finally |
+| 定点回归 | 132 个测试类 + 一致性语料，1185 项，唯一失败是 c80ae80 引入的文档示例登记遗漏（03ffd5a 已修），与本片无关 |
+| Z3 | N/A：结构判定，无算术约束 |
+| Lincheck | N/A：单线程 |
+| JBMC | 发版时验证 |
+| 边界 | 不做常量折叠（`while (1 == 1)` 视为可能走过）；不可达语句不报诊断；协程降级生成的帧类复查时不查本规则（由降级保证）；lambda 体未纳入 |

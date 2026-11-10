@@ -74,7 +74,10 @@ private const val RESULT_TYPE_SIMPLE_NAME = "Result"
  */
 class TypeChecker(
     private val symbolTable: SymbolTable? = null,
-    private val rejectUnloweredAwait: Boolean = true
+    private val rejectUnloweredAwait: Boolean = true,
+    // 非 void 函数体不得正常走到末尾（LANG-RETURN-PATHS-01）。协程降级生成的帧类复查时关闭：
+    // 帧方法的返回路径由降级本身保证，且其结构（分派循环）不是用户写的。
+    private val checkReturnPaths: Boolean = true
 ) {
     private val errors = mutableListOf<TypeError>()
     private val classImplements = mutableMapOf<String, List<String>>() // className -> interfaceNames
@@ -925,6 +928,14 @@ class TypeChecker(
             // body=null 表示只有签名（内置/外部函数），无需检查语句。
             for (stmt in func.body!!.statements) {
                 checkStatement(stmt, funcEnv, func.returnType)
+            }
+            val returnsValue = func.returnType != null && func.returnType !is JasUnitType
+            if (checkReturnPaths && returnsValue && ReturnFlow.canComplete(func.body!!.statements)) {
+                error(
+                    "Missing return: function '${func.name}' returns ${typeDisplayName(func.returnType!!)} " +
+                        "but can reach the end of its body; end every path with return or throw",
+                    func
+                )
             }
         }
     }
