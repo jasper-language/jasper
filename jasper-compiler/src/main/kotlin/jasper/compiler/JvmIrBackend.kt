@@ -1307,12 +1307,13 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
             }
             is IrDoWhileLoop -> {
                 // do body while(cond)：体至少执行一次，条件在末尾判断。
-                //   loop: body; cond; IFNE loop; end:
-                // continue 跳 loopLabel 会**跳过条件**直接回体，这是与 while 的已知差异
-                // （由 translator 生成 IR 的方式决定，后端照此翻译）。
+                //   loop: body; cond: cond; IFNE loop; end:
+                // continue 跳 condLabel（先求值条件，与 Java 一致）；旧实现跳 loopLabel，
+                // 跳过条件直接回体，条件为假时死循环（Q225）。break 跳 endLabel。
                 val loopLabel = Label()
+                val condLabel = Label()
                 val endLabel = Label()
-                val targets = Pair(loopLabel, endLabel)
+                val targets = Pair(condLabel, endLabel)
                 ctx.loopStack.add(targets)
                 ctx.loopTargets[stmt] = targets
                 ctx.loopFinallyDepth[targets] = ctx.finallyStack.size
@@ -1323,6 +1324,7 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         generateIrStatement(mv, s, ctx, owner)
                     }
                 }
+                mv.visitLabel(condLabel)
                 val cond = stmt.condition
                 if (isAlwaysTrue(cond)) {
                     // 同 while：字面量 true 直接回跳，出口只经 break 可达（Q154）。

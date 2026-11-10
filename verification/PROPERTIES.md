@@ -300,3 +300,19 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | `byte` 与 `char` 仍与规范不一致（规范 uint8 / char32，实现有符号 8 位 / UTF-16），入 Q229 |
+
+## LANG-DOWHILE-CONTINUE-01 do-while 的 continue 先求值条件（FV-B，Kotlin 后端）
+
+源码身份：引入本节的提交；`JvmIrBackend.kt`（`IrDoWhileLoop` 的 `condLabel`）。
+
+性质：同步路径 `do { … continue; … } while (c);` 的 continue（含带标签的、从内层循环跳到外层 do-while 的）跳到条件求值处，与 Java / Kotlin 一致；此前跳回循环体开头，条件为假时不结束（Q225，后端注释曾自认「已知差异」）。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `DoWhileContinueTest` 种子 20261114，20 组随机跳过模式（模数、命中余数、break 位置、n），期望值由 Kotlin do-while 独立算出；每次运行限时 10 秒 |
+| 端到端 | 同一测试类：无标签 continue（5 个 n）、带标签 continue 到外层 do-while（3 个 n） |
+| 变异 | 1 组被抓：continue 目标改回循环头（3 项全部失败 / 超时） |
+| 定点回归 | 7 个测试类 36 项 0 失败（含全部 *Loop* 类与 ReturnPathsTest） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 协程帧内的 do-while 由块规划器单独降级（S-C 第十二片），未改 |
