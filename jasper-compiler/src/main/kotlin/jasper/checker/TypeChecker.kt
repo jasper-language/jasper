@@ -95,6 +95,12 @@ class TypeChecker(
     private var currentClassFields: FieldOwner? = null
 
     /**
+     * 当前正在检查的、已知没有 `this` 的位置的描述（如「enum constant 'A' arguments」）；
+     * 非 null 时标识符 `this` 报错。目前只有枚举常量实参设置它（在 `<clinit>` 里求值）。
+     */
+    private var staticContext: String? = null
+
+    /**
      * 当前被检查文件声明的包名（null 表示无 package 声明）。
      *
      * 做什么：判断「某类型简单名是否与本文件同包因而可直接引用」时的基准包。
@@ -416,6 +422,7 @@ class TypeChecker(
                         .also { it.sourceLine = decl.sourceLine; it.sourceColumn = decl.sourceColumn },
                     env
                 )
+                checkEnumConstantArguments(decl, ctors, env)
             }
             is JasProperty -> {}
             is JasImport -> {}
@@ -440,6 +447,73 @@ class TypeChecker(
                 }
             }
             else -> {}
+        }
+    }
+
+    /**
+     * 做什么：检查每个枚举常量的实参能否调用枚举的某个构造器（Q230）：个数、类型，以及构造器存在。
+     * 什么时候用：[checkDeclaration] 处理 JasEnum，枚举体按类体检查之后。
+     * 前置条件：env 是枚举声明所在的顶层环境（不含 this）：常量实参在 `<clinit>` 里求值，
+     *   是静态上下文，引用 `this` 或实例字段应当报错。
+     * 失败模式：不抛异常；不符时追加诊断，翻译器据此不会遇到无法匹配的常量。
+     * 规则：
+     *   - 常量按实参个数选构造器（与成员、`new` 的重载口径一致）。没有显式构造器时只有默认的
+     *     零参构造器，带实参的常量报错；`A()` 与 `A` 等价。
+     *   - 同个数的构造器多于一个时报歧义（同元数重载尚不支持，见类成员的同类诊断）。
+     *   - 选中的构造器带 varargs 形参时报错：常量调用尚不打包可变参数，宁可拒绝也不静默传错。
+     *   - 每个实参带着形参类型推断（数组字面量等需要期望类型），再要求可赋给形参类型。
+     */
+    private fun checkEnumConstantArguments(decl: JasEnum, ctors: List<JasConstructor>, env: TypeEnvironment) {
+        val previousStaticContext = staticContext
+        try {
+            for (constant in decl.constants) {
+                staticContext = "the arguments of enum constant '${constant.name}'"
+                checkEnumConstantArgumentsOf(decl, constant, ctors, env)
+            }
+        } finally {
+            staticContext = previousStaticContext
+        }
+    }
+
+    /** [checkEnumConstantArguments] 对单个常量的检查：选构造器，再逐个比对实参类型。 */
+    private fun checkEnumConstantArgumentsOf(decl: JasEnum, constant: JasEnumConstant, ctors: List<JasConstructor>, env: TypeEnvironment) {
+        val n = constant.args.size
+        if (ctors.isEmpty()) {
+            if (n > 0) {
+                error("Enum constant '${constant.name}' passes $n argument(s), but enum '${decl.name}' declares no constructor", constant)
+                constant.args.forEach { inferExpression(it, env) }
+            }
+            return
+        }
+        val candidates = ctors.filter { it.parameters.size == n }
+        if (candidates.isEmpty()) {
+            val arities = ctors.map { it.parameters.size }.distinct().sorted().joinToString(", ")
+            error("No constructor of enum '${decl.name}' takes $n argument(s) for constant '${constant.name}' (declared: $arities)", constant)
+            constant.args.forEach { inferExpression(it, env) }
+            return
+        }
+        if (candidates.size > 1) {
+            error("Enum constant '${constant.name}' is ambiguous: enum '${decl.name}' declares ${candidates.size} constructors taking $n argument(s)", constant)
+            constant.args.forEach { inferExpression(it, env) }
+            return
+        }
+        val ctor = candidates.single()
+        if (ctor.parameters.any { it.vararg }) {
+            error("Enum constant '${constant.name}' cannot call a varargs constructor of enum '${decl.name}'", constant)
+            constant.args.forEach { inferExpression(it, env) }
+            return
+        }
+        for ((i, arg) in constant.args.withIndex()) {
+            val param = ctor.parameters[i]
+            val argType = inferExpression(arg, env, param.type)
+            val paramType = param.type
+            if (argType != null && paramType != null && !typesCompatible(argType, paramType)) {
+                error(
+                    "Type mismatch: enum constant '${constant.name}' argument ${i + 1} cannot pass " +
+                        "${typeDisplayName(argType)} to parameter '${param.name}' of type ${typeDisplayName(paramType)}",
+                    arg
+                )
+            }
         }
     }
 
@@ -1628,6 +1702,8 @@ class TypeChecker(
                     } else if (expr.name == "this") {
                         // `this` 是语言内建接收者，由类/方法上下文确定；它不是局部变量。
                         // 具体类型由 translator 的接收者路径处理，这里不把它误报成未声明名字。
+                        // 已知没有接收者的位置（枚举常量实参，Q230）除外：那里用 this 必须报错。
+                        staticContext?.let { error("'this' cannot be used in $it", expr) }
                         null
                     } else {
                         // 名字未声明是静态语言错误；脚本模式同样不能用赋值隐式创建变量。

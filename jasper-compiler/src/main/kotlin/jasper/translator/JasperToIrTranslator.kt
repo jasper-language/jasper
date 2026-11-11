@@ -738,15 +738,20 @@ class JasperToIrTranslator {
      */
     private fun collectConstructorParamTypes(ast: JasSourceFile, ctx: TranslationContext) {
         for (decl in ast.declarations) {
-            if (decl !is JasClass) continue
-            val owner = typeMapper.resolveNamedTypeName(decl.name)
+            // 枚举同样登记（Q230）：带实参的枚举常量按这张表把实参宽化到构造器声明的形参类型。
+            val (name, constructors) = when (decl) {
+                is JasClass -> decl.name to decl.constructors
+                is JasEnum -> decl.name to decl.members.filterIsInstance<JasConstructor>()
+                else -> continue
+            }
+            val owner = typeMapper.resolveNamedTypeName(name)
             val byKey = ctx.constructorParamTypesByType.getOrPut(owner) { mutableMapOf() }
-            if (decl.constructors.isEmpty()) {
+            if (constructors.isEmpty()) {
                 // 默认构造器：`new C()` 的声明签名是空形参。
                 byKey.putIfAbsent(memberArityKey("<init>", 0), emptyList())
                 continue
             }
-            for (ctor in decl.constructors) {
+            for (ctor in constructors) {
                 // 形参类型缺失时无法得到可靠描述符——整条跳过，避免登记半个签名。
                 if (ctor.parameters.any { it.type == null }) continue
                 byKey.putIfAbsent(
@@ -1586,8 +1591,9 @@ class JasperToIrTranslator {
         val constantSymbols = ctx.enumConstantSymbolsByType.getOrPut(qualifiedClassName) { mutableMapOf() }
         val previousFieldInitializers = ctx.instanceFieldInitializers
         ctx.instanceFieldInitializers = instanceFieldInitializersOf(enum.members)
+        val enumType = typeMapper.type(qualifiedClassName)
         for (const in enum.constants) {
-            irCls.declarations.add(translateEnumConstant(const, constantSymbols))
+            irCls.declarations.add(translateEnumConstant(const, constantSymbols, enumType, qualifiedClassName, ctx))
         }
         for (member in enum.members) {
             val irMember = translateClassMember(member, ctx, symbol)
@@ -1616,13 +1622,37 @@ class JasperToIrTranslator {
      * 失败模式：无；符号缺失时补建并写回索引，保证声明处与使用处仍共享同一身份。
      * 为什么复用符号：后端 pass 1 按 IrEnumEntry.symbol 建立「符号 -> owner/名字」索引，
      *   使用处（IrGetEnumValue）引用同一符号才能解析到同一字段。
+     * 实参（Q230）：常量的实参翻译成一个 IrConstructorCall，挂在 initializerExpression 上；
+     *   后端在 `<clinit>` 里先压 (name, ordinal) 再求值这些实参，按「(String,int) + 实参描述符」
+     *   调用 `<init>`。实参按构造器声明的形参类型宽化（与 `new` 同一张表、同一条
+     *   castToDeclared 路径），描述符因此与 [JvmIrBackend] 发射的构造器一致。个数和类型是否
+     *   匹配由检查器负责，这里不再兜底。无实参的常量不挂表达式，后端走 `(String,int)`。
      */
     private fun translateEnumConstant(
         const: JasEnumConstant,
-        constantSymbols: MutableMap<String, IrEnumEntrySymbol>
+        constantSymbols: MutableMap<String, IrEnumEntrySymbol>,
+        enumType: IrType,
+        owner: String,
+        ctx: TranslationContext
     ): IrEnumEntry {
         val entrySymbol = constantSymbols.getOrPut(const.name) { IrEnumEntrySymbolImpl() }
-        return factory.createEnumEntry(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(const.name), entrySymbol)
+        val entry = factory.createEnumEntry(0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(const.name), entrySymbol)
+        if (const.args.isNotEmpty()) {
+            val declaredParams = ctx.constructorParamTypesByType[owner]?.get(memberArityKey("<init>", const.args.size))
+            check(declaredParams != null && declaredParams.size == const.args.size) {
+                "enum constant '${const.name}' of '$owner' has no constructor taking ${const.args.size} argument(s); the checker must reject this"
+            }
+            val args = const.args.mapIndexed { i, arg -> castToDeclared(declaredParams[i], translateExpression(arg, ctx)) }
+            val ctorSymbol = IrConstructorSymbolImpl()
+            ctx.constructorTypes[ctorSymbol] = "object"
+            val call = IrNodeFactory.createConstructorCall(
+                0, 0, enumType, null,
+                args.toTypedArray(), emptyArray(), ctorSymbol,
+                SourceElement.NO_SOURCE, 0
+            )
+            entry.initializerExpression = factory.createExpressionBody(0, 0, call)
+        }
+        return entry
     }
 
     // ── annotation type ──

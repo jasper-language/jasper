@@ -826,15 +826,18 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
     // 表示），声明顺序即 ordinal 顺序。不再使用「字段名首字母大写」启发式——它会把
     // 普通静态字段误当常量，也会漏掉小写开头的常量，且与 translator 的 IrEnumEntry
     // 表示对不上（Q18 崩溃的根因之一）。
-    // 已知限制：当前只支持无用户参数的枚举常量的 <clinit> 实例化；带实参的常量
-    // （`A(1)`）仍按 (name, ordinal) 调用构造器，属任务书明确的非目标。
+    // 带实参的常量（Q230，`A(1, "x")`）：translator 把实参放在 IrEnumEntry.initializerExpression
+    // 的 IrConstructorCall 里，已宽化到构造器声明的形参类型；这里在 (name, ordinal) 之后
+    // 按声明顺序求值，描述符为 `(Ljava/lang/String;I<实参描述符>)V`，与 generateEnumConstructor
+    // 按形参类型拼出的描述符一致。实参在 <clinit> 里求值（静态上下文，无 this）。
     private fun generateEnumInfrastructure(
         cw: ClassWriter,
         cls: IrClass,
         internalName: String,
         staticFields: List<IrField> = emptyList()
     ) {
-        val enumConstNames = cls.declarations.filterIsInstance<IrEnumEntry>().map { it.name.toString() }
+        val enumEntries = cls.declarations.filterIsInstance<IrEnumEntry>()
+        val enumConstNames = enumEntries.map { it.name.toString() }
         if (enumConstNames.isEmpty()) {
             // 没有枚举常量时不创建枚举基础设施；但用户静态字段仍需初始化。
             if (staticFields.any { needsRuntimeStaticInit(it) }) {
@@ -851,14 +854,27 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         // <clinit> 里先实例化常量，再装填缓存数组——顺序不能反，数组元素引用的是常量字段。
         val clMv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null)
         clMv.visitCode()
-        for ((i, constName) in enumConstNames.withIndex()) {
+        // 实参求值共用一个静态方法上下文（无 this，局部槽从 0 起），实参里的 lambda、块表达式
+        // 产生的临时变量都落在 <clinit> 自己的局部表里。
+        val clinitCtx = MethodContext(clMv, mutableListOf(), mutableMapOf(), mutableMapOf(), 0, null, true)
+        for ((i, entry) in enumEntries.withIndex()) {
+            val constName = enumConstNames[i]
             // NEW + DUP 保留一份引用供 <init> 消耗；枚举构造器的前两个隐式参数是
-            // (name, ordinal)，这里用 LDC 常量名与 SIPUSH 序号压栈。
+            // (name, ordinal)，这里用 LDC 常量名与 SIPUSH 序号压栈，用户实参排在其后。
             clMv.visitTypeInsn(Opcodes.NEW, internalName)
             clMv.visitInsn(Opcodes.DUP)
             clMv.visitLdcInsn(constName)
             clMv.visitIntInsn(Opcodes.SIPUSH, i)
-            clMv.visitMethodInsn(Opcodes.INVOKESPECIAL, internalName, "<init>", "(Ljava/lang/String;I)V", false)
+            val call = entry.initializerExpression?.expression as? IrConstructorCall
+            var argDescs = ""
+            if (call != null) {
+                for (a in 0 until call.valueArgumentsCount) {
+                    val arg = call.getValueArgument(a) ?: continue
+                    generateIrExpression(clMv, arg, clinitCtx, internalName)
+                    argDescs += typeMapper.jvmDescriptorFromIrType(arg.type)
+                }
+            }
+            clMv.visitMethodInsn(Opcodes.INVOKESPECIAL, internalName, "<init>", "(Ljava/lang/String;I$argDescs)V", false)
             clMv.visitFieldInsn(Opcodes.PUTSTATIC, internalName, constName, "L$internalName;")
         }
         // 构造长度为 n 的数组，然后逐元素 DUP-压索引-GETSTATIC-AASTORE 填充。

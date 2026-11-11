@@ -376,7 +376,7 @@
 | 定点回归 | 除 Lincheck 外全部测试类 + 一致性：120 个类 1578 项 0 失败 1 跳过 |
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
-| 边界 | int32 → float32 不是隐式拓宽（检查器既有规则，可能丢精度）；带实参的枚举常量 `RED(5)` 后端未实现（入 Q230） |
+| 边界 | int32 → float32 不是隐式拓宽（检查器既有规则，可能丢精度）；带实参的枚举常量 `RED(5)` 后端未实现（入 Q230，已由 LANG-ENUM-ARGS-01 实现） |
 
 ## LANG-BYTE-UINT8-01 byte 是无符号 uint8（FV-B，Kotlin 翻译器类型 + 后端）
 
@@ -476,3 +476,20 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 平台类型的泛型实参不参与兼容性判断（按原始类型）；平台返回值可空性见 Q243 |
+
+## LANG-ENUM-ARGS-01 带实参的枚举常量与枚举构造器参数（FV-B，Kotlin 前端 + 翻译器 + 后端）
+
+源码身份：引入本节的提交；`TypeChecker.kt`（`checkEnumConstantArguments` / `checkEnumConstantArgumentsOf`、`staticContext`）、`JasperToIrTranslator.kt`（`collectConstructorParamTypes` 登记枚举构造器、`translateEnumConstant` 生成实参）、`JvmIrBackend.kt`（`generateEnumInfrastructure` 在 `<clinit>` 里压实参）。
+
+性质（Q230）：`RED(5)` 此前在运行期报 NoSuchMethodError `<init>(String,int)`。现在常量按实参个数选构造器，实参宽化到声明形参类型；`<clinit>` 按 `(String,int)+形参描述符` 调用，与发射的构造器一致；字段声明初值先于构造器体；`values()` / `valueOf` / `ordinal()` / `name()` / switch 不变。以下情况都是编译诊断：无构造器却带实参、个数不符（含有显式构造器后的无实参常量）、类型不符或窄化、同元数歧义、varargs 构造器、实参里用 `this`、实参里的未解析名字。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `EnumConstructorArgsTest` 种子 23020261110：6 个随机枚举，每个 3–9 个常量，实参为 (int32, int64, string)，方法按随机系数组合字段；每个常量的字段、ordinal、名字、方法结果与 Kotlin 独立计算的模型一致，`valueOf` 取到同一常量 |
+| 端到端 | 同一测试类 5 项正例：五种实参类型（含 int32 → int64 宽化）外部读取并用 javap 核对三次 `<init>` 描述符、方法使用字段、switch + values/valueOf/ordinal/name、字段初值先于构造器体且实参读已构造的常量、按个数选三个构造器之一 |
+| 负例 | 5 项 10 个源：无构造器、个数不符（2 个）、类型不符与窄化、歧义与 varargs、this / 未解析名字（含无构造器时） |
+| 变异 | 7 组全部被抓：`<clinit>` 不压实参、实参不宽化、类型不检查、个数不检查、无构造器不报、this 不报、歧义不报（类型检查变异首版未通过编译，改写后复跑） |
+| 定点回归 | `EnumTest`、`StaticEnumFieldTest`、`FieldInitializerTest` 共 29 项通过；除 Lincheck 外全部测试类 + 一致性：139 个类 4237 项 0 失败 1 跳过 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 常量类体 `A { ... }` 仍被 AST 丢弃（未实现）；嵌套枚举不翻译；常量超过 127 个时 `<clinit>` 的 BIPUSH 序号溢出（既有问题） |
