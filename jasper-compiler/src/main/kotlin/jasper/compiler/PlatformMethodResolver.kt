@@ -143,6 +143,36 @@ class PlatformMethodResolver {
     }
 
     /**
+     * 做什么：解析平台类上的 public static 字段，返回其 JVM 描述符（Q163）。
+     * 什么时候用：检查器识别 `java.lang.System.err` 这类全限定静态字段读取，以及翻译器 / 后端
+     *   为它定 IR 类型与 GETSTATIC 描述符时。
+     * 失败模式：类加载不到、没有该字段或字段不是 public static 时返回 null，不抛异常。
+     * 为什么用 Class.getField：它只返回 public 字段并沿超类与接口查找，正是源码可读的集合。
+     */
+    fun resolveStaticField(ownerInternalName: String, fieldName: String): String? {
+        val key = ownerInternalName to fieldName
+        if (fieldCache.containsKey(key)) return fieldCache[key]
+        val owner = loadClass(internalNameToBinaryName(ownerInternalName))
+        val field = try {
+            owner?.getField(fieldName)
+        } catch (e: NoSuchFieldException) {
+            null
+        } catch (e: SecurityException) {
+            null
+        } catch (e: LinkageError) {
+            null
+        }
+        val descriptor = field?.takeIf { Modifier.isStatic(it.modifiers) }?.let { Type.getDescriptor(it.type) }
+        fieldCache[key] = descriptor
+        return descriptor
+    }
+
+    /** 平台类能否加载：全限定名里哪一段是类，由它决定（`java.lang.System` 是类，`java.lang` 不是）。 */
+    fun isPlatformClass(internalName: String): Boolean = loadClass(internalNameToBinaryName(internalName)) != null
+
+    private val fieldCache = HashMap<Pair<String, String>, String?>()
+
+    /**
      * 做什么：解析源码类从平台超类继承的实例方法，public 与 protected 都算。
      * 什么时候用：接收者是本次编译单元声明的类，方法不是源码声明的，沿超类链到了平台类。
      * 前置条件：ownerInternalName 是链上第一个平台类；调用点的接收者类型是该源码类。

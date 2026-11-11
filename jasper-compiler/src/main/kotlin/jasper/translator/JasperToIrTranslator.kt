@@ -3427,6 +3427,20 @@ class JasperToIrTranslator {
         )
     }
 
+    /**
+     * 全限定平台静态字段读取（Q163）：降为无实参调用，调用名带 [IrIntrinsics.PLATFORM_GET_STATIC]
+     * 前缀，宿主类登记在平台静态调用宿主表；IR 类型取字段真实描述符，后续成员调用、拼接与局部
+     * 变量都按真实类型处理。检查器已确认字段存在，解析不到时保持 Unit 让后端报内部错误而不是猜。
+     */
+    private fun translatePlatformStaticField(field: String, owner: String, ctx: TranslationContext): IrExpression {
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = IrIntrinsics.PLATFORM_GET_STATIC + field
+        ctx.platformStaticCallOwners[symbol] = owner
+        val type = platformMethodResolver.resolveStaticField(owner, field)
+            ?.let { typeMapper.irTypeFromDescriptor(it) } ?: typeMapper.unitType()
+        return IrNodeFactory.createCall(0, 0, type, IrStatementOrigin.GET_PROPERTY, emptyArray(), emptyArray<IrType>(), symbol, null)
+    }
+
     private fun substituteIrType(
         type: IrType,
         inferredArgs: Map<String, JasType>
@@ -3518,6 +3532,7 @@ class JasperToIrTranslator {
         if (expr.isSafe) {
             return translateSafeAccess(expr.target, ctx) { receiver -> JasPropertyAccess(receiver, expr.property) }
         }
+        expr.platformStaticFieldOwner?.let { owner -> return translatePlatformStaticField(expr.property, owner, ctx) }
         // 枚举常量优先识别：`Color.Red` 的形态与「类名.静态字段」完全相同，但 IR 表示不同
         // （IrGetEnumValue 对应 IrEnumEntry）。若不先分流，会落入字段路径并生成对类名
         // 求值的 GETFIELD——正是 `INTERNAL: Index -1 out of bounds` 的来源。

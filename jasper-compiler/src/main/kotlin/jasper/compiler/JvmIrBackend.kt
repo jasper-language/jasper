@@ -2620,6 +2620,14 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
         ctx: MethodContext,
         currentOwner: String
     ) {
+        if (methodName.startsWith(IrIntrinsics.PLATFORM_GET_STATIC)) {
+            // 全限定平台静态字段读取（Q163）：描述符必须与字段声明逐字一致，取自同一解析器。
+            val field = methodName.removePrefix(IrIntrinsics.PLATFORM_GET_STATIC)
+            val descriptor = platformMethodResolver.resolveStaticField(ownerInternalName, field)
+                ?: error("platform static field was not resolved by checker: $ownerInternalName.$field")
+            mv.visitFieldInsn(Opcodes.GETSTATIC, ownerInternalName, field, descriptor)
+            return
+        }
         val argExpressions = (0 until expr.valueArgumentsCount).mapNotNull { expr.getValueArgument(it) }
         val argDescriptors = argExpressions.map { platformArgDescriptor(it) }
         val signature = platformMethodResolver.resolveStatic(

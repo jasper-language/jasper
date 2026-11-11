@@ -428,3 +428,19 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 平台静态调用仍由后端 `receiverJvmDescriptor` 回填（Q158 / Q163 / Q165 同族）；解析不到的平台成员保持 Unit |
+
+## LANG-PLATFORM-STATIC-FIELD-01 全限定平台静态字段与调用链（FV-B，Kotlin 前端 + 翻译器 + 后端）
+
+源码身份：引入本节的提交；`PlatformMethodResolver.kt`（`resolveStaticField`）、`SymbolTable.kt`（`resolvePlatformStaticField`）、`TypeChecker.kt`（`qualifiedPlatformStaticField`、静态调用目标排除字段接收者、平台实参描述符）、`JasperAst.kt`（`JasPropertyAccess.platformStaticFieldOwner`）、`IrIntrinsics.kt`（`PLATFORM_GET_STATIC`）、`JasperToIrTranslator.kt`（`translatePlatformStaticField`）、`JvmIrBackend.kt`（GETSTATIC）。
+
+性质（Q163 / Q165）：`a.b.C.f` 读取类路径类的 public static 字段并带真实 JVM 类型；`java.lang.System.err.println(x)` 是对字段值的实例调用，不再被当成类 `java.lang.System.err` 上的静态调用；非 public / 实例 / 不存在的字段是编译错误。Q165 的 `cast (全限定静态调用链) as T` 内部错误由 Q223 起检查 cast 操作数解决，本节用变异确认。规则写入 docs/current-decisions「JVM Platform Names」。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `PlatformStaticFieldTest` 种子 20261112：50 次随机读取 12 个 JDK 静态字段（int / long / short / byte / char 常量、String、Boolean 对象）并拼接，与 JDK 反射独立取值一致 |
+| 端到端 | 同一测试类：int / long 字段作返回值、字段拼接、存局部、作平台静态调用实参、`String.CASE_INSENSITIVE_ORDER.compare`、`System.err.println` 输出捕获、Q165 cast 链；负例：不存在的字段、private 实例字段、public 实例字段 |
+| 变异 | 7 组全部被抓：翻译器不降级字段读、检查器不识别字段、字段接收者仍当静态调用、实参描述符不取字段类型、不限 static（以 public 实例字段 `java.awt.Point.x` 负例抓）、Q165 回退 cast 操作数检查；后端接收者描述符的字段分支是冗余的（翻译器已给真实 IR 类型），变异存活后删除 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：125 个类 1604 项 0 失败 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 平台对象的实例字段读取（`p.x`）不在本节；平台结果在语言类型层仍是 any |

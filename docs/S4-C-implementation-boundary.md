@@ -1548,7 +1548,7 @@ finally / defer 中的 throw / 挂起 / 跳出；for-in 与循环后置块；实
 
 ### 顺带修复
 
-全限定类型名的静态调用此前不能由生成代码表达：标识符 `std.FrameSlot` 经检查器后在翻译器里解析不到静态成员，生成 `demo/void` 的非法调用。`declaredClassName` 现在接受含点的标识符。源码标识符不含点，只影响生成代码；源码里 `a.b.C.m()` 的既有问题（Q163、Q165）未动。
+全限定类型名的静态调用此前不能由生成代码表达：标识符 `std.FrameSlot` 经检查器后在翻译器里解析不到静态成员，生成 `demo/void` 的非法调用。`declaredClassName` 现在接受含点的标识符。源码标识符不含点，只影响生成代码；源码里 `a.b.C.m()` 的既有问题（Q163、Q165）已于 2026-11-10 修复，规则见 current-decisions「JVM Platform Names」。
 
 ### 已知缺口（未改）
 

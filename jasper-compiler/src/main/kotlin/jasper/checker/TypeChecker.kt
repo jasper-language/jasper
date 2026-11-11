@@ -1912,6 +1912,14 @@ class TypeChecker(
                 //   不存在字段的访问（假符号 + Unit 描述符），最终产出非法字节码
                 //   （ClassFormatError / NoSuchFieldError，Q19 C23）。any 接收者的成员集合
                 //   不可知，仍按宽松处理（保持既有动态调用语义）。
+                if (!expr.isSafe) {
+                    qualifiedPlatformStaticField(expr, env)?.let { owner ->
+                        // 全限定平台静态字段（`java.io.File.pathSeparator`）：与平台调用一致，
+                        // 语言层类型是 any，真实 JVM 类型由翻译器 / 后端按字段描述符取得。
+                        expr.platformStaticFieldOwner = owner
+                        return JasAnyType
+                    }
+                }
                 val targetType = safeReceiverType(expr, env)
                 // 「类名.字段」与「值.字段」是两种不同语义：前者只能访问静态字段。
                 // 先单独处理，否则会把类名当成一个值为 null 的变量，导致实例字段被静默放行，
@@ -2278,12 +2286,40 @@ class TypeChecker(
         segments.add(root)
         segments.reverse()
         if (segments.size < 3) return null
+        // `java.lang.System.err.println(x)`：接收者 `java.lang.System.err` 是平台静态字段，
+        // 这是对字段值的实例调用，不是类 `java.lang.System.err` 上的静态调用（Q163）。
+        if (qualifiedPlatformStaticField(target.target as? JasPropertyAccess, env) != null) return null
         val className = segments.dropLast(1).joinToString(".")
         return QualifiedStaticTarget(
             className = className,
             ownerInternalName = className.replace('.', '/'),
             methodName = segments.last()
         )
+    }
+
+    /**
+     * `a.b.C.f` 是否全限定平台静态字段读取：根名不是值、类型参数或本编译单元类型（与
+     * [qualifiedPlatformStaticTarget] 同一规则），至少「包 + 类 + 字段」三段，且 `a.b.C` 上有
+     * public static 字段 f。是则返回宿主类内部名，否则 null（Q163）。
+     */
+    private fun qualifiedPlatformStaticField(expr: JasPropertyAccess?, env: TypeEnvironment): String? {
+        if (expr == null || expr.isSafe) return null
+        val segments = mutableListOf<String>()
+        var cursor: JasExpression = expr
+        while (cursor is JasPropertyAccess && !cursor.isSafe) {
+            segments.add(cursor.property)
+            cursor = cursor.target
+        }
+        if (cursor !is JasIdentifier) return null
+        val root = cursor.name
+        if (root == "this" || root == "super") return null
+        if (env.contains(root) || env.hasTypeParameter(root)) return null
+        if (symbolTable?.resolveType(root) != null) return null
+        segments.add(root)
+        segments.reverse()
+        if (segments.size < 3) return null
+        val owner = segments.dropLast(1).joinToString("/")
+        return owner.takeIf { symbolTable?.resolvePlatformStaticField(it, segments.last()) != null }
     }
 
     /**
@@ -2331,6 +2367,9 @@ class TypeChecker(
      */
     private fun platformExpressionDescriptor(expr: JasExpression, inferredType: JasType?): String {
         return when (expr) {
+            is JasPropertyAccess -> expr.platformStaticFieldOwner
+                ?.let { symbolTable?.resolvePlatformStaticField(it, expr.property) }
+                ?: platformArgumentDescriptor(inferredType)
             is JasCall -> {
                 val target = expr.target as? JasPropertyAccess
                 val owner = expr.platformStaticOwner

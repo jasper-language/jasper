@@ -571,7 +571,10 @@ data class JasVarargCall(val fixedCount: Int, val arrayType: JasArrayType, val p
 /**
  * 属性访问表达式：target 访问对象；property 属性名；isSafe=true 表示安全访问（?.）。
  */
-data class JasPropertyAccess(val target: JasExpression, val property: String, val isSafe: Boolean = false) : JasExpression()
+data class JasPropertyAccess(val target: JasExpression, val property: String, val isSafe: Boolean = false) : JasExpression() {
+    /** 检查阶段回填：本节点是全限定平台静态字段读取（`java.lang.System.err`）时，宿主类内部名（Q163）。 */
+    var platformStaticFieldOwner: String? = null
+}
 
 /**
  * 下标访问表达式：target 被索引的对象/数组；index 下标表达式。

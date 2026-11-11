@@ -220,6 +220,10 @@ class SymbolTable {
         return platformMethodResolver.resolveStatic(ownerInternalName, methodName, argumentDescriptors)
     }
 
+    /** 全限定平台静态字段的 JVM 描述符；不是 public static 字段时为 null（Q163）。 */
+    fun resolvePlatformStaticField(ownerInternalName: String, fieldName: String): String? =
+        platformMethodResolver.resolveStaticField(ownerInternalName, fieldName)
+
     /**
      * 本次编译中**已出现过的类型身份**及类别（class/interface/enum/annotation）。
      *

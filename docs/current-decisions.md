@@ -257,3 +257,23 @@ required for normal program execution.
 Reflection may exist, but it must be Jasper-controlled: explicit, compiler-known,
 and backed by emitted metadata or registration data that can survive GraalVM
 native-image. It should not inherit Java's open-ended reflective lookup model.
+
+## JVM Platform Names (bootstrap backend)
+
+While the backend is the JVM, source code may name JDK and classpath members by
+their fully qualified name. Resolution happens at compile time only; nothing is
+looked up reflectively at run time, so this stays compatible with native-image.
+
+- `a.b.C.m(args)` is a static call when `a.b.C` is a class on the compiler's
+  classpath with exactly one matching `public static` method `m`.
+- `a.b.C.f` reads a `public static` field `f` of that class, for example
+  `java.io.File.pathSeparator`. A member call on it is an instance call on the
+  field value: `java.lang.System.err.println(x)` (Q163, 2026-11-10).
+- The root name must not be a local value, a type parameter, or a type
+  declared in the compilation; those win.
+- Platform results are `any` in the language type system. The compiler keeps
+  their real JVM type internally, so storing one in a local, concatenating it,
+  or calling a member on it uses the real member (Q226).
+- A name that resolves to neither a class with that static method nor a static
+  field is a compile error. Non-public and instance fields cannot be read this
+  way.
