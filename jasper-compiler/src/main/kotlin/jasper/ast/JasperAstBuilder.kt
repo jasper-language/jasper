@@ -1668,10 +1668,12 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     /**
-     * literal 的 HexFloat 标签：暂未解析数值，产出值为 0.0 的 JasFloatLiteral（保留原文）。
+     * literal 的 HexFloat 标签：按 [FloatLiterals.hexValue] 正确舍入取值，产出 JasFloatLiteral（保留原文）。
+     *
+     * 边界：缺少 p 指数、越界或非零舍入成 0 由检查器诊断（Q228，此前一律产出 0.0）。
      */
     override fun visitHexFloatLiteral(ctx: JasperParser.HexFloatLiteralContext): JasNode? {
-        return JasFloatLiteral(0.0, ctx.text).at(ctx)
+        return JasFloatLiteral(FloatLiterals.hexValue(ctx.text), ctx.text).at(ctx)
     }
 
     /**

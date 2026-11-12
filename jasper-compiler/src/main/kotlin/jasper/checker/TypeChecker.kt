@@ -1681,8 +1681,12 @@ class TypeChecker(
                     JasPrimitiveType("int32")
                 }
             }
-            // 后缀 f / F 是 float32，其余（含 d / D）是 float64（docs/02 §2.2）。
-            is JasFloatLiteral -> JasPrimitiveType(if (expr.raw.endsWith("f") || expr.raw.endsWith("F")) "float32" else "float64")
+            // 后缀 f / F 是 float32，其余（含 d / D）是 float64（docs/02 §2.2）。十六进制浮点缺指数、
+            // 越界或非零舍入成 0 是错误（Q228，docs/02 §2.2.1）；十进制写法的范围检查不在本项。
+            is JasFloatLiteral -> {
+                if (FloatLiterals.isHex(expr.raw)) FloatLiterals.hexProblem(expr.raw)?.let { error(it, expr) }
+                JasPrimitiveType(if (expr.raw.endsWith("f") || expr.raw.endsWith("F")) "float32" else "float64")
+            }
             is JasStringLiteral -> JasStringType
             is JasBoolLiteral -> JasPrimitiveType("bool")
             is JasNullLiteral -> JasNullableType(JasAnyType)
