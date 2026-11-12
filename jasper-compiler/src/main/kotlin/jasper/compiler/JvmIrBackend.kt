@@ -2181,7 +2181,15 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                             // 判定，平台接口（如 java.util.List）由解析器回报的声明类判定。
                             val invokeInterface = isInterfaceTarget ||
                                 platformSignature?.declaringClassIsInterface == true
-                            if (invokeInterface) {
+                            // 无参 toString 不走平台解析（既有契约）；接收者是平台接口时 INVOKEVIRTUAL 到接口
+                            // 会 IncompatibleClassChangeError（Q158：`var c: CharSequence = ...; c.toString()`），
+                            // 改为 Object.toString——任何引用都有它，虚派发到真实实现。
+                            val objectToString = realName == "toString" && argExpressions.isEmpty() &&
+                                platformSignature == null && !useDeclared && !isInterfaceTarget &&
+                                platformMethodResolver.isPlatformInterface(receiverInternal)
+                            if (objectToString) {
+                                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object", "toString", "()Ljava/lang/String;", false)
+                            } else if (invokeInterface) {
                                 mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, receiverInternal, realName, "($paramSb)$returnDesc", true)
                             } else {
                                 mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, receiverInternal, realName, "($paramSb)$returnDesc", false)

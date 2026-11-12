@@ -3252,6 +3252,12 @@ class TypeChecker(
         // Interface subtype checking
         // 接口/父接口子类型：沿已收集的 implements/extends 关系链判断。
         if (actual is JasNamedType && expected is JasNamedType && isSubtype(actual.name, expected.name)) return true
+        // 两侧都是全限定平台类（名字带点、不是本编译单元声明的类型）：按 JVM 可赋值关系判断，
+        // `var c: java.lang.CharSequence = new java.lang.StringBuilder()` 合法（Q158）。
+        if (actual is JasNamedType && expected is JasNamedType && isPlatformClassName(actual.name) &&
+            isPlatformClassName(expected.name) &&
+            symbolTable?.isPlatformAssignable(actual.name.replace('.', '/'), expected.name.replace('.', '/')) == true
+        ) return true
         if (actual is JasTupleType && expected is JasTupleType) return tupleValueCompatible(actual, expected)
         // Numeric widening conversions
         // 数值拓宽：int32 -> int64 -> float64 等按 numericWidening 表放行。
@@ -3479,6 +3485,10 @@ class TypeChecker(
         }
         return typesCompatible(actual.returnType, methodType.returnType)
     }
+
+    /** 全限定平台类名：带点，且不是本编译单元声明的类型（声明的类型按源码继承关系判断）。 */
+    private fun isPlatformClassName(name: String): Boolean =
+        '.' in name && symbolTable?.resolveType(name) == null && !isDeclaredTypeName(name)
 
     private fun isSubtype(subName: String, superName: String, visited: MutableSet<String> = mutableSetOf()): Boolean {
         // 先把两边都规范化成「包 + 名」的限定名：继承图按限定名建键，

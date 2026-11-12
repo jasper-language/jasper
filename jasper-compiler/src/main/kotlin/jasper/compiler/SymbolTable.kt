@@ -220,6 +220,10 @@ class SymbolTable {
         return platformMethodResolver.resolveStatic(ownerInternalName, methodName, argumentDescriptors)
     }
 
+    /** 两个全限定平台类之间的 JVM 可赋值关系（Q158）；任一类加载不到时为 false。 */
+    fun isPlatformAssignable(subInternalName: String, superInternalName: String): Boolean =
+        platformMethodResolver.isPlatformAssignable(subInternalName, superInternalName)
+
     /** 全限定平台静态字段的 JVM 描述符；不是 public static 字段时为 null（Q163）。 */
     fun resolvePlatformStaticField(ownerInternalName: String, fieldName: String): String? =
         platformMethodResolver.resolveStaticField(ownerInternalName, fieldName)

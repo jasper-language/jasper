@@ -188,6 +188,64 @@ class PlatformMethodResolver {
         return resolveMethod(ownerInternalName, methodName, argumentDescriptors, CallKind.INHERITED)
     }
 
+    /**
+     * 在可调用候选里按实参描述符选唯一一个：优先参数描述符逐项完全一致的候选（Math.max(3, 9)
+     * 既匹配 (int,int) 也可宽化匹配 (long,long)，不先取精确项会误判成歧义）；多个精确候选或
+     * 多个宽化 / 装箱候选都返回 null，不在可行重载之间猜。方法与构造器共用这一口径。
+     */
+    private fun <T> pickUnique(candidates: List<T>, argumentDescriptors: List<String>, parameters: (T) -> Array<Class<*>>): T? {
+        val matched = candidates.filter { candidate ->
+            val types = parameters(candidate)
+            types.size == argumentDescriptors.size &&
+                argumentDescriptors.indices.all { i -> argumentAssignable(argumentDescriptors[i], types[i]) }
+        }
+        val exact = matched.filter { parameters(it).map(::primitiveDescriptorOrReference) == argumentDescriptors }
+        return when {
+            exact.size == 1 -> exact.single()
+            exact.isNotEmpty() -> null
+            matched.size == 1 -> matched.single()
+            else -> null
+        }
+    }
+
+    /**
+     * 做什么：解析平台类唯一可用的 public 构造器，返回其描述符（返回部分为 V）。
+     * 什么时候用：翻译 `new a.b.C(args)` 而 C 不是本编译单元声明的类型时（Q158）。
+     * 失败模式：类加载不到、无唯一候选或类是接口 / 抽象类时返回 null。
+     * 为什么需要：构造器描述符必须是声明的形参类型，不能拼实参静态类型——
+     *   `new ArrayList(m.keySet())` 要调 `<init>(Collection)`，没有 `<init>(Set)`。
+     */
+    fun resolveConstructor(ownerInternalName: String, argumentDescriptors: List<String>): PlatformMethodSignature? {
+        val key = CacheKey(ownerInternalName, "<init>", argumentDescriptors, CallKind.INSTANCE)
+        if (cache.containsKey(key)) return cache[key]
+        val owner = loadClass(internalNameToBinaryName(ownerInternalName))
+        val resolved = try {
+            owner?.takeIf { !it.isInterface && !Modifier.isAbstract(it.modifiers) }
+                ?.constructors?.asList()
+                ?.let { pickUnique(it, argumentDescriptors) { c -> c.parameterTypes } }
+                ?.let { PlatformMethodSignature(Type.getConstructorDescriptor(it), false) }
+        } catch (e: SecurityException) {
+            null
+        }
+        cache[key] = resolved
+        return resolved
+    }
+
+    /**
+     * `sub` 能否赋给 `sup`（两者都是类路径上的平台类，按 JVM 的 isAssignableFrom）。
+     * 什么时候用：检查器比较两个都不是本编译单元声明的具名类型时（Q158：`CharSequence = new StringBuilder()`）。
+     * 失败模式：任一类加载不到时返回 false，调用方按原规则处理。
+     */
+    fun isPlatformAssignable(subInternalName: String, superInternalName: String): Boolean {
+        val sub = loadClass(internalNameToBinaryName(subInternalName)) ?: return false
+        val sup = loadClass(internalNameToBinaryName(superInternalName)) ?: return false
+        return sup.isAssignableFrom(sub)
+    }
+
+    /** 类路径上的平台接口（如 java.lang.CharSequence）；加载不到时为 false。 */
+    fun isPlatformInterface(internalName: String): Boolean =
+        loadClass(internalNameToBinaryName(internalName))?.isInterface == true
+
     /** 沿超类链收集 public / protected 方法，再加 getMethods 带来的接口默认方法；子类的覆盖在前。 */
     private fun inheritableMethods(start: Class<*>): List<Method> {
         val out = LinkedHashMap<Pair<String, List<Class<*>>>, Method>()
@@ -256,24 +314,7 @@ class PlatformMethodResolver {
             // 安全管理器拒绝反射时按「无法确定」处理，退回旧行为。
             return null
         }
-        val matched = candidates.filter { method ->
-            argumentDescriptors.indices.all { i ->
-                argumentAssignable(argumentDescriptors[i], method.parameterTypes[i])
-            }
-        }
-        // 优先选择参数描述符逐项完全一致的候选。Math.max(3, 9) 既匹配 (int,int)，也
-        // 可宽化匹配 (long,long)；若不先取精确项就会把合法调用误判成重载歧义。
-        val exact = matched.filter { method ->
-            method.parameterTypes.map(::primitiveDescriptorOrReference) == argumentDescriptors
-        }
-        // 有多个精确候选仍说明仅凭描述符无法消歧；没有精确候选时，只有唯一宽化/装箱
-        // 候选才接受，避免在多个可行重载之间任意猜测。
-        val method = when {
-            exact.size == 1 -> exact.single()
-            exact.isNotEmpty() -> return null
-            matched.size == 1 -> matched.single()
-            else -> return null
-        }
+        val method = pickUnique(candidates, argumentDescriptors) { it.parameterTypes } ?: return null
         return try {
             PlatformMethodSignature(
                 descriptor = Type.getMethodDescriptor(method),

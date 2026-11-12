@@ -3857,6 +3857,12 @@ class JasperToIrTranslator {
             for (i in args.indices) {
                 args[i] = castToDeclared(declaredParams[i], args[i])
             }
+        } else if (owner != null && allocationName == null && owner.substringAfterLast('/') !in ctx.declaredTypeNames) {
+            // 平台类（Q158）：后端按实参 IR 类型拼构造器描述符，所以实参必须先转成声明的形参类型——
+            // `new ArrayList(m.keySet())` 要调 `<init>(Collection)`，按实参会拼出不存在的 `<init>(Set)`。
+            platformMethodResolver.resolveConstructor(typeMapper.jvmInternalNameFromIrType(type), args.map { typeMapper.jvmDescriptorFromIrType(it.type) })
+                ?.parameterDescriptors
+                ?.forEachIndexed { i, desc -> args[i] = castToDeclared(typeMapper.irTypeFromDescriptor(desc), args[i]) }
         }
         ctx.constructorTypes[ctorSymbol] = "object"
         return IrNodeFactory.createConstructorCall(

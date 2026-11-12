@@ -444,3 +444,19 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 平台对象的实例字段读取（`p.x`）不在本节；平台结果在语言类型层仍是 any |
+
+## LANG-PLATFORM-SILENT-01 平台类型的静默错误组（FV-B，Kotlin 前端 + 翻译器 + 后端）
+
+源码身份：引入本节的提交；`PlatformMethodResolver.kt`（`pickUnique` 方法 / 构造器共用的重载选择、`resolveConstructor`、`isPlatformAssignable`、`isPlatformInterface`）、`SymbolTable.kt`（`isPlatformAssignable`）、`TypeChecker.kt`（全限定平台类之间按 JVM 可赋值关系判断兼容）、`JasperToIrTranslator.kt`（平台构造器实参转成声明形参类型）、`JvmIrBackend.kt`（平台接口接收者上的无参 toString 走 Object.toString）。
+
+性质（Q158，来自 JB-L3 实测）：① `new 平台类(实参)` 的描述符取声明形参而非实参静态类型（`new ArrayList(m.keySet())` 此前找 `<init>(Set)` → NoSuchMethodError）；② 平台子类型可赋给平台父类型（`CharSequence = new StringBuilder()` 此前被拒），无关平台类型仍拒绝；③ 平台调用结果作实参与 ① 同根；④ 平台类型字段上的调用、⑤ 静态字段初始化器里的平台静态调用在当前 main 已正确（Q221 / Q226 起），本节补回归。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `PlatformTypeSilentErrorTest` 种子 20261113：40 次随机 TreeMap put 后经 `new ArrayList(m.keySet())` 遍历，结果与 JDK TreeMap 独立计算一致 |
+| 端到端 | 同一测试类 7 组：BufferedInputStream / ByteArrayInputStream 构造链、CharSequence / java.util.List 父类型变量、keySet 作构造实参、TreeMap 字段 get、静态字段初始化器里 Integer.parseInt、无关平台类型负例 |
+| 变异 | 5 组全部被抓：构造器实参不转声明形参、平台子类型判断关闭、可赋值方向放成恒真、平台接口 toString 回退 INVOKEVIRTUAL、去掉「精确候选优先」（32 项失败） |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：127 个类 1618 项 0 失败 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 平台类型的泛型实参不参与兼容性判断（按原始类型）；平台返回值可空性见 Q243 |
