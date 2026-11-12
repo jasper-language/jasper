@@ -60,6 +60,13 @@ tasks.test {
     jvmArgs("-XX:+EnableDynamicAgentLoading")
     // Lincheck 模型检查由 lincheckTest 在独立 JVM 中运行（见上）。
     filter { excludeTestsMatching("*LincheckTest") }
+    // Jazzer fuzz 模式（JAZZER_FUZZ 非空）默认只按类路径目录插桩测试类所在的 jasper 包；被测的 Jasper
+    // 运行时是测试期编译出来的 std.* 类，不在其中，覆盖反馈只来自 Kotlin 驱动层与 oracle（Q155）。
+    // 调用方未指定插桩范围时设为 std.** 加原有的 jasper.**（只设 std.** 会丢掉驱动层反馈）；
+    // 显式给出的范围（如只测 std.jaso.**）原样保留。回归模式只重放语料、不依赖覆盖，不设置。
+    if (!System.getenv("JAZZER_FUZZ").isNullOrEmpty() && System.getenv("JAZZER_INSTRUMENTATION_INCLUDES") == null) {
+        environment("JAZZER_INSTRUMENTATION_INCLUDES", "std.**:jasper.**")
+    }
     dependsOn(lincheckTest)
 }
 
