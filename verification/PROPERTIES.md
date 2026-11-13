@@ -510,3 +510,19 @@
 | Z3 / Lincheck | N/A（JVM 监视器语义由平台保证；本节验证的是指令确实生成且出口配对） |
 | JBMC | 发版时验证 |
 | 边界 | `lock` 仍是关键字，平台 `ReentrantLock.lock()` 写不出（并入 08-APPFW-34 保留字，需用户裁决）；null 锁对象运行期空指针 |
+
+## LANG-CONCAT-OPERAND-01 `+` 任一侧是 string 即拼接（FV-B，Kotlin 检查器 + 翻译器 + 后端）
+
+源码身份：引入本节的提交；`TypeChecker.kt`（`+` 的结果类型：拼接为 string，一侧 any 为 any）、`JasperToIrTranslator.kt`（`translateBinaryOp` 任一侧 string 降为 STRING_PLUS）、`JvmIrBackend.kt`（`+` 任一侧描述符为 String 走拼接）。
+
+性质（Q241，appfw FB-merge-003 / FB-data-13 / FB-theme-07）：此前检查器、翻译器、后端都只看左操作数，`n + " x"`、`b.code() + " x"`、`枚举 + " x"` 推断成 int32 并发 IADD → VerifyError。现在任一侧为 string 即拼接、结果类型 string；一侧为 any（平台调用结果）时检查器结果为 any，由翻译器按真实类型选择；左结合不变（`1 + 2 + "x"` 为 `"3x"`）。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `StringConcatOperandTest` 种子 20261115：60 个随机 2–5 项数字 / 字符串混合加法链，结果与按左结合规则独立计算一致 |
+| 端到端 | 同一测试类：int32 局部、方法返回值、枚举、int64、float64、bool、char（补充平面）、byte（200）在左侧；平台调用 string 在右侧（实例与静态）；`1 + 2 + "x"`、`"x" + 1 + 2`、方法 + 方法；纯数值加不变 |
+| 变异 | 4 组全部被抓：翻译器只看左侧、检查器不把拼接定为 string、一侧 any 时借用数值类型、后端只看左侧描述符（以右侧平台静态调用 `java.lang.String.valueOf(5)` 抓） |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：130 个类 1637 项 0 失败 |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 两侧都是 any 时仍按翻译期真实类型决定 |

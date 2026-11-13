@@ -1956,8 +1956,10 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // 否则 `System.nanoTime() - 1L` 会选 ISUB 而产出无法校验的字节码。
                         val desc0 = receiverJvmDescriptor(arg0)
                         val desc1 = receiverJvmDescriptor(arg1)
-                        // 左操作数是字符串时整条表达式退化为字符串拼接（+ 的重载解析结果）。
-                        if (desc0 == "Ljava/lang/String;" || desc0 == "Ljava/lang/String") {
+                        // 任一操作数是字符串时整条表达式是字符串拼接（+ 的重载解析结果）；只看左侧时
+                        // 右侧是平台调用返回 string 的 `n + s.trim()` 仍会发 IADD（Q241）。
+                        val isConcat = irName == "+" && listOf(desc0, desc1).any { it == "Ljava/lang/String;" || it == "Ljava/lang/String" }
+                        if (isConcat || desc0 == "Ljava/lang/String;" || desc0 == "Ljava/lang/String") {
                             emitStringConcatCall(mv, expr, ctx, owner)
                         } else {
                             // JVM shift instructions take (long, int): the shift

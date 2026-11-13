@@ -2972,6 +2972,16 @@ class JasperToIrTranslator {
             else -> {
                 val left = translateExpression(expr.left, ctx)
                 val right = translateExpression(expr.right, ctx)
+                // `+` 只要有一侧是 string 就是拼接（检查器同一规则）。以前结果类型按左操作数算，
+                // `n + " x"`、`b.code() + " x"`、`枚举 + " x"` 被当成数值加，后端发 IADD（Q241）。
+                if (expr.op == "+" && (isStringIrType(left.type) || isStringIrType(right.type))) {
+                    val concatSymbol = IrSimpleFunctionSymbolImpl()
+                    ctx.callNames[concatSymbol] = IrIntrinsics.STRING_PLUS
+                    return IrNodeFactory.createCall(
+                        0, 0, typeMapper.stringType(), IrStatementOrigin.PLUS,
+                        arrayOf(left, right), emptyArray(), concatSymbol, null
+                    )
+                }
                 val resultType = when (expr.op) {
                     "==", "!=", "<", ">", "<=", ">=" -> typeMapper.boolType()
                     "<<", ">>", ">>>" -> left.type

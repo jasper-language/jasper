@@ -1740,6 +1740,14 @@ class TypeChecker(
                 }
                 // 比较/逻辑运算符结果恒为 bool；其余（算术等）取一侧类型兜底 int32。
                 when (expr.op) {
+                    // 拼接的结果是 string，不是左操作数类型：`n + " x"` 以前推断成 int32（Q241）。
+                    // 一侧是 any（如平台调用结果）时静态上不知道是拼接还是数值加，结果也是 any，
+                    // 由翻译器按真实类型选择；不能借用另一侧的数值类型。
+                    "+" -> when {
+                        isConcat -> JasStringType
+                        leftType is JasAnyType || rightType is JasAnyType -> JasAnyType
+                        else -> leftType ?: rightType ?: JasPrimitiveType("int32")
+                    }
                     "&&", "||" -> JasPrimitiveType("bool")
                     "==", "!=" -> JasPrimitiveType("bool")
                     "<", ">", "<=", ">=" -> JasPrimitiveType("bool")
