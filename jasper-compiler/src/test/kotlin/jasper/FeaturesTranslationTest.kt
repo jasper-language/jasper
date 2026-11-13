@@ -726,7 +726,8 @@ class FeaturesTranslationTest {
         val source = """
             package test;
             function main(): void {
-                var x: int32 = 0;
+                // 锁对象必须是对象：int32 没有监视器，Q234 起是编译错误（见 LockStatementTest）。
+                var x = new java.lang.Object();
                 lock (x) { }
             }
         """.trimIndent()

@@ -1763,6 +1763,12 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
                         // PrintStream.print/println 返回 void，补 null 维持「留一个值」约定。
                         mv.visitInsn(Opcodes.ACONST_NULL)
                     }
+                    IrIntrinsics.MONITOR_ENTER, IrIntrinsics.MONITOR_EXIT -> {
+                        // lock 语句（Q234）：锁对象是引用（检查器已拒绝基本类型）；指令不产生值，补 null 维持约定。
+                        generateIrExpression(mv, expr.getValueArgument(0)!!, ctx, owner)
+                        mv.visitInsn(if (irName == IrIntrinsics.MONITOR_ENTER) Opcodes.MONITORENTER else Opcodes.MONITOREXIT)
+                        mv.visitInsn(Opcodes.ACONST_NULL)
+                    }
                     "toString" -> {
                         emitToString(mv, expr, ctx, owner)
                     }

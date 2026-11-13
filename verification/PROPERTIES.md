@@ -493,3 +493,20 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 常量类体 `A { ... }` 仍被 AST 丢弃（未实现）；嵌套枚举不翻译；常量超过 127 个时 `<clinit>` 的 BIPUSH 序号溢出（既有问题） |
+
+## LANG-LOCK-01 lock 语句是对象监视器互斥（FV-B，Kotlin 翻译器 + 后端 + 检查器）
+
+源码身份：引入本节的提交；`JasperToIrTranslator.kt`（`translateLock`、`monitorCall`）、`IrIntrinsics.kt`（`MONITOR_ENTER` / `MONITOR_EXIT`）、`JvmIrBackend.kt`（MONITORENTER / MONITOREXIT）、`TypeChecker.kt`（基本类型锁对象、lock 体内 await 的诊断，`lockDepth`）。
+
+性质（Q234，appfw FB-merge-002）：`lock (x) { body }` 此前只生成空 finally、没有任何监视器指令，等于没写（实测 4×20 万次自增得 34 万）。现在进入时 MONITORENTER、finally 里 MONITOREXIT；锁对象只求值一次并存进函数内唯一的临时局部；return / break / continue / 异常出口都释放；基本类型作锁对象、lock 体内 await 是编译错误。语义写入 docs/10 §10.9.1。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `LockStatementTest` 种子 20261114：6 轮随机线程数（2–6）与每线程次数（1000–20000）并发自增，结果恰为各次数之和 |
+| 端到端 | 同一测试类：4 线程 × 5 万次自增得 20 万；`Thread.holdsLock` 确认块内持有、return / break+continue / 数组越界异常 / 嵌套各出口后已释放；字节码含 1 条 MONITORENTER 与至少 2 条 MONITOREXIT；负例：`lock (5)`、lock 体内 await |
+| 既有测试改期望 | `FeaturesTranslationTest` 的 `lock (x)` 用例原以 int32 作锁对象（只因 lock 是空操作才能过），改为对象 |
+| 变异 | 7 组全部被抓：不发 MONITORENTER、不发 MONITOREXIT、finally 不包块（循环里栈高不一致）、锁局部用固定名、放行基本类型锁对象、放行 lock 体内 await、进入发成退出指令 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性 1623 项，唯一失败是上一行 FeaturesTranslationTest 旧用例；改后该类与 LockStatementTest 共 57 项全过 |
+| Z3 / Lincheck | N/A（JVM 监视器语义由平台保证；本节验证的是指令确实生成且出口配对） |
+| JBMC | 发版时验证 |
+| 边界 | `lock` 仍是关键字，平台 `ReentrantLock.lock()` 写不出（并入 08-APPFW-34 保留字，需用户裁决）；null 锁对象运行期空指针 |

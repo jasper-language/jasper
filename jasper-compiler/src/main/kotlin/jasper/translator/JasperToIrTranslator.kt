@@ -2661,16 +2661,34 @@ class JasperToIrTranslator {
         val monitorExpr = translateExpression(stmt.expression, ctx)
         val monitorSymbol = IrVariableSymbolImpl()
         val monitorVar = IrNodeFactory.createVariable(
-            0, 0, IrDeclarationOrigin.DEFINED, Name.identifier("lock$"),
+            // 后端以变量名为局部槽的键：嵌套 lock 共用固定名字会让内层覆盖外层的锁对象。
+            0, 0, IrDeclarationOrigin.DEFINED, nextTempName(ctx, "lock"),
             monitorExpr.type, monitorSymbol, true, false, false
         )
         monitorVar.initializer = monitorExpr
         (block.statements as MutableList<IrStatement>).add(monitorVar)
+        // `lock (x) { body }` = MONITORENTER x; try { body } finally { MONITOREXIT x }（Q234）。
+        // 旧实现只有空 finally，不产生任何互斥。锁对象先存进局部：退出时必须是进入时的同一个对象，
+        // 不能重新求值 x。finally 覆盖 return / break / continue / 异常所有出口。
+        (block.statements as MutableList<IrStatement>).add(monitorCall(IrIntrinsics.MONITOR_ENTER, monitorExpr.type, monitorSymbol, ctx))
         val tryBlock = IrNodeFactory.createTry(0, 0, typeMapper.unitType())
         tryBlock.tryResult = translateBlock(stmt.body, ctx)
-        tryBlock.finallyExpression = typeMapper.unitExpr()
+        // finally 包成块：块内语句按语句路径生成，调用留下的占位值会被弹掉；直接把调用作 finally
+        // 表达式时 Unit 类型不弹栈，循环回边两侧栈高不一致，ASM 算帧失败（循环里的 lock）。
+        val exitBlock = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+        (exitBlock.statements as MutableList<IrStatement>).add(monitorCall(IrIntrinsics.MONITOR_EXIT, monitorExpr.type, monitorSymbol, ctx))
+        tryBlock.finallyExpression = exitBlock
         (block.statements as MutableList<IrStatement>).add(tryBlock)
         return block
+    }
+
+    private fun monitorCall(name: String, type: IrType, monitor: IrVariableSymbol, ctx: TranslationContext): IrExpression {
+        val symbol = IrSimpleFunctionSymbolImpl()
+        ctx.callNames[symbol] = name
+        return IrNodeFactory.createCall(
+            0, 0, typeMapper.unitType(), null,
+            arrayOf(IrNodeFactory.createGetValue(0, 0, type, monitor, null)), emptyArray(), symbol, null
+        )
     }
 
     private fun translateAssert(stmt: JasAssert, ctx: TranslationContext): IrBlock {

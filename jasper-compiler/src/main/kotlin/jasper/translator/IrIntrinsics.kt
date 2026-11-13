@@ -28,6 +28,9 @@ object IrIntrinsics {
     const val STRING_PLUS = "__jasper_string_plus__"
     /** 闭包调用：闭包对象 + 实参。 */
     const val INVOKE_LAMBDA = "__jasper_invoke_lambda__"
+    /** `lock (x)` 的进入 / 退出（Q234）：一个实参（锁对象），后端发 MONITORENTER / MONITOREXIT。 */
+    const val MONITOR_ENTER = "__jasper_monitor_enter__"
+    const val MONITOR_EXIT = "__jasper_monitor_exit__"
     /**
      * 平台静态字段读取（Q163）：调用名是本前缀加字段名，宿主类登记在平台静态调用宿主表里，
      * 没有实参；后端发 GETSTATIC，描述符由 PlatformMethodResolver.resolveStaticField 给出。

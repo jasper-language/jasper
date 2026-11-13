@@ -346,6 +346,8 @@ class TypeChecker(
         val typeParameters = mutableMapOf<String, JasTypeParameter>()
         var loopDepth: Int = 0
         var switchDepth: Int = 0
+        /** 所在 lock 语句的层数；await 不能出现在 lock 体内（Q234）。 */
+        var lockDepth: Int = 0
 
         /** 在当前作用域登记/覆盖「变量名 -> 类型」绑定。 */
         fun set(name: String, type: JasType?) { types[name] = type }
@@ -366,6 +368,7 @@ class TypeChecker(
             env.typeParameters.putAll(this.typeParameters)
             env.loopDepth = this.loopDepth
             env.switchDepth = this.switchDepth
+            env.lockDepth = this.lockDepth
             return env
         }
     }
@@ -1428,8 +1431,14 @@ class TypeChecker(
                 checkStatement(stmt.body, env, returnType)
             }
             is JasLock -> {
-                inferExpression(stmt.expression, env)
+                val lockType = inferExpression(stmt.expression, env)
+                // 锁是 JVM 对象监视器：基本类型没有监视器（Q234）。
+                if (lockType is JasPrimitiveType) {
+                    error("lock needs an object to lock on, got ${typeDisplayName(lockType)}", stmt)
+                }
+                env.lockDepth++
                 checkStatement(stmt.body, env, returnType)
+                env.lockDepth--
             }
             is JasAssert -> {
                 checkBooleanCondition(stmt.condition, env, "assert", stmt)
@@ -1745,6 +1754,10 @@ class TypeChecker(
                 when (expr.op) {
                     "!" -> JasPrimitiveType("bool")
                     "await" -> {
+                        if (env.lockDepth > 0) {
+                            // 协程恢复可能换线程，持有的监视器无法在别的线程释放（IllegalMonitorStateException）。
+                            error("await is not allowed inside a lock block; release the lock before awaiting", expr)
+                        }
                         val named = operandType as? JasNamedType
                         val identity = named?.let { symbolTable?.resolveTypeKey(it.name) }
                         if (identity == jasper.compiler.TypeKey("std", "Future")) {
