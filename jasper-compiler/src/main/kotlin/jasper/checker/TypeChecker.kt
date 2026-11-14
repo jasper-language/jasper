@@ -1815,8 +1815,28 @@ class TypeChecker(
                         error("Function '$name' comes from a module and this file does not import it (import ${symbolTable.headerFunctions[name]})", expr)
                         JasAnyType
                     } else if (funcs.isEmpty()) {
-                        // 符号表里没有同名函数：可能是未知/外部函数，宽松放行为 any（不报错）。
-                        JasAnyType
+                        // 顶层没有同名函数（Q251）。以前一律放行为 any，`noSuchFunction(...)` 编译通过、
+                        // 运行期 VerifyError。现在：局部函数值（lambda 变量）照常调用；本类静态方法照旧
+                        // 允许简单名调用；本类实例方法必须写 `this.`（与字段规则一致，以前会被编成静态
+                        // 调用、运行期 IncompatibleClassChangeError）；其余是未解析的名字。
+                        val owner = currentClassFields?.className
+                        val members = owner?.let { symbolTable.findMemberFunctions(it, name) }.orEmpty()
+                        when {
+                            env.contains(name) -> JasAnyType
+                            // `**` 等由预处理器 / 降级产生的编译器内部调用（保留名 `__jasper_*__`）。
+                            name.startsWith("__jasper_") && name.endsWith("__") -> JasAnyType
+                            // `from "math" import add;` 显式导入的函数：声明在别的模块，这里看不到签名。
+                            symbolTable.importDeclarations[name]?.fromSource != null -> JasAnyType
+                            members.any { isStaticFunction(it) } -> JasAnyType
+                            members.isNotEmpty() -> {
+                                error("Method '$name' of '$owner' must be called as 'this.$name(...)'", expr)
+                                JasAnyType
+                            }
+                            else -> {
+                                error("Unresolved function: '$name'", expr)
+                                JasAnyType
+                            }
+                        }
                     } else {
                         // 重载解析第一步：按实参个数（arity）过滤候选。
                         // varargs 函数接受「固定形参个数」及以上的任意实参个数。
@@ -3046,8 +3066,18 @@ class TypeChecker(
     private fun isTypeNameReference(target: JasExpression, env: TypeEnvironment): Boolean {
         if (target !is JasIdentifier) return false
         if (env.contains(target.name) || env.hasTypeParameter(target.name)) return false
-        return symbolTable?.resolveType(target.name) != null
+        if (symbolTable?.resolveType(target.name) == null) return false
+        // 符号表对「全局唯一同名类型」有兜底，别包类型不 import 也能解析到；但本文件看不见它时，
+        // 翻译器会按当前包生成 `<包>/Helper`，运行期才 VerifyError / ClassNotFoundException（Q251）。
+        // 与显式类型位置同一规则：不可见就报「未知类型」并附 import 提示，同一节点只报一次。
+        if (!isVisibleTypeName(target.name, env) && reportedInvisibleTypeNames.add(target)) {
+            error(unknownTypeMessage(target.name), target)
+        }
+        return true
     }
+
+    /** 已因「类型名作接收者但本文件不可见」报过错的节点，避免同一节点在多条检查路径上重复报告。 */
+    private val reportedInvisibleTypeNames: MutableSet<JasExpression> = java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
 
     /**
      * 在类型 [typeName] 的成员中查找名为 [memberName] 的属性声明。

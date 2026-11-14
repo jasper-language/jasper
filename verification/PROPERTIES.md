@@ -542,3 +542,20 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 协程降级（CoroutineBlockPlanner）的 for 有自己的步进块，不经本路径；for 的循环后置块（onComplete 等）不在本节 |
+
+## LANG-UNRESOLVED-CALL-01 解析不到的调用目标是编译错误（FV-B，Kotlin 检查器）
+
+源码身份：引入本节的提交；`TypeChecker.kt`（具名调用找不到顶层函数时的分流：局部函数值、编译器内部保留名、`from` 导入函数、本类静态方法放行，本类实例方法要求 `this.`，其余 `Unresolved function`；`isTypeNameReference` 对本文件不可见的类型名报未知类型）。
+
+性质（Q251，appfw FB-theme-10 / FB-m1-006 / FB-theme-11）：此前 `noSuchFunction(...)` 放行为 any，运行期 VerifyError；未 import 的别包类型作接收者（`Helper.twice(...)`）经符号表「全局唯一同名」兜底通过检查，翻译器却按当前包生成 `<包>/Helper`，运行期 VerifyError / ClassNotFoundException；类内不写 `this.` 调用实例方法被编成静态调用，运行期 IncompatibleClassChangeError（本片测试中新发现）。现在三者都是编译错误；兜底本身保留（他处跨文件签名解析依赖它），只在「类型名作接收者」处加可见性检查。规则写入 docs/07。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `UnresolvedCallTest` 种子 20261117：20 个随机程序，从 4 个顶层函数里随机调用 2–5 次并把其中一次改错名，均被拒绝且诊断含错名 |
+| 端到端 | 同一测试类：未定义自由函数、未 import 的 `Helper.twice`（直接与作平台调用实参）、完全未知的 `Wire.split`、补 import 后运行得 42；合法写法（顶层函数、`this.` 实例方法、本类静态方法简单名、lambda 局部、println）运行得 40；类内简单名调用实例方法被拒 |
+| 既有测试 | `**`（预处理为 `__jasper_pow__`）、`from "math" import add`、协程帧跨包诊断（ReferenceFrameCoroutinePipelineTest）均保持 |
+| 变异 | 7 组全部被抓：不报未解析函数、不要求 this.、本类静态方法当实例、局部函数值报错、内部保留名报错、from 导入函数报错、不可见类型名不报 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性 1645 项，唯一失败 ScopeExitTest 为负载下偶发（单独复跑 3/3 通过，入队 Q262） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 「全局唯一同名类型」兜底仍在符号表里，跨文件签名中的简单名仍按调用方作用域解析（同名劫持见 Q238） |
