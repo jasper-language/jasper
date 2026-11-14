@@ -526,3 +526,19 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | 两侧都是 any 时仍按翻译期真实类型决定 |
+
+## LANG-FOR-CONTINUE-TRY-01 三段式 for 的 continue 执行更新子句（FV-B，Kotlin 翻译器）
+
+源码身份：引入本节的提交；`JasperToIrTranslator.kt`（`translateFor` 把有更新子句的循环体包进一次性 do-while(false)、`translateContinue` 对这类 for 改为跳出内层循环、`TranslationContext.continueRedirects`）。
+
+性质（Q240，appfw FB-build-011）：更新子句此前接在循环体末尾，`continue` 直接回到条件、跳过更新 → 死循环。现在指向本 for 的 continue（含带标签）先跳出包住循环体的一次性内层循环，再执行更新、回到条件；break 与其他循环的 continue 目标不变。Q259（appfw FB-m1-005：try 内 for 之后的语句被跳过）按其描述的控制流形状写纯 Jasper 用例，在修复前后的 main 上都不复现，已请 appfw 用新 main 复测原代码。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `ForContinueTryTest` 种子 20261116：40 个随机三段式 for（上界、步长、跳过模数随机，约半数包在 try 内），带迭代上限，结果与 Kotlin 同形 while 模型一致 |
+| 端到端 | 同一测试类：appfw FB-build-011 原样（顶层函数与类方法）、FB-m1-005 形状（try 内 for-in 后接语句与 if、其后 try-catch-finally，脚本空 / 非空）；`DoWhileContinueTest`、`ForLoopCoroutinePipelineTest` 同跑 |
+| 变异 | 3 组被抓：不改写 continue、不登记一次性循环、一次性循环条件改为 true；循环结束后清理登记的那一行变异存活——continue 只能出现在本循环体内，循环结束后的登记永不被查，属冗余，已删除 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：131 个类 1640 项 0 失败（语言线专用 VM JasperLang01） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 协程降级（CoroutineBlockPlanner）的 for 有自己的步进块，不经本路径；for 的循环后置块（onComplete 等）不在本节 |

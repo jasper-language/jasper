@@ -244,6 +244,8 @@ data class TranslationContext(
     var currentClassName: String = "",
     // 循环栈：break/continue 指向栈顶最近循环。
     val loopStack: MutableList<IrLoop> = mutableListOf(),
+    /** 三段式 for 循环 → 包住其循环体的一次性内层循环；continue 该 for 时改为跳出内层循环（Q240）。 */
+    val continueRedirects: MutableMap<IrLoop, IrLoop> = mutableMapOf(),
     // 带标签循环：label -> 目标 IR 循环（break label / continue label 使用）。
     val loopLabels: MutableMap<String, IrLoop> = mutableMapOf(),
     // 需要 onBreak 的循环：loop -> broke$ 标志符号；break 指向该循环时先置位。
@@ -2087,10 +2089,25 @@ class JasperToIrTranslator {
         ctx.loopStack.add(irLoop)
         irLoop.condition = if (stmt.condition != null) translateExpression(stmt.condition!!, ctx) else typeMapper.trueConst()
         val loopBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+        // 有更新子句时，循环体包进只执行一次的内层 do-while(false)，指向本 for 的 continue 改成跳出
+        // 这个内层循环：随后执行更新子句再回到条件。旧实现把更新子句接在循环体末尾，continue 直接回到
+        // 条件、跳过更新 → 死循环（Q240，appfw FB-build-011）。内层循环不进 loopStack，break 与
+        // 其他循环的 continue 仍指向原目标。
+        val bodyTarget = if (stmt.update != null) {
+            val once = IrNodeFactory.createDoWhileLoop(0, 0, typeMapper.unitType(), IrStatementOrigin.DO_WHILE_LOOP)
+            once.condition = typeMapper.falseConst()
+            ctx.continueRedirects[irLoop] = once
+            val onceBody = IrNodeFactory.createBlock(0, 0, typeMapper.unitType(), null)
+            once.body = onceBody
+            (loopBody.statements as MutableList<IrStatement>).add(once)
+            onceBody
+        } else {
+            loopBody
+        }
         for (bodyStmt in stmt.body.statements) {
             val irBodyStmt = translateStatement(bodyStmt, ctx)
             if (irBodyStmt != null) {
-                (loopBody.statements as MutableList<IrStatement>).add(irBodyStmt)
+                (bodyTarget.statements as MutableList<IrStatement>).add(irBodyStmt)
             }
         }
         if (stmt.update != null) {
@@ -2608,6 +2625,8 @@ class JasperToIrTranslator {
     private fun translateContinue(stmt: JasContinueStatement, ctx: TranslationContext): IrStatement {
         val loop = stmt.label?.let { ctx.loopLabels[it] } ?: ctx.loopStack.lastOrNull()
             ?: return typeMapper.unitExpr()
+        // 三段式 for 的 continue 要先执行更新子句：跳出包住循环体的一次性内层循环（见 translateFor）。
+        ctx.continueRedirects[loop]?.let { return IrNodeFactory.createBreak(0, 0, typeMapper.unitType(), it) }
         return IrNodeFactory.createContinue(0, 0, typeMapper.unitType(), loop)
     }
 
