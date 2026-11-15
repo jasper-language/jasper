@@ -1304,6 +1304,7 @@ class TypeChecker(
                 }
                 // 变量类型：优先用显式声明类型；否则复用上面的推断结果（可能为 null）。
                 env.set(stmt.name, stmt.type ?: initType)
+                if (stmt.type == null) stmt.inferredType = declaredInferredLocalType(initType, env)
             }
             is JasExpressionStatement -> checkExpression(stmt.expression, env)
             is JasStatementIncrement -> inferPostfixIncDec(stmt.increment, env)
@@ -2339,7 +2340,9 @@ class TypeChecker(
             val staticCandidates = symbolTable?.findMemberFunctions(typeName, memberName)
                 ?.filter { candidate -> candidate.modifiers.contains("static") }
             if (arityOk && staticCandidates?.size == 1) expr.resolvedFunction = fn
-            return fn.returnType ?: JasUnitType
+            val inferred = inferMethodTypeArguments(expr, fn, fn.parameters.map { it.type ?: JasAnyType }, argTypes)
+            val returned = fn.returnType ?: JasUnitType
+            return if (inferred.isEmpty()) returned else substitute(returned, inferred)
         }
         // 不是静态方法：给出比「未解析」更精确的诊断，帮助用户区分「忘写 static」与「名字写错」。
         if (fn != null) {
@@ -2709,7 +2712,9 @@ class TypeChecker(
                 call.resolvedFunction = resolution.function
                 call.varargCall = resolution.vararg
                 validateMemberArguments(call, target.property, resolution.function, resolution.parameterTypes, argTypes)
-                memberReturnType(resolution.function, receiverType)
+                val inferred = inferMethodTypeArguments(call, resolution.function, resolution.parameterTypes, argTypes)
+                val returned = memberReturnType(resolution.function, receiverType)
+                if (inferred.isEmpty()) returned else substitute(returned, inferred)
             }
         }
     }
@@ -3003,7 +3008,7 @@ class TypeChecker(
      */
     private fun memberParameterTypes(fn: JasFunction, receiverType: JasNamedType): List<JasType> {
         val declared = fn.parameters.map { it.type ?: JasAnyType }
-        val mapping = receiverTypeArgumentMapping(receiverType)
+        val mapping = declaringTypeArgumentMapping(receiverType, fn)
         if (mapping.isEmpty()) return declared
         return declared.map { substitute(it, mapping) }
     }
@@ -3023,6 +3028,71 @@ class TypeChecker(
     }
 
     /**
+     * 沿继承链把接收者的类型实参带到**声明 [fn] 的类型**上，返回那个类型的「类型参数 → 实参」映射（Q236）。
+     *
+     * 以前只映射接收者自身的类型参数：`interface UserRepo extends Repo<User, int64>` 上调用 Repo 里声明的
+     * `find(id: ID)`，ID / E 原样留下，形参报 `expected ID, got int64`、返回类型是裸 `Future<E?>`。
+     * 现在从接收者出发，按每层 `extends` / `implements` 写下的实参逐层代换，直到找到成员表里有 [fn] 的类型。
+     * 找不到声明类型（例如平台类型）时退回接收者自身映射。
+     */
+    private fun declaringTypeArgumentMapping(receiverType: JasNamedType, fn: JasFunction): Map<String, JasType> {
+        /** 从 [type] 出发沿 extends / implements 逐层代换，找到声明 fn 的类型时返回它的映射；深度上限防环。 */
+        fun walk(type: JasNamedType, depth: Int): Map<String, JasType>? {
+            if (depth > 16) return null
+            val cls = symbolTable?.findClass(type.name)
+            val iface = if (cls == null) symbolTable?.findInterface(type.name) else null
+            val params = cls?.typeParameters ?: iface?.typeParameters ?: return null
+            val own = if (params.size == type.typeArguments.size) params.map { it.name }.zip(type.typeArguments).toMap() else emptyMap()
+            val members = cls?.members ?: iface?.members ?: emptyList()
+            if (members.any { it === fn }) return own
+            val supers = if (cls != null) listOfNotNull(cls.superclass) + cls.interfaces else iface!!.extends
+            for (sup in supers) {
+                val named = sup as? JasNamedType ?: continue
+                val instantiated = substitute(named, own) as? JasNamedType ?: continue
+                walk(instantiated, depth + 1)?.let { return it }
+            }
+            return null
+        }
+        return walk(receiverType, 0) ?: receiverTypeArgumentMapping(receiverType)
+    }
+
+    /**
+     * [type] 在其继承链上对 [targetName] 的实例化：`Place implements Cmd<Receipt>` 时 `Place` 对 `Cmd` 得
+     * `Cmd<Receipt>`。用于泛型方法类型参数推断（形参 `Cmd<R>`、实参 `Place`）；找不到时 null。
+     */
+    private fun supertypeInstance(type: JasNamedType, targetName: String, depth: Int = 0): JasNamedType? {
+        if (canonicalTypeName(type.name) == canonicalTypeName(targetName)) return type
+        if (depth > 16) return null
+        val cls = symbolTable?.findClass(type.name)
+        val iface = if (cls == null) symbolTable?.findInterface(type.name) else null
+        val params = cls?.typeParameters ?: iface?.typeParameters ?: return null
+        val own = if (params.size == type.typeArguments.size) params.map { it.name }.zip(type.typeArguments).toMap() else emptyMap()
+        val supers = if (cls != null) listOfNotNull(cls.superclass) + cls.interfaces else iface!!.extends
+        for (sup in supers) {
+            val named = substitute(sup, own) as? JasNamedType ?: continue
+            supertypeInstance(named, targetName, depth + 1)?.let { return it }
+        }
+        return null
+    }
+
+    /**
+     * 成员方法自己的类型参数按实参推断（Q236）：与顶层泛型函数同一套 [unify]。
+     * 以前只有顶层函数推断，类的静态 / 实例泛型方法返回类型停在裸 `T` / `R`。
+     * 推断结果写回 [JasCall.inferredTypeArgs]，翻译器据此在调用点补 CHECKCAST。
+     */
+    private fun inferMethodTypeArguments(call: JasCall, fn: JasFunction, parameterTypes: List<JasType>, argTypes: List<JasType?>): Map<String, JasType> {
+        if (fn.typeParameters.isEmpty()) return emptyMap()
+        val names = fn.typeParameters.map { it.name }.toSet()
+        val inferred = mutableMapOf<String, JasType>()
+        for ((i, argType) in argTypes.withIndex()) {
+            val paramType = parameterTypes.getOrNull(i) ?: continue
+            if (argType != null) unify(argType, paramType, names, inferred)
+        }
+        if (inferred.isNotEmpty()) call.inferredTypeArgs = inferred.toMap()
+        return inferred
+    }
+
+    /**
      * 取选中重载的返回类型，并按接收者的泛型实参替换声明类型的类型参数。
      *
      * 什么时候用：[inferInstanceMemberCall] 选中候选后。
@@ -3033,7 +3103,7 @@ class TypeChecker(
      */
     private fun memberReturnType(fn: JasFunction, receiverType: JasNamedType): JasType {
         val base = fn.returnType ?: JasUnitType
-        val mapping = receiverTypeArgumentMapping(receiverType)
+        val mapping = declaringTypeArgumentMapping(receiverType, fn)
         if (mapping.isEmpty()) return base
         return substitute(base, mapping)
     }
@@ -3267,6 +3337,12 @@ class TypeChecker(
                     unify(a, p, typeParams, inferred)
                 }
             }
+            // 名字不同：在实参的继承链上找形参类型的实例化再对齐（`Place` 对 `Cmd<R>` 得 `Cmd<Receipt>`，Q236）。
+            paramType is JasNamedType && argType is JasNamedType && paramType.typeArguments.isNotEmpty() &&
+                supertypeInstance(argType, paramType.name) != null -> {
+                val instance = supertypeInstance(argType, paramType.name)!!
+                paramType.typeArguments.zip(instance.typeArguments).all { (p, a) -> unify(a, p, typeParams, inferred) }
+            }
             // 兜底：直接看兼容性（不产生新的推断）。
             typesCompatible(argType, paramType) -> true
             else -> false
@@ -3374,6 +3450,13 @@ class TypeChecker(
         // 规范化后同名视为兼容（如 int32/Int、string/String、map 别名）。
         // 无法归一的类型（可空、数组、函数等）名字是 null，不能因「都是 null」就算兼容，
         // 否则 `Foo?` 可赋给 `Bar?`、`int32?` 可赋给 `string?`。
+        // 同名泛型类型的类型实参不变（Q236）：`Future<Receipt>` 不能赋给 `Future<string>`。以前只比名字，
+        // 泛型方法结果能赋给任意实参的同名类型，运行期才 ClassCastException。裸类型、any、通配符与
+        // 尚未解析的类型参数保持宽松；内建集合族已在上面单独比较。
+        if (actual is JasNamedType && expected is JasNamedType &&
+            canonicalTypeName(actual)?.let { it == canonicalTypeName(expected) } == true &&
+            !typeArgumentsInvariantlyEqual(actual.typeArguments, expected.typeArguments)
+        ) return false
         if (canonicalTypeName(actual)?.let { it == canonicalTypeName(expected) } == true) return true
         // 基本类型的可空形式是不同的包装类（Integer 不是 Long），不做隐式拓宽；
         // 必须先于 numericWidening，它的名字归一会穿过 `?`。需要时写 `x ?? 0` 取值后再拓宽。
@@ -3631,6 +3714,43 @@ class TypeChecker(
             if (!typesCompatible(actual.paramTypes[i], methodType.paramTypes[i])) return false
         }
         return typesCompatible(actual.returnType, methodType.returnType)
+    }
+
+    /**
+     * 无标注局部的推断类型能否交给翻译器定局部类型（Q236）：本程序 / 标准库声明的具名类型（可空亦可），
+     * 且类型实参里不含当前作用域的类型参数或 any。泛型方法结果经擦除后 IR 只剩 Object，
+     * 不把检查器已知的具体类型带下去，`var x = bus.send(c).get(); x.n` 会 VerifyError。
+     */
+    private fun declaredInferredLocalType(type: JasType?, env: TypeEnvironment): JasType? {
+        val named = ((type as? JasNullableType)?.inner ?: type) as? JasNamedType ?: return null
+        if (env.hasTypeParameter(named.name)) return null
+        val st = symbolTable ?: return null
+        if (st.findClass(named.name) == null && st.findInterface(named.name) == null && st.findEnum(named.name) == null) return null
+        /** 类型里不含当前作用域的类型参数与 any。 */
+        fun concrete(t: JasType): Boolean = when (t) {
+            is JasNamedType -> !env.hasTypeParameter(t.name) && t.typeArguments.all(::concrete)
+            is JasNullableType -> concrete(t.inner)
+            is JasAnyType -> false
+            else -> true
+        }
+        return if (concrete(named)) type else null
+    }
+
+    /** 两组类型实参在「不变」意义下相同；任一侧为空（裸类型）或含不具体的实参时视为相同。 */
+    private fun typeArgumentsInvariantlyEqual(a: List<JasType>, b: List<JasType>): Boolean {
+        if (a.isEmpty() || b.isEmpty() || a.size != b.size) return true
+        /** 实参是否足够具体可参与不变比较：不是 any / 通配符 / 未解析的类型参数。 */
+        fun concrete(t: JasType): Boolean = when (t) {
+            is JasAnyType, is JasWildcardType -> false
+            is JasNamedType -> (isDeclaredTypeName(t.name) || KnownTypeNames.isBuiltinOrInterop(t.name) || '.' in t.name) &&
+                t.typeArguments.all(::concrete)
+            is JasNullableType -> concrete(t.inner)
+            is JasArrayType -> concrete(t.inner)
+            else -> true
+        }
+        return a.zip(b).all { (x, y) ->
+            !concrete(x) || !concrete(y) || (typesCompatible(x, y) && typesCompatible(y, x))
+        }
     }
 
     /** 全限定平台类名：带点，且不是本编译单元声明的类型（声明的类型按源码继承关系判断）。 */

@@ -1956,6 +1956,7 @@ class JasperToIrTranslator {
         // 变量类型优先级：闭包初值用其具体类型 > 显式声明类型 > 初值类型 > Unit（兜底）。
         val varType = if (isClosureInit && translatedInit != null) translatedInit.type
             else if (stmt.type != null) typeMapper.mapType(stmt.type)
+            else if (stmt.inferredType != null) typeMapper.mapType(stmt.inferredType)
             else translatedInit?.type ?: typeMapper.unitType()
         val irVar = IrNodeFactory.createVariable(
             0, 0, IrDeclarationOrigin.DEFINED, Name.identifier(stmt.name),
@@ -3473,10 +3474,29 @@ class JasperToIrTranslator {
         // 静态调用名必须是普通函数名：后端以 "v:" 前缀区分实例调用，其余一律按 INVOKESTATIC。
         ctx.callNames[ref.symbol] = (expr.target as JasPropertyAccess).property
         val irArgs = expr.args.map { translateExpression(it, ctx) }.toTypedArray()
-        return IrNodeFactory.createCall(
+        val call = IrNodeFactory.createCall(
             0, 0, ref.returnType, IrStatementOrigin.INVOKE,
             irArgs, emptyArray<IrType>(), ref.symbol, null
         )
+        // 泛型静态方法（`Util.first<T>(f): T`）：调用描述符保持擦除，结果按检查器推断出的类型实参
+        // 转回具体类型（CHECKCAST / 拆箱），否则 `var b = Util.first(f)` 的局部是 Object（Q236）。
+        val inferred = expr.inferredTypeArgs
+        if (inferred.isNullOrEmpty()) return call
+        // 擦除后的返回 IR 类型可能已是 Any（不再是类型参数），在 IR 层代换不出具体类型；
+        // 以检查器选中的声明返回类型为准，在语言类型层代换后再映射（T = int32 时得 int，后端拆箱）。
+        val declaredReturn = expr.resolvedFunction?.returnType
+        val concrete = if (declaredReturn != null) typeMapper.mapType(substituteJasType(declaredReturn, inferred))
+            else substituteIrType(ref.returnType, inferred)
+        return castToDeclared(concrete, call)
+    }
+
+    /** 语言类型层的类型参数代换（只替换无实参的具名类型参数，递归处理类型实参 / 可空 / 数组）。 */
+    private fun substituteJasType(type: JasType, mapping: Map<String, JasType>): JasType = when (type) {
+        is JasNamedType -> if (type.typeArguments.isEmpty() && type.name in mapping) mapping.getValue(type.name)
+            else JasNamedType(type.name, type.typeArguments.map { substituteJasType(it, mapping) })
+        is JasNullableType -> JasNullableType(substituteJasType(type.inner, mapping))
+        is JasArrayType -> JasArrayType(substituteJasType(type.inner, mapping))
+        else -> type
     }
 
     /**

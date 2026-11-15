@@ -608,3 +608,18 @@
 | 变异 | 见 LANG-BUILTIN-WIDEN-01（静态实参不做数值拓宽、漏 I2D 两组变异被抓） |
 | 定点回归 | 除 Lincheck 外全部测试类 + 一致性：135 个类 1655 项 0 失败（语言线专用 VM） |
 | JBMC | 发版时验证 |
+
+## LANG-GENERIC-RETURN-01 泛型方法返回类型按调用点代换（FV-B，Kotlin 检查器 + 翻译器 + 后端）
+
+源码身份：引入本节的提交；`TypeChecker.kt`（`inferMethodTypeArguments`、`declaringTypeArgumentMapping`、`supertypeInstance`、`unify` 经继承链对齐、`declaredInferredLocalType`、`typeArgumentsInvariantlyEqual`）、`JasperAst.kt`（`JasVariableStatement.inferredType`）、`JasperToIrTranslator.kt`（泛型静态调用结果按代换后类型转换、无标注局部用推断类型）、`JvmIrBackend.kt`（桥接方法覆盖经子接口继承的接口方法）。
+
+性质（Q236，appfw FB-app-001 / FB-data-02 / FB-data-03 / FB-web-019 / FB-build-001 / FB-build-012 / FB-UI-003）：此前只有顶层泛型函数推断类型参数；类的静态 / 实例泛型方法、经子接口继承的泛型方法返回类型停在裸 `T` / `R`，写类型标注报 `cannot assign R to ...`，不写则运行期 VerifyError；经子接口实现的泛型方法缺桥接，运行期 AbstractMethodError；泛型方法结果能赋给任意实参的同名类型（不健全）。现在按调用点推断并代换、继承链逐层代换、补桥、无标注局部带上检查器推断的具体类型、同名泛型类型的类型实参不变。规则写入 docs/03 §3.6.1。
+
+| 项 | 内容 |
+|---|---|
+| 端到端 | `GenericReturnSubstitutionTest` 4 组：类静态泛型方法（有 / 无标注、T = int32 拆箱）、实例泛型方法经实现接口推断（有 / 无标注）、经子接口继承的 `find`（有 / 无标注）、不健全赋值两例被拒 |
+| 变异 | 8 组全部被抓：只用接收者自身映射、实例调用不代换、静态调用不代换、unify 不走继承链、桥接只看直接接口、静态结果不转换、无标注局部不带类型、关闭类型实参不变 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：136 个类 1659 项 0 失败（语言线专用 VM） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 类型实参按不变处理，暂无声明处型变（`out` / `in`）；推断不看期望类型（只看实参）；平台泛型类型的实参仍不参与比较 |

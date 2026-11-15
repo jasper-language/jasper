@@ -1028,7 +1028,16 @@ class JvmIrBackend(private val typeMapper: TypeMapper) {
      *   (接口方法, 实现方法) 需要桥」收敛到本函数，主生成路径无须理解泛型（隔离的变化点）。
      */
     private fun generateBridgeMethods(cw: ClassWriter, cls: IrClass, internalName: String) {
-        val ifaceNames = classInterfaceNames[internalName] ?: return
+        val direct = classInterfaceNames[internalName] ?: return
+        // 接口经子接口继承来的方法同样需要桥（Q236）：`UserRepoImpl implements UserRepo`，
+        // `UserRepo extends Repo<User, int64>`，`find(ID)` 声明在 Repo，擦除为 `find(Object)`。
+        // 接口的父接口也记在 classInterfaceNames 里，这里取传递闭包（保持声明顺序，去重）。
+        val ifaceNames = LinkedHashSet<String>()
+        val pending = ArrayDeque(direct)
+        while (pending.isNotEmpty()) {
+            val next = pending.removeFirst()
+            if (ifaceNames.add(next)) classInterfaceNames[next]?.let { pending.addAll(it) }
+        }
         val ownMethods = cls.declarations.filterIsInstance<IrSimpleFunction>()
         if (ownMethods.isEmpty() || ifaceNames.isEmpty()) return
         val ownByName = ownMethods.groupBy { it.name.toString() }

@@ -282,7 +282,13 @@ open class JasStatement : JasNode()
  * 局部变量声明语句：name 变量名；type 声明类型（null 表示待推导）；
  * initializer 初始化表达式（null 表示仅声明不初始化）；isConst 是否为常量。
  */
-data class JasVariableStatement(val name: String, val type: JasType?, val initializer: JasExpression?, val isConst: Boolean = false) : JasStatement()
+data class JasVariableStatement(val name: String, val type: JasType?, val initializer: JasExpression?, val isConst: Boolean = false) : JasStatement() {
+    /**
+     * 检查阶段回填：没写类型标注时检查器推断出的本程序声明类型（Q236）。翻译器用它定局部类型，
+     * 初值经 CHECKCAST 转回具体类型；只在推断结果是本程序 / 标准库声明的具名类型时设置。
+     */
+    var inferredType: JasType? = null
+}
 
 /**
  * 表达式语句：把表达式当语句执行（主要用于带副作用的调用或赋值）。
