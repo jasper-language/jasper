@@ -1681,20 +1681,24 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
      */
     override fun visitCharLiteral(ctx: JasperParser.CharLiteralContext): JasNode? {
         val text = ctx.text
-        val unescaped = doUnescape(text.drop(1).dropLast(1))
+        val (unescaped, problem) = unescape(text.drop(1).dropLast(1))
         // 按码点数判断：'😀' 是 1 个码点、2 个 UTF-16 码元，旧实现按 length == 1 判成 0（Q229）。
-        return if (unescaped.isNotEmpty() && unescaped.codePointCount(0, unescaped.length) == 1) {
-            JasCharLiteral(unescaped.codePointAt(0), text)
-        } else {
-            JasCharLiteral(0, text)
-        }.at(ctx)
+        val single = unescaped.isNotEmpty() && unescaped.codePointCount(0, unescaped.length) == 1
+        val literal = JasCharLiteral(if (single) unescaped.codePointAt(0) else 0, text)
+        val scalar = single && unescaped.codePointAt(0) !in 0xD800..0xDFFF
+        literal.problem = problem
+            ?: if (!single) "Character literal $text must contain exactly one character"
+            else if (!scalar) "Character literal $text is a lone surrogate; char holds a Unicode scalar value"
+            else null
+        return literal.at(ctx)
     }
 
     /**
      * literal 的 String 标签：反转义后产出 JasStringLiteral。
      */
     override fun visitStringLiteral(ctx: JasperParser.StringLiteralContext): JasNode? {
-        return JasStringLiteral(doUnescape(ctx.text)).at(ctx)
+        val (value, problem) = unescape(ctx.text.removeSurrounding("\""))
+        return JasStringLiteral(value).also { it.problem = problem }.at(ctx)
     }
 
     /**
@@ -2294,29 +2298,55 @@ class JasperAstBuilder : JasperParserBaseVisitor<JasNode?>() {
     }
 
     /**
-     * 私有辅助：去掉字符串外层引号并处理常见转义序列（换行、制表、回车、反斜杠、引号等）。
+     * 私有辅助：处理字符串 / 字符字面量的转义，返回（值，问题）。
      *
-     * 边界：未知转义保留其字符本身；孤立的反斜杠被丢弃。
+     * 转义集合与词法 CHAR_ESCAPE 一致：`\b \t \n \f \r \' \" \\`、`\xHH`（码点 0..255）、`\uHHHH`
+     * （UTF-16 码元；`\uD83D\uDE00` 两个码元合成一个补充平面字符）。以前只认 `n t r \ " '`，
+     * `\u0041`、`\b`、`\f` 静默丢掉反斜杠（Q239，appfw FB-web-014）。未知转义或位数不足返回问题文本，
+     * 由检查器报错；值里保留原文，便于继续检查。
      */
-    private fun doUnescape(text: String): String {
-        val content = text.removeSurrounding("\"")
+    private fun unescape(content: String): Pair<String, String?> {
         val sb = StringBuilder()
+        var problem: String? = null
         var i = 0
-        while (i < content.length) {
-            when (content[i]) {
-                '\\' -> {
-                    i++
-                    if (i < content.length) sb.append(when (content[i]) {
-                        'n' -> '\n'; 't' -> '\t'; 'r' -> '\r'
-                        '\\' -> '\\'; '"' -> '"'; '\'' -> '\''
-                        else -> content[i]
-                    })
-                }
-                else -> sb.append(content[i])
-            }
-            i++
+        /** 从 [start] 起恰好 [count] 位十六进制数字的值；越界或含非十六进制字符时 null。 */
+        fun hex(start: Int, count: Int): Int? {
+            if (start + count > content.length) return null
+            val digits = content.substring(start, start + count)
+            return if (digits.all { Character.digit(it, 16) >= 0 }) digits.toInt(16) else null
         }
-        return sb.toString()
+        while (i < content.length) {
+            val c = content[i]
+            if (c != '\\' || i + 1 >= content.length) {
+                sb.append(c)
+                i++
+                continue
+            }
+            when (val e = content[i + 1]) {
+                'n' -> { sb.append('\n'); i += 2 }
+                't' -> { sb.append('\t'); i += 2 }
+                'r' -> { sb.append('\r'); i += 2 }
+                'b' -> { sb.append('\b'); i += 2 }
+                'f' -> { sb.append('\u000C'); i += 2 }
+                '\\', '"', '\'' -> { sb.append(e); i += 2 }
+                'u' -> {
+                    val v = hex(i + 2, 4)
+                    if (v == null) { problem = problem ?: "Escape '\\u' needs exactly 4 hexadecimal digits"; sb.append("\\u"); i += 2 }
+                    else { sb.append(v.toChar()); i += 6 }
+                }
+                'x' -> {
+                    val v = hex(i + 2, 2)
+                    if (v == null) { problem = problem ?: "Escape '\\x' needs exactly 2 hexadecimal digits"; sb.append("\\x"); i += 2 }
+                    else { sb.append(v.toChar()); i += 4 }
+                }
+                else -> {
+                    problem = problem ?: "Unknown escape sequence '\\$e'; valid escapes are \\b \\t \\n \\f \\r \\' \\\" \\\\ \\xHH \\uHHHH"
+                    sb.append('\\').append(e)
+                    i += 2
+                }
+            }
+        }
+        return sb.toString() to problem
     }
 
     /**

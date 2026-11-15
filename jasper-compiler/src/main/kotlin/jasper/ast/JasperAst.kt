@@ -487,12 +487,18 @@ data class JasFloatLiteral(val value: Double, val raw: String) : JasExpression()
 /**
  * 字符字面量：value 码点数值（Int）；raw 源码原文（含引号与转义写法）。
  */
-data class JasCharLiteral(val value: Int, val raw: String) : JasExpression()
+data class JasCharLiteral(val value: Int, val raw: String) : JasExpression() {
+    /** 构建阶段发现的问题（非法转义、不是恰好一个码点）；检查器据此报错，不再静默取 0（Q239）。 */
+    var problem: String? = null
+}
 
 /**
  * 字符串字面量：text 字符串内容；raw=true 表示原始字符串（不处理转义）。
  */
-data class JasStringLiteral(val text: String, val raw: Boolean = false) : JasExpression()
+data class JasStringLiteral(val text: String, val raw: Boolean = false) : JasExpression() {
+    /** 构建阶段发现的非法转义；检查器据此报错，不再静默丢掉反斜杠（Q239）。 */
+    var problem: String? = null
+}
 
 /**
  * 布尔字面量：value 取值 true/false。

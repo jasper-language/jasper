@@ -1688,7 +1688,15 @@ class TypeChecker(
                 if (FloatLiterals.isHex(expr.raw)) FloatLiterals.hexProblem(expr.raw)?.let { error(it, expr) }
                 JasPrimitiveType(if (expr.raw.endsWith("f") || expr.raw.endsWith("F")) "float32" else "float64")
             }
-            is JasStringLiteral -> JasStringType
+            is JasStringLiteral -> {
+                expr.problem?.let { error(it, expr) }
+                JasStringType
+            }
+            // 字符字面量：非法转义或不是恰好一个码点时报错（以前静默取 0，Q239）。
+            is JasCharLiteral -> {
+                expr.problem?.let { error(it, expr) }
+                JasPrimitiveType("char")
+            }
             is JasBoolLiteral -> JasPrimitiveType("bool")
             is JasNullLiteral -> JasNullableType(JasAnyType)
             is JasArrayLiteral -> inferArrayLiteral(expr, env, expected)
