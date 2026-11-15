@@ -277,3 +277,17 @@ looked up reflectively at run time, so this stays compatible with native-image.
 - A name that resolves to neither a class with that static method nor a static
   field is a compile error. Non-public and instance fields cannot be read this
   way.
+
+## Same-Named Types Across Packages (Q238, 2026-11-15)
+
+Two packages may declare types with the same simple name (for example
+`pa.Variant` and `pb.Variant`). A file uses them as follows:
+
+- One of them can be imported by its simple name; the other is written
+  with its qualified name in types and expressions (`var v: pb.Variant =
+  pb.Variant.Destructive;`, `pb.Util.make()`), or imported under an alias:
+  `from pb import Variant as UiVariant;` then `UiVariant.Destructive`.
+- Simple names inside a member signature (`show(t: Thing)`) mean what they
+  mean in the file that declares the member, not in the caller's file. A
+  caller that imports a different `Thing`, or none, can still pass the
+  declaring file's `Thing`.

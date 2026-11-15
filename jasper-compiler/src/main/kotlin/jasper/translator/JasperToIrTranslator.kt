@@ -3763,12 +3763,37 @@ class JasperToIrTranslator {
      *   `var Counter = ...; Counter.total` 误判成静态访问。
      */
     private fun declaredClassName(target: JasExpression, ctx: TranslationContext): String? {
+        if (target is JasPropertyAccess) return qualifiedDeclaredClassName(target, ctx)
         if (target !is JasIdentifier) return null
         // 含点的标识符只来自生成代码（协程帧调用 std.FrameSlot），源码标识符不含点；生成帧可位于任意包。
         if ('.' in target.name) return target.name.replace('.', '/').takeIf { it in ctx.staticMemberFunctionSymbolsByType }
         if (ctx.symbols.containsKey(target.name)) return null
-        if (target.name !in ctx.declaredTypeNames) return null
+        if (target.name !in ctx.declaredTypeNames) {
+            // 导入别名（`from pb import Variant as UiVariant`）：别名本身不是声明名，经本文件 import 表还原（Q238）。
+            val imported = typeMapper.currentImports[target.name] ?: return null
+            if (imported.substringAfterLast('.') !in ctx.declaredTypeNames) return null
+            return imported.replace('.', '/')
+        }
         return typeMapper.resolveNamedTypeName(target.name)
+    }
+
+    /**
+     * `pb.Variant` 这类标识符链作类型名接收者时的类名（Q238，appfw FB-theme-06）：根不是局部值，且点分名
+     * 对应本程序登记过的类型（枚举常量 / 静态成员 / 字段任一表里有它）时返回内部名，否则 null。
+     */
+    private fun qualifiedDeclaredClassName(target: JasPropertyAccess, ctx: TranslationContext): String? {
+        val segments = mutableListOf<String>()
+        var cursor: JasExpression = target
+        while (cursor is JasPropertyAccess && !cursor.isSafe) {
+            segments.add(cursor.property)
+            cursor = cursor.target
+        }
+        if (cursor !is JasIdentifier || ctx.symbols.containsKey(cursor.name)) return null
+        segments.add(cursor.name)
+        val key = segments.reversed().joinToString("/")
+        val known = key in ctx.enumConstantSymbolsByType || key in ctx.staticMemberFunctionSymbolsByType ||
+            ctx.fieldSymbolsByClass.containsKey(key)
+        return key.takeIf { known }
     }
 
     /**

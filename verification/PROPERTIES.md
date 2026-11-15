@@ -654,3 +654,18 @@
 | 定点回归 | 除 Lincheck 外全部测试类 + 一致性：138 个类 1664 项 0 失败（语言线专用 VM） |
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
+
+## LANG-SAME-NAME-TYPES-01 两个包的同名类型可共存（FV-B，Kotlin 检查器 + 翻译器）
+
+源码身份：引入本节的提交；`TypeChecker.kt`（`declaringDeclaration`、`inDeclaringScope`：成员形参类型按声明文件作用域解析；`qualifiedUserTypeName` / `typeNameOf`：限定名作类型名接收者与类型值）、`JasperToIrTranslator.kt`（`declaredClassName` 认导入别名、`qualifiedDeclaredClassName` 认限定名）；docs/current-decisions「Same-Named Types Across Packages」。
+
+性质（Q238，appfw FB-merge-001 / FB-theme-06）：此前成员签名里的简单类型名按调用方作用域解析，别包另有同名类型时合法实参被拒；别包同名类型的限定名 `pb.Variant.Destructive` 报 Unresolved reference；导入别名 `UiVariant.Destructive` 触发翻译器内部错误。现在三者都可用。
+
+| 项 | 内容 |
+|---|---|
+| 端到端 | `SameNameTypesTest` 3 组：FB-merge-001 原样（注解 pa.Thing 与类 pb.Thing 共存、跨包子类作实参）；限定名声明与枚举常量、比较；别名声明与枚举常量、比较 |
+| 变异 | 5 组全部被抓：形参不按声明作用域、限定名不作类型值、限定名不作接收者、翻译器不认别名、翻译器不认限定名 |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：139 个类 1667 项 0 失败（语言线专用 VM） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |
+| 边界 | 成员返回类型仍按调用方作用域解析（只改了形参）；限定名只覆盖本程序声明的类型（平台类型见 LANG-PLATFORM-STATIC-FIELD-01） |

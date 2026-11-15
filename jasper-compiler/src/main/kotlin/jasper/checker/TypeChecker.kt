@@ -1814,7 +1814,7 @@ class TypeChecker(
                 // 「类名不能访问实例成员」的错误路径，而正确的语义是静态调用（Q19 C22）。
                 val staticTarget = expr.target
                 if (staticTarget is JasPropertyAccess && !staticTarget.isSafe && isTypeNameReference(staticTarget.target, env)) {
-                    return inferStaticMemberCall(expr, staticTarget, argTypes)
+                    return inferStaticMemberCall(expr, staticTarget, argTypes, env)
                 }
                 // 全限定平台类名（java.lang.Integer.parseInt）不是单段 JasIdentifier 类型名。
                 // 在推断目标属性链之前分流，否则根的 `java` 会被当作普通值并报 Unresolved reference。
@@ -2059,6 +2059,9 @@ class TypeChecker(
                 //   （ClassFormatError / NoSuchFieldError，Q19 C23）。any 接收者的成员集合
                 //   不可知，仍按宽松处理（保持既有动态调用语义）。
                 if (!expr.isSafe) {
+                    // `pb.Variant` 作为类型名出现在表达式里（后面跟 `.Destructive` 等成员），与简单类型名一样
+                    // 按类型名对待（Q238）；否则根 `pb` 会被当作值报 Unresolved reference。
+                    qualifiedUserTypeName(expr, env)?.let { return JasNamedType(it) }
                     qualifiedPlatformStaticField(expr, env)?.let { owner ->
                         // 全限定平台静态字段（`java.io.File.pathSeparator`）：与平台调用一致，
                         // 语言层类型是 any，真实 JVM 类型由翻译器 / 后端按字段描述符取得。
@@ -2071,7 +2074,7 @@ class TypeChecker(
                 // 先单独处理，否则会把类名当成一个值为 null 的变量，导致实例字段被静默放行，
                 // 直到运行期才以 NPE 的形式暴露（JDBC #8 / R2DBC #18 / JPA #10）。
                 if (!expr.isSafe && isTypeNameReference(expr.target, env)) {
-                    val typeName = (expr.target as JasIdentifier).name
+                    val typeName = typeNameOf(expr.target, env)
                     // 枚举常量（`Color.Red`）的静态类型就是枚举类型本身。必须先于字段/成员
                     // 索引识别：常量不是 JasProperty，SymbolTable 不会为它建成员索引，否则
                     // 会被误报为「Cannot resolve member」并降级成 any（比较/赋值仍能过，
@@ -2307,9 +2310,10 @@ class TypeChecker(
     private fun inferStaticMemberCall(
         expr: JasCall,
         target: JasPropertyAccess,
-        argTypes: List<JasType?>
+        argTypes: List<JasType?>,
+        env: TypeEnvironment
     ): JasType? {
-        val typeName = (target.target as JasIdentifier).name
+        val typeName = typeNameOf(target.target, env)
         val memberName = target.property
         // 枚举的 values()/valueOf(String) 由后端为每个枚举类合成，源码层按静态方法使用。
         val enumDecl = symbolTable?.findEnum(typeName)
@@ -3015,10 +3019,54 @@ class TypeChecker(
      *   具体实参会被误报为 `expected T, got Person`（Q28 回归防线）。
      */
     private fun memberParameterTypes(fn: JasFunction, receiverType: JasNamedType): List<JasType> {
-        val declared = fn.parameters.map { it.type ?: JasAnyType }
+        val owner = declaringDeclaration(receiverType, fn)
+        val declared = fn.parameters.map { p -> (p.type ?: JasAnyType).let { if (owner != null) inDeclaringScope(it, owner, fn) else it } }
         val mapping = declaringTypeArgumentMapping(receiverType, fn)
         if (mapping.isEmpty()) return declared
         return declared.map { substitute(it, mapping) }
+    }
+
+    /** 沿接收者的继承链找到成员表里有 [fn] 的类 / 接口声明；找不到（平台类型等）时 null。 */
+    private fun declaringDeclaration(receiverType: JasNamedType, fn: JasFunction): JasDeclaration? {
+        val seen = mutableSetOf<String>()
+        val pending = ArrayDeque(listOf(receiverType.name))
+        while (pending.isNotEmpty()) {
+            val name = pending.removeFirst()
+            if (!seen.add(name) || seen.size > 32) continue
+            val cls = symbolTable?.findClass(name)
+            val iface = if (cls == null) symbolTable?.findInterface(name) else null
+            val members = cls?.members ?: iface?.members ?: continue
+            if (members.any { it === fn }) return cls ?: iface
+            val supers = if (cls != null) listOfNotNull(cls.superclass) + cls.interfaces else iface!!.extends
+            supers.mapNotNullTo(pending) { (it as? JasNamedType)?.name }
+        }
+        return null
+    }
+
+    /**
+     * 把成员签名里的简单类型名按**声明它的文件**的作用域解析（Q238，appfw FB-merge-001）。
+     *
+     * 签名 `show(t: Thing)` 写在 `pb` 包里，指 `pb.Thing`；以前在调用方（`pt` 包、未 import Thing）的作用域
+     * 解析，别包另有同名 `pa.Thing` 时解析成空或别的类型，合法实参被报 `expected Thing, got Impl`。
+     * 只有两边作用域解析结果不同时才改写成限定名，其余保持原样（诊断文本不变）。类型参数不改写。
+     */
+    private fun inDeclaringScope(type: JasType, owner: JasDeclaration, fn: JasFunction): JasType {
+        val st = symbolTable ?: return type
+        val typeParams = fn.typeParameters.map { it.name }.toSet() +
+            ((owner as? JasClass)?.typeParameters ?: (owner as? JasInterface)?.typeParameters ?: emptyList()).map { it.name }
+        /** 递归改写类型里在两边作用域解析不同的简单名。 */
+        fun rewrite(t: JasType): JasType = when (t) {
+            is JasNamedType -> {
+                val args = t.typeArguments.map(::rewrite)
+                val qualified = if ('.' in t.name || t.name in typeParams) null else
+                    st.resolveTypeKeyForDeclaration(owner, t.name)?.takeIf { it != st.resolveTypeKey(t.name) }?.qualifiedName
+                if (qualified == null && args == t.typeArguments) t else JasNamedType(qualified ?: t.name, args)
+            }
+            is JasNullableType -> JasNullableType(rewrite(t.inner))
+            is JasArrayType -> JasArrayType(rewrite(t.inner))
+            else -> t
+        }
+        return rewrite(type)
     }
 
     /**
@@ -3162,6 +3210,7 @@ class TypeChecker(
      *   （局部值优先于类型名），否则局部变量恰好与类同名时会误判成静态访问。
      */
     private fun isTypeNameReference(target: JasExpression, env: TypeEnvironment): Boolean {
+        if (target is JasPropertyAccess) return qualifiedUserTypeName(target, env) != null
         if (target !is JasIdentifier) return false
         if (env.contains(target.name) || env.hasTypeParameter(target.name)) return false
         if (symbolTable?.resolveType(target.name) == null) return false
@@ -3173,6 +3222,32 @@ class TypeChecker(
         }
         return true
     }
+
+    /**
+     * `a.b.C` 形式的标识符链是否本程序声明的类型的限定名（Q238，appfw FB-theme-06）：两个包有同名类型时，
+     * 不 import 的那个只能写限定名（`pb.Variant.Destructive`）。根名是值或类型参数时不是。返回点分限定名或 null。
+     */
+    private fun qualifiedUserTypeName(target: JasExpression, env: TypeEnvironment): String? {
+        val segments = mutableListOf<String>()
+        var cursor: JasExpression = target
+        while (cursor is JasPropertyAccess && !cursor.isSafe) {
+            segments.add(cursor.property)
+            cursor = cursor.target
+        }
+        if (cursor !is JasIdentifier || segments.isEmpty()) return null
+        if (cursor.name == "this" || cursor.name == "super") return null
+        if (env.contains(cursor.name) || env.hasTypeParameter(cursor.name)) return null
+        segments.add(cursor.name)
+        val qualified = segments.reversed().joinToString(".")
+        val st = symbolTable ?: return null
+        val declared = st.findClass(qualified) ?: st.findEnum(qualified) ?: st.findInterface(qualified)
+        return qualified.takeIf { declared != null }
+    }
+
+    /** 类型名接收者的名字：简单名，或 [qualifiedUserTypeName] 认出的限定名。 */
+    private fun typeNameOf(target: JasExpression, env: TypeEnvironment): String =
+        (target as? JasIdentifier)?.name ?: qualifiedUserTypeName(target, env)
+            ?: throw IllegalStateException("not a type name receiver")
 
     /** 已因「类型名作接收者但本文件不可见」报过错的节点，避免同一节点在多条检查路径上重复报告。 */
     private val reportedInvisibleTypeNames: MutableSet<JasExpression> = java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
