@@ -639,3 +639,18 @@
 | Z3 / Lincheck | N/A |
 | JBMC | 发版时验证 |
 | 边界 | f"..." 格式字符串、re"..." 正则与字节串的转义不在本节 |
+
+## LANG-LIST-REMOVE-VALUE-01 集合元素 / 键 / 值实参按擦除后的 Object 传递（FV-B，Kotlin 翻译器）
+
+源码身份：引入本节的提交；`JasperToIrTranslator.kt`（`translateCollectionCallIfApplicable` 对 ELEMENT / KEY / VALUE 位置实参装箱，INDEX 保持 int32）。
+
+性质（Q242，appfw FB-build-010）：`MutableList<T>.remove(value: T): bool` 按值删除（stdlib MutableList.jas）。此前元素实参以原始 int 交给 JDK 重载解析，`MutableList<int32>.remove(v)` 选中 `List.remove(int 下标)`：按下标删、返回被删元素。现在元素 / 键 / 值位置先装箱为 Object（JDK 泛型擦除后的形参类型），下标位置不变。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `ListRemoveValueTest` 种子 20261120：120 步随机 add / remove（值域 0..11，约三分之一为 remove），每次 remove 的返回与最终内容和 Kotlin MutableList.remove(element) 一致 |
+| 端到端 | 同一测试类：`[10,20,30,1]` 删值 1 删掉末尾而非下标 1；删不存在的值返回 false；string 与 int64 列表；既有 `Collection*` 测试同跑 |
+| 变异 | 2 组全部被抓：不装箱（回到按下标删）、连下标也装箱（get / set 选错重载） |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：138 个类 1664 项 0 失败（语言线专用 VM） |
+| Z3 / Lincheck | N/A |
+| JBMC | 发版时验证 |

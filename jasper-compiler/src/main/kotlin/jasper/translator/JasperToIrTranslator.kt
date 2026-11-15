@@ -3332,7 +3332,15 @@ class JasperToIrTranslator {
         val spec = BuiltinCollections.loweringMember(receiverName, access.property) ?: return null
         val args = ArrayList<IrExpression>(expr.args.size + 1)
         args.add(receiver)
-        args.addAll(expr.args.map { translateExpression(it, ctx) })
+        // 元素 / 键 / 值位置在 JDK 上是擦除后的 Object：先装箱，后端按真实签名选重载时才会选
+        // `List.remove(Object)`。以前 `MutableList<int32>.remove(v)` 带着 int 去解析，选中
+        // `remove(int 下标)`，按下标删且返回被删元素（Q242，appfw FB-build-010）。下标位置保持 int32。
+        val anyType = typeMapper.type("kotlin.Any")
+        args.addAll(expr.args.mapIndexed { i, arg ->
+            val value = translateExpression(arg, ctx)
+            val kind = spec.parameterKinds.getOrNull(i)
+            if (kind != null && kind != CollectionParameterKind.INDEX) castToDeclared(anyType, value) else value
+        })
         // `Map.put` / `Map.remove` 的返回是「旧值」，键不存在时为 null；若把调用点
         // IR 类型记成值类型，后端会在调用后立即拆箱，**即使调用结果被丢弃**（语句
         // 位置）也会对 null 抛 NPE。语言 v1 没有把「旧值」建模为可空，因此这里把
