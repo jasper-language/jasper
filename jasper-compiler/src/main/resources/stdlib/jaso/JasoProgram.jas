@@ -58,16 +58,25 @@ public class JasoModulePath {
     public static function split(text: string): JasoStrings {
         var out: JasoStrings = new JasoStrings();
         var separator: string = java.lang.System.getProperty("path.separator");
+        // indexOf / substring 是平台方法，下标是 UTF-16 码元；这里不能混用 Jasper 的 `.length`（码点数），
+        // 所以只沿 indexOf 的结果前进，末段用 substring(start) 取到结尾（Q231 起 `s.length()` 是编译错误）。
+        // JVM 的 path.separator 恒为一个字符（`:` 或 `;`），前进一个码元即可。
         var start: int32 = 0;
-        while (start <= text.length()) {
+        while (true) {
             var end: int32 = text.indexOf(separator, start);
+            var piece: string = "";
             if (end < 0) {
-                end = text.length();
+                piece = text.substring(start);
+            } else {
+                piece = text.substring(start, end);
             }
-            if (end > start) {
-                out.append(text.substring(start, end));
+            if (piece != "") {
+                out.append(piece);
             }
-            start = end + separator.length();
+            if (end < 0) {
+                break;
+            }
+            start = end + 1;
         }
         return out;
     }
@@ -411,7 +420,7 @@ public class JasoProgramOptions {
 
     /** 做什么：Ed25519 公钥：恰好 64 个小写十六进制数字。 */
     private static function hex(text: string): byte[] {
-        if (text.length() != 64) {
+        if (text.length != 64) {
             throw new JasoRuntimeError("program.usage", "--trust key must be 64 hex digits");
         }
         var out: byte[] = new byte[32];

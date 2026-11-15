@@ -589,7 +589,7 @@
 | 负例 | `s.length()` 存 int64 局部、`return s.length()`、`xs.length()`：诊断文本指向属性写法，且不产 class |
 | 既有测试改期望 | `Char32Test` 随机用例改用 `s.length`，期望由 UTF-16 码元数改为码点数（按 §11.3） |
 | 变异 | 4 组全部被抓：不拒绝调用形式、只拒绝 string 不拒绝数组（各被负例抓）、静态实参不做数值拓宽、静态实参漏 I2D（各被固定与随机两项抓） |
-| 定点回归 | REGRESSION_RESULT |
+| 定点回归 | rebase 到 f5acace 后，除 Lincheck 外全部测试类 + 一致性：134 个类 1652 项 0 失败（语言线专用 VM）；rebase 后需把之后合入的 `s.length()` 写法改掉：随附 `stdlib/jaso/JasoProgram.jas`（`split` 改为只沿 indexOf 前进，不混用码点长度与 UTF-16 下标；`hex` 改 `.length`）、`EnumConstructorArgsTest` 两处 |
 | Z3 / Lincheck | N/A：无并发、无可交给 SMT 的算术不变式；替代证据为上面的随机执行与变异 |
 | JBMC | 发版时验证 |
 | 边界 | 平台成员调用（如 `s.hashCode()`）的 IR 返回类型回填由 Q226（LANG-PLATFORM-RESULT-01）负责，本条不覆盖；`graphemeCount()` 尚未实现 |

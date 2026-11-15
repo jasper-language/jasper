@@ -188,7 +188,7 @@ class EnumConstructorArgsTest {
 
                 public constructor(base: int32, name: string) {
                     this.size = base * this.factor;
-                    this.tag = name.length();
+                    this.tag = name.length;
                 }
             }
             public function main(): int32 {
@@ -253,7 +253,7 @@ class EnumConstructorArgsTest {
                     public constructor(a: int32, b: int64, s: string) { this.a = a; this.b = b; this.s = s; }
                     public function score(ord: int32): int64 {
                         var r: int64 = this.a;
-                        return r * $ka + this.b * $kb + this.s.length() * 1000 + ord;
+                        return r * $ka + this.b * $kb + this.s.length * 1000 + ord;
                     }
                 }
                 public function picked(): int64 { return R.${consts[pick].name}.score($pick); }
