@@ -593,3 +593,18 @@
 | Z3 / Lincheck | N/A：无并发、无可交给 SMT 的算术不变式；替代证据为上面的随机执行与变异 |
 | JBMC | 发版时验证 |
 | 边界 | 平台成员调用（如 `s.hashCode()`）的 IR 返回类型回填由 Q226（LANG-PLATFORM-RESULT-01）负责，本条不覆盖；`graphemeCount()` 尚未实现 |
+
+## LANG-ARG-WIDEN-01 int32 实参按形参类型拓宽（回归覆盖；修复见 LANG-BUILTIN-WIDEN-01）
+
+源码身份：引入本节的提交只加测试；修复本身是 Q231 `738fac7`（静态调用实参经 `emitCallArgumentConversion` 做数值拓宽）与此前成员 / 构造器实参的声明形参转换。
+
+性质（Q237，appfw FB-app-010 / FB-web-015 / FB-003 / FB-theme-08）：int32 实参（字面量、局部、方法返回值、集合 size()、算术）传给 int64 / float64 形参（顶层函数、类静态方法、实例方法、构造器、std `Deadline.afterNanos`）按形参类型拓宽；大方法里多段 try/for 不再出无位置的 `[INTERNAL] -2`。
+
+| 项 | 内容 |
+|---|---|
+| 属性测试 | `ArgumentWideningTest` 种子 20261118：60 组随机 int32 局部与字面量经三参 int64 函数累加，与 Kotlin Long 运算一致 |
+| 端到端 | 同一测试类：七种调用形态；12 段 try / for / catch / finally 的大方法（appfw 报 INTERNAL 的形态） |
+| 修复确认 | 同一测试在 appfw 基线 `0defe28` 上 3 组全失败（VerifyError ×2、`[INTERNAL] -2`），在 `0e85ea6` 上全过 |
+| 变异 | 见 LANG-BUILTIN-WIDEN-01（静态实参不做数值拓宽、漏 I2D 两组变异被抓） |
+| 定点回归 | 除 Lincheck 外全部测试类 + 一致性：135 个类 1655 项 0 失败（语言线专用 VM） |
+| JBMC | 发版时验证 |
